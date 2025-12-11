@@ -2155,3 +2155,300 @@ registerDynamicRoute('GET', '/api/admin/monitoring/trace/:requestId', async (_co
     candidates
   })
 })
+
+// ========== 请求间隔时间线 Mock 数据 ==========
+
+// 生成请求间隔时间线数据（用于散点图）
+function generateIntervalTimelineData(
+  hours: number = 24,
+  limit: number = 5000,
+  includeUserInfo: boolean = false
+) {
+  const now = Date.now()
+  const startTime = now - hours * 60 * 60 * 1000
+  const points: Array<{ x: string; y: number; user_id?: string }> = []
+
+  // 用户列表（用于管理员视图）
+  const users = [
+    { id: 'demo-admin-uuid-0001', username: 'Demo Admin' },
+    { id: 'demo-user-uuid-0002', username: 'Demo User' },
+    { id: 'demo-user-uuid-0003', username: 'Alice Chen' },
+    { id: 'demo-user-uuid-0004', username: 'Bob Zhang' }
+  ]
+
+  // 生成模拟的请求间隔数据
+  // 间隔时间分布：大部分在 0-10 分钟，少量在 10-60 分钟，极少数在 60-120 分钟
+  const pointCount = Math.min(limit, Math.floor(hours * 80)) // 每小时约 80 个数据点
+
+  let currentTime = startTime + Math.random() * 60 * 1000 // 从起始时间后随机开始
+
+  for (let i = 0; i < pointCount && currentTime < now; i++) {
+    // 生成间隔时间（分钟），使用指数分布模拟真实场景
+    let interval: number
+    const rand = Math.random()
+    if (rand < 0.7) {
+      // 70% 的请求间隔在 0-5 分钟
+      interval = Math.random() * 5
+    } else if (rand < 0.9) {
+      // 20% 的请求间隔在 5-30 分钟
+      interval = 5 + Math.random() * 25
+    } else if (rand < 0.98) {
+      // 8% 的请求间隔在 30-90 分钟
+      interval = 30 + Math.random() * 60
+    } else {
+      // 2% 的请求间隔在 90-120 分钟
+      interval = 90 + Math.random() * 30
+    }
+
+    // 添加一些工作时间的模式（工作时间间隔更短）
+    const hour = new Date(currentTime).getHours()
+    if (hour >= 9 && hour <= 18) {
+      interval *= 0.6 // 工作时间间隔更短
+    } else if (hour >= 22 || hour <= 6) {
+      interval *= 1.5 // 夜间间隔更长
+    }
+
+    // 确保间隔不超过 120 分钟
+    interval = Math.min(interval, 120)
+
+    const point: { x: string; y: number; user_id?: string } = {
+      x: new Date(currentTime).toISOString(),
+      y: Math.round(interval * 100) / 100
+    }
+
+    if (includeUserInfo) {
+      // 管理员视图：添加用户信息
+      const user = users[Math.floor(Math.random() * users.length)]
+      point.user_id = user.id
+    }
+
+    points.push(point)
+
+    // 下一个请求时间 = 当前时间 + 间隔 + 一些随机抖动
+    currentTime += interval * 60 * 1000 + Math.random() * 30 * 1000
+  }
+
+  // 按时间排序
+  points.sort((a, b) => new Date(a.x).getTime() - new Date(b.x).getTime())
+
+  const response: {
+    analysis_period_hours: number
+    total_points: number
+    points: typeof points
+    users?: Record<string, string>
+  } = {
+    analysis_period_hours: hours,
+    total_points: points.length,
+    points
+  }
+
+  if (includeUserInfo) {
+    response.users = Object.fromEntries(users.map(u => [u.id, u.username]))
+  }
+
+  return response
+}
+
+// 用户 interval-timeline 接口
+mockHandlers['GET /api/users/me/usage/interval-timeline'] = async (config) => {
+  await delay()
+  const params = config.params || {}
+  const hours = parseInt(params.hours) || 24
+  const limit = parseInt(params.limit) || 5000
+  const data = generateIntervalTimelineData(hours, limit, false)
+  return createMockResponse(data)
+}
+
+// 管理员 interval-timeline 接口
+mockHandlers['GET /api/admin/usage/cache-affinity/interval-timeline'] = async (config) => {
+  await delay()
+  requireAdmin()
+  const params = config.params || {}
+  const hours = parseInt(params.hours) || 24
+  const limit = parseInt(params.limit) || 10000
+  const userId = params.user_id
+  const includeUserInfo = params.include_user_info === 'true' || params.include_user_info === true
+
+  // 如果指定了 user_id，则不包含用户信息
+  const data = generateIntervalTimelineData(hours, limit, includeUserInfo && !userId)
+  return createMockResponse(data)
+}
+
+// ========== TTL 分析 Mock 数据 ==========
+
+// 生成 TTL 分析数据
+function generateTTLAnalysisData(hours: number = 168) {
+  const users = [
+    { id: 'demo-admin-uuid-0001', username: 'Demo Admin', email: 'admin@demo.aether.io' },
+    { id: 'demo-user-uuid-0002', username: 'Demo User', email: 'user@demo.aether.io' },
+    { id: 'demo-user-uuid-0003', username: 'Alice Chen', email: 'alice@demo.aether.io' },
+    { id: 'demo-user-uuid-0004', username: 'Bob Zhang', email: 'bob@demo.aether.io' }
+  ]
+
+  const usersAnalysis = users.map(user => {
+    // 为每个用户生成不同的使用模式
+    const requestCount = 50 + Math.floor(Math.random() * 500)
+
+    // 根据用户特性生成不同的间隔分布
+    let within5min, within15min, within30min, within60min, over60min
+    let p50, p75, p90
+    let recommendedTtl: number
+    let recommendationReason: string
+
+    const userType = Math.random()
+    if (userType < 0.3) {
+      // 高频用户 (30%)
+      within5min = Math.floor(requestCount * (0.6 + Math.random() * 0.2))
+      within15min = Math.floor(requestCount * (0.1 + Math.random() * 0.1))
+      within30min = Math.floor(requestCount * (0.05 + Math.random() * 0.05))
+      within60min = Math.floor(requestCount * (0.02 + Math.random() * 0.03))
+      over60min = requestCount - within5min - within15min - within30min - within60min
+      p50 = 1.5 + Math.random() * 2
+      p75 = 3 + Math.random() * 3
+      p90 = 4 + Math.random() * 2
+      recommendedTtl = 5
+      recommendationReason = `高频用户：90% 的请求间隔在 ${p90.toFixed(1)} 分钟内`
+    } else if (userType < 0.6) {
+      // 中频用户 (30%)
+      within5min = Math.floor(requestCount * (0.3 + Math.random() * 0.15))
+      within15min = Math.floor(requestCount * (0.25 + Math.random() * 0.15))
+      within30min = Math.floor(requestCount * (0.15 + Math.random() * 0.1))
+      within60min = Math.floor(requestCount * (0.1 + Math.random() * 0.05))
+      over60min = requestCount - within5min - within15min - within30min - within60min
+      p50 = 5 + Math.random() * 5
+      p75 = 10 + Math.random() * 8
+      p90 = 18 + Math.random() * 10
+      recommendedTtl = 15
+      recommendationReason = `中高频用户：75% 的请求间隔在 ${p75.toFixed(1)} 分钟内`
+    } else if (userType < 0.85) {
+      // 中低频用户 (25%)
+      within5min = Math.floor(requestCount * (0.15 + Math.random() * 0.1))
+      within15min = Math.floor(requestCount * (0.2 + Math.random() * 0.1))
+      within30min = Math.floor(requestCount * (0.25 + Math.random() * 0.1))
+      within60min = Math.floor(requestCount * (0.15 + Math.random() * 0.1))
+      over60min = requestCount - within5min - within15min - within30min - within60min
+      p50 = 12 + Math.random() * 8
+      p75 = 22 + Math.random() * 10
+      p90 = 35 + Math.random() * 15
+      recommendedTtl = 30
+      recommendationReason = `中频用户：75% 的请求间隔在 ${p75.toFixed(1)} 分钟内`
+    } else {
+      // 低频用户 (15%)
+      within5min = Math.floor(requestCount * (0.05 + Math.random() * 0.1))
+      within15min = Math.floor(requestCount * (0.1 + Math.random() * 0.1))
+      within30min = Math.floor(requestCount * (0.15 + Math.random() * 0.1))
+      within60min = Math.floor(requestCount * (0.25 + Math.random() * 0.1))
+      over60min = requestCount - within5min - within15min - within30min - within60min
+      p50 = 25 + Math.random() * 15
+      p75 = 45 + Math.random() * 20
+      p90 = 70 + Math.random() * 30
+      recommendedTtl = 60
+      recommendationReason = `低频用户：75% 的请求间隔为 ${p75.toFixed(1)} 分钟，建议使用长 TTL`
+    }
+
+    // 确保没有负数
+    over60min = Math.max(0, over60min)
+
+    const avgInterval = (within5min * 2.5 + within15min * 10 + within30min * 22 + within60min * 45 + over60min * 80) / requestCount
+
+    return {
+      group_id: user.id,
+      username: user.username,
+      email: user.email,
+      request_count: requestCount,
+      interval_distribution: {
+        within_5min: within5min,
+        within_15min: within15min,
+        within_30min: within30min,
+        within_60min: within60min,
+        over_60min: over60min
+      },
+      interval_percentages: {
+        within_5min: Math.round(within5min / requestCount * 1000) / 10,
+        within_15min: Math.round(within15min / requestCount * 1000) / 10,
+        within_30min: Math.round(within30min / requestCount * 1000) / 10,
+        within_60min: Math.round(within60min / requestCount * 1000) / 10,
+        over_60min: Math.round(over60min / requestCount * 1000) / 10
+      },
+      percentiles: {
+        p50: Math.round(p50 * 100) / 100,
+        p75: Math.round(p75 * 100) / 100,
+        p90: Math.round(p90 * 100) / 100
+      },
+      avg_interval_minutes: Math.round(avgInterval * 100) / 100,
+      min_interval_minutes: Math.round((0.1 + Math.random() * 0.5) * 100) / 100,
+      max_interval_minutes: Math.round((80 + Math.random() * 40) * 100) / 100,
+      recommended_ttl_minutes: recommendedTtl,
+      recommendation_reason: recommendationReason
+    }
+  })
+
+  // 汇总 TTL 分布
+  const ttlDistribution = {
+    '5min': usersAnalysis.filter(u => u.recommended_ttl_minutes === 5).length,
+    '15min': usersAnalysis.filter(u => u.recommended_ttl_minutes === 15).length,
+    '30min': usersAnalysis.filter(u => u.recommended_ttl_minutes === 30).length,
+    '60min': usersAnalysis.filter(u => u.recommended_ttl_minutes === 60).length
+  }
+
+  return {
+    analysis_period_hours: hours,
+    total_users_analyzed: usersAnalysis.length,
+    ttl_distribution: ttlDistribution,
+    users: usersAnalysis
+  }
+}
+
+// 生成缓存命中分析数据
+function generateCacheHitAnalysisData(hours: number = 168) {
+  const totalRequests = 5000 + Math.floor(Math.random() * 10000)
+  const requestsWithCacheHit = Math.floor(totalRequests * (0.25 + Math.random() * 0.35))
+  const totalInputTokens = totalRequests * (2000 + Math.floor(Math.random() * 3000))
+  const totalCacheReadTokens = Math.floor(totalInputTokens * (0.15 + Math.random() * 0.25))
+  const totalCacheCreationTokens = Math.floor(totalInputTokens * (0.05 + Math.random() * 0.1))
+
+  // 缓存读取成本：按每百万 token $0.30 计算
+  const cacheReadCostPer1M = 0.30
+  const cacheCreationCostPer1M = 3.75
+  const totalCacheReadCost = (totalCacheReadTokens / 1000000) * cacheReadCostPer1M
+  const totalCacheCreationCost = (totalCacheCreationTokens / 1000000) * cacheCreationCostPer1M
+
+  // 缓存读取节省了 90% 的成本
+  const estimatedSavings = totalCacheReadCost * 9
+
+  const tokenCacheHitRate = totalCacheReadTokens / (totalInputTokens + totalCacheReadTokens) * 100
+
+  return {
+    analysis_period_hours: hours,
+    total_requests: totalRequests,
+    requests_with_cache_hit: requestsWithCacheHit,
+    request_cache_hit_rate: Math.round(requestsWithCacheHit / totalRequests * 10000) / 100,
+    total_input_tokens: totalInputTokens,
+    total_cache_read_tokens: totalCacheReadTokens,
+    total_cache_creation_tokens: totalCacheCreationTokens,
+    token_cache_hit_rate: Math.round(tokenCacheHitRate * 100) / 100,
+    total_cache_read_cost_usd: Math.round(totalCacheReadCost * 10000) / 10000,
+    total_cache_creation_cost_usd: Math.round(totalCacheCreationCost * 10000) / 10000,
+    estimated_savings_usd: Math.round(estimatedSavings * 10000) / 10000
+  }
+}
+
+// TTL 分析接口
+mockHandlers['GET /api/admin/usage/cache-affinity/ttl-analysis'] = async (config) => {
+  await delay()
+  requireAdmin()
+  const params = config.params || {}
+  const hours = parseInt(params.hours) || 168
+  const data = generateTTLAnalysisData(hours)
+  return createMockResponse(data)
+}
+
+// 缓存命中分析接口
+mockHandlers['GET /api/admin/usage/cache-affinity/hit-analysis'] = async (config) => {
+  await delay()
+  requireAdmin()
+  const params = config.params || {}
+  const hours = parseInt(params.hours) || 168
+  const data = generateCacheHitAnalysisData(hours)
+  return createMockResponse(data)
+}
