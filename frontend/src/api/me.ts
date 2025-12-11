@@ -253,5 +253,18 @@ export const meApi = {
   }> {
     const response = await apiClient.put('/api/users/me/model-capabilities', data)
     return response.data
+  },
+
+  // 获取请求间隔时间线（用于散点图）
+  async getIntervalTimeline(params?: {
+    hours?: number
+    limit?: number
+  }): Promise<{
+    analysis_period_hours: number
+    total_points: number
+    points: Array<{ x: string; y: number }>
+  }> {
+    const response = await apiClient.get('/api/users/me/usage/interval-timeline', { params })
+    return response.data
   }
 }

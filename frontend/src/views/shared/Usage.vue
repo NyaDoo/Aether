@@ -1,10 +1,17 @@
 <template>
   <div class="space-y-6 pb-8">
-    <!-- 活跃度热图 -->
-    <ActivityHeatmapCard
-      :data="activityHeatmapData"
-      :title="isAdminPage ? '总体活跃天数' : '我的活跃天数'"
-    />
+    <!-- 活跃度热图 + 请求间隔时间线 -->
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+      <ActivityHeatmapCard
+        :data="activityHeatmapData"
+        :title="isAdminPage ? '总体活跃天数' : '我的活跃天数'"
+      />
+      <IntervalTimelineCard
+        :title="isAdminPage ? '请求间隔时间线' : '我的请求间隔'"
+        :is-admin="isAdminPage"
+        :hours="168"
+      />
+    </div>
 
     <!-- 分析统计 -->
     <!-- 管理员：模型 + 提供商 + API格式（3列） -->
@@ -87,7 +94,8 @@ import {
   UsageApiFormatTable,
   UsageRecordsTable,
   ActivityHeatmapCard,
-  RequestDetailDrawer
+  RequestDetailDrawer,
+  IntervalTimelineCard
 } from '@/features/usage/components'
 import {
   useUsageData,

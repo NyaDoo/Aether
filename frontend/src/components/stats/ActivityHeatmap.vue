@@ -188,7 +188,7 @@ const monthMarkers = computed(() => {
     if (month === lastMonth) {
       return
     }
-    markers[index] = String(month + 1)
+    markers[index] = `${month + 1}月`
     lastMonth = month
   })
 

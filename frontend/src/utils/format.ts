@@ -126,3 +126,20 @@ export function formatBillingType(type: string | undefined | null): string {
   }
   return typeMap[type || ''] || type || '按量付费'
 }
+
+// Format cost with 4 decimal places (for cache analysis)
+export function formatCost(cost: number | null | undefined): string {
+  if (cost === null || cost === undefined) return '-'
+  return `$${cost.toFixed(4)}`
+}
+
+// Format remaining time from unix timestamp
+export function formatRemainingTime(expireAt: number | undefined, currentTime: number): string {
+  if (!expireAt) return '未知'
+  const remaining = expireAt - currentTime
+  if (remaining <= 0) return '已过期'
+
+  const minutes = Math.floor(remaining / 60)
+  const seconds = Math.floor(remaining % 60)
+  return `${minutes}分${seconds}秒`
+}
