@@ -379,6 +379,7 @@ import { useFormDialog } from '@/composables/useFormDialog'
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getGlobalModels } from '@/api/global-models'
 import { adminApi } from '@/api/admin'
+import { log } from '@/utils/logger'
 
 export interface UserFormData {
   id?: string
@@ -500,7 +501,7 @@ async function loadAccessControlOptions() {
     globalModels.value = modelsData.models || []
     apiFormats.value = formatsData.formats || []
   } catch (err) {
-    console.error('加载访问限制选项失败:', err)
+    log.error('加载访问限制选项失败:', err)
   }
 }
 
