@@ -14,6 +14,7 @@ from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.pipeline import ApiRequestPipeline
 from src.database import get_db
 from src.models.database import Provider, ProviderEndpoint, ProviderAPIKey
+from src.core.crypto import crypto_service
 from src.services.request.candidate import RequestCandidateService
 
 router = APIRouter(prefix="/api/admin/monitoring/trace", tags=["Admin - Monitoring: Trace"])
@@ -171,22 +172,25 @@ class AdminGetRequestTraceAdapter(AdminApiAdapter):
             for k in keys:
                 key_map[k.id] = k.name
                 key_capabilities_map[k.id] = k.capabilities
-                # 生成脱敏预览：保留前缀和最后4位
-                api_key = k.api_key or ""
-                if len(api_key) > 8:
-                    # 检测常见前缀模式
-                    prefix_end = 0
-                    for prefix in ["sk-", "key-", "api-", "ak-"]:
-                        if api_key.lower().startswith(prefix):
-                            prefix_end = len(prefix)
-                            break
-                    if prefix_end > 0:
-                        key_preview_map[k.id] = f"{api_key[:prefix_end]}***{api_key[-4:]}"
+                # 生成脱敏预览：先解密再脱敏
+                try:
+                    decrypted_key = crypto_service.decrypt(k.api_key)
+                    if len(decrypted_key) > 8:
+                        # 检测常见前缀模式
+                        prefix_end = 0
+                        for prefix in ["sk-", "key-", "api-", "ak-"]:
+                            if decrypted_key.lower().startswith(prefix):
+                                prefix_end = len(prefix)
+                                break
+                        if prefix_end > 0:
+                            key_preview_map[k.id] = f"{decrypted_key[:prefix_end]}***{decrypted_key[-4:]}"
+                        else:
+                            key_preview_map[k.id] = f"{decrypted_key[:4]}***{decrypted_key[-4:]}"
+                    elif len(decrypted_key) > 4:
+                        key_preview_map[k.id] = f"***{decrypted_key[-4:]}"
                     else:
-                        key_preview_map[k.id] = f"{api_key[:3]}***{api_key[-4:]}"
-                elif len(api_key) > 4:
-                    key_preview_map[k.id] = f"***{api_key[-4:]}"
-                else:
+                        key_preview_map[k.id] = "***"
+                except Exception:
                     key_preview_map[k.id] = "***"
 
         # 构建 candidate 响应列表

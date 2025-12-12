@@ -552,8 +552,8 @@ const isCapabilityUsed = (cap: string): boolean => {
   return activeCapabilities.value.includes(cap)
 }
 
-// 检查某个能力是否被 Key 支持
-const isCapabilitySupported = (cap: string): boolean => {
+// 检查某个能力是否被 Key 支持（保留以备后用）
+const _isCapabilitySupported = (cap: string): boolean => {
   return keyCapabilities.value.includes(cap)
 }
 
@@ -653,7 +653,20 @@ watch(groupedTimeline, (newGroups) => {
     return
   }
 
-  // 默认选择最后一个组
+  // 查找最后一个有效结果的组（failed 优先于 skipped/available）
+  // 从后往前找第一个 failed 的组
+  for (let i = newGroups.length - 1; i >= 0; i--) {
+    const group = newGroups[i]
+    if (group.primaryStatus === 'failed') {
+      selectedGroupIndex.value = i
+      // 选中最后一个失败的尝试
+      const failedIdx = group.allAttempts.findLastIndex((a: CandidateRecord) => a.status === 'failed')
+      selectedAttemptIndex.value = failedIdx >= 0 ? failedIdx : group.allAttempts.length - 1
+      return
+    }
+  }
+
+  // 都没有则选择最后一个组
   selectedGroupIndex.value = newGroups.length - 1
   selectedAttemptIndex.value = newGroups[newGroups.length - 1].allAttempts.length - 1
 }, { immediate: true })
@@ -702,8 +715,8 @@ const getStatusLabel = (status: string) => {
   return labels[status] || status
 }
 
-// 获取状态徽章样式
-const getStatusBadgeVariant = (status: string): any => {
+// 获取状态徽章样式（保留以备后用）
+const _getStatusBadgeVariant = (status: string): string => {
   const variants: Record<string, string> = {
     available: 'outline',
     pending: 'secondary',
