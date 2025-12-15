@@ -802,6 +802,11 @@ class CacheAwareScheduler:
         # 查询该 Provider 是否有实现这个 GlobalModel
         for model in provider.models:
             if model.global_model_id == global_model.id and model.is_active:
+                logger.debug(
+                    f"[_check_model_support_for_global_model] Provider={provider.name}, "
+                    f"GlobalModel={global_model.name}, "
+                    f"provider_model_name={model.provider_model_name}"
+                )
                 # 检查流式支持
                 if is_stream:
                     supports_streaming = model.get_effective_supports_streaming()

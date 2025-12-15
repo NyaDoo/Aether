@@ -273,24 +273,7 @@ class ModelCacheService:
                     logger.debug(f"GlobalModel 缓存命中(别名解析): {normalized_name}")
                     return ModelCacheService._dict_to_global_model(cached_data)
 
-            # 2. 直接通过 GlobalModel.name 查找
-            global_model = (
-                db.query(GlobalModel)
-                .filter(GlobalModel.name == normalized_name, GlobalModel.is_active == True)
-                .first()
-            )
-
-            if global_model:
-                resolution_method = "direct_match"
-                # 缓存结果
-                global_model_dict = ModelCacheService._global_model_to_dict(global_model)
-                await CacheService.set(
-                    cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
-                )
-                logger.debug(f"GlobalModel 已缓存(别名解析-直接匹配): {normalized_name}")
-                return global_model
-
-            # 3. 通过别名匹配（优化：精确查询，避免加载所有 Model）
+            # 2. 优先通过 provider_model_name 和别名匹配（Provider 配置的别名优先级最高）
             from sqlalchemy import or_
 
             from src.models.database import Provider
@@ -337,72 +320,103 @@ class ModelCacheService:
                     .all()
                 )
 
-            # 用于检测别名冲突
-            matched_global_models = []
+            # 用于存储匹配结果：{(model_id, global_model_id): (GlobalModel, match_type, priority)}
+            # 使用字典去重，同一个 Model 只保留优先级最高的匹配
+            matched_models_dict = {}
 
             # 遍历查询结果进行匹配
             for model, gm in models_with_global:
-                # 检查 provider_model_name 是否匹配
-                if model.provider_model_name == normalized_name:
-                    matched_global_models.append((gm, "provider_model_name"))
-                    logger.debug(
-                        f"模型名称 '{normalized_name}' 通过 provider_model_name 匹配到 "
-                        f"GlobalModel: {gm.name}"
-                    )
+                key = (model.id, gm.id)
 
-                # 检查 provider_model_aliases 是否匹配
+                # 检查 provider_model_aliases 是否匹配（优先级更高）
                 if model.provider_model_aliases:
                     for alias_entry in model.provider_model_aliases:
                         if isinstance(alias_entry, dict):
                             alias_name = alias_entry.get("name", "").strip()
                             if alias_name == normalized_name:
-                                matched_global_models.append((gm, "alias"))
+                                # alias 优先级为 0（最高），覆盖任何已存在的匹配
+                                matched_models_dict[key] = (gm, "alias", 0)
                                 logger.debug(
                                     f"模型名称 '{normalized_name}' 通过别名匹配到 "
-                                    f"GlobalModel: {gm.name}"
+                                    f"GlobalModel: {gm.name} (Model: {model.id[:8]}...)"
                                 )
                                 break
 
-            # 处理匹配结果
-            if not matched_global_models:
-                resolution_method = "not_found"
-                # 未找到匹配，缓存负结果
-                await CacheService.set(
-                    cache_key, "NOT_FOUND", ttl_seconds=ModelCacheService.CACHE_TTL
-                )
-                logger.debug(f"GlobalModel 未找到(别名解析): {normalized_name}")
-                return None
+                # 如果还没有匹配（或只有 provider_model_name 匹配），检查 provider_model_name
+                if key not in matched_models_dict or matched_models_dict[key][1] != "alias":
+                    if model.provider_model_name == normalized_name:
+                        # provider_model_name 优先级为 1（兜底），只在没有 alias 匹配时使用
+                        if key not in matched_models_dict:
+                            matched_models_dict[key] = (gm, "provider_model_name", 1)
+                            logger.debug(
+                                f"模型名称 '{normalized_name}' 通过 provider_model_name 匹配到 "
+                                f"GlobalModel: {gm.name} (Model: {model.id[:8]}...)"
+                            )
 
-            # 优先使用 provider_model_name 的直接匹配，其次才是 aliases；同级别按名称排序保证确定性
-            matched_global_models.sort(
-                key=lambda item: (0 if item[1] == "provider_model_name" else 1, item[0].name)
-            )
-
-            # 记录解析方式
-            resolution_method = matched_global_models[0][1]
-
-            if len(matched_global_models) > 1:
-                # 检测到别名冲突
-                unique_models = {gm.id: gm for gm, _ in matched_global_models}
-                if len(unique_models) > 1:
-                    model_names = [gm.name for gm in unique_models.values()]
-                    logger.warning(
-                        f"别名冲突: 模型名称 '{normalized_name}' 匹配到多个不同的 GlobalModel: "
-                        f"{', '.join(model_names)}，使用第一个匹配结果"
+            # 如果通过 provider_model_name/alias 找到了，直接返回
+            if matched_models_dict:
+                # 转换为列表并排序：按 priority（alias=0 优先）、然后按 GlobalModel.name
+                matched_global_models = [
+                    (gm, match_type) for gm, match_type, priority in matched_models_dict.values()
+                ]
+                matched_global_models.sort(
+                    key=lambda item: (
+                        0 if item[1] == "alias" else 1,  # alias 优先
+                        item[0].name  # 同优先级按名称排序（确定性）
                     )
-                    # 记录别名冲突指标
-                    model_alias_conflict_total.inc()
+                )
 
-            # 返回第一个匹配的 GlobalModel
-            result_global_model: GlobalModel = matched_global_models[0][0]
-            global_model_dict = ModelCacheService._global_model_to_dict(result_global_model)
+                # 记录解析方式
+                resolution_method = matched_global_models[0][1]
+
+                if len(matched_global_models) > 1:
+                    # 检测到冲突
+                    unique_models = {gm.id: gm for gm, _ in matched_global_models}
+                    if len(unique_models) > 1:
+                        model_names = [gm.name for gm in unique_models.values()]
+                        logger.warning(
+                            f"模型冲突: 名称 '{normalized_name}' 匹配到多个不同的 GlobalModel: "
+                            f"{', '.join(model_names)}，使用第一个匹配结果（别名优先）"
+                        )
+                        # 记录冲突指标
+                        model_alias_conflict_total.inc()
+
+                # 返回第一个匹配的 GlobalModel
+                result_global_model: GlobalModel = matched_global_models[0][0]
+                global_model_dict = ModelCacheService._global_model_to_dict(result_global_model)
+                await CacheService.set(
+                    cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
+                )
+                logger.debug(
+                    f"GlobalModel 已缓存(别名解析-{resolution_method}): {normalized_name} -> {result_global_model.name}"
+                )
+                return result_global_model
+
+            # 3. 如果通过 provider 别名没找到，最后尝试直接通过 GlobalModel.name 查找
+            global_model = (
+                db.query(GlobalModel)
+                .filter(GlobalModel.name == normalized_name, GlobalModel.is_active == True)
+                .first()
+            )
+
+            if global_model:
+                resolution_method = "direct_match"
+                # 缓存结果
+                global_model_dict = ModelCacheService._global_model_to_dict(global_model)
+                await CacheService.set(
+                    cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
+                )
+                logger.debug(f"GlobalModel 已缓存(别名解析-直接匹配): {normalized_name}")
+                return global_model
+
+            # 4. 完全未找到
+            resolution_method = "not_found"
+            # 未找到匹配，缓存负结果
             await CacheService.set(
-                cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
+                cache_key, "NOT_FOUND", ttl_seconds=ModelCacheService.CACHE_TTL
             )
-            logger.debug(
-                f"GlobalModel 已缓存(别名解析): {normalized_name} -> {result_global_model.name}"
-            )
-            return result_global_model
+            logger.debug(f"GlobalModel 未找到(别名解析): {normalized_name}")
+            return None
 
         finally:
             # 记录监控指标
