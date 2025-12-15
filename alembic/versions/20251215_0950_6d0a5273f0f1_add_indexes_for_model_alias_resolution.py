@@ -18,30 +18,52 @@ depends_on = None
 
 def upgrade() -> None:
     """应用迁移：升级到新版本"""
-    # 为 Model 表添加索引，优化别名解析性能
+    # 为 models 表添加索引，优化别名解析性能
 
     # 1. provider_model_name 索引（支持精确匹配）
     op.create_index(
         "idx_model_provider_model_name",
-        "Model",
+        "models",
         ["provider_model_name"],
         unique=False,
         postgresql_where=sa.text("is_active = true"),
     )
 
-    # 2. provider_model_aliases JSONB GIN 索引（支持 JSONB 查询，仅 PostgreSQL）
+    # 2. provider_model_aliases GIN 索引（支持 JSONB 查询，仅 PostgreSQL）
     # GIN 索引可以加速 @> 操作符的查询
-    op.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_model_provider_model_aliases_gin
-        ON "Model" USING gin(provider_model_aliases)
-        WHERE is_active = true
-        """
-    )
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        # 先将 json 列转为 jsonb（jsonb 性能更好且支持 GIN 索引）
+        op.execute(
+            """
+            ALTER TABLE models
+            ALTER COLUMN provider_model_aliases TYPE jsonb
+            USING provider_model_aliases::jsonb
+            """
+        )
+        # 创建 GIN 索引
+        op.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_model_provider_model_aliases_gin
+            ON models USING gin(provider_model_aliases jsonb_path_ops)
+            WHERE is_active = true
+            """
+        )
 
 
 def downgrade() -> None:
     """回滚迁移：降级到旧版本"""
     # 删除索引
-    op.drop_index("idx_model_provider_model_name", table_name="Model")
-    op.execute('DROP INDEX IF EXISTS idx_model_provider_model_aliases_gin')
+    op.drop_index("idx_model_provider_model_name", table_name="models")
+
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.execute("DROP INDEX IF EXISTS idx_model_provider_model_aliases_gin")
+        # 将 jsonb 列还原为 json
+        op.execute(
+            """
+            ALTER TABLE models
+            ALTER COLUMN provider_model_aliases TYPE json
+            USING provider_model_aliases::json
+            """
+        )
