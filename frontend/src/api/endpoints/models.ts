@@ -5,9 +5,6 @@ import type {
   ModelUpdate,
   ModelCatalogResponse,
   ProviderAvailableSourceModelsResponse,
-  UpdateModelMappingRequest,
-  UpdateModelMappingResponse,
-  DeleteModelMappingResponse
 } from './types'
 
 /**
@@ -96,27 +93,6 @@ export async function getProviderAvailableSourceModels(
   providerId: string
 ): Promise<ProviderAvailableSourceModelsResponse> {
   const response = await client.get(`/api/admin/providers/${providerId}/available-source-models`)
-  return response.data
-}
-
-/**
- * 更新目录中的模型映射
- */
-export async function updateCatalogMapping(
-  mappingId: string,
-  data: UpdateModelMappingRequest
-): Promise<UpdateModelMappingResponse> {
-  const response = await client.put(`/api/admin/models/catalog/mappings/${mappingId}`, data)
-  return response.data
-}
-
-/**
- * 删除目录中的模型映射
- */
-export async function deleteCatalogMapping(
-  mappingId: string
-): Promise<DeleteModelMappingResponse> {
-  const response = await client.delete(`/api/admin/models/catalog/mappings/${mappingId}`)
   return response.data
 }
 

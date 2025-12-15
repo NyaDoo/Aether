@@ -313,7 +313,6 @@ import {
   Gauge,
   Layers,
   FolderTree,
-  Tag,
   Box,
   LogOut,
   SunMoon,
@@ -411,7 +410,6 @@ const navigation = computed(() => {
         { name: '用户管理', href: '/admin/users', icon: Users },
         { name: '提供商', href: '/admin/providers', icon: FolderTree },
         { name: '模型管理', href: '/admin/models', icon: Layers },
-        { name: '别名映射', href: '/admin/aliases', icon: Tag },
         { name: '独立密钥', href: '/admin/keys', icon: Key },
         { name: '使用记录', href: '/admin/usage', icon: BarChart3 },
       ]

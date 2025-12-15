@@ -104,19 +104,6 @@
                 <span class="hidden sm:inline">关联提供商</span>
                 <span class="sm:hidden">提供商</span>
               </button>
-              <button
-                type="button"
-                class="flex-1 px-2 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-md transition-all duration-200"
-                :class="[
-                  detailTab === 'aliases'
-                    ? 'bg-primary text-primary-foreground shadow-sm'
-                    : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
-                ]"
-                @click="detailTab = 'aliases'"
-              >
-                <span class="hidden sm:inline">别名/映射</span>
-                <span class="sm:hidden">别名</span>
-              </button>
             </div>
 
             <!-- Tab 内容 -->
@@ -684,236 +671,6 @@
                 </div>
               </Card>
             </div>
-
-            <!-- Tab 3: 别名 -->
-            <div v-show="detailTab === 'aliases'">
-              <Card class="overflow-hidden">
-                <!-- 标题栏 -->
-                <div class="px-4 py-3 border-b border-border/60">
-                  <div class="flex items-center justify-between gap-4">
-                    <div>
-                      <h4 class="text-sm font-semibold">
-                        别名与映射
-                      </h4>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        class="h-8 w-8"
-                        title="添加别名/映射"
-                        @click="$emit('addAlias')"
-                      >
-                        <Plus class="w-3.5 h-3.5" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        class="h-8 w-8"
-                        title="刷新"
-                        @click="$emit('refreshAliases')"
-                      >
-                        <RefreshCw
-                          class="w-3.5 h-3.5"
-                          :class="loadingAliases ? 'animate-spin' : ''"
-                        />
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- 表格内容 -->
-                <div
-                  v-if="loadingAliases"
-                  class="flex items-center justify-center py-12"
-                >
-                  <Loader2 class="w-6 h-6 animate-spin text-primary" />
-                </div>
-
-                <template v-else-if="aliases.length > 0">
-                  <!-- 桌面端表格 -->
-                  <Table class="hidden sm:table">
-                  <TableHeader>
-                    <TableRow class="border-b border-border/60 hover:bg-transparent">
-                      <TableHead class="h-10 font-semibold">
-                        别名
-                      </TableHead>
-                      <TableHead class="w-[80px] h-10 font-semibold">
-                        类型
-                      </TableHead>
-                      <TableHead class="w-[100px] h-10 font-semibold">
-                        作用域
-                      </TableHead>
-                      <TableHead class="w-[100px] h-10 font-semibold text-center">
-                        操作
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    <TableRow
-                      v-for="alias in aliases"
-                      :key="alias.id"
-                      class="border-b border-border/40 hover:bg-muted/30 transition-colors"
-                    >
-                      <TableCell class="py-3">
-                        <div class="flex items-center gap-2">
-                          <span
-                            class="w-2 h-2 rounded-full shrink-0"
-                            :class="alias.is_active ? 'bg-green-500' : 'bg-gray-300'"
-                            :title="alias.is_active ? '活跃' : '停用'"
-                          />
-                          <code class="text-sm font-medium bg-muted px-1.5 py-0.5 rounded">{{ alias.alias }}</code>
-                        </div>
-                      </TableCell>
-                      <TableCell class="py-3">
-                        <Badge
-                          variant="secondary"
-                          class="text-xs"
-                        >
-                          {{ alias.mapping_type === 'mapping' ? '映射' : '别名' }}
-                        </Badge>
-                      </TableCell>
-                      <TableCell class="py-3">
-                        <Badge
-                          v-if="alias.provider_id"
-                          variant="outline"
-                          class="text-xs truncate max-w-[90px]"
-                          :title="alias.provider_name || 'Provider'"
-                        >
-                          {{ alias.provider_name || 'Provider' }}
-                        </Badge>
-                        <Badge
-                          v-else
-                          variant="default"
-                          class="text-xs"
-                        >
-                          全局
-                        </Badge>
-                      </TableCell>
-                      <TableCell class="py-3 text-center">
-                        <div class="flex items-center justify-center gap-0.5">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            class="h-7 w-7"
-                            title="编辑"
-                            @click="$emit('editAlias', alias)"
-                          >
-                            <Edit class="w-3.5 h-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            class="h-7 w-7"
-                            :title="alias.is_active ? '停用' : '启用'"
-                            @click="$emit('toggleAliasStatus', alias)"
-                          >
-                            <Power class="w-3.5 h-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            class="h-7 w-7"
-                            title="删除"
-                            @click="$emit('deleteAlias', alias)"
-                          >
-                            <Trash2 class="w-3.5 h-3.5" />
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  </TableBody>
-                  </Table>
-
-                  <!-- 移动端卡片列表 -->
-                  <div class="sm:hidden divide-y divide-border/40">
-                  <div
-                    v-for="alias in aliases"
-                    :key="alias.id"
-                    class="p-4 space-y-2"
-                  >
-                    <div class="flex items-start justify-between gap-3">
-                      <div class="flex items-center gap-2 min-w-0 flex-1">
-                        <span
-                          class="w-2 h-2 rounded-full shrink-0"
-                          :class="alias.is_active ? 'bg-green-500' : 'bg-gray-300'"
-                        />
-                        <code class="text-sm font-medium bg-muted px-1.5 py-0.5 rounded truncate">{{ alias.alias }}</code>
-                      </div>
-                      <div class="flex items-center gap-1 shrink-0">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          class="h-7 w-7"
-                          @click="$emit('editAlias', alias)"
-                        >
-                          <Edit class="w-3.5 h-3.5" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          class="h-7 w-7"
-                          @click="$emit('toggleAliasStatus', alias)"
-                        >
-                          <Power class="w-3.5 h-3.5" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          class="h-7 w-7"
-                          @click="$emit('deleteAlias', alias)"
-                        >
-                          <Trash2 class="w-3.5 h-3.5" />
-                        </Button>
-                      </div>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <Badge
-                        variant="secondary"
-                        class="text-xs"
-                      >
-                        {{ alias.mapping_type === 'mapping' ? '映射' : '别名' }}
-                      </Badge>
-                      <Badge
-                        v-if="alias.provider_id"
-                        variant="outline"
-                        class="text-xs truncate max-w-[120px]"
-                      >
-                        {{ alias.provider_name || 'Provider' }}
-                      </Badge>
-                      <Badge
-                        v-else
-                        variant="default"
-                        class="text-xs"
-                      >
-                        全局
-                      </Badge>
-                    </div>
-                  </div>
-                  </div>
-                </template>
-
-                <div
-                  v-else
-                  class="text-center py-12"
-                >
-                  <!-- 空状态 -->
-                  <Tag class="w-12 h-12 mx-auto text-muted-foreground/30 mb-3" />
-                  <p class="text-sm text-muted-foreground">
-                    暂无别名或映射
-                  </p>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    class="mt-4"
-                    @click="$emit('addAlias')"
-                  >
-                    <Plus class="w-4 h-4 mr-1" />
-                    添加别名/映射
-                  </Button>
-                </div>
-              </Card>
-            </div>
           </div>
         </Card>
       </div>
@@ -931,7 +688,6 @@ import {
   Zap,
   Image,
   Building2,
-  Tag,
   Plus,
   Edit,
   Trash2,
@@ -955,13 +711,11 @@ import TableCell from '@/components/ui/table-cell.vue'
 
 // 使用外部类型定义
 import type { GlobalModelResponse } from '@/api/global-models'
-import type { ModelAlias } from '@/api/endpoints/aliases'
 import type { TieredPricingConfig, PricingTier } from '@/api/endpoints/types'
 import type { CapabilityDefinition } from '@/api/endpoints'
 
 const props = withDefaults(defineProps<Props>(), {
   loadingProviders: false,
-  loadingAliases: false,
   hasBlockingDialogOpen: false,
 })
 const emit = defineEmits<{
@@ -973,11 +727,6 @@ const emit = defineEmits<{
   'deleteProvider': [provider: any]
   'toggleProviderStatus': [provider: any]
   'refreshProviders': []
-  'addAlias': []
-  'editAlias': [alias: ModelAlias]
-  'toggleAliasStatus': [alias: ModelAlias]
-  'deleteAlias': [alias: ModelAlias]
-  'refreshAliases': []
 }>()
 const { success: showSuccess, error: showError } = useToast()
 
@@ -985,9 +734,7 @@ interface Props {
   model: GlobalModelResponse | null
   open: boolean
   providers: any[]
-  aliases: ModelAlias[]
   loadingProviders?: boolean
-  loadingAliases?: boolean
   hasBlockingDialogOpen?: boolean
   capabilities?: CapabilityDefinition[]
 }

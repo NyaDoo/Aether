@@ -92,11 +92,6 @@ const routes: RouteRecordRaw[] = [
         component: () => importWithRetry(() => import('@/views/admin/ModelManagement.vue'))
       },
       {
-        path: 'aliases',
-        name: 'AliasManagement',
-        component: () => importWithRetry(() => import('@/views/admin/AliasManagement.vue'))
-      },
-      {
         path: 'health-monitor',
         name: 'HealthMonitor',
         component: () => importWithRetry(() => import('@/views/shared/HealthMonitor.vue'))

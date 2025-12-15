@@ -425,25 +425,12 @@
       @success="handleModelFormSuccess"
     />
 
-    <!-- 创建/编辑别名/映射对话框 -->
-    <AliasDialog
-      :open="createAliasDialogOpen"
-      :editing-alias="editingAlias"
-      :global-models="globalModels"
-      :providers="providers"
-      :fixed-target-model="isTargetModelFixed ? selectedModel : null"
-      @update:open="handleAliasDialogUpdate"
-      @submit="handleAliasSubmit"
-    />
-
     <!-- 模型详情抽屉 -->
     <ModelDetailDrawer
       :model="selectedModel"
       :open="!!selectedModel"
       :providers="selectedModelProviders"
-      :aliases="selectedModelAliases"
       :loading-providers="loadingModelProviders"
-      :loading-aliases="loadingModelAliases"
       :has-blocking-dialog-open="hasBlockingDialogOpen"
       :capabilities="capabilities"
       @update:open="handleDrawerOpenChange"
@@ -454,11 +441,6 @@
       @delete-provider="confirmDeleteProviderImplementation"
       @toggle-provider-status="toggleProviderStatus"
       @refresh-providers="refreshSelectedModelProviders"
-      @add-alias="openAddAliasDialog"
-      @edit-alias="openEditAliasDialog"
-      @toggle-alias-status="toggleAliasStatusFromDrawer"
-      @delete-alias="confirmDeleteAliasFromDrawer"
-      @refresh-aliases="refreshSelectedModelAliases"
     />
 
     <!-- 批量添加关联提供商对话框 -->
@@ -736,9 +718,7 @@ import {
 } from 'lucide-vue-next'
 import ModelDetailDrawer from '@/features/models/components/ModelDetailDrawer.vue'
 import GlobalModelFormDialog from '@/features/models/components/GlobalModelFormDialog.vue'
-import AliasDialog from '@/features/models/components/AliasDialog.vue'
 import ProviderModelFormDialog from '@/features/providers/components/ProviderModelFormDialog.vue'
-import type { CreateModelAliasRequest, UpdateModelAliasRequest } from '@/api/endpoints/aliases'
 import type { Model } from '@/api/endpoints'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
@@ -768,13 +748,6 @@ import {
   type GlobalModelResponse,
 } from '@/api/global-models'
 import { log } from '@/utils/logger'
-import {
-  getAliases,
-  createAlias,
-  updateAlias,
-  deleteAlias,
-  type ModelAlias,
-} from '@/api/endpoints/aliases'
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getAllCapabilities, type CapabilityDefinition } from '@/api/endpoints'
 
@@ -788,13 +761,9 @@ const searchQuery = ref('')
 const selectedModel = ref<GlobalModelResponse | null>(null)
 const createModelDialogOpen = ref(false)
 const editingModel = ref<GlobalModelResponse | null>(null)
-const createAliasDialogOpen = ref(false)
-const editingAliasId = ref<string | null>(null)
-const isTargetModelFixed = ref(false)  // 目标模型是否固定（从模型详情抽屉打开时为 true）
 
 // 数据
 const globalModels = ref<GlobalModelResponse[]>([])
-const allAliases = ref<ModelAlias[]>([])
 const providers = ref<any[]>([])
 const capabilities = ref<CapabilityDefinition[]>([])
 
@@ -804,9 +773,7 @@ const catalogPageSize = ref(20)
 
 // 选中模型的详细数据
 const selectedModelProviders = ref<any[]>([])
-const selectedModelAliases = ref<ModelAlias[]>([])
 const loadingModelProviders = ref(false)
-const loadingModelAliases = ref(false)
 
 // 批量添加关联提供商
 const batchAddProvidersDialogOpen = ref(false)
@@ -876,18 +843,9 @@ function hasTieredPricing(model: GlobalModelResponse): boolean {
 // 检测是否有对话框打开（防止误关闭抽屉）
 const hasBlockingDialogOpen = computed(() =>
   createModelDialogOpen.value ||
-  createAliasDialogOpen.value ||
   batchAddProvidersDialogOpen.value ||
   editProviderDialogOpen.value
 )
-
-// 编辑中的别名对象（用于传递给 AliasDialog）
-const editingAlias = computed(() => {
-  if (!editingAliasId.value) return null
-  return allAliases.value.find(a => a.id === editingAliasId.value) ||
-         selectedModelAliases.value.find(a => a.id === editingAliasId.value) ||
-         null
-})
 
 // 能力筛选
 const capabilityFilters = ref({
@@ -1131,11 +1089,8 @@ async function selectModel(model: GlobalModelResponse) {
   selectedModel.value = model
   detailTab.value = 'basic'
 
-  // 加载该模型的关联提供商和别名
-  await Promise.all([
-    loadModelProviders(model.id),
-    loadModelAliases(model.id)
-  ])
+  // 加载该模型的关联提供商
+  await loadModelProviders(model.id)
 }
 
 // 加载指定模型的关联提供商
@@ -1184,27 +1139,6 @@ async function loadModelProviders(_globalModelId: string) {
     selectedModelProviders.value = []
   } finally {
     loadingModelProviders.value = false
-  }
-}
-
-// 加载指定模型的别名
-async function loadModelAliases(globalModelId: string) {
-  loadingModelAliases.value = true
-  try {
-    const aliases = await getAliases({ limit: 1000 })
-    selectedModelAliases.value = aliases.filter(a => a.global_model_id === globalModelId)
-  } catch (err: any) {
-    log.error('加载别名失败:', err)
-    selectedModelAliases.value = []
-  } finally {
-    loadingModelAliases.value = false
-  }
-}
-
-// 刷新当前选中模型的别名
-async function refreshSelectedModelAliases() {
-  if (selectedModel.value) {
-    await loadModelAliases(selectedModel.value.id)
   }
 }
 
@@ -1329,14 +1263,6 @@ async function confirmDeleteProviderImplementation(provider: any) {
   }
 }
 
-// 打开添加别名对话框（从模型详情抽屉）
-function openAddAliasDialog() {
-  if (!selectedModel.value) return
-  editingAliasId.value = null
-  isTargetModelFixed.value = true  // 目标模型固定为当前选中模型
-  createAliasDialogOpen.value = true
-}
-
 function openCreateModelDialog() {
   editingModel.value = null
   createModelDialogOpen.value = true
@@ -1389,106 +1315,6 @@ async function toggleModelStatus(model: GlobalModelResponse) {
   } catch (err: any) {
     showError(err.response?.data?.detail || err.message, '操作失败')
   }
-}
-
-async function loadAliases() {
-  try {
-    allAliases.value = await getAliases({ limit: 1000 })
-  } catch (err: any) {
-    showError(err.response?.data?.detail || err.message, '加载别名失败')
-  }
-}
-
-function openEditAliasDialog(alias: ModelAlias) {
-  editingAliasId.value = alias.id
-  isTargetModelFixed.value = false
-  createAliasDialogOpen.value = true
-}
-
-// 处理别名对话框关闭事件
-function handleAliasDialogUpdate(value: boolean) {
-  createAliasDialogOpen.value = value
-  if (!value) {
-    editingAliasId.value = null
-    isTargetModelFixed.value = false
-  }
-}
-
-// 处理别名提交（来自 AliasDialog 组件）
-async function handleAliasSubmit(data: CreateModelAliasRequest | UpdateModelAliasRequest, isEdit: boolean) {
-  submitting.value = true
-  try {
-    if (isEdit && editingAliasId.value) {
-      // 更新
-      await updateAlias(editingAliasId.value, data as UpdateModelAliasRequest)
-      success(data.mapping_type === 'mapping' ? '映射已更新' : '别名已更新')
-    } else {
-      // 创建
-      await createAlias(data as CreateModelAliasRequest)
-      success(data.mapping_type === 'mapping' ? '映射已创建' : '别名已创建')
-    }
-    createAliasDialogOpen.value = false
-    editingAliasId.value = null
-    isTargetModelFixed.value = false
-
-    // 刷新数据
-    await loadAliases()
-    if (selectedModel.value) {
-      await loadModelAliases(selectedModel.value.id)
-    }
-    // 刷新外层模型列表以更新 alias_count
-    await loadGlobalModels()
-  } catch (err: any) {
-    const detail = err.response?.data?.detail || err.message
-    // 优化错误提示文案
-    let errorMessage = detail
-    if (detail === '映射已存在') {
-      errorMessage = '目标作用域已存在同名别名，请先删除冲突的映射或选择其他作用域'
-    }
-    showError(errorMessage, isEdit ? '更新失败' : '创建失败')
-  } finally {
-    submitting.value = false
-  }
-}
-
-async function confirmDeleteAlias(alias: ModelAlias) {
-  const confirmed = await confirmDanger(
-    `确定要删除别名 "${alias.alias}" 吗？`,
-    '删除别名'
-  )
-  if (!confirmed) return
-
-  try {
-    await deleteAlias(alias.id)
-    success('别名已删除')
-    await loadAliases()
-    // 刷新外层模型列表以更新 alias_count
-    await loadGlobalModels()
-  } catch (err: any) {
-    showError(err.response?.data?.detail || err.message, '删除失败')
-  }
-}
-
-async function toggleAliasStatus(alias: ModelAlias) {
-  try {
-    await updateAlias(alias.id, { is_active: !alias.is_active })
-    alias.is_active = !alias.is_active
-    success(alias.is_active ? '别名已启用' : '别名已停用')
-  } catch (err: any) {
-    showError(err.response?.data?.detail || err.message, '操作失败')
-  }
-}
-
-// 从抽屉中切换别名状态
-async function toggleAliasStatusFromDrawer(alias: ModelAlias) {
-  await toggleAliasStatus(alias)
-  await refreshSelectedModelAliases()
-}
-
-// 从抽屉中删除别名
-async function confirmDeleteAliasFromDrawer(alias: ModelAlias) {
-  await confirmDeleteAlias(alias)
-  await refreshSelectedModelAliases()
 }
 
 async function refreshData() {

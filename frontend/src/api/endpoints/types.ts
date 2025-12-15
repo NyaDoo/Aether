@@ -211,11 +211,17 @@ export interface ConcurrencyStatus {
   key_max_concurrent?: number
 }
 
+export interface ProviderModelAlias {
+  name: string
+  priority: number  // 优先级（数字越小优先级越高）
+}
+
 export interface Model {
   id: string
   provider_id: string
   global_model_id?: string  // 关联的 GlobalModel ID
-  provider_model_name: string  // Provider 侧的模型名称（原 name）
+  provider_model_name: string  // Provider 侧的主模型名称
+  provider_model_aliases?: ProviderModelAlias[] | null  // 模型名称别名列表（带优先级）
   // 原始配置值（可能为空，为空时使用 GlobalModel 默认值）
   price_per_request?: number | null  // 按次计费价格
   tiered_pricing?: TieredPricingConfig | null  // 阶梯计费配置
@@ -244,7 +250,8 @@ export interface Model {
 }
 
 export interface ModelCreate {
-  provider_model_name: string  // Provider 侧的模型名称（原 name）
+  provider_model_name: string  // Provider 侧的主模型名称
+  provider_model_aliases?: ProviderModelAlias[]  // 模型名称别名列表（带优先级）
   global_model_id: string  // 关联的 GlobalModel ID（必填）
   // 计费配置（可选，为空时使用 GlobalModel 默认值）
   price_per_request?: number  // 按次计费价格
@@ -261,6 +268,7 @@ export interface ModelCreate {
 
 export interface ModelUpdate {
   provider_model_name?: string
+  provider_model_aliases?: ProviderModelAlias[] | null  // 模型名称别名列表（带优先级）
   global_model_id?: string
   price_per_request?: number | null  // 按次计费价格（null 表示清空/使用默认值）
   tiered_pricing?: TieredPricingConfig | null  // 阶梯计费配置
@@ -271,21 +279,6 @@ export interface ModelUpdate {
   supports_image_generation?: boolean
   is_active?: boolean
   is_available?: boolean
-}
-
-export interface ModelMapping {
-  id: string
-  source_model: string  // 别名/源模型名
-  target_global_model_id: string  // 目标 GlobalModel ID
-  target_global_model_name: string | null
-  target_global_model_display_name: string | null
-  provider_id: string | null
-  provider_name: string | null
-  scope: 'global' | 'provider'
-  mapping_type: 'alias' | 'mapping'
-  is_active: boolean
-  created_at: string
-  updated_at: string
 }
 
 export interface ModelCapabilities {
@@ -335,7 +328,6 @@ export interface ModelCatalogItem {
   global_model_name: string  // GlobalModel.name（原 source_model）
   display_name: string  // GlobalModel.display_name
   description?: string | null  // GlobalModel.description
-  aliases: string[]  // 所有指向该 GlobalModel 的别名列表
   providers: ModelCatalogProviderDetail[]  // 支持该模型的 Provider 列表
   price_range: ModelPriceRange  // 价格区间
   total_providers: number
@@ -351,8 +343,6 @@ export interface ProviderAvailableSourceModel {
   global_model_name: string  // GlobalModel.name（原 source_model）
   display_name: string  // GlobalModel.display_name
   provider_model_name: string  // Model.provider_model_name（Provider 侧的模型名）
-  has_alias: boolean  // 是否有别名指向该 GlobalModel
-  aliases: string[]  // 别名列表
   model_id?: string | null  // Model.id
   price: ProviderModelPriceInfo
   capabilities: ModelCapabilities
@@ -369,65 +359,6 @@ export interface BatchAssignProviderConfig {
   create_model?: boolean
   model_config?: ModelCreate
   model_id?: string
-}
-
-export interface BatchAssignModelMappingRequest {
-  global_model_id: string  // 要分配的 GlobalModel ID（原 source_model）
-  providers: BatchAssignProviderConfig[]
-}
-
-export interface BatchAssignProviderResult {
-  provider_id: string
-  mapping_id?: string | null
-  created_model: boolean
-  model_id?: string | null
-  updated: boolean
-}
-
-export interface BatchAssignError {
-  provider_id: string
-  error: string
-}
-
-export interface BatchAssignModelMappingResponse {
-  success: boolean
-  created_mappings: BatchAssignProviderResult[]
-  errors: BatchAssignError[]
-}
-
-export interface ModelMappingCreate {
-  source_model: string  // 源模型名或别名
-  target_global_model_id: string  // 目标 GlobalModel ID
-  provider_id?: string | null
-  mapping_type?: 'alias' | 'mapping'
-  is_active?: boolean
-}
-
-export interface ModelMappingUpdate {
-  source_model?: string  // 源模型名或别名
-  target_global_model_id?: string  // 目标 GlobalModel ID
-  provider_id?: string | null
-  mapping_type?: 'alias' | 'mapping'
-  is_active?: boolean
-}
-
-export interface UpdateModelMappingRequest {
-  source_model?: string
-  target_global_model_id?: string
-  provider_id?: string | null
-  mapping_type?: 'alias' | 'mapping'
-  is_active?: boolean
-}
-
-export interface UpdateModelMappingResponse {
-  success: boolean
-  mapping_id: string
-  message?: string
-}
-
-export interface DeleteModelMappingResponse {
-  success: boolean
-  message?: string
 }
 
 export interface AdaptiveStatsResponse {
