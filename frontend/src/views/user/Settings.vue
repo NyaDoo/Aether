@@ -62,6 +62,7 @@
             <Button
               type="submit"
               :disabled="savingProfile"
+              class="shadow-none hover:shadow-none"
             >
               {{ savingProfile ? '保存中...' : '保存修改' }}
             </Button>
@@ -107,6 +108,7 @@
             <Button
               type="submit"
               :disabled="changingPassword"
+              class="shadow-none hover:shadow-none"
             >
               {{ changingPassword ? '修改中...' : '修改密码' }}
             </Button>
@@ -320,6 +322,7 @@
 import { ref, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { meApi, type Profile } from '@/api/me'
+import { useDarkMode, type ThemeMode } from '@/composables/useDarkMode'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
 import Badge from '@/components/ui/badge.vue'
@@ -338,6 +341,7 @@ import { log } from '@/utils/logger'
 
 const authStore = useAuthStore()
 const { success, error: showError } = useToast()
+const { setThemeMode } = useDarkMode()
 
 const profile = ref<Profile | null>(null)
 
@@ -375,20 +379,8 @@ function handleThemeChange(value: string) {
   themeSelectOpen.value = false
   updatePreferences()
 
-  // 应用主题
-  if (value === 'dark') {
-    document.documentElement.classList.add('dark')
-  } else if (value === 'light') {
-    document.documentElement.classList.remove('dark')
-  } else {
-    // system: 跟随系统
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-    if (prefersDark) {
-      document.documentElement.classList.add('dark')
-    } else {
-      document.documentElement.classList.remove('dark')
-    }
-  }
+  // 使用 useDarkMode 统一切换主题
+  setThemeMode(value as ThemeMode)
 }
 
 function handleLanguageChange(value: string) {
@@ -418,10 +410,16 @@ async function loadProfile() {
 async function loadPreferences() {
   try {
     const prefs = await meApi.getPreferences()
+
+    // 主题以本地 localStorage 为准（useDarkMode 在应用启动时已初始化）
+    // 这样可以避免刷新页面时主题被服务端旧值覆盖
+    const { themeMode: currentThemeMode } = useDarkMode()
+    const localTheme = currentThemeMode.value
+
     preferencesForm.value = {
       avatar_url: prefs.avatar_url || '',
       bio: prefs.bio || '',
-      theme: prefs.theme || 'light',
+      theme: localTheme,  // 使用本地主题，而非服务端返回值
       language: prefs.language || 'zh-CN',
       timezone: prefs.timezone || 'Asia/Shanghai',
       notifications: {
@@ -431,11 +429,12 @@ async function loadPreferences() {
       }
     }
 
-    // 应用主题
-    if (preferencesForm.value.theme === 'dark') {
-      document.documentElement.classList.add('dark')
-    } else if (preferencesForm.value.theme === 'light') {
-      document.documentElement.classList.remove('dark')
+    // 如果本地主题和服务端不一致，同步到服务端（静默更新，不提示用户）
+    const serverTheme = prefs.theme || 'light'
+    if (localTheme !== serverTheme) {
+      meApi.updatePreferences({ theme: localTheme }).catch(() => {
+        // 静默失败，不影响用户体验
+      })
     }
   } catch (error) {
     log.error('加载偏好设置失败:', error)

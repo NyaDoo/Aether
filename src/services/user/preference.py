@@ -71,8 +71,8 @@ class PreferenceService:
                 raise NotFoundException("Provider not found or inactive")
             preferences.default_provider_id = default_provider_id
         if theme is not None:
-            if theme not in ["light", "dark", "auto"]:
-                raise ValueError("Invalid theme. Must be 'light', 'dark', or 'auto'")
+            if theme not in ["light", "dark", "auto", "system"]:
+                raise ValueError("Invalid theme. Must be 'light', 'dark', 'auto', or 'system'")
             preferences.theme = theme
         if language is not None:
             preferences.language = language
