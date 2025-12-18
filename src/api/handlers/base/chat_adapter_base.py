@@ -64,18 +64,6 @@ class ChatAdapterBase(ApiAdapter):
 
     def __init__(self, allowed_api_formats: Optional[list[str]] = None):
         self.allowed_api_formats = allowed_api_formats or [self.FORMAT_ID]
-        self.response_normalizer = None
-        # 可选启用响应规范化
-        self._init_response_normalizer()
-
-    def _init_response_normalizer(self):
-        """初始化响应规范化器 - 子类可覆盖"""
-        try:
-            from src.services.provider.response_normalizer import ResponseNormalizer
-
-            self.response_normalizer = ResponseNormalizer()
-        except ImportError:
-            pass
 
     async def handle(self, context: ApiRequestContext):
         """处理 Chat API 请求"""
@@ -228,8 +216,6 @@ class ChatAdapterBase(ApiAdapter):
             user_agent=user_agent,
             start_time=start_time,
             allowed_api_formats=self.allowed_api_formats,
-            response_normalizer=self.response_normalizer,
-            enable_response_normalization=self.response_normalizer is not None,
             adapter_detector=self.detect_capability_requirements,
         )
 

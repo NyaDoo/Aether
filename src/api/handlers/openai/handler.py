@@ -128,10 +128,5 @@ class OpenAIChatHandler(ChatHandlerBase):
         Returns:
             规范化后的响应
         """
-        if self.response_normalizer and self.response_normalizer.should_normalize(response):
-            return self.response_normalizer.normalize_openai_response(
-                response_data=response,
-                request_id=self.request_id,
-                strict=False,
-            )
+        # 作为中转站，直接透传响应，不做标准化处理
         return response

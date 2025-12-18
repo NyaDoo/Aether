@@ -88,8 +88,6 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         user_agent: str,
         start_time: float,
         allowed_api_formats: Optional[list] = None,
-        response_normalizer: Optional[Any] = None,
-        enable_response_normalization: bool = False,
         adapter_detector: Optional[Callable[[Dict[str, str], Optional[Dict[str, Any]]], Dict[str, bool]]] = None,
     ):
         allowed = allowed_api_formats or [self.FORMAT_ID]
@@ -106,8 +104,6 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         )
         self._parser: Optional[ResponseParser] = None
         self._request_builder = PassthroughRequestBuilder()
-        self.response_normalizer = response_normalizer
-        self.enable_response_normalization = enable_response_normalization
 
     @property
     def parser(self) -> ResponseParser:
