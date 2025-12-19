@@ -162,23 +162,30 @@ git pull
 
 # 标记是否需要重启
 NEED_RESTART=false
+BASE_REBUILT=false
 
 # 检查基础镜像是否存在，或依赖是否变化
 if ! docker image inspect aether-base:latest >/dev/null 2>&1; then
     echo ">>> Base image not found, building..."
     build_base
+    BASE_REBUILT=true
     NEED_RESTART=true
 elif check_deps_changed; then
     echo ">>> Dependencies changed, rebuilding base image..."
     build_base
+    BASE_REBUILT=true
     NEED_RESTART=true
 else
     echo ">>> Dependencies unchanged."
 fi
 
-# 检查代码是否变化
+# 检查代码是否变化，或者 base 重建了（app 依赖 base）
 if ! docker image inspect aether-app:latest >/dev/null 2>&1; then
     echo ">>> App image not found, building..."
+    build_app
+    NEED_RESTART=true
+elif [ "$BASE_REBUILT" = true ]; then
+    echo ">>> Base image rebuilt, rebuilding app image..."
     build_app
     NEED_RESTART=true
 elif check_code_changed; then
