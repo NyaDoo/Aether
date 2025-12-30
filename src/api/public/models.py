@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from src.api.base.models_service import (
+    AccessRestrictions,
     ModelInfo,
     find_model_by_id,
     get_available_provider_ids,
@@ -375,9 +376,12 @@ async def list_models(
     logger.info(f"[Models] GET /v1/models | format={api_format}")
 
     # 认证
-    user, _ = _authenticate(db, api_key)
+    user, key_record = _authenticate(db, api_key)
     if not user:
         return _build_auth_error_response(api_format)
+
+    # 构建访问限制
+    restrictions = AccessRestrictions.from_api_key_and_user(key_record, user)
 
     formats = _get_formats_for_api(api_format)
 
@@ -390,7 +394,7 @@ async def list_models(
         else:
             return {"object": "list", "data": []}
 
-    models = await list_available_models(db, available_provider_ids, formats)
+    models = await list_available_models(db, available_provider_ids, formats, restrictions)
     logger.debug(f"[Models] 返回 {len(models)} 个模型")
 
     if api_format == "claude":
@@ -419,14 +423,17 @@ async def retrieve_model(
     logger.info(f"[Models] GET /v1/models/{model_id} | format={api_format}")
 
     # 认证
-    user, _ = _authenticate(db, api_key)
+    user, key_record = _authenticate(db, api_key)
     if not user:
         return _build_auth_error_response(api_format)
+
+    # 构建访问限制
+    restrictions = AccessRestrictions.from_api_key_and_user(key_record, user)
 
     formats = _get_formats_for_api(api_format)
 
     available_provider_ids = get_available_provider_ids(db, formats)
-    model_info = find_model_by_id(db, model_id, available_provider_ids, formats)
+    model_info = find_model_by_id(db, model_id, available_provider_ids, formats, restrictions)
 
     if not model_info:
         return _build_404_response(model_id, api_format)
@@ -455,15 +462,18 @@ async def list_models_gemini(
     api_key = _extract_api_key_from_request(request, gemini_def)
 
     # 认证
-    user, _ = _authenticate(db, api_key)
+    user, key_record = _authenticate(db, api_key)
     if not user:
         return _build_auth_error_response("gemini")
+
+    # 构建访问限制
+    restrictions = AccessRestrictions.from_api_key_and_user(key_record, user)
 
     available_provider_ids = get_available_provider_ids(db, _GEMINI_FORMATS)
     if not available_provider_ids:
         return {"models": []}
 
-    models = await list_available_models(db, available_provider_ids, _GEMINI_FORMATS)
+    models = await list_available_models(db, available_provider_ids, _GEMINI_FORMATS, restrictions)
     logger.debug(f"[Models] 返回 {len(models)} 个模型")
     response = _build_gemini_list_response(models, page_size, page_token)
     logger.debug(f"[Models] Gemini 响应: {response}")
@@ -486,12 +496,17 @@ async def get_model_gemini(
     api_key = _extract_api_key_from_request(request, gemini_def)
 
     # 认证
-    user, _ = _authenticate(db, api_key)
+    user, key_record = _authenticate(db, api_key)
     if not user:
         return _build_auth_error_response("gemini")
 
+    # 构建访问限制
+    restrictions = AccessRestrictions.from_api_key_and_user(key_record, user)
+
     available_provider_ids = get_available_provider_ids(db, _GEMINI_FORMATS)
-    model_info = find_model_by_id(db, model_id, available_provider_ids, _GEMINI_FORMATS)
+    model_info = find_model_by_id(
+        db, model_id, available_provider_ids, _GEMINI_FORMATS, restrictions
+    )
 
     if not model_info:
         return _build_404_response(model_id, "gemini")
