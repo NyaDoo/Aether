@@ -96,13 +96,15 @@ if not DISABLE_FILE_LOG:
     log_dir.mkdir(exist_ok=True)
 
     # 文件日志通用配置
+    # 注意: enqueue=False 使用同步模式，避免 multiprocessing 信号量泄漏
+    # 在 macOS 上，进程异常退出时 POSIX 信号量不会自动释放，导致资源耗尽
     file_log_config = {
         "format": FILE_FORMAT,
         "filter": _log_filter,
         "rotation": "100 MB",
         "retention": "30 days",
         "compression": "gz",
-        "enqueue": True,
+        "enqueue": False,
         "encoding": "utf-8",
         "catch": True,
     }
