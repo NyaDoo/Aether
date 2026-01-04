@@ -244,55 +244,10 @@
           </div>
 
           <!-- 模型多选下拉框 -->
-          <div class="space-y-2">
-            <Label class="text-sm font-medium">允许的模型</Label>
-            <div class="relative">
-              <button
-                type="button"
-                class="w-full h-10 px-3 border rounded-lg bg-background text-left flex items-center justify-between hover:bg-muted/50 transition-colors"
-                @click="modelDropdownOpen = !modelDropdownOpen"
-              >
-                <span :class="form.allowed_models.length ? 'text-foreground' : 'text-muted-foreground'">
-                  {{ form.allowed_models.length ? `已选择 ${form.allowed_models.length} 个` : '全部可用' }}
-                </span>
-                <ChevronDown
-                  class="h-4 w-4 text-muted-foreground transition-transform"
-                  :class="modelDropdownOpen ? 'rotate-180' : ''"
-                />
-              </button>
-              <div
-                v-if="modelDropdownOpen"
-                class="fixed inset-0 z-[80]"
-                @click.stop="modelDropdownOpen = false"
-              />
-              <div
-                v-if="modelDropdownOpen"
-                class="absolute z-[90] w-full mt-1 bg-popover border rounded-lg shadow-lg max-h-48 overflow-y-auto"
-              >
-                <div
-                  v-for="model in globalModels"
-                  :key="model.name"
-                  class="flex items-center gap-2 px-3 py-2 hover:bg-muted/50 cursor-pointer"
-                  @click="toggleSelection('allowed_models', model.name)"
-                >
-                  <input
-                    type="checkbox"
-                    :checked="form.allowed_models.includes(model.name)"
-                    class="h-4 w-4 rounded border-gray-300 cursor-pointer"
-                    @click.stop
-                    @change="toggleSelection('allowed_models', model.name)"
-                  >
-                  <span class="text-sm">{{ model.name }}</span>
-                </div>
-                <div
-                  v-if="globalModels.length === 0"
-                  class="px-3 py-2 text-sm text-muted-foreground"
-                >
-                  暂无可用模型
-                </div>
-              </div>
-            </div>
-          </div>
+          <ModelMultiSelect
+            v-model="form.allowed_models"
+            :models="globalModels"
+          />
         </div>
       </div>
     </form>
@@ -327,6 +282,7 @@ import {
 } from '@/components/ui'
 import { Plus, SquarePen, Key, Shield, ChevronDown } from 'lucide-vue-next'
 import { useFormDialog } from '@/composables/useFormDialog'
+import { ModelMultiSelect } from '@/components/common'
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getGlobalModels } from '@/api/global-models'
 import { adminApi } from '@/api/admin'
@@ -363,7 +319,6 @@ const saving = ref(false)
 // 下拉框状态
 const providerDropdownOpen = ref(false)
 const apiFormatDropdownOpen = ref(false)
-const modelDropdownOpen = ref(false)
 
 // 选项数据
 const providers = ref<ProviderWithEndpointsSummary[]>([])
@@ -397,7 +352,6 @@ function resetForm() {
   }
   providerDropdownOpen.value = false
   apiFormatDropdownOpen.value = false
-  modelDropdownOpen.value = false
 }
 
 function loadKeyData() {

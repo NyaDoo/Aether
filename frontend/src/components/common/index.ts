@@ -7,3 +7,6 @@
 export { default as EmptyState } from './EmptyState.vue'
 export { default as AlertDialog } from './AlertDialog.vue'
 export { default as LoadingState } from './LoadingState.vue'
+
+// 表单组件
+export { default as ModelMultiSelect } from './ModelMultiSelect.vue'

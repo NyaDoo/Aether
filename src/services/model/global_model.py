@@ -148,6 +148,8 @@ class GlobalModelService:
         删除 GlobalModel
 
         默认行为: 级联删除所有关联的 Provider 模型实现
+        注意: 不清理 API Key 和 User 的 allowed_models 引用，
+        保留无效引用可让用户在前端看到"已失效"的模型，便于手动清理或等待重建同名模型
         """
         global_model = GlobalModelService.get_global_model(db, global_model_id)
 
