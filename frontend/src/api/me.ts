@@ -286,5 +286,14 @@ export const meApi = {
   }> {
     const response = await apiClient.get('/api/users/me/usage/interval-timeline', { params })
     return response.data
+  },
+
+  /**
+   * 获取活跃度热力图数据（用户）
+   * 后端已缓存5分钟
+   */
+  async getActivityHeatmap(): Promise<ActivityHeatmap> {
+    const response = await apiClient.get<ActivityHeatmap>('/api/users/me/usage/heatmap')
+    return response.data
   }
 }

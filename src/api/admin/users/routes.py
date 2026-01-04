@@ -248,6 +248,7 @@ class AdminUpdateUserAdapter(AdminApiAdapter):
             raise InvalidRequestException("请求数据验证失败")
 
         update_data = request.model_dump(exclude_unset=True)
+        old_role = existing_user.role
         if "role" in update_data and update_data["role"]:
             if hasattr(update_data["role"], "value"):
                 update_data["role"] = update_data["role"]
@@ -257,6 +258,12 @@ class AdminUpdateUserAdapter(AdminApiAdapter):
         user = UserService.update_user(db, self.user_id, **update_data)
         if not user:
             raise NotFoundException("用户不存在", "user")
+
+        # 角色变更时清除热力图缓存（影响 include_actual_cost 权限）
+        if "role" in update_data and update_data["role"] != old_role:
+            from src.services.usage.service import UsageService
+
+            await UsageService.clear_user_heatmap_cache(self.user_id)
 
         changed_fields = list(update_data.keys())
         context.add_audit_metadata(

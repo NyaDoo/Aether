@@ -64,9 +64,6 @@ export function useUsageData(options: UseUsageDataOptions) {
     }))
   })
 
-  // 活跃度热图数据
-  const activityHeatmapData = computed(() => stats.value.activity_heatmap)
-
   // 加载统计数据（不加载记录）
   async function loadStats(dateRange?: DateRangeParams) {
     isLoadingStats.value = true
@@ -93,7 +90,7 @@ export function useUsageData(options: UseUsageDataOptions) {
           cache_stats: (statsData as any).cache_stats,
           period_start: '',
           period_end: '',
-          activity_heatmap: statsData.activity_heatmap || null
+          activity_heatmap: null
         }
 
         modelStats.value = modelData.map(item => ({
@@ -143,7 +140,7 @@ export function useUsageData(options: UseUsageDataOptions) {
           avg_response_time: userData.avg_response_time || 0,
           period_start: '',
           period_end: '',
-          activity_heatmap: userData.activity_heatmap || null
+          activity_heatmap: null
         }
 
         modelStats.value = (userData.summary_by_model || []).map((item: any) => ({
@@ -305,7 +302,6 @@ export function useUsageData(options: UseUsageDataOptions) {
 
     // 计算属性
     enhancedModelStats,
-    activityHeatmapData,
 
     // 方法
     loadStats,

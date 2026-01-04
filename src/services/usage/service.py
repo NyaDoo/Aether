@@ -86,6 +86,118 @@ class UsageRecordParams:
 class UsageService:
     """用量统计服务"""
 
+    # ==================== 缓存键常量 ====================
+
+    # 热力图缓存键前缀（依赖 TTL 自动过期，用户角色变更时主动清除）
+    HEATMAP_CACHE_KEY_PREFIX = "activity_heatmap"
+
+    # ==================== 热力图缓存 ====================
+
+    @classmethod
+    def _get_heatmap_cache_key(cls, user_id: Optional[str], include_actual_cost: bool) -> str:
+        """生成热力图缓存键"""
+        cost_suffix = "with_cost" if include_actual_cost else "no_cost"
+        if user_id:
+            return f"{cls.HEATMAP_CACHE_KEY_PREFIX}:user:{user_id}:{cost_suffix}"
+        else:
+            return f"{cls.HEATMAP_CACHE_KEY_PREFIX}:admin:all:{cost_suffix}"
+
+    @classmethod
+    async def clear_user_heatmap_cache(cls, user_id: str) -> None:
+        """
+        清除用户的热力图缓存（用户角色变更时调用）
+
+        Args:
+            user_id: 用户ID
+        """
+        from src.clients.redis_client import get_redis_client
+
+        redis_client = await get_redis_client(require_redis=False)
+        if not redis_client:
+            return
+
+        # 清除该用户的所有热力图缓存（with_cost 和 no_cost）
+        keys_to_delete = [
+            cls._get_heatmap_cache_key(user_id, include_actual_cost=True),
+            cls._get_heatmap_cache_key(user_id, include_actual_cost=False),
+        ]
+
+        for key in keys_to_delete:
+            try:
+                await redis_client.delete(key)
+                logger.debug(f"已清除热力图缓存: {key}")
+            except Exception as e:
+                logger.warning(f"清除热力图缓存失败: {key}, error={e}")
+
+    @classmethod
+    async def get_cached_heatmap(
+        cls,
+        db: Session,
+        user_id: Optional[str] = None,
+        include_actual_cost: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        获取带缓存的热力图数据
+
+        缓存策略：
+        - TTL: 5分钟（CacheTTL.ACTIVITY_HEATMAP）
+        - 仅依赖 TTL 自动过期，新使用记录最多延迟 5 分钟出现
+        - 用户角色变更时通过 clear_user_heatmap_cache() 主动清除
+
+        Args:
+            db: 数据库会话
+            user_id: 用户ID，None 表示获取全局热力图（管理员）
+            include_actual_cost: 是否包含实际成本
+
+        Returns:
+            热力图数据字典
+        """
+        from src.clients.redis_client import get_redis_client
+        from src.config.constants import CacheTTL
+        import json
+
+        cache_key = cls._get_heatmap_cache_key(user_id, include_actual_cost)
+
+        cache_ttl = CacheTTL.ACTIVITY_HEATMAP
+        redis_client = await get_redis_client(require_redis=False)
+
+        # 尝试从缓存获取
+        if redis_client:
+            try:
+                cached = await redis_client.get(cache_key)
+                if cached:
+                    try:
+                        return json.loads(cached)  # type: ignore[no-any-return]
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"热力图缓存解析失败，删除损坏缓存: {cache_key}, error={e}")
+                        try:
+                            await redis_client.delete(cache_key)
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.error(f"读取热力图缓存出错: {cache_key}, error={e}")
+
+        # 从数据库查询
+        result = cls.get_daily_activity(
+            db=db,
+            user_id=user_id,
+            window_days=365,
+            include_actual_cost=include_actual_cost,
+        )
+
+        # 保存到缓存（失败不影响返回结果）
+        if redis_client:
+            try:
+                await redis_client.setex(
+                    cache_key,
+                    cache_ttl,
+                    json.dumps(result, ensure_ascii=False, default=str),
+                )
+            except Exception as e:
+                logger.warning(f"保存热力图缓存失败: {cache_key}, error={e}")
+
+        return result
+
     # ==================== 内部数据类 ====================
 
     @staticmethod

@@ -198,5 +198,14 @@ export const usageApi = {
     const params = ids?.length ? { ids: ids.join(',') } : {}
     const response = await apiClient.get('/api/admin/usage/active', { params })
     return response.data
+  },
+
+  /**
+   * 获取活跃度热力图数据（管理员）
+   * 后端已缓存5分钟
+   */
+  async getActivityHeatmap(): Promise<ActivityHeatmap> {
+    const response = await apiClient.get<ActivityHeatmap>('/api/admin/usage/heatmap')
+    return response.data
   }
 }

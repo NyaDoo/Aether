@@ -5,6 +5,8 @@
       <ActivityHeatmapCard
         :data="activityHeatmapData"
         :title="isAdminPage ? '总体活跃天数' : '我的活跃天数'"
+        :is-loading="isLoadingHeatmap"
+        :has-error="heatmapError"
       />
       <IntervalTimelineCard
         :title="isAdminPage ? '请求间隔时间线' : '我的请求间隔'"
@@ -112,8 +114,11 @@ import {
 import type { PeriodValue, FilterStatusValue } from '@/features/usage/types'
 import type { UserOption } from '@/features/usage/components/UsageRecordsTable.vue'
 import { log } from '@/utils/logger'
+import type { ActivityHeatmap } from '@/types/activity'
+import { useToast } from '@/composables/useToast'
 
 const route = useRoute()
+const { warning } = useToast()
 const authStore = useAuthStore()
 
 // 判断是否是管理员页面
@@ -144,12 +149,34 @@ const {
   currentRecords,
   totalRecords,
   enhancedModelStats,
-  activityHeatmapData,
   availableModels,
   availableProviders,
   loadStats,
   loadRecords
 } = useUsageData({ isAdminPage })
+
+// 热力图状态
+const activityHeatmapData = ref<ActivityHeatmap | null>(null)
+const isLoadingHeatmap = ref(false)
+const heatmapError = ref(false)
+
+// 加载热力图数据
+async function loadHeatmapData() {
+  isLoadingHeatmap.value = true
+  heatmapError.value = false
+  try {
+    if (isAdminPage.value) {
+      activityHeatmapData.value = await usageApi.getActivityHeatmap()
+    } else {
+      activityHeatmapData.value = await meApi.getActivityHeatmap()
+    }
+  } catch (error) {
+    log.error('加载热力图数据失败:', error)
+    heatmapError.value = true
+  } finally {
+    isLoadingHeatmap.value = false
+  }
+}
 
 // 用户页面需要前端筛选
 const filteredRecords = computed(() => {
@@ -335,7 +362,22 @@ const selectedRequestId = ref<string | null>(null)
 // 初始化加载
 onMounted(async () => {
   const dateRange = getDateRangeFromPeriod(selectedPeriod.value)
-  await loadStats(dateRange)
+
+  // 并行加载统计数据和热力图（使用 allSettled 避免其中一个失败影响另一个）
+  const [statsResult, heatmapResult] = await Promise.allSettled([
+    loadStats(dateRange),
+    loadHeatmapData()
+  ])
+
+  // 检查加载结果并通知用户
+  if (statsResult.status === 'rejected') {
+    log.error('加载统计数据失败:', statsResult.reason)
+    warning('统计数据加载失败，请刷新重试')
+  }
+  if (heatmapResult.status === 'rejected') {
+    log.error('加载热力图数据失败:', heatmapResult.reason)
+    // 热力图加载失败不提示，因为 UI 已显示占位符
+  }
 
   // 管理员页面加载用户列表和第一页记录
   if (isAdminPage.value) {

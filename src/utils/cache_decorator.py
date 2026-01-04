@@ -49,8 +49,16 @@ def cache_result(key_prefix: str, ttl: int = 60, user_specific: bool = True) -> 
                 # 尝试从缓存获取
                 cached = await redis_client.get(cache_key)
                 if cached:
-                    logger.debug(f"缓存命中: {cache_key}")
-                    return json.loads(cached)
+                    try:
+                        result = json.loads(cached)
+                        logger.debug(f"缓存命中: {cache_key}")
+                        return result
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"缓存解析失败，删除损坏缓存: {cache_key}, 错误: {e}")
+                        try:
+                            await redis_client.delete(cache_key)
+                        except Exception:
+                            pass
 
                 # 执行原函数
                 result = await func(*args, **kwargs)

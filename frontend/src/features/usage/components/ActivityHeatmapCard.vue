@@ -18,8 +18,22 @@
         <span class="flex-shrink-0">多</span>
       </div>
     </div>
+    <div
+      v-if="isLoading"
+      class="h-full min-h-[160px] flex items-center justify-center text-sm text-muted-foreground"
+    >
+      <Loader2 class="h-5 w-5 animate-spin mr-2" />
+      加载中...
+    </div>
+    <div
+      v-else-if="hasError"
+      class="h-full min-h-[160px] flex items-center justify-center text-sm text-destructive"
+    >
+      <AlertCircle class="h-4 w-4 mr-1.5" />
+      加载失败
+    </div>
     <ActivityHeatmap
-      v-if="hasData"
+      v-else-if="hasData"
       :data="data"
       :show-header="false"
     />
@@ -34,6 +48,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { Loader2, AlertCircle } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import ActivityHeatmap from '@/components/stats/ActivityHeatmap.vue'
 import type { ActivityHeatmap as ActivityHeatmapData } from '@/types/activity'
@@ -41,6 +56,8 @@ import type { ActivityHeatmap as ActivityHeatmapData } from '@/types/activity'
 const props = defineProps<{
   data: ActivityHeatmapData | null
   title: string
+  isLoading?: boolean
+  hasError?: boolean
 }>()
 
 const legendLevels = [0.08, 0.25, 0.45, 0.65, 0.85]

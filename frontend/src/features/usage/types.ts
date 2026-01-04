@@ -1,5 +1,3 @@
-import type { ActivityHeatmap } from '@/types/activity'
-
 // 统计数据状态
 export interface UsageStatsState {
   total_requests: number
@@ -17,7 +15,6 @@ export interface UsageStatsState {
   }
   period_start: string
   period_end: string
-  activity_heatmap: ActivityHeatmap | null
 }
 
 // 模型统计
@@ -115,7 +112,6 @@ export function createDefaultStats(): UsageStatsState {
     error_rate: undefined,
     cache_stats: undefined,
     period_start: '',
-    period_end: '',
-    activity_heatmap: null
+    period_end: ''
   }
 }

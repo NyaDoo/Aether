@@ -135,6 +135,20 @@ async def get_my_interval_timeline(
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
+@router.get("/usage/heatmap")
+async def get_my_activity_heatmap(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Get user's activity heatmap data for the past 365 days.
+
+    This endpoint is cached for 5 minutes to reduce database load.
+    """
+    adapter = GetMyActivityHeatmapAdapter()
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
 @router.get("/providers")
 async def list_available_providers(request: Request, db: Session = Depends(get_db)):
     adapter = ListAvailableProvidersAdapter()
@@ -650,13 +664,6 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             ],
         }
 
-        response_data["activity_heatmap"] = UsageService.get_daily_activity(
-            db=db,
-            user_id=user.id,
-            window_days=365,
-            include_actual_cost=user.role == "admin",
-        )
-
         # 管理员可以看到真实成本
         if user.role == "admin":
             response_data["total_actual_cost"] = total_actual_cost
@@ -720,6 +727,20 @@ class GetMyIntervalTimelineAdapter(AuthenticatedApiAdapter):
             user_id=str(user.id),
         )
 
+        return result
+
+
+class GetMyActivityHeatmapAdapter(AuthenticatedApiAdapter):
+    """Activity heatmap adapter with Redis caching for user."""
+
+    async def handle(self, context):  # type: ignore[override]
+        user = context.user
+        result = await UsageService.get_cached_heatmap(
+            db=context.db,
+            user_id=user.id,
+            include_actual_cost=user.role == "admin",
+        )
+        context.add_audit_metadata(action="activity_heatmap")
         return result
 
 

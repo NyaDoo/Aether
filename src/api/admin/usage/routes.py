@@ -73,6 +73,20 @@ async def get_usage_stats(
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
 
 
+@router.get("/heatmap")
+async def get_activity_heatmap(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Get activity heatmap data for the past 365 days.
+
+    This endpoint is cached for 5 minutes to reduce database load.
+    """
+    adapter = AdminActivityHeatmapAdapter()
+    return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
 @router.get("/records")
 async def get_usage_records(
     request: Request,
@@ -168,12 +182,6 @@ class AdminUsageStatsAdapter(AdminApiAdapter):
             (Usage.status_code >= 400) | (Usage.error_message.isnot(None))
         ).count()
 
-        activity_heatmap = UsageService.get_daily_activity(
-            db=db,
-            window_days=365,
-            include_actual_cost=True,
-        )
-
         context.add_audit_metadata(
             action="usage_stats",
             start_date=self.start_date.isoformat() if self.start_date else None,
@@ -204,8 +212,20 @@ class AdminUsageStatsAdapter(AdminApiAdapter):
                 ),
                 "cache_read_cost": float(cache_stats.cache_read_cost or 0) if cache_stats else 0,
             },
-            "activity_heatmap": activity_heatmap,
         }
+
+
+class AdminActivityHeatmapAdapter(AdminApiAdapter):
+    """Activity heatmap adapter with Redis caching."""
+
+    async def handle(self, context):  # type: ignore[override]
+        result = await UsageService.get_cached_heatmap(
+            db=context.db,
+            user_id=None,
+            include_actual_cost=True,
+        )
+        context.add_audit_metadata(action="activity_heatmap")
+        return result
 
 
 class AdminUsageByModelAdapter(AdminApiAdapter):
