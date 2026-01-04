@@ -1133,7 +1133,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         allowed_endpoints=key_data.get("allowed_endpoints"),
                         allowed_api_formats=key_data.get("allowed_api_formats"),
                         allowed_models=key_data.get("allowed_models"),
-                        rate_limit=key_data.get("rate_limit", 100),
+                        rate_limit=key_data.get("rate_limit"),  # None = 无限制
                         concurrent_limit=key_data.get("concurrent_limit", 5),
                         force_capabilities=key_data.get("force_capabilities"),
                         is_active=key_data.get("is_active", True),

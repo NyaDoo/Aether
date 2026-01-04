@@ -850,28 +850,20 @@ async function deleteApiKey(apiKey: AdminApiKey) {
 }
 
 function editApiKey(apiKey: AdminApiKey) {
-  // 计算过期天数
-  let expireDays: number | undefined = undefined
-  let neverExpire = true
+  // 解析过期日期为 YYYY-MM-DD 格式
+  // 保留原始日期，不做时间过滤（避免编辑当天过期的 Key 时意外清空）
+  let expiresAt: string | undefined = undefined
 
   if (apiKey.expires_at) {
     const expiresDate = new Date(apiKey.expires_at)
-    const now = new Date()
-    const diffMs = expiresDate.getTime() - now.getTime()
-    const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24))
-
-    if (diffDays > 0) {
-      expireDays = diffDays
-      neverExpire = false
-    }
+    expiresAt = expiresDate.toISOString().split('T')[0]
   }
 
   editingKeyData.value = {
     id: apiKey.id,
     name: apiKey.name || '',
-    expire_days: expireDays,
-    never_expire: neverExpire,
-    rate_limit: apiKey.rate_limit || 100,
+    expires_at: expiresAt,
+    rate_limit: apiKey.rate_limit ?? undefined,
     auto_delete_on_expiry: apiKey.auto_delete_on_expiry || false,
     allowed_providers: apiKey.allowed_providers || [],
     allowed_api_formats: apiKey.allowed_api_formats || [],
@@ -1033,14 +1025,25 @@ function closeKeyFormDialog() {
 
 // 统一处理表单提交
 async function handleKeyFormSubmit(data: StandaloneKeyFormData) {
+  // 验证过期日期（如果设置了，必须晚于今天）
+  if (data.expires_at) {
+    const selectedDate = new Date(data.expires_at)
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    if (selectedDate <= today) {
+      error('过期日期必须晚于今天')
+      return
+    }
+  }
+
   keyFormDialogRef.value?.setSaving(true)
   try {
     if (data.id) {
       // 更新
       const updateData: Partial<CreateStandaloneApiKeyRequest> = {
         name: data.name || undefined,
-        rate_limit: data.rate_limit,
-        expire_days: data.never_expire ? null : (data.expire_days || null),
+        rate_limit: data.rate_limit ?? null,  // undefined = 无限制，显式传 null
+        expires_at: data.expires_at || null,  // undefined/空 = 永不过期
         auto_delete_on_expiry: data.auto_delete_on_expiry,
         // 空数组表示清除限制（允许全部），后端会将空数组存为 NULL
         allowed_providers: data.allowed_providers,
@@ -1058,8 +1061,8 @@ async function handleKeyFormSubmit(data: StandaloneKeyFormData) {
       const createData: CreateStandaloneApiKeyRequest = {
         name: data.name || undefined,
         initial_balance_usd: data.initial_balance_usd,
-        rate_limit: data.rate_limit,
-        expire_days: data.never_expire ? null : (data.expire_days || null),
+        rate_limit: data.rate_limit ?? null,  // undefined = 无限制，显式传 null
+        expires_at: data.expires_at || null,  // undefined/空 = 永不过期
         auto_delete_on_expiry: data.auto_delete_on_expiry,
         // 空数组表示不设置限制（允许全部），后端会将空数组存为 NULL
         allowed_providers: data.allowed_providers,

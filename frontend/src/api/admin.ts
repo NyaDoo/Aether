@@ -42,7 +42,7 @@ export interface UserApiKeyExport {
   allowed_endpoints?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
-  rate_limit?: number
+  rate_limit?: number | null  // null = 无限制
   concurrent_limit?: number | null
   force_capabilities?: any
   is_active: boolean
@@ -220,7 +220,7 @@ export interface AdminApiKey {
   total_requests?: number
   total_tokens?: number
   total_cost_usd?: number
-  rate_limit?: number
+  rate_limit?: number | null  // null = 无限制
   allowed_providers?: string[] | null  // 允许的提供商列表
   allowed_api_formats?: string[] | null  // 允许的 API 格式列表
   allowed_models?: string[] | null  // 允许的模型列表
@@ -236,8 +236,8 @@ export interface CreateStandaloneApiKeyRequest {
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
-  rate_limit?: number
-  expire_days?: number | null  // null = 永不过期
+  rate_limit?: number | null  // null = 无限制
+  expires_at?: string | null  // ISO 日期字符串，如 "2025-12-31"，null = 永不过期
   initial_balance_usd: number  // 初始余额，必须设置
   auto_delete_on_expiry?: boolean  // 过期后是否自动删除
 }

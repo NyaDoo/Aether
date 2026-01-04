@@ -25,9 +25,10 @@ class ApiKeyService:
         allowed_providers: Optional[List[str]] = None,
         allowed_api_formats: Optional[List[str]] = None,
         allowed_models: Optional[List[str]] = None,
-        rate_limit: int = 100,
+        rate_limit: Optional[int] = None,
         concurrent_limit: int = 5,
         expire_days: Optional[int] = None,
+        expires_at: Optional[datetime] = None,  # 直接传入过期时间，优先于 expire_days
         initial_balance_usd: Optional[float] = None,
         is_standalone: bool = False,
         auto_delete_on_expiry: bool = False,
@@ -44,6 +45,7 @@ class ApiKeyService:
             rate_limit: 速率限制
             concurrent_limit: 并发限制
             expire_days: 过期天数，None = 永不过期
+            expires_at: 直接指定过期时间，优先于 expire_days
             initial_balance_usd: 初始余额（USD），仅用于独立Key，None = 无限制
             is_standalone: 是否为独立余额Key（仅管理员可创建）
             auto_delete_on_expiry: 过期后是否自动删除（True=物理删除，False=仅禁用）
@@ -54,10 +56,10 @@ class ApiKeyService:
         key_hash = ApiKey.hash_key(key)
         key_encrypted = crypto_service.encrypt(key)  # 加密存储密钥
 
-        # 计算过期时间
-        expires_at = None
-        if expire_days:
-            expires_at = datetime.now(timezone.utc) + timedelta(days=expire_days)
+        # 计算过期时间：优先使用 expires_at，其次使用 expire_days
+        final_expires_at = expires_at
+        if final_expires_at is None and expire_days:
+            final_expires_at = datetime.now(timezone.utc) + timedelta(days=expire_days)
 
         # 空数组转为 None（表示不限制）
         api_key = ApiKey(
@@ -70,7 +72,7 @@ class ApiKeyService:
             allowed_models=allowed_models or None,
             rate_limit=rate_limit,
             concurrent_limit=concurrent_limit,
-            expires_at=expires_at,
+            expires_at=final_expires_at,
             balance_used_usd=0.0,
             current_balance_usd=initial_balance_usd,  # 直接使用初始余额，None = 无限制
             is_standalone=is_standalone,
@@ -145,6 +147,9 @@ class ApiKeyService:
         # 允许显式设置为空数组/None 的字段（空数组会转为 None，表示"全部"）
         nullable_list_fields = {"allowed_providers", "allowed_api_formats", "allowed_models"}
 
+        # 允许显式设置为 None 的字段（如 expires_at=None 表示永不过期，rate_limit=None 表示无限制）
+        nullable_fields = {"expires_at", "rate_limit"}
+
         for field, value in kwargs.items():
             if field not in updatable_fields:
                 continue
@@ -153,6 +158,9 @@ class ApiKeyService:
                 if value is not None:
                     # 空数组转为 None（表示允许全部）
                     setattr(api_key, field, value if value else None)
+            elif field in nullable_fields:
+                # 这些字段允许显式设置为 None
+                setattr(api_key, field, value)
             elif value is not None:
                 setattr(api_key, field, value)
 

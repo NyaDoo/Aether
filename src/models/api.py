@@ -309,8 +309,9 @@ class CreateApiKeyRequest(BaseModel):
     allowed_endpoints: Optional[List[str]] = None  # 允许使用的端点 ID 列表
     allowed_api_formats: Optional[List[str]] = None  # 允许使用的 API 格式列表
     allowed_models: Optional[List[str]] = None  # 允许使用的模型名称列表
-    rate_limit: Optional[int] = 100
-    expire_days: Optional[int] = None  # None = 永不过期，数字 = 多少天后过期
+    rate_limit: Optional[int] = None  # None = 无限制
+    expire_days: Optional[int] = None  # None = 永不过期，数字 = 多少天后过期（兼容旧版）
+    expires_at: Optional[str] = None  # ISO 日期字符串，如 "2025-12-31"，优先于 expire_days
     initial_balance_usd: Optional[float] = Field(
         None, description="初始余额（USD），仅用于独立Key，None = 无限制"
     )

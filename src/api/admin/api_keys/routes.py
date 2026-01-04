@@ -3,7 +3,7 @@
 独立余额Key：不关联用户配额，有独立余额限制，用于给非注册用户使用。
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -11,12 +11,48 @@ from sqlalchemy.orm import Session
 
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.pipeline import ApiRequestPipeline
-from src.core.exceptions import NotFoundException
+from src.core.exceptions import InvalidRequestException, NotFoundException
 from src.core.logger import logger
 from src.database import get_db
 from src.models.api import CreateApiKeyRequest
-from src.models.database import ApiKey, User
+from src.models.database import ApiKey
 from src.services.user.apikey import ApiKeyService
+
+
+def parse_expiry_date(date_str: Optional[str]) -> Optional[datetime]:
+    """解析过期日期字符串为 datetime 对象（UTC 时区）。
+
+    Args:
+        date_str: 日期字符串，支持 "YYYY-MM-DD" 或 ISO 格式
+
+    Returns:
+        datetime 对象（当天 23:59:59.999999 UTC），或 None 如果输入为空
+
+    Raises:
+        BadRequestException: 日期格式无效
+    """
+    if not date_str or not date_str.strip():
+        return None
+
+    date_str = date_str.strip()
+
+    # 尝试 YYYY-MM-DD 格式
+    try:
+        parsed_date = datetime.strptime(date_str, "%Y-%m-%d")
+        # 设置为当天结束时间 (23:59:59.999999 UTC)
+        return parsed_date.replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+        )
+    except ValueError:
+        pass
+
+    # 尝试完整 ISO 格式
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    raise InvalidRequestException(f"无效的日期格式: {date_str}，请使用 YYYY-MM-DD 格式")
 
 
 router = APIRouter(prefix="/api/admin/api-keys", tags=["Admin - API Keys (Standalone)"])
@@ -215,6 +251,9 @@ class AdminCreateStandaloneKeyAdapter(AdminApiAdapter):
         # 独立Key需要关联到管理员用户（从context获取）
         admin_user_id = context.user.id
 
+        # 解析过期时间（优先使用 expires_at，其次使用 expire_days）
+        expires_at_dt = parse_expiry_date(self.key_data.expires_at)
+
         # 创建独立Key
         api_key, plain_key = ApiKeyService.create_api_key(
             db=db,
@@ -224,7 +263,8 @@ class AdminCreateStandaloneKeyAdapter(AdminApiAdapter):
             allowed_api_formats=self.key_data.allowed_api_formats,
             allowed_models=self.key_data.allowed_models,
             rate_limit=self.key_data.rate_limit,  # None 表示不限制
-            expire_days=self.key_data.expire_days,
+            expire_days=self.key_data.expire_days,  # 兼容旧版
+            expires_at=expires_at_dt,  # 优先使用
             initial_balance_usd=self.key_data.initial_balance_usd,
             is_standalone=True,  # 标记为独立Key
             auto_delete_on_expiry=self.key_data.auto_delete_on_expiry,
@@ -270,7 +310,8 @@ class AdminUpdateApiKeyAdapter(AdminApiAdapter):
         update_data = {}
         if self.key_data.name is not None:
             update_data["name"] = self.key_data.name
-        if self.key_data.rate_limit is not None:
+        # rate_limit: 显式传递时更新（包括 null 表示无限制）
+        if "rate_limit" in self.key_data.model_fields_set:
             update_data["rate_limit"] = self.key_data.rate_limit
         if (
             hasattr(self.key_data, "auto_delete_on_expiry")
@@ -287,19 +328,21 @@ class AdminUpdateApiKeyAdapter(AdminApiAdapter):
             update_data["allowed_models"] = self.key_data.allowed_models
 
         # 处理过期时间
-        if self.key_data.expire_days is not None:
-            if self.key_data.expire_days > 0:
-                from datetime import timedelta
-
+        # 优先使用 expires_at（如果显式传递且有值）
+        if self.key_data.expires_at and self.key_data.expires_at.strip():
+            update_data["expires_at"] = parse_expiry_date(self.key_data.expires_at)
+        elif "expires_at" in self.key_data.model_fields_set:
+            # expires_at 明确传递为 null 或空字符串，设为永不过期
+            update_data["expires_at"] = None
+        # 兼容旧版 expire_days
+        elif "expire_days" in self.key_data.model_fields_set:
+            if self.key_data.expire_days is not None and self.key_data.expire_days > 0:
                 update_data["expires_at"] = datetime.now(timezone.utc) + timedelta(
                     days=self.key_data.expire_days
                 )
             else:
-                # expire_days = 0 或负数表示永不过期
+                # expire_days = None/0/负数 表示永不过期
                 update_data["expires_at"] = None
-        elif hasattr(self.key_data, "expire_days") and self.key_data.expire_days is None:
-            # 明确传递 None，设为永不过期
-            update_data["expires_at"] = None
 
         # 使用 ApiKeyService 更新
         updated_key = ApiKeyService.update_api_key(db, self.key_id, **update_data)

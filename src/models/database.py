@@ -150,7 +150,7 @@ class ApiKey(Base):
     allowed_endpoints = Column(JSON, nullable=True)  # 允许使用的端点 ID 列表
     allowed_api_formats = Column(JSON, nullable=True)  # 允许使用的 API 格式列表
     allowed_models = Column(JSON, nullable=True)  # 允许使用的模型名称列表
-    rate_limit = Column(Integer, default=100)  # 每分钟请求限制
+    rate_limit = Column(Integer, default=None, nullable=True)  # 每分钟请求限制，None = 无限制
     concurrent_limit = Column(Integer, default=5, nullable=True)  # 并发请求限制
 
     # Key 能力配置

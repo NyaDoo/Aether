@@ -79,45 +79,45 @@
 
           <div class="space-y-2">
             <Label
-              for="form-expire-days"
+              for="form-expires-at"
               class="text-sm font-medium"
             >有效期设置</Label>
             <div class="flex items-center gap-2">
-              <Input
-                id="form-expire-days"
-                :model-value="form.expire_days ?? ''"
-                type="number"
-                min="1"
-                max="3650"
-                placeholder="天数"
-                :class="form.never_expire ? 'flex-1 h-9 opacity-50' : 'flex-1 h-9'"
-                :disabled="form.never_expire"
-                @update:model-value="(v) => form.expire_days = parseNumberInput(v, { min: 1, max: 3650 })"
-              />
-              <label class="flex items-center gap-1.5 border rounded-md px-2 py-1.5 bg-muted/50 cursor-pointer text-xs whitespace-nowrap">
-                <input
-                  v-model="form.never_expire"
-                  type="checkbox"
-                  class="h-3.5 w-3.5 rounded border-gray-300 cursor-pointer"
-                  @change="onNeverExpireChange"
+              <div class="relative flex-1">
+                <Input
+                  id="form-expires-at"
+                  :model-value="form.expires_at || ''"
+                  type="date"
+                  :min="minExpiryDate"
+                  class="h-9 pr-8"
+                  :placeholder="form.expires_at ? '' : '永不过期'"
+                  @update:model-value="(v) => form.expires_at = v || undefined"
+                />
+                <button
+                  v-if="form.expires_at"
+                  type="button"
+                  class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  title="清空（永不过期）"
+                  @click="clearExpiryDate"
                 >
-                永不过期
-              </label>
+                  <X class="h-4 w-4" />
+                </button>
+              </div>
               <label
                 class="flex items-center gap-1.5 border rounded-md px-2 py-1.5 bg-muted/50 cursor-pointer text-xs whitespace-nowrap"
-                :class="form.never_expire ? 'opacity-50' : ''"
+                :class="!form.expires_at ? 'opacity-50 cursor-not-allowed' : ''"
               >
                 <input
                   v-model="form.auto_delete_on_expiry"
                   type="checkbox"
                   class="h-3.5 w-3.5 rounded border-gray-300 cursor-pointer"
-                  :disabled="form.never_expire"
+                  :disabled="!form.expires_at"
                 >
                 到期删除
               </label>
             </div>
             <p class="text-xs text-muted-foreground">
-              不勾选"到期删除"则仅禁用
+              {{ form.expires_at ? '到期后' + (form.auto_delete_on_expiry ? '自动删除' : '仅禁用') + '（当天 UTC 23:59 失效）' : '留空表示永不过期' }}
             </p>
           </div>
 
@@ -280,7 +280,7 @@ import {
   Input,
   Label,
 } from '@/components/ui'
-import { Plus, SquarePen, Key, Shield, ChevronDown } from 'lucide-vue-next'
+import { Plus, SquarePen, Key, Shield, ChevronDown, X } from 'lucide-vue-next'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { ModelMultiSelect } from '@/components/common'
 import { getProvidersSummary } from '@/api/endpoints/providers'
@@ -294,8 +294,7 @@ export interface StandaloneKeyFormData {
   id?: string
   name: string
   initial_balance_usd?: number
-  expire_days?: number
-  never_expire: boolean
+  expires_at?: string  // ISO 日期字符串，如 "2025-12-31"，undefined = 永不过期
   rate_limit?: number
   auto_delete_on_expiry: boolean
   allowed_providers: string[]
@@ -329,8 +328,7 @@ const allApiFormats = ref<string[]>([])
 const form = ref<StandaloneKeyFormData>({
   name: '',
   initial_balance_usd: 10,
-  expire_days: undefined,
-  never_expire: true,
+  expires_at: undefined,
   rate_limit: undefined,
   auto_delete_on_expiry: false,
   allowed_providers: [],
@@ -338,12 +336,18 @@ const form = ref<StandaloneKeyFormData>({
   allowed_models: []
 })
 
+// 计算最小可选日期（明天）
+const minExpiryDate = computed(() => {
+  const tomorrow = new Date()
+  tomorrow.setDate(tomorrow.getDate() + 1)
+  return tomorrow.toISOString().split('T')[0]
+})
+
 function resetForm() {
   form.value = {
     name: '',
     initial_balance_usd: 10,
-    expire_days: undefined,
-    never_expire: true,
+    expires_at: undefined,
     rate_limit: undefined,
     auto_delete_on_expiry: false,
     allowed_providers: [],
@@ -360,8 +364,7 @@ function loadKeyData() {
     id: props.apiKey.id,
     name: props.apiKey.name || '',
     initial_balance_usd: props.apiKey.initial_balance_usd,
-    expire_days: props.apiKey.expire_days,
-    never_expire: props.apiKey.never_expire,
+    expires_at: props.apiKey.expires_at,
     rate_limit: props.apiKey.rate_limit,
     auto_delete_on_expiry: props.apiKey.auto_delete_on_expiry,
     allowed_providers: props.apiKey.allowed_providers || [],
@@ -406,12 +409,10 @@ function toggleSelection(field: 'allowed_providers' | 'allowed_api_formats' | 'a
   }
 }
 
-// 永不过期切换
-function onNeverExpireChange() {
-  if (form.value.never_expire) {
-    form.value.expire_days = undefined
-    form.value.auto_delete_on_expiry = false
-  }
+// 清空过期日期（同时清空到期删除选项）
+function clearExpiryDate() {
+  form.value.expires_at = undefined
+  form.value.auto_delete_on_expiry = false
 }
 
 // 提交表单

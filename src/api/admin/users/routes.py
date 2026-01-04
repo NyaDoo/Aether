@@ -431,7 +431,7 @@ class AdminCreateUserKeyAdapter(AdminApiAdapter):
             name=key_data.name,
             allowed_providers=key_data.allowed_providers,
             allowed_models=key_data.allowed_models,
-            rate_limit=key_data.rate_limit or 100,
+            rate_limit=key_data.rate_limit,  # None = 无限制
             expire_days=key_data.expire_days,
             initial_balance_usd=None,  # 普通Key不设置余额限制
             is_standalone=False,  # 不是独立Key
