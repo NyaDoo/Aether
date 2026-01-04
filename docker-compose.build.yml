@@ -1,7 +1,7 @@
 # Aether 部署配置 - 本地构建
 # 使用方法:
 #   首次构建 base: docker build -f Dockerfile.base -t aether-base:latest .
-#   启动服务: docker-compose -f docker-compose.build.yml up -d --build
+#   启动服务: docker compose -f docker-compose.build.yml up -d --build
 
 services:
   postgres:

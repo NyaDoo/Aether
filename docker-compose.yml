@@ -1,5 +1,5 @@
 # Aether 部署配置 - 使用预构建镜像
-# 使用方法: docker-compose up -d
+# 使用方法: docker compose up -d
 
 services:
   postgres:

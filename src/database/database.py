@@ -411,7 +411,7 @@ def init_db():
         print("  3. 数据库用户名和密码是否正确", file=sys.stderr)
         print("", file=sys.stderr)
         print("如果使用 Docker，请先运行:", file=sys.stderr)
-        print("  docker-compose up -d postgres redis", file=sys.stderr)
+        print("  docker compose up -d postgres redis", file=sys.stderr)
         print("", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
         # 使用 os._exit 直接退出，避免 uvicorn 捕获并打印堆栈

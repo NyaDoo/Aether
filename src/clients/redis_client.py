@@ -213,7 +213,7 @@ class RedisClientManager:
                     f"Redis连接失败: {error_msg}\n"
                     "缓存亲和性功能需要Redis支持，请确保Redis服务正常运行。\n"
                     "检查事项：\n"
-                    "1. Redis服务是否已启动（docker-compose up -d redis）\n"
+                    "1. Redis服务是否已启动（docker compose up -d redis）\n"
                     "2. 环境变量 REDIS_URL 或 REDIS_PASSWORD 是否配置正确\n"
                     "3. Redis端口（默认6379）是否可访问"
                 ) from e

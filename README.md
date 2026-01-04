@@ -58,13 +58,13 @@ cp .env.example .env
 python generate_keys.py  # 生成密钥, 并将生成的密钥填入 .env
 
 # 3. 部署
-docker-compose up -d
+docker compose up -d
 
 # 4. 首次部署时, 初始化数据库
 ./migrate.sh
 
 # 5. 更新
-docker-compose pull && docker-compose up -d && ./migrate.sh
+docker compose pull && docker compose up -d && ./migrate.sh
 ```
 
 ### Docker Compose（本地构建镜像）
@@ -86,7 +86,7 @@ python generate_keys.py  # 生成密钥, 并将生成的密钥填入 .env
 
 ```bash
 # 启动依赖
-docker-compose -f docker-compose.build.yml up -d postgres redis
+docker compose -f docker-compose.build.yml up -d postgres redis
 
 # 后端
 uv sync

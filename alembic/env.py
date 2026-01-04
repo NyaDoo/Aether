@@ -30,7 +30,7 @@ from src.models.database import Base
 config = context.config
 
 # 从环境变量获取数据库 URL
-# 优先使用 DATABASE_URL，否则从 DB_PASSWORD 自动构建（与 docker-compose 保持一致）
+# 优先使用 DATABASE_URL，否则从 DB_PASSWORD 自动构建（与 docker compose 保持一致）
 database_url = os.getenv("DATABASE_URL")
 if not database_url:
     db_password = os.getenv("DB_PASSWORD", "")
