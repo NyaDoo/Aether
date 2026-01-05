@@ -484,6 +484,9 @@ class StreamUsageTracker:
                             status="streaming",
                             provider=self.provider,
                             first_byte_time_ms=first_byte_time_ms,
+                            provider_id=self.provider_id,
+                            provider_endpoint_id=self.provider_endpoint_id,
+                            provider_api_key_id=self.provider_api_key_id,
                         )
                     except Exception as e:
                         logger.warning(f"更新使用记录状态为 streaming 失败: {e}")
@@ -942,6 +945,9 @@ class EnhancedStreamUsageTracker(StreamUsageTracker):
                             status="streaming",
                             provider=self.provider,
                             first_byte_time_ms=first_byte_time_ms,
+                            provider_id=self.provider_id,
+                            provider_endpoint_id=self.provider_endpoint_id,
+                            provider_api_key_id=self.provider_api_key_id,
                         )
                     except Exception as e:
                         logger.warning(f"更新使用记录状态为 streaming 失败: {e}")

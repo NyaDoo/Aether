@@ -1476,6 +1476,9 @@ class UsageService:
         provider: Optional[str] = None,
         target_model: Optional[str] = None,
         first_byte_time_ms: Optional[int] = None,
+        provider_id: Optional[str] = None,
+        provider_endpoint_id: Optional[str] = None,
+        provider_api_key_id: Optional[str] = None,
     ) -> Optional[Usage]:
         """
         快速更新使用记录状态
@@ -1488,6 +1491,9 @@ class UsageService:
             provider: 提供商名称（可选，streaming 状态时更新）
             target_model: 映射后的目标模型名（可选）
             first_byte_time_ms: 首字时间/TTFB（可选，streaming 状态时更新）
+            provider_id: Provider ID（可选，streaming 状态时更新）
+            provider_endpoint_id: Endpoint ID（可选，streaming 状态时更新）
+            provider_api_key_id: Provider API Key ID（可选，streaming 状态时更新）
 
         Returns:
             更新后的 Usage 记录，如果未找到则返回 None
@@ -1513,6 +1519,12 @@ class UsageService:
             usage.target_model = target_model
         if first_byte_time_ms is not None:
             usage.first_byte_time_ms = first_byte_time_ms
+        if provider_id is not None:
+            usage.provider_id = provider_id
+        if provider_endpoint_id is not None:
+            usage.provider_endpoint_id = provider_endpoint_id
+        if provider_api_key_id is not None:
+            usage.provider_api_key_id = provider_api_key_id
 
         db.commit()
 
