@@ -20,10 +20,11 @@
     </nav>
 
     <!-- Header -->
-    <header class="fixed top-0 left-0 right-0 z-50 border-b border-[#cc785c]/10 dark:border-[rgba(227,224,211,0.12)] bg-[#fafaf7]/90 dark:bg-[#191714]/95 backdrop-blur-xl transition-all">
-      <div class="mx-auto max-w-7xl px-6 py-4">
-        <div class="flex items-center justify-between">
-          <!-- Logo & Brand -->
+    <header class="sticky top-0 z-50 border-b border-[#cc785c]/10 dark:border-[rgba(227,224,211,0.12)] bg-[#fafaf7]/90 dark:bg-[#191714]/95 backdrop-blur-xl transition-all">
+      <div class="h-16 flex items-center">
+        <!-- Centered content container (max-w-7xl) -->
+        <div class="mx-auto max-w-7xl w-full px-6 flex items-center justify-between">
+          <!-- Left: Logo & Brand -->
           <div
             class="flex items-center gap-3 group/logo cursor-pointer"
             @click="scrollToSection(0)"
@@ -40,7 +41,7 @@
             </div>
           </div>
 
-          <!-- Center Navigation -->
+          <!-- Center: Navigation -->
           <nav class="hidden md:flex items-center gap-2">
             <button
               v-for="(section, index) in sections"
@@ -59,42 +60,54 @@
             </button>
           </nav>
 
-          <!-- Right Actions -->
-          <div class="flex items-center gap-3">
-            <button
-              class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
-              :title="themeMode === 'system' ? '跟随系统' : themeMode === 'dark' ? '深色模式' : '浅色模式'"
-              @click="toggleDarkMode"
-            >
-              <SunMoon
-                v-if="themeMode === 'system'"
-                class="h-4 w-4"
-              />
-              <Sun
-                v-else-if="themeMode === 'light'"
-                class="h-4 w-4"
-              />
-              <Moon
-                v-else
-                class="h-4 w-4"
-              />
-            </button>
+          <!-- Right: Login/Dashboard Button -->
+          <RouterLink
+            v-if="authStore.isAuthenticated"
+            :to="dashboardPath"
+            class="min-w-[72px] text-center rounded-xl bg-[#191919] dark:bg-[#cc785c] px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-[#262625] dark:hover:bg-[#b86d52] whitespace-nowrap"
+          >
+            控制台
+          </RouterLink>
+          <button
+            v-else
+            class="min-w-[72px] text-center rounded-xl bg-[#cc785c] px-4 py-2 text-sm font-medium text-white shadow-lg shadow-[#cc785c]/30 transition hover:bg-[#d4a27f] whitespace-nowrap"
+            @click="showLoginDialog = true"
+          >
+            登录
+          </button>
+        </div>
 
-            <RouterLink
-              v-if="authStore.isAuthenticated"
-              :to="dashboardPath"
-              class="rounded-xl bg-[#191919] dark:bg-[#cc785c] px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-[#262625] dark:hover:bg-[#b86d52]"
-            >
-              控制台
-            </RouterLink>
-            <button
+        <!-- Fixed right icons (px-8 to match dashboard) -->
+        <div class="absolute right-8 top-1/2 -translate-y-1/2 flex items-center gap-2">
+          <!-- Theme Toggle -->
+          <button
+            class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
+            :title="themeMode === 'system' ? '跟随系统' : themeMode === 'dark' ? '深色模式' : '浅色模式'"
+            @click="toggleDarkMode"
+          >
+            <SunMoon
+              v-if="themeMode === 'system'"
+              class="h-4 w-4"
+            />
+            <Sun
+              v-else-if="themeMode === 'light'"
+              class="h-4 w-4"
+            />
+            <Moon
               v-else
-              class="rounded-xl bg-[#cc785c] px-4 py-2 text-sm font-medium text-white shadow-lg shadow-[#cc785c]/30 transition hover:bg-[#d4a27f]"
-              @click="showLoginDialog = true"
-            >
-              登录
-            </button>
-          </div>
+              class="h-4 w-4"
+            />
+          </button>
+          <!-- GitHub Link -->
+          <a
+            href="https://github.com/fawney19/Aether"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
+            title="GitHub 仓库"
+          >
+            <GithubIcon class="h-4 w-4" />
+          </a>
         </div>
       </div>
     </header>
@@ -336,31 +349,6 @@
       </section>
     </main>
 
-    <!-- Footer -->
-    <footer class="relative z-10 border-t border-[#cc785c]/10 dark:border-[rgba(227,224,211,0.12)] bg-[#fafaf7]/90 dark:bg-[#191714]/95 backdrop-blur-md py-8">
-      <div class="mx-auto max-w-7xl px-6">
-        <div class="flex flex-col items-center justify-between gap-4 sm:flex-row">
-          <p class="text-sm text-[#91918d] dark:text-muted-foreground">
-            © 2025 Aether. 团队内部使用
-          </p>
-          <div class="flex items-center gap-6 text-sm text-[#91918d] dark:text-muted-foreground">
-            <a
-              href="#"
-              class="transition hover:text-[#191919] dark:hover:text-white"
-            >使用条款</a>
-            <a
-              href="#"
-              class="transition hover:text-[#191919] dark:hover:text-white"
-            >隐私政策</a>
-            <a
-              href="#"
-              class="transition hover:text-[#191919] dark:hover:text-white"
-            >技术支持</a>
-          </div>
-        </div>
-      </div>
-    </footer>
-
     <LoginDialog v-model="showLoginDialog" />
   </div>
 </template>
@@ -378,6 +366,7 @@ import {
   SunMoon,
   Terminal
 } from 'lucide-vue-next'
+import GithubIcon from '@/components/icons/GithubIcon.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useClipboard } from '@/composables/useClipboard'

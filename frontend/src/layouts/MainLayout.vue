@@ -280,6 +280,16 @@
               class="h-4 w-4"
             />
           </button>
+          <!-- GitHub Link -->
+          <a
+            href="https://github.com/fawney19/Aether"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition"
+            title="GitHub 仓库"
+          >
+            <GithubIcon class="h-4 w-4" />
+          </a>
         </div>
       </header>
     </template>
@@ -322,6 +332,7 @@ import {
   X,
   Mail,
 } from 'lucide-vue-next'
+import GithubIcon from '@/components/icons/GithubIcon.vue'
 
 const router = useRouter()
 const route = useRoute()
