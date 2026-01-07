@@ -528,7 +528,7 @@ class AuthCurrentUserAdapter(AuthenticatedApiAdapter):
             "used_usd": user.used_usd,
             "total_usd": user.total_usd,
             "allowed_providers": user.allowed_providers,
-            "allowed_endpoints": user.allowed_endpoints,
+            "allowed_api_formats": user.allowed_api_formats,
             "allowed_models": user.allowed_models,
             "created_at": user.created_at.isoformat(),
             "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,

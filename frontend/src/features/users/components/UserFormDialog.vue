@@ -273,8 +273,8 @@
                 class="w-full h-10 px-3 border rounded-lg bg-background text-left flex items-center justify-between hover:bg-muted/50 transition-colors"
                 @click="endpointDropdownOpen = !endpointDropdownOpen"
               >
-                <span :class="form.allowed_endpoints.length ? 'text-foreground' : 'text-muted-foreground'">
-                  {{ form.allowed_endpoints.length ? `已选择 ${form.allowed_endpoints.length} 个` : '全部可用' }}
+                <span :class="form.allowed_api_formats.length ? 'text-foreground' : 'text-muted-foreground'">
+                  {{ form.allowed_api_formats.length ? `已选择 ${form.allowed_api_formats.length} 个` : '全部可用' }}
                 </span>
                 <ChevronDown
                   class="h-4 w-4 text-muted-foreground transition-transform"
@@ -294,14 +294,14 @@
                   v-for="format in apiFormats"
                   :key="format.value"
                   class="flex items-center gap-2 px-3 py-2 hover:bg-muted/50 cursor-pointer"
-                  @click="toggleSelection('allowed_endpoints', format.value)"
+                  @click="toggleSelection('allowed_api_formats', format.value)"
                 >
                   <input
                     type="checkbox"
-                    :checked="form.allowed_endpoints.includes(format.value)"
+                    :checked="form.allowed_api_formats.includes(format.value)"
                     class="h-4 w-4 rounded border-gray-300 cursor-pointer"
                     @click.stop
-                    @change="toggleSelection('allowed_endpoints', format.value)"
+                    @change="toggleSelection('allowed_api_formats', format.value)"
                   >
                   <span class="text-sm">{{ format.label }}</span>
                 </div>
@@ -374,7 +374,7 @@ export interface UserFormData {
   role: 'admin' | 'user'
   is_active?: boolean
   allowed_providers?: string[] | null
-  allowed_endpoints?: string[] | null
+  allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
 }
 
@@ -414,7 +414,7 @@ const form = ref({
   unlimited: false,
   is_active: true,
   allowed_providers: [] as string[],
-  allowed_endpoints: [] as string[],
+  allowed_api_formats: [] as string[],
   allowed_models: [] as string[]
 })
 
@@ -435,7 +435,7 @@ function resetForm() {
     unlimited: false,
     is_active: true,
     allowed_providers: [],
-    allowed_endpoints: [],
+    allowed_api_formats: [],
     allowed_models: []
   }
 }
@@ -454,7 +454,7 @@ function loadUserData() {
     unlimited: props.user.quota_usd == null,
     is_active: props.user.is_active ?? true,
     allowed_providers: props.user.allowed_providers || [],
-    allowed_endpoints: props.user.allowed_endpoints || [],
+    allowed_api_formats: props.user.allowed_api_formats || [],
     allowed_models: props.user.allowed_models || []
   }
 }
@@ -495,7 +495,7 @@ async function loadAccessControlOptions() {
 }
 
 // 切换选择
-function toggleSelection(field: 'allowed_providers' | 'allowed_endpoints' | 'allowed_models', value: string) {
+function toggleSelection(field: 'allowed_providers' | 'allowed_api_formats' | 'allowed_models', value: string) {
   const arr = form.value[field]
   const index = arr.indexOf(value)
   if (index === -1) {
@@ -520,7 +520,7 @@ async function handleSubmit() {
       quota_usd: form.value.unlimited ? null : form.value.quota,
       role: form.value.role,
       allowed_providers: form.value.allowed_providers.length > 0 ? form.value.allowed_providers : null,
-      allowed_endpoints: form.value.allowed_endpoints.length > 0 ? form.value.allowed_endpoints : null,
+      allowed_api_formats: form.value.allowed_api_formats.length > 0 ? form.value.allowed_api_formats : null,
       allowed_models: form.value.allowed_models.length > 0 ? form.value.allowed_models : null
     }
 

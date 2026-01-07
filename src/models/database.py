@@ -72,7 +72,7 @@ class User(Base):
 
     # 访问限制（NULL 表示不限制，允许访问所有资源）
     allowed_providers = Column(JSON, nullable=True)  # 允许使用的提供商 ID 列表
-    allowed_endpoints = Column(JSON, nullable=True)  # 允许使用的端点 ID 列表
+    allowed_api_formats = Column(JSON, nullable=True)  # 允许使用的 API 格式列表
     allowed_models = Column(JSON, nullable=True)  # 允许使用的模型名称列表
 
     # Key 能力配置
@@ -165,7 +165,6 @@ class ApiKey(Base):
 
     # 访问限制（NULL 表示不限制，允许访问所有资源）
     allowed_providers = Column(JSON, nullable=True)  # 允许使用的提供商 ID 列表
-    allowed_endpoints = Column(JSON, nullable=True)  # 允许使用的端点 ID 列表
     allowed_api_formats = Column(JSON, nullable=True)  # 允许使用的 API 格式列表
     allowed_models = Column(JSON, nullable=True)  # 允许使用的模型名称列表
     rate_limit = Column(Integer, default=None, nullable=True)  # 每分钟请求限制，None = 无限制
@@ -272,7 +271,7 @@ class Usage(Base):
 
     # 请求信息
     request_id = Column(String(100), unique=True, index=True, nullable=False)
-    provider = Column(String(100), nullable=False)
+    provider_name = Column(String(100), nullable=False)  # Provider 名称（非外键）
     model = Column(String(100), nullable=False)
     target_model = Column(String(100), nullable=True, comment="映射后的目标模型名（若无映射则为空）")
 
@@ -554,7 +553,6 @@ class Provider(Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
     # 限制
-    rate_limit = Column(Integer, nullable=True)  # 每分钟请求限制
     concurrent_limit = Column(Integer, nullable=True)  # 并发请求限制
 
     # 配置

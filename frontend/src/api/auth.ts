@@ -98,7 +98,7 @@ export interface User {
   used_usd?: number
   total_usd?: number
   allowed_providers?: string[] | null  // 允许使用的提供商 ID 列表
-  allowed_endpoints?: string[] | null  // 允许使用的端点 ID 列表
+  allowed_api_formats?: string[] | null  // 允许使用的 API 格式列表
   allowed_models?: string[] | null  // 允许使用的模型名称列表
   created_at: string
   last_login_at?: string

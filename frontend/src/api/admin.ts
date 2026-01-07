@@ -22,7 +22,7 @@ export interface UserExport {
   password_hash: string
   role: string
   allowed_providers?: string[] | null
-  allowed_endpoints?: string[] | null
+  allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
   model_capability_settings?: any
   quota_usd?: number | null
@@ -40,7 +40,6 @@ export interface UserApiKeyExport {
   balance_used_usd?: number
   current_balance_usd?: number | null
   allowed_providers?: string[] | null
-  allowed_endpoints?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
   rate_limit?: number | null  // null = 无限制

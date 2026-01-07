@@ -22,7 +22,7 @@ export const MOCK_ADMIN_USER: User = {
   used_usd: 156.78,
   total_usd: 1234.56,
   allowed_providers: null,
-  allowed_endpoints: null,
+  allowed_api_formats: null,
   allowed_models: null,
   created_at: '2024-01-01T00:00:00Z',
   last_login_at: new Date().toISOString()
@@ -38,7 +38,7 @@ export const MOCK_NORMAL_USER: User = {
   used_usd: 45.32,
   total_usd: 245.32,
   allowed_providers: null,
-  allowed_endpoints: null,
+  allowed_api_formats: null,
   allowed_models: null,
   created_at: '2024-06-01T00:00:00Z',
   last_login_at: new Date().toISOString()
@@ -274,7 +274,7 @@ export const MOCK_ALL_USERS: AdminUser[] = [
     used_usd: 156.78,
     total_usd: 1234.56,
     allowed_providers: null,
-    allowed_endpoints: null,
+    allowed_api_formats: null,
     allowed_models: null,
     created_at: '2024-01-01T00:00:00Z'
   },
@@ -288,7 +288,7 @@ export const MOCK_ALL_USERS: AdminUser[] = [
     used_usd: 45.32,
     total_usd: 245.32,
     allowed_providers: null,
-    allowed_endpoints: null,
+    allowed_api_formats: null,
     allowed_models: null,
     created_at: '2024-06-01T00:00:00Z'
   },
@@ -302,7 +302,7 @@ export const MOCK_ALL_USERS: AdminUser[] = [
     used_usd: 23.45,
     total_usd: 123.45,
     allowed_providers: null,
-    allowed_endpoints: null,
+    allowed_api_formats: null,
     allowed_models: null,
     created_at: '2024-03-15T00:00:00Z'
   },
@@ -316,7 +316,7 @@ export const MOCK_ALL_USERS: AdminUser[] = [
     used_usd: 89.12,
     total_usd: 589.12,
     allowed_providers: null,
-    allowed_endpoints: null,
+    allowed_api_formats: null,
     allowed_models: null,
     created_at: '2024-02-20T00:00:00Z'
   },
@@ -330,7 +330,7 @@ export const MOCK_ALL_USERS: AdminUser[] = [
     used_usd: 30.00,
     total_usd: 30.00,
     allowed_providers: null,
-    allowed_endpoints: null,
+    allowed_api_formats: null,
     allowed_models: null,
     created_at: '2024-04-10T00:00:00Z'
   }

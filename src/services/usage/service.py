@@ -309,7 +309,7 @@ class UsageService:
             "user_id": user.id if user else None,
             "api_key_id": api_key.id if api_key else None,
             "request_id": request_id,
-            "provider": provider,
+            "provider_name": provider,
             "model": model,
             "target_model": target_model,
             "provider_id": provider_id,
@@ -479,7 +479,7 @@ class UsageService:
     ) -> None:
         """更新已存在的 Usage 记录（内部方法）"""
         # 更新关键字段
-        existing_usage.provider = usage_params["provider"]
+        existing_usage.provider_name = usage_params["provider_name"]
         existing_usage.status = usage_params["status"]
         existing_usage.status_code = usage_params["status_code"]
         existing_usage.error_message = usage_params["error_message"]
@@ -1092,7 +1092,7 @@ class UsageService:
         # 汇总查询
         summary = db.query(
             date_func.label("period"),
-            Usage.provider,
+            Usage.provider_name,
             Usage.model,
             func.count(Usage.id).label("requests"),
             func.sum(Usage.input_tokens).label("input_tokens"),
@@ -1111,12 +1111,12 @@ class UsageService:
         if end_date:
             summary = summary.filter(Usage.created_at <= end_date)
 
-        summary = summary.group_by(date_func, Usage.provider, Usage.model).all()
+        summary = summary.group_by(date_func, Usage.provider_name, Usage.model).all()
 
         return [
             {
                 "period": row.period,
-                "provider": row.provider,
+                "provider": row.provider_name,
                 "model": row.model,
                 "requests": row.requests,
                 "input_tokens": row.input_tokens,
@@ -1445,7 +1445,7 @@ class UsageService:
             user_id=user.id if user else None,
             api_key_id=api_key.id if api_key else None,
             request_id=request_id,
-            provider="pending",  # 尚未确定 provider
+            provider_name="pending",  # 尚未确定 provider
             model=model,
             input_tokens=0,
             output_tokens=0,
@@ -1508,12 +1508,12 @@ class UsageService:
         if error_message:
             usage.error_message = error_message
         if provider:
-            usage.provider = provider
-        elif status == "streaming" and usage.provider == "pending":
-            # 状态变为 streaming 但 provider 仍为 pending，记录警告
+            usage.provider_name = provider
+        elif status == "streaming" and usage.provider_name == "pending":
+            # 状态变为 streaming 但 provider_name 仍为 pending，记录警告
             logger.warning(
-                f"状态更新为 streaming 但 provider 为空: request_id={request_id}, "
-                f"当前 provider={usage.provider}"
+                f"状态更新为 streaming 但 provider_name 为空: request_id={request_id}, "
+                f"当前 provider_name={usage.provider_name}"
             )
         if target_model:
             usage.target_model = target_model
@@ -1679,7 +1679,7 @@ class UsageService:
             from src.models.database import ProviderAPIKey
 
             query = query.add_columns(
-                Usage.provider,
+                Usage.provider_name,
                 ProviderAPIKey.name.label("api_key_name"),
             ).outerjoin(ProviderAPIKey, Usage.provider_api_key_id == ProviderAPIKey.id)
 
@@ -1731,7 +1731,7 @@ class UsageService:
                 "first_byte_time_ms": r.first_byte_time_ms,  # 首字时间 (TTFB)
             }
             if include_admin_fields:
-                item["provider"] = r.provider
+                item["provider"] = r.provider_name
                 item["api_key_name"] = r.api_key_name
             result.append(item)
 

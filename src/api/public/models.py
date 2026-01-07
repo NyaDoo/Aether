@@ -126,7 +126,9 @@ def _filter_formats_by_restrictions(
     """
     if restrictions.allowed_api_formats is None:
         return formats, None
-    filtered = [f for f in formats if f in restrictions.allowed_api_formats]
+    # 统一转为大写比较，兼容数据库中存储的大小写
+    allowed_upper = {f.upper() for f in restrictions.allowed_api_formats}
+    filtered = [f for f in formats if f.upper() in allowed_upper]
     if not filtered:
         logger.info(f"[Models] API Key 不允许访问格式 {api_format}")
         return [], _build_empty_list_response(api_format)

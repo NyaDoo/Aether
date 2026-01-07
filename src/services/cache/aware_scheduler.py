@@ -486,11 +486,10 @@ class CacheAwareScheduler:
             user_api_key: 用户 API Key 对象（可能包含 user relationship）
 
         Returns:
-            包含 allowed_providers, allowed_endpoints, allowed_models 的字典
+            包含 allowed_providers, allowed_models, allowed_api_formats 的字典
         """
         result = {
             "allowed_providers": None,
-            "allowed_endpoints": None,
             "allowed_models": None,
             "allowed_api_formats": None,
         }
@@ -534,20 +533,16 @@ class CacheAwareScheduler:
             user_api_key.allowed_providers, user.allowed_providers if user else None
         )
 
-        # 合并 allowed_endpoints
-        result["allowed_endpoints"] = merge_restrictions(
-            user_api_key.allowed_endpoints if hasattr(user_api_key, "allowed_endpoints") else None,
-            user.allowed_endpoints if user else None,
-        )
-
         # 合并 allowed_models
         result["allowed_models"] = merge_restrictions(
             user_api_key.allowed_models, user.allowed_models if user else None
         )
 
-        # API 格式仅从 ApiKey 获取（User 不设置此限制）
-        if user_api_key.allowed_api_formats:
-            result["allowed_api_formats"] = set(user_api_key.allowed_api_formats)
+        # 合并 allowed_api_formats
+        result["allowed_api_formats"] = merge_restrictions(
+            user_api_key.allowed_api_formats,
+            user.allowed_api_formats if user else None
+        )
 
         return result
 
@@ -607,12 +602,13 @@ class CacheAwareScheduler:
         restrictions = self._get_effective_restrictions(user_api_key)
         allowed_api_formats = restrictions["allowed_api_formats"]
         allowed_providers = restrictions["allowed_providers"]
-        allowed_endpoints = restrictions["allowed_endpoints"]
         allowed_models = restrictions["allowed_models"]
 
         # 0.1 检查 API 格式是否被允许
         if allowed_api_formats is not None:
-            if target_format.value not in allowed_api_formats:
+            # 统一转为大写比较，兼容数据库中存储的大小写
+            allowed_upper = {f.upper() for f in allowed_api_formats}
+            if target_format.value.upper() not in allowed_upper:
                 logger.debug(
                     f"API Key {user_api_key.id[:8] if user_api_key else 'N/A'}... 不允许使用 API 格式 {target_format.value}, "
                     f"允许的格式: {allowed_api_formats}"
@@ -659,7 +655,7 @@ class CacheAwareScheduler:
         if not providers:
             return [], global_model_id
 
-        # 2. 构建候选列表（传入 allowed_endpoints、is_stream 和 capability_requirements 用于过滤）
+        # 2. 构建候选列表（传入 is_stream 和 capability_requirements 用于过滤）
         candidates = await self._build_candidates(
             db=db,
             providers=providers,
@@ -668,7 +664,6 @@ class CacheAwareScheduler:
             resolved_model_name=resolved_model_name,
             affinity_key=affinity_key,
             max_candidates=max_candidates,
-            allowed_endpoints=allowed_endpoints,
             is_stream=is_stream,
             capability_requirements=capability_requirements,
         )
@@ -905,7 +900,6 @@ class CacheAwareScheduler:
         affinity_key: Optional[str],
         resolved_model_name: Optional[str] = None,
         max_candidates: Optional[int] = None,
-        allowed_endpoints: Optional[set] = None,
         is_stream: bool = False,
         capability_requirements: Optional[Dict[str, bool]] = None,
     ) -> List[ProviderCandidate]:
@@ -920,7 +914,6 @@ class CacheAwareScheduler:
             affinity_key: 亲和性标识符（通常为API Key ID）
             resolved_model_name: 解析后的 GlobalModel.name（用于 Key.allowed_models 校验）
             max_candidates: 最大候选数
-            allowed_endpoints: 允许的 Endpoint ID 集合（None 表示不限制）
             is_stream: 是否是流式请求，如果为 True 则过滤不支持流式的 Provider
             capability_requirements: 能力需求（可选）
 
@@ -947,13 +940,6 @@ class CacheAwareScheduler:
                     else endpoint.api_format.value
                 )
                 if not endpoint.is_active or endpoint_format_str != target_format.value:
-                    continue
-
-                # 检查 Endpoint 是否在允许列表中
-                if allowed_endpoints is not None and endpoint.id not in allowed_endpoints:
-                    logger.debug(
-                        f"Endpoint {endpoint.id[:8]}... 不在用户/API Key 的允许列表中，跳过"
-                    )
                     continue
 
                 # 获取活跃的 Key 并按 internal_priority + 负载均衡排序

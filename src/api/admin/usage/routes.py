@@ -353,8 +353,8 @@ class AdminUsageByModelAdapter(AdminApiAdapter):
         )
         # 过滤掉 pending/streaming 状态的请求（尚未完成的请求不应计入统计）
         query = query.filter(Usage.status.notin_(["pending", "streaming"]))
-        # 过滤掉 unknown/pending provider（请求未到达任何提供商）
-        query = query.filter(Usage.provider.notin_(["unknown", "pending"]))
+        # 过滤掉 unknown/pending provider_name（请求未到达任何提供商）
+        query = query.filter(Usage.provider_name.notin_(["unknown", "pending"]))
 
         if self.start_date:
             query = query.filter(Usage.created_at >= self.start_date)
@@ -565,8 +565,8 @@ class AdminUsageByApiFormatAdapter(AdminApiAdapter):
         )
         # 过滤掉 pending/streaming 状态的请求
         query = query.filter(Usage.status.notin_(["pending", "streaming"]))
-        # 过滤掉 unknown/pending provider
-        query = query.filter(Usage.provider.notin_(["unknown", "pending"]))
+        # 过滤掉 unknown/pending provider_name
+        query = query.filter(Usage.provider_name.notin_(["unknown", "pending"]))
         # 只统计有 api_format 的记录
         query = query.filter(Usage.api_format.isnot(None))
 
@@ -765,8 +765,8 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
                 float(usage.rate_multiplier) if usage.rate_multiplier is not None else 1.0
             )
 
-            # 提供商名称优先级：关联的 Provider 表 > usage.provider 字段
-            provider_name = usage.provider
+            # 提供商名称优先级：关联的 Provider 表 > usage.provider_name 字段
+            provider_name = usage.provider_name
             if usage.provider_id and str(usage.provider_id) in provider_map:
                 provider_name = provider_map[str(usage.provider_id)]
 
@@ -881,7 +881,7 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
                 "name": api_key.name if api_key else None,
                 "display": api_key.get_display_key() if api_key else None,
             },
-            "provider": usage_record.provider,
+            "provider": usage_record.provider_name,
             "api_format": usage_record.api_format,
             "model": usage_record.model,
             "target_model": usage_record.target_model,
@@ -934,7 +934,7 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
         # 尝试获取模型的阶梯配置（带来源信息）
         cost_service = ModelCostService(db)
         pricing_result = await cost_service.get_tiered_pricing_with_source_async(
-            usage_record.provider, usage_record.model
+            usage_record.provider_name, usage_record.model
         )
 
         if not pricing_result:

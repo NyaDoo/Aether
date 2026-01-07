@@ -684,7 +684,6 @@ class AdminExportConfigAdapter(AdminApiAdapter):
                     "rpm_limit": provider.rpm_limit,
                     "provider_priority": provider.provider_priority,
                     "is_active": provider.is_active,
-                    "rate_limit": provider.rate_limit,
                     "concurrent_limit": provider.concurrent_limit,
                     "config": provider.config,
                     "endpoints": endpoints_data,
@@ -831,7 +830,6 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                             "provider_priority", 100
                         )
                         existing_provider.is_active = prov_data.get("is_active", True)
-                        existing_provider.rate_limit = prov_data.get("rate_limit")
                         existing_provider.concurrent_limit = prov_data.get(
                             "concurrent_limit"
                         )
@@ -856,7 +854,6 @@ class AdminImportConfigAdapter(AdminApiAdapter):
                         rpm_limit=prov_data.get("rpm_limit"),
                         provider_priority=prov_data.get("provider_priority", 100),
                         is_active=prov_data.get("is_active", True),
-                        rate_limit=prov_data.get("rate_limit"),
                         concurrent_limit=prov_data.get("concurrent_limit"),
                         config=prov_data.get("config"),
                     )
@@ -1109,7 +1106,6 @@ class AdminExportUsersAdapter(AdminApiAdapter):
                 "balance_used_usd": key.balance_used_usd,
                 "current_balance_usd": key.current_balance_usd,
                 "allowed_providers": key.allowed_providers,
-                "allowed_endpoints": key.allowed_endpoints,
                 "allowed_api_formats": key.allowed_api_formats,
                 "allowed_models": key.allowed_models,
                 "rate_limit": key.rate_limit,
@@ -1146,7 +1142,7 @@ class AdminExportUsersAdapter(AdminApiAdapter):
                     "password_hash": user.password_hash,
                     "role": user.role.value if user.role else "user",
                     "allowed_providers": user.allowed_providers,
-                    "allowed_endpoints": user.allowed_endpoints,
+                    "allowed_api_formats": user.allowed_api_formats,
                     "allowed_models": user.allowed_models,
                     "model_capability_settings": user.model_capability_settings,
                     "quota_usd": user.quota_usd,
@@ -1238,7 +1234,6 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                 balance_used_usd=key_data.get("balance_used_usd", 0.0),
                 current_balance_usd=key_data.get("current_balance_usd"),
                 allowed_providers=key_data.get("allowed_providers"),
-                allowed_endpoints=key_data.get("allowed_endpoints"),
                 allowed_api_formats=key_data.get("allowed_api_formats"),
                 allowed_models=key_data.get("allowed_models"),
                 rate_limit=key_data.get("rate_limit"),
@@ -1282,7 +1277,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         if user_data.get("role"):
                             existing_user.role = UserRole(user_data["role"])
                         existing_user.allowed_providers = user_data.get("allowed_providers")
-                        existing_user.allowed_endpoints = user_data.get("allowed_endpoints")
+                        existing_user.allowed_api_formats = user_data.get("allowed_api_formats")
                         existing_user.allowed_models = user_data.get("allowed_models")
                         existing_user.model_capability_settings = user_data.get(
                             "model_capability_settings"
@@ -1306,7 +1301,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         password_hash=user_data.get("password_hash", ""),
                         role=role,
                         allowed_providers=user_data.get("allowed_providers"),
-                        allowed_endpoints=user_data.get("allowed_endpoints"),
+                        allowed_api_formats=user_data.get("allowed_api_formats"),
                         allowed_models=user_data.get("allowed_models"),
                         model_capability_settings=user_data.get("model_capability_settings"),
                         quota_usd=user_data.get("quota_usd"),

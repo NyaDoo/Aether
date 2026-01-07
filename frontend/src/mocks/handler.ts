@@ -690,7 +690,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
       used_usd: 0,
       total_usd: 0,
       allowed_providers: null,
-      allowed_endpoints: null,
+      allowed_api_formats: null,
       allowed_models: null,
       created_at: new Date().toISOString()
     }

@@ -143,12 +143,13 @@ class AccessRestrictions:
                 allowed_api_formats = api_key.allowed_api_formats
 
         # 如果 API Key 没有限制，检查 User 的限制
-        # 注意: User 没有 allowed_api_formats 字段
         if user:
             if allowed_providers is None and user.allowed_providers is not None:
                 allowed_providers = user.allowed_providers
             if allowed_models is None and user.allowed_models is not None:
                 allowed_models = user.allowed_models
+            if allowed_api_formats is None and user.allowed_api_formats is not None:
+                allowed_api_formats = user.allowed_api_formats
 
         return cls(
             allowed_providers=allowed_providers,

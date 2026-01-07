@@ -10,7 +10,7 @@ export interface User {
   used_usd: number
   total_usd: number
   allowed_providers: string[] | null  // 允许使用的提供商 ID 列表
-  allowed_endpoints: string[] | null  // 允许使用的端点 ID 列表
+  allowed_api_formats: string[] | null  // 允许使用的 API 格式列表
   allowed_models: string[] | null  // 允许使用的模型名称列表
   created_at: string
   updated_at?: string
@@ -23,7 +23,7 @@ export interface CreateUserRequest {
   role?: 'admin' | 'user'
   quota_usd?: number | null
   allowed_providers?: string[] | null
-  allowed_endpoints?: string[] | null
+  allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
 }
 
@@ -34,7 +34,7 @@ export interface UpdateUserRequest {
   quota_usd?: number | null
   password?: string
   allowed_providers?: string[] | null
-  allowed_endpoints?: string[] | null
+  allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
 }
 

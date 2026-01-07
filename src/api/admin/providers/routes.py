@@ -73,7 +73,6 @@ async def create_provider(request: Request, db: Session = Depends(get_db)):
     - `rpm_limit`: 每分钟请求数限制（可选）
     - `provider_priority`: 提供商优先级（数字越小优先级越高，默认 100）
     - `is_active`: 是否启用（默认 true）
-    - `rate_limit`: 速率限制配置（可选）
     - `concurrent_limit`: 并发限制（可选）
     - `config`: 额外配置信息（JSON，可选）
 
@@ -110,7 +109,6 @@ async def update_provider(provider_id: str, request: Request, db: Session = Depe
     - `rpm_limit`: 每分钟请求数限制
     - `provider_priority`: 提供商优先级
     - `is_active`: 是否启用
-    - `rate_limit`: 速率限制配置
     - `concurrent_limit`: 并发限制
     - `config`: 额外配置信息（JSON）
 
@@ -228,7 +226,6 @@ class AdminCreateProviderAdapter(AdminApiAdapter):
                 rpm_limit=validated_data.rpm_limit,
                 provider_priority=validated_data.provider_priority,
                 is_active=validated_data.is_active,
-                rate_limit=validated_data.rate_limit,
                 concurrent_limit=validated_data.concurrent_limit,
                 config=validated_data.config,
             )

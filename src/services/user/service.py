@@ -182,12 +182,12 @@ class UserService:
             "role",
             # 访问限制字段
             "allowed_providers",
-            "allowed_endpoints",
+            "allowed_api_formats",
             "allowed_models",
         ]
 
         # 允许设置为 None 的字段（表示无限制）
-        nullable_fields = ["quota_usd", "allowed_providers", "allowed_endpoints", "allowed_models"]
+        nullable_fields = ["quota_usd", "allowed_providers", "allowed_api_formats", "allowed_models"]
 
         for field, value in kwargs.items():
             if field not in updatable_fields:

@@ -847,7 +847,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
             "records": [
                 {
                     "id": r.id,
-                    "provider": r.provider,
+                    "provider": r.provider_name,
                     "model": r.model,
                     "target_model": r.target_model,  # 映射后的目标模型名
                     "api_format": r.api_format,

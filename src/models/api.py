@@ -293,7 +293,7 @@ class UpdateUserRequest(BaseModel):
     password: Optional[str] = None
     role: Optional[UserRole] = None
     allowed_providers: Optional[List[str]] = None  # 允许使用的提供商 ID 列表
-    allowed_endpoints: Optional[List[str]] = None  # 允许使用的端点 ID 列表
+    allowed_api_formats: Optional[List[str]] = None  # 允许使用的 API 格式列表
     allowed_models: Optional[List[str]] = None  # 允许使用的模型名称列表
     quota_usd: Optional[float] = None
     is_active: Optional[bool] = None
@@ -316,7 +316,6 @@ class CreateApiKeyRequest(BaseModel):
 
     name: Optional[str] = None
     allowed_providers: Optional[List[str]] = None  # 允许使用的提供商 ID 列表
-    allowed_endpoints: Optional[List[str]] = None  # 允许使用的端点 ID 列表
     allowed_api_formats: Optional[List[str]] = None  # 允许使用的 API 格式列表
     allowed_models: Optional[List[str]] = None  # 允许使用的模型名称列表
     rate_limit: Optional[int] = None  # None = 无限制
@@ -339,7 +338,7 @@ class UserResponse(BaseModel):
     username: str
     role: UserRole
     allowed_providers: Optional[List[str]] = None  # 允许使用的提供商 ID 列表
-    allowed_endpoints: Optional[List[str]] = None  # 允许使用的端点 ID 列表
+    allowed_api_formats: Optional[List[str]] = None  # 允许使用的 API 格式列表
     allowed_models: Optional[List[str]] = None  # 允许使用的模型名称列表
     quota_usd: float
     used_usd: float

@@ -71,7 +71,6 @@ class CreateProviderRequest(BaseModel):
     rpm_limit: Optional[int] = Field(None, ge=0, description="RPM 限制")
     provider_priority: Optional[int] = Field(100, ge=0, le=1000, description="提供商优先级（数字越小越优先）")
     is_active: Optional[bool] = Field(True, description="是否启用")
-    rate_limit: Optional[int] = Field(None, ge=0, description="速率限制")
     concurrent_limit: Optional[int] = Field(None, ge=0, description="并发限制")
     config: Optional[Dict[str, Any]] = Field(None, description="其他配置")
 
@@ -174,7 +173,6 @@ class UpdateProviderRequest(BaseModel):
     rpm_limit: Optional[int] = Field(None, ge=0)
     provider_priority: Optional[int] = Field(None, ge=0, le=1000)
     is_active: Optional[bool] = None
-    rate_limit: Optional[int] = Field(None, ge=0)
     concurrent_limit: Optional[int] = Field(None, ge=0)
     config: Optional[Dict[str, Any]] = None
 
@@ -322,7 +320,7 @@ class UpdateUserRequest(BaseModel):
     is_active: Optional[bool] = None
     role: Optional[str] = None
     allowed_providers: Optional[List[str]] = Field(None, description="允许使用的提供商 ID 列表")
-    allowed_endpoints: Optional[List[str]] = Field(None, description="允许使用的端点 ID 列表")
+    allowed_api_formats: Optional[List[str]] = Field(None, description="允许使用的 API 格式列表")
     allowed_models: Optional[List[str]] = Field(None, description="允许使用的模型名称列表")
 
     @field_validator("username")

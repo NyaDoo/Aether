@@ -907,7 +907,7 @@ function editUser(user: any) {
     role: user.role,
     is_active: user.is_active,
     allowed_providers: user.allowed_providers || [],
-    allowed_endpoints: user.allowed_endpoints || [],
+    allowed_api_formats: user.allowed_api_formats || [],
     allowed_models: user.allowed_models || []
   }
   showUserFormDialog.value = true
@@ -929,7 +929,7 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string }) 
         quota_usd: data.quota_usd,
         role: data.role,
         allowed_providers: data.allowed_providers,
-        allowed_endpoints: data.allowed_endpoints,
+        allowed_api_formats: data.allowed_api_formats,
         allowed_models: data.allowed_models
       }
       if (data.password) {
@@ -946,7 +946,7 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string }) 
         quota_usd: data.quota_usd,
         role: data.role,
         allowed_providers: data.allowed_providers,
-        allowed_endpoints: data.allowed_endpoints,
+        allowed_api_formats: data.allowed_api_formats,
         allowed_models: data.allowed_models
       })
       // 如果创建时指定为禁用，则更新状态

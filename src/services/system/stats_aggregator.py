@@ -144,7 +144,7 @@ class StatsAggregatorService:
             or 0
         )
         unique_providers = (
-            db.query(func.count(func.distinct(Usage.provider)))
+            db.query(func.count(func.distinct(Usage.provider_name)))
             .filter(and_(Usage.created_at >= day_start, Usage.created_at < day_end))
             .scalar()
             or 0

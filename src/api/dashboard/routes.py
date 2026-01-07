@@ -766,7 +766,7 @@ class DashboardProviderStatusAdapter(DashboardAdapter):
         for provider in providers:
             count = (
                 db.query(func.count(Usage.id))
-                .filter(and_(Usage.provider == provider.name, Usage.created_at >= since))
+                .filter(and_(Usage.provider_name == provider.name, Usage.created_at >= since))
                 .scalar()
             )
             entries.append(
@@ -854,7 +854,7 @@ class DashboardDailyStatsAdapter(DashboardAdapter):
                     .scalar() or 0
                 )
                 today_unique_providers = (
-                    db.query(func.count(func.distinct(Usage.provider)))
+                    db.query(func.count(func.distinct(Usage.provider_name)))
                     .filter(Usage.created_at >= today)
                     .scalar() or 0
                 )
