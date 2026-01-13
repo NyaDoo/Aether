@@ -4,21 +4,33 @@
     <div class="px-4 py-3 border-b border-border/60">
       <div class="flex items-center justify-between">
         <div class="flex items-baseline gap-2">
-          <h4 class="text-sm font-semibold">别名规则</h4>
+          <h4 class="text-sm font-semibold">映射规则</h4>
           <span class="text-xs text-muted-foreground">
             支持正则表达式 ({{ localAliases.length }}/{{ MAX_ALIASES_PER_MODEL }})
           </span>
         </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          class="h-7 w-7"
-          title="添加规则"
-          :disabled="localAliases.length >= MAX_ALIASES_PER_MODEL"
-          @click="addAlias"
-        >
-          <Plus class="w-4 h-4" />
-        </Button>
+        <div class="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-7 w-7"
+            title="添加规则"
+            :disabled="localAliases.length >= MAX_ALIASES_PER_MODEL"
+            @click="addAlias"
+          >
+            <Plus class="w-4 h-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-7 w-7"
+            title="刷新"
+            :disabled="props.loading"
+            @click="$emit('refresh')"
+          >
+            <RefreshCw class="w-4 h-4" :class="{ 'animate-spin': props.loading }" />
+          </Button>
+        </div>
       </div>
     </div>
 
@@ -117,13 +129,12 @@
               :key="item.keyId"
               class="bg-background rounded-md border p-3"
             >
-              <div class="flex items-center gap-2 text-sm mb-2">
+              <div class="flex items-center gap-1.5 text-sm mb-2">
                 <span class="text-muted-foreground">{{ item.providerName }}</span>
                 <span class="text-muted-foreground">/</span>
                 <span class="font-medium">{{ item.keyName }}</span>
-                <span class="text-xs text-muted-foreground font-mono ml-auto">
-                  {{ item.maskedKey }}
-                </span>
+                <span class="text-muted-foreground">·</span>
+                <code class="text-xs text-muted-foreground/70">{{ item.maskedKey }}</code>
               </div>
               <div class="flex flex-wrap gap-1">
                 <Badge
@@ -170,9 +181,11 @@ const props = defineProps<{
   globalModelId: string
   modelName: string
   aliases: string[]
+  loading?: boolean
 }>()
 const emit = defineEmits<{
   update: [aliases: string[]]
+  refresh: []
 }>()
 // 安全限制常量（与后端保持一致）
 const MAX_ALIASES_PER_MODEL = 50

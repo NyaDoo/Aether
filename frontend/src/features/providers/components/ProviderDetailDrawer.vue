@@ -176,7 +176,8 @@
                     class="px-4 py-2.5 hover:bg-muted/30 transition-colors group/item"
                     :class="{
                       'opacity-50': keyDragState.isDragging && keyDragState.draggedIndex === index,
-                      'bg-primary/5 border-l-2 border-l-primary': keyDragState.targetIndex === index && keyDragState.isDragging
+                      'bg-primary/5 border-l-2 border-l-primary': keyDragState.targetIndex === index && keyDragState.isDragging,
+                      'opacity-40 bg-muted/20': !key.is_active
                     }"
                     draggable="true"
                     @dragstart="handleKeyDragStart($event, index)"
@@ -209,13 +210,10 @@
                             </Button>
                           </div>
                         </div>
-                        <Badge
-                          v-if="!key.is_active"
-                          variant="secondary"
-                          class="text-[10px] px-1.5 py-0 shrink-0"
-                        >
-                          禁用
-                        </Badge>
+                      </div>
+                      <!-- 并发 + 健康度 + 操作按钮 -->
+                      <div class="flex items-center gap-1 shrink-0">
+                        <!-- 熔断徽章 -->
                         <Badge
                           v-if="key.circuit_breaker_open"
                           variant="destructive"
@@ -223,16 +221,6 @@
                         >
                           熔断
                         </Badge>
-                      </div>
-                      <!-- 并发 + 健康度 + 操作按钮 -->
-                      <div class="flex items-center gap-1 shrink-0">
-                        <!-- RPM 限制信息（放在最前面） -->
-                        <span
-                          v-if="key.rpm_limit || key.is_adaptive"
-                          class="text-[10px] text-muted-foreground mr-1"
-                        >
-                          {{ key.is_adaptive ? '自适应' : key.rpm_limit }} RPM
-                        </span>
                         <!-- 健康度 -->
                         <div
                           v-if="key.health_score !== undefined"
@@ -321,8 +309,13 @@
                         @keydown="(e) => handlePriorityKeydown(e, key)"
                         @blur="handlePriorityBlur(key)"
                       >
+                      <!-- RPM 限制信息（第二位） -->
+                      <template v-if="key.rpm_limit || key.is_adaptive">
+                        <span class="text-muted-foreground/40">|</span>
+                        <span>{{ key.is_adaptive ? '自适应' : key.rpm_limit }} RPM</span>
+                      </template>
                       <span class="text-muted-foreground/40">|</span>
-                      <!-- API 格式：展开显示每个格式和倍率 -->
+                      <!-- API 格式：展开显示每个格式、倍率、熔断状态 -->
                       <template
                         v-for="(format, idx) in getKeyApiFormats(key, endpoint)"
                         :key="format"
@@ -331,15 +324,11 @@
                           v-if="idx > 0"
                           class="text-muted-foreground/40"
                         >/</span>
-                        <span>{{ API_FORMAT_SHORT[format] || format }} {{ getKeyRateMultiplier(key, format) }}x</span>
+                        <span :class="{ 'text-destructive': isFormatCircuitOpen(key, format) }">
+                          {{ API_FORMAT_SHORT[format] || format }} {{ getKeyRateMultiplier(key, format) }}x{{ getFormatProbeCountdown(key, format) }}
+                        </span>
                       </template>
                       <span v-if="key.rate_limit">| {{ key.rate_limit }}rpm</span>
-                      <span
-                        v-if="key.next_probe_at"
-                        class="text-amber-600 dark:text-amber-400"
-                      >
-                        | {{ formatProbeTime(key.next_probe_at) }}探测
-                      </span>
                     </div>
                   </div>
                 </div>
@@ -592,6 +581,7 @@ import Badge from '@/components/ui/badge.vue'
 import Card from '@/components/ui/card.vue'
 import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
+import { useCountdownTimer, formatCountdown } from '@/composables/useCountdownTimer'
 import { getProvider, getProviderEndpoints, getProviderAliasMappingPreview, type ProviderAliasMappingPreviewResponse } from '@/api/endpoints'
 import {
   KeyFormDialog,
@@ -641,6 +631,7 @@ const emit = defineEmits<{
 
 const { error: showError, success: showSuccess } = useToast()
 const { copyToClipboard } = useClipboard()
+const { tick: countdownTick, start: startCountdownTimer, stop: stopCountdownTimer } = useCountdownTimer()
 
 const loading = ref(false)
 const provider = ref<any>(null)
@@ -831,7 +822,11 @@ watch(() => props.open, (newOpen) => {
     loadProvider()
     loadEndpoints()
     loadAliasMappingPreview()
+    // 启动倒计时定时器
+    startCountdownTimer()
   } else if (!newOpen) {
+    // 停止倒计时定时器
+    stopCountdownTimer()
     // 重置所有状态
     provider.value = null
     endpoints.value = []
@@ -1481,6 +1476,44 @@ function getHealthScoreBarColor(score: number): string {
   if (score >= 0.8) return 'bg-green-500 dark:bg-green-400'
   if (score >= 0.5) return 'bg-yellow-500 dark:bg-yellow-400'
   return 'bg-red-500 dark:bg-red-400'
+}
+
+// 检查指定格式是否熔断
+function isFormatCircuitOpen(key: EndpointAPIKey, format: string): boolean {
+  if (!key.circuit_breaker_by_format) return false
+  const formatData = key.circuit_breaker_by_format[format]
+  return formatData?.open === true
+}
+
+// 获取指定格式的探测倒计时（如果熔断，返回带空格前缀的倒计时文本）
+function getFormatProbeCountdown(key: EndpointAPIKey, format: string): string {
+  // 触发响应式更新
+  void countdownTick.value
+
+  if (!key.circuit_breaker_by_format) return ''
+  const formatData = key.circuit_breaker_by_format[format]
+  if (!formatData?.open) return ''
+
+  // 半开状态
+  if (formatData.half_open_until) {
+    const halfOpenUntil = new Date(formatData.half_open_until)
+    const now = new Date()
+    if (halfOpenUntil > now) {
+      return ' 探测中'
+    }
+  }
+  // 等待探测
+  if (formatData.next_probe_at) {
+    const nextProbe = new Date(formatData.next_probe_at)
+    const now = new Date()
+    const diffMs = nextProbe.getTime() - now.getTime()
+    if (diffMs > 0) {
+      return ' ' + formatCountdown(diffMs)
+    } else {
+      return ' 探测中'
+    }
+  }
+  return ''
 }
 
 // 加载 Provider 信息
