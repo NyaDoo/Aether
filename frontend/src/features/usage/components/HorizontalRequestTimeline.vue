@@ -956,10 +956,12 @@ const getStatusColorClass = (status: string) => {
 
 .node-line {
   position: absolute;
+  right: -64px;
+  top: 50%;
+  transform: translateY(-50%);
   width: 64px;
   height: 2px;
   background: hsl(var(--border));
-  margin: 0 -1px;
   z-index: 1;
 }
 
