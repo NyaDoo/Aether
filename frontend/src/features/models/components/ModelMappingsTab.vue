@@ -155,14 +155,11 @@
     <!-- 空状态 -->
     <div
       v-else
-      class="text-center py-8"
+      class="text-center py-32"
     >
       <GitMerge class="w-10 h-10 mx-auto text-muted-foreground/30 mb-3" />
       <p class="text-sm text-muted-foreground">
         暂无映射规则
-      </p>
-      <p class="text-xs text-muted-foreground mt-1">
-        添加映射可匹配 Provider Key 白名单中的模型
       </p>
     </div>
   </Card>
@@ -462,14 +459,15 @@ function addMapping() {
   expandedIndex.value = localMappings.value.length - 1
 }
 
-function removeMapping(index: number) {
+async function removeMapping(index: number) {
   localMappings.value.splice(index, 1)
-  isDirty.value = true
   if (expandedIndex.value === index) {
     expandedIndex.value = null
   } else if (expandedIndex.value !== null && expandedIndex.value > index) {
     expandedIndex.value--
   }
+  // 删除后自动保存
+  await saveMappings()
 }
 
 async function saveMappings() {

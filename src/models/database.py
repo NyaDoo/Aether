@@ -1004,12 +1004,14 @@ class ProviderAPIKey(Base):
     note = Column(String(500), nullable=True)  # 备注说明（可选）
 
     # 成本计算
+    # [DEPRECATED] rate_multiplier 已废弃，请使用 rate_multipliers
+    # 将在未来版本中移除，目前仅作为 rate_multipliers 未配置时的回退值
     rate_multiplier = Column(
         Float, default=1.0, nullable=False
-    )  # 默认成本倍率（真实成本 = 表面成本 × 倍率）
+    )  # [DEPRECATED] 默认成本倍率，请使用 rate_multipliers
     rate_multipliers = Column(
         JSON, nullable=True
-    )  # 按 API 格式的成本倍率 {"CLAUDE": 1.0, "OPENAI": 0.8}
+    )  # 按 API 格式的成本倍率 {"CLAUDE_CLI": 1.0, "OPENAI_CLI": 0.8}
 
     # 优先级配置 (数字越小越优先)
     internal_priority = Column(

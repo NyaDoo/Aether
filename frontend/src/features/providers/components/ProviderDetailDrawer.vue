@@ -1423,6 +1423,11 @@ function getKeyRateMultiplier(key: EndpointAPIKey, format: string): number {
   if (key.rate_multipliers && key.rate_multipliers[format] !== undefined) {
     return key.rate_multipliers[format]
   }
+  // 如果 rate_multipliers 存在但该格式未配置，说明用户期望使用默认值 1.0
+  // 只有当 rate_multipliers 完全不存在时，才回退到 rate_multiplier
+  if (key.rate_multipliers && Object.keys(key.rate_multipliers).length > 0) {
+    return 1.0
+  }
   // 回退到默认倍率
   return key.rate_multiplier || 1.0
 }

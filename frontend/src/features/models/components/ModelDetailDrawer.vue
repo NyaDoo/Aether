@@ -499,6 +499,7 @@ const emit = defineEmits<{
   'editProvider': [provider: any]
   'deleteProvider': [provider: any]
   'toggleProviderStatus': [provider: any]
+  'refreshModel': []
 }>()
 const { success: showSuccess, error: showError } = useToast()
 const { copyToClipboard } = useClipboard()
@@ -548,6 +549,8 @@ function handleMappingsUpdate(_mappings: string[]) {
   // 映射已在 ModelMappingsTab 内部保存到服务器
   // 刷新路由数据以反映可能的候选变化
   refreshRoutingData()
+  // 通知父组件刷新模型数据
+  emit('refreshModel')
 }
 
 // 暴露刷新方法给父组件

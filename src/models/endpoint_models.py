@@ -132,11 +132,12 @@ class EndpointAPIKeyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="密钥名称（必填，用于识别）")
 
     # 成本计算
+    # [DEPRECATED] rate_multiplier 已废弃，请使用 rate_multipliers
     rate_multiplier: float = Field(
-        default=1.0, ge=0.01, description="默认成本倍率（真实成本 = 表面成本 × 倍率）"
+        default=1.0, ge=0.01, description="[DEPRECATED] 默认成本倍率，已废弃，请使用 rate_multipliers"
     )
     rate_multipliers: Optional[Dict[str, float]] = Field(
-        default=None, description="按 API 格式的成本倍率，如 {'CLAUDE': 1.0, 'OPENAI': 0.8}"
+        default=None, description="按 API 格式的成本倍率，如 {'CLAUDE_CLI': 1.0, 'OPENAI_CLI': 0.8}"
     )
 
     # 优先级和限制（数字越小越优先）
@@ -273,9 +274,10 @@ class EndpointAPIKeyUpdate(BaseModel):
         default=None, min_length=3, max_length=500, description="API Key（将自动加密）"
     )
     name: Optional[str] = Field(default=None, min_length=1, max_length=100, description="密钥名称")
-    rate_multiplier: Optional[float] = Field(default=None, ge=0.01, description="默认成本倍率")
+    # [DEPRECATED] rate_multiplier 已废弃，请使用 rate_multipliers
+    rate_multiplier: Optional[float] = Field(default=None, ge=0.01, description="[DEPRECATED] 默认成本倍率，已废弃")
     rate_multipliers: Optional[Dict[str, float]] = Field(
-        default=None, description="按 API 格式的成本倍率，如 {'CLAUDE': 1.0, 'OPENAI': 0.8}"
+        default=None, description="按 API 格式的成本倍率，如 {'CLAUDE_CLI': 1.0, 'OPENAI_CLI': 0.8}"
     )
     internal_priority: Optional[int] = Field(
         default=None, description="Key 内部优先级（提供商优先模式，数字越小越优先）"
@@ -399,9 +401,10 @@ class EndpointAPIKeyResponse(BaseModel):
     name: str = Field(..., description="密钥名称")
 
     # 成本计算
-    rate_multiplier: float = Field(default=1.0, description="默认成本倍率")
+    # [DEPRECATED] rate_multiplier 已废弃，请使用 rate_multipliers
+    rate_multiplier: float = Field(default=1.0, description="[DEPRECATED] 默认成本倍率，已废弃")
     rate_multipliers: Optional[Dict[str, float]] = Field(
-        default=None, description="按 API 格式的成本倍率，如 {'CLAUDE': 1.0, 'OPENAI': 0.8}"
+        default=None, description="按 API 格式的成本倍率，如 {'CLAUDE_CLI': 1.0, 'OPENAI_CLI': 0.8}"
     )
 
     # 优先级和限制

@@ -593,6 +593,8 @@ class CacheAwareScheduler:
 
         # 提取模型映射（用于 Provider Key 的 allowed_models 匹配）
         model_mappings: List[str] = (global_model.config or {}).get("model_mappings", [])
+        if model_mappings:
+            logger.debug(f"[Scheduler] GlobalModel={global_model.name} 配置了映射规则: {model_mappings}")
 
         # 获取合并后的访问限制（ApiKey + User）
         restrictions = self._get_effective_restrictions(user_api_key)
@@ -929,6 +931,12 @@ class CacheAwareScheduler:
                 model_mappings=model_mappings,
                 candidate_models=candidate_models,
             )
+            if mapping_matched_model:
+                logger.debug(
+                    f"[Scheduler] Key {key.id[:8]}... 映射匹配成功: "
+                    f"model={model_name} -> {mapping_matched_model}, "
+                    f"allowed_models={key.allowed_models}, model_mappings={model_mappings}"
+                )
         except TimeoutError:
             # 正则匹配超时（可能是 ReDoS 攻击或复杂模式）
             logger.warning(f"映射匹配超时: key_id={key.id}, model={model_name}")
@@ -1047,6 +1055,9 @@ class CacheAwareScheduler:
 
             for key in keys:
                 # Key 级别的能力检查
+                # 注意：不传入 candidate_models 限制，允许映射匹配到 Key 的 allowed_models 中的任意模型名
+                # 这支持以下场景：Key 只允许使用 gpt-5.2，而 GlobalModel 配置了映射 gpt-5.*2
+                # 映射匹配后，实际请求会使用 gpt-5.2 作为模型名发送给 Provider
                 is_available, skip_reason, mapping_matched_model = self._check_key_availability(
                     key,
                     target_format_str,
@@ -1054,7 +1065,6 @@ class CacheAwareScheduler:
                     capability_requirements,
                     resolved_model_name=resolved_model_name,
                     model_mappings=model_mappings,
-                    candidate_models=provider_model_names,
                 )
 
                 candidate = ProviderCandidate(

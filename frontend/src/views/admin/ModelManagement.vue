@@ -430,6 +430,7 @@
       @edit-provider="openEditProviderImplementation"
       @delete-provider="confirmDeleteProviderImplementation"
       @toggle-provider-status="toggleProviderStatus"
+      @refresh-model="refreshSelectedModel"
     />
 
     <!-- 批量添加关联提供商对话框 -->
@@ -614,6 +615,7 @@ import {
 } from '@/components/ui'
 import {
   listGlobalModels,
+  getGlobalModel,
   updateGlobalModel,
   deleteGlobalModel,
   batchAssignToProviders,
@@ -956,6 +958,17 @@ async function selectModel(model: GlobalModelResponse) {
 
   // 加载该模型的关联提供商
   await loadModelProviders(model.id)
+}
+
+// 刷新当前选中的模型数据
+async function refreshSelectedModel() {
+  if (!selectedModel.value) return
+  try {
+    const updated = await getGlobalModel(selectedModel.value.id)
+    selectedModel.value = updated
+  } catch (err) {
+    log.error('刷新模型数据失败:', err)
+  }
 }
 
 // 加载指定模型的关联提供商

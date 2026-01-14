@@ -102,8 +102,9 @@ export interface EndpointAPIKey {
   api_key_masked: string
   api_key_plain?: string | null
   name: string  // 密钥名称（必填，用于识别）
-  rate_multiplier: number  // 默认成本倍率（真实成本 = 表面成本 × 倍率）
-  rate_multipliers?: Record<string, number> | null  // 按 API 格式的成本倍率，如 {"CLAUDE": 1.0, "OPENAI": 0.8}
+  /** @deprecated 已废弃，请使用 rate_multipliers */
+  rate_multiplier: number  // [DEPRECATED] 默认成本倍率，已废弃
+  rate_multipliers?: Record<string, number> | null  // 按 API 格式的成本倍率，如 {"CLAUDE_CLI": 1.0, "OPENAI_CLI": 0.8}
   internal_priority: number  // Key 内部优先级
   global_priority?: number | null  // 全局 Key 优先级
   rpm_limit?: number | null  // RPM 速率限制 (1-10000)，null 表示自适应模式
@@ -179,7 +180,8 @@ export interface EndpointAPIKeyUpdate {
   api_formats?: string[]  // 支持的 API 格式列表
   name?: string
   api_key?: string  // 仅在需要更新时提供
-  rate_multiplier?: number  // 默认成本倍率
+  /** @deprecated 已废弃，请使用 rate_multipliers */
+  rate_multiplier?: number  // [DEPRECATED] 默认成本倍率，已废弃
   rate_multipliers?: Record<string, number> | null  // 按 API 格式的成本倍率
   internal_priority?: number
   global_priority?: number | null

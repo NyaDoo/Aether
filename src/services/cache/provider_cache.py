@@ -64,12 +64,19 @@ class ProviderCacheService:
 
         # 3. 计算倍率并写入缓存
         if provider_key:
-            # 优先使用 rate_multipliers[api_format]，回退到 rate_multiplier
-            rate_multiplier = provider_key.rate_multiplier or 1.0
+            # 优先使用 rate_multipliers[api_format]
+            # 如果 rate_multipliers 存在但未配置该格式，默认为 1.0
+            # 只有当 rate_multipliers 完全不存在时，才回退到 rate_multiplier
             if api_format and provider_key.rate_multipliers:
                 format_upper = api_format.upper()
                 if format_upper in provider_key.rate_multipliers:
                     rate_multiplier = provider_key.rate_multipliers[format_upper]
+                else:
+                    # rate_multipliers 存在但该格式未配置，使用默认值 1.0
+                    rate_multiplier = 1.0
+            else:
+                # rate_multipliers 不存在或未指定 api_format，回退到默认倍率
+                rate_multiplier = provider_key.rate_multiplier or 1.0
 
             await CacheService.set(
                 cache_key, rate_multiplier, ttl_seconds=ProviderCacheService.CACHE_TTL
