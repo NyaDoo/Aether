@@ -248,8 +248,9 @@ class AdminUpdateEndpointKeyAdapter(AdminApiAdapter):
         db.commit()
         db.refresh(key)
 
-        # 如果刚刚开启了 auto_fetch_models，立即触发一次模型获取
+        # 处理 auto_fetch_models 的开启和关闭
         if not auto_fetch_enabled_before and auto_fetch_enabled_after:
+            # 刚刚开启了 auto_fetch_models，立即触发一次模型获取
             logger.info("[AUTO_FETCH] Key %s 开启自动获取模型，立即触发模型获取", self.key_id)
             try:
                 from src.services.model.fetch_scheduler import get_model_fetch_scheduler
@@ -260,6 +261,12 @@ class AdminUpdateEndpointKeyAdapter(AdminApiAdapter):
             except Exception as e:
                 logger.error(f"触发模型获取失败: {e}")
                 # 不抛出异常，避免影响 Key 更新操作
+        elif auto_fetch_enabled_before and not auto_fetch_enabled_after:
+            # 关闭了 auto_fetch_models，将 allowed_models 设置为 null（不限制）
+            logger.info("[AUTO_FETCH] Key %s 关闭自动获取模型，清空 allowed_models", self.key_id)
+            key.allowed_models = None
+            db.commit()
+            db.refresh(key)
 
         # 任何字段更新都清除缓存，确保缓存一致性
         # 包括 is_active、allowed_models、capabilities 等影响权限和行为的字段
