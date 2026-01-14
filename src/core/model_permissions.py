@@ -16,7 +16,7 @@
 
 import re
 from functools import lru_cache
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import regex
 
@@ -35,7 +35,7 @@ AllowedModels = Optional[Union[List[str], Dict[str, List[str]]]]
 def normalize_allowed_models(
     allowed_models: AllowedModels,
     api_format: Optional[str] = None,
-) -> Optional[Set[str]]:
+) -> Optional[set[str]]:
     """
     将 allowed_models 规范化为模型名称集合
 
@@ -45,7 +45,7 @@ def normalize_allowed_models(
 
     Returns:
         - None: 不限制（允许所有模型）
-        - Set[str]: 允许的模型名称集合（可能为空集，表示拒绝所有）
+        - set[str]: 允许的模型名称集合（可能为空集，表示拒绝所有）
     """
     if allowed_models is None:
         return None
@@ -58,7 +58,7 @@ def normalize_allowed_models(
     if isinstance(allowed_models, dict):
         if api_format is None:
             # 没有指定格式，合并所有格式的模型
-            all_models: Set[str] = set()
+            all_models: set[str] = set()
             for models in allowed_models.values():
                 if isinstance(models, list):
                     all_models.update(models)
@@ -153,7 +153,7 @@ def merge_allowed_models(
     # 任一为字典模式：按 API 格式分别取交集，避免把 dict 合并成 list 导致权限过宽
     from src.core.enums import APIFormat
 
-    def merge_sets(a: Optional[Set[str]], b: Optional[Set[str]]) -> Optional[Set[str]]:
+    def merge_sets(a: Optional[set[str]], b: Optional[set[str]]) -> Optional[set[str]]:
         # None 表示不限制：交集规则下等价于“只受另一方限制”
         if a is None:
             return b
@@ -163,7 +163,7 @@ def merge_allowed_models(
 
     known_formats = [fmt.value for fmt in APIFormat]
 
-    per_format: Dict[str, Optional[Set[str]]] = {}
+    per_format: Dict[str, Optional[set[str]]] = {}
     for fmt in known_formats:
         s1 = normalize_allowed_models(allowed_models_1, api_format=fmt)
         s2 = normalize_allowed_models(allowed_models_2, api_format=fmt)
@@ -215,7 +215,7 @@ def get_allowed_models_preview(
     if allowed_models is None:
         return "(不限制)"
 
-    all_models: Set[str] = set()
+    all_models: set[str] = set()
 
     if isinstance(allowed_models, list):
         all_models = set(allowed_models)
@@ -295,7 +295,7 @@ def convert_to_simple_mode(allowed_models: AllowedModels) -> Optional[List[str]]
         return allowed_models
 
     if isinstance(allowed_models, dict):
-        all_models: Set[str] = set()
+        all_models: set[str] = set()
         for models in allowed_models.values():
             if isinstance(models, list):
                 all_models.update(models)
@@ -325,7 +325,7 @@ def parse_allowed_models_to_list(allowed_models: AllowedModels) -> List[str]:
         return allowed_models
 
     if isinstance(allowed_models, dict):
-        all_models: Set[str] = set()
+        all_models: set[str] = set()
         for models in allowed_models.values():
             if isinstance(models, list):
                 all_models.update(models)
@@ -533,6 +533,7 @@ def check_model_allowed_with_aliases(
     api_format: Optional[str] = None,
     resolved_model_name: Optional[str] = None,
     model_aliases: Optional[List[str]] = None,
+    candidate_models: Optional[set[str]] = None,
 ) -> tuple[bool, Optional[str]]:
     """
     检查模型是否被允许（支持别名通配符匹配）
@@ -554,6 +555,7 @@ def check_model_allowed_with_aliases(
         api_format: 当前请求的 API 格式
         resolved_model_name: 解析后的 GlobalModel.name
         model_aliases: GlobalModel 的别名列表（来自 config.model_aliases）
+        candidate_models: 可选的候选模型集合（用于限制别名匹配只能落到这些模型名上）
 
     Returns:
         (is_allowed, matched_model_name):
@@ -578,9 +580,16 @@ def check_model_allowed_with_aliases(
         # 空集合 = 拒绝所有
         return False, None
 
+    # 如果提供了候选集合，只允许在候选集合中进行别名匹配
+    if candidate_models is not None:
+        allowed_set = allowed_set & candidate_models
+        if len(allowed_set) == 0:
+            return False, None
+
     # 遍历 allowed_models 中的每个模型名，检查是否有别名能匹配
-    # 注意：返回第一个匹配的模型名，匹配顺序由 allowed_set 迭代顺序和 model_aliases 数组顺序决定
-    for allowed_model in allowed_set:
+    # 注意：为了避免 set 迭代顺序带来的非确定性，这里对 allowed_set 做排序
+    # 返回第一个匹配的模型名，匹配顺序由 allowed_models 排序结果和 model_aliases 数组顺序共同决定
+    for allowed_model in sorted(allowed_set):
         for alias_pattern in model_aliases:
             if match_model_with_pattern(alias_pattern, allowed_model):
                 # 返回匹配到的模型名，用于实际请求

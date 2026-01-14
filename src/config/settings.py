@@ -141,7 +141,7 @@ class Config:
 
         # HTTP 请求超时配置（秒）
         self.http_connect_timeout = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10.0"))
-        self.http_read_timeout = float(os.getenv("HTTP_READ_TIMEOUT", "300.0"))
+        self.http_read_timeout = float(os.getenv("HTTP_READ_TIMEOUT", "60.0"))
         self.http_write_timeout = float(os.getenv("HTTP_WRITE_TIMEOUT", "60.0"))
         self.http_pool_timeout = float(os.getenv("HTTP_POOL_TIMEOUT", "10.0"))
 

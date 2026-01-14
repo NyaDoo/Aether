@@ -47,7 +47,7 @@
               class="w-4 h-4 text-muted-foreground shrink-0 transition-transform self-start mt-0.5"
               :class="{ 'rotate-90': expandedItems.has(index) }"
             />
-            <!-- 精确映射：两行显示 -->
+            <!-- 精确映射 -->
             <template v-if="item.type === 'exact'">
               <div class="flex flex-col min-w-0">
                 <span class="font-semibold text-sm truncate">
@@ -72,7 +72,7 @@
                 | {{ item.mappings.length }} 个映射
               </span>
             </template>
-            <!-- 正则映射：两行显示 -->
+            <!-- 正则映射 -->
             <template v-else>
               <div class="flex flex-col min-w-0">
                 <span class="font-semibold text-sm truncate">
@@ -96,7 +96,7 @@
               <span class="text-xs text-muted-foreground shrink-0">
                 | {{ item.mappings.length }} 个映射
               </span>
-              <!-- 正则映射显示匹配的 Key 数量 -->
+              <!-- Key 数量 -->
               <span
                 v-if="item.matchedKeys && item.matchedKeys.length > 0"
                 class="text-xs text-muted-foreground shrink-0"
@@ -180,31 +180,41 @@
               :key="keyItem.keyId"
               class="bg-background rounded-md border p-3"
             >
-              <!-- Key 信息 -->
-              <div class="flex items-center gap-2 text-sm mb-2">
-                <Key class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-                <span class="font-medium truncate">{{ keyItem.keyName || '未命名密钥' }}</span>
-                <span class="text-xs text-muted-foreground font-mono ml-auto shrink-0">
-                  {{ keyItem.maskedKey }}
-                </span>
+              <!-- Key 信息和正则表达式（两列布局） -->
+              <div class="flex items-center gap-3">
+                <!-- 第一列：Key 名称 + sk -->
+                <div class="flex flex-col shrink-0">
+                  <span class="font-medium text-sm">{{ keyItem.keyName || '未命名密钥' }}</span>
+                  <span class="text-xs text-muted-foreground font-mono">
+                    {{ keyItem.maskedKey }}
+                  </span>
+                </div>
+                <!-- 分隔线 -->
+                <div
+                  v-if="getKeyPatterns(keyItem).length > 0"
+                  class="w-px h-8 bg-border shrink-0"
+                />
+                <!-- 第二列：正则表达式（限制2行） -->
+                <div
+                  v-if="getKeyPatterns(keyItem).length > 0"
+                  class="flex-1 min-w-0"
+                >
+                  <div
+                    class="font-mono text-[11px] text-muted-foreground line-clamp-2"
+                    :title="getKeyPatterns(keyItem).join(', ')"
+                  >
+                    {{ getKeyPatterns(keyItem).join(', ') }}
+                  </div>
+                </div>
               </div>
               <!-- 匹配的模型列表 -->
-              <div class="space-y-1">
+              <div class="mt-2 space-y-1">
                 <div
                   v-for="match in keyItem.matches"
                   :key="match.name"
                   class="flex items-center justify-between gap-2 py-1"
                 >
-                  <div class="flex items-center gap-2 flex-1 min-w-0">
-                    <span class="font-mono text-sm truncate">{{ match.name }}</span>
-                    <span
-                      v-if="match.pattern"
-                      class="text-xs text-muted-foreground truncate"
-                      :title="match.pattern"
-                    >
-                      {{ match.pattern }}
-                    </span>
-                  </div>
+                  <span class="font-mono text-sm truncate">{{ match.name }}</span>
                   <Button
                     variant="ghost"
                     size="icon"
@@ -270,7 +280,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { Tag, Plus, Edit, Trash2, ChevronRight, Loader2, Play, Key } from 'lucide-vue-next'
+import { Tag, Plus, Edit, Trash2, ChevronRight, Loader2, Play } from 'lucide-vue-next'
 import { Card, Button, Badge } from '@/components/ui'
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import ModelMappingDialog, { type AliasGroup } from '../ModelMappingDialog.vue'
@@ -489,6 +499,17 @@ function toggleExpand(index: number) {
   } else {
     expandedItems.value.add(index)
   }
+}
+
+// 获取单个 Key 的去重正则模式列表
+function getKeyPatterns(keyItem: MatchedKeyInfo): string[] {
+  const patterns = new Set<string>()
+  for (const match of keyItem.matches) {
+    if (match.pattern) {
+      patterns.add(match.pattern)
+    }
+  }
+  return Array.from(patterns)
 }
 
 // 打开添加对话框

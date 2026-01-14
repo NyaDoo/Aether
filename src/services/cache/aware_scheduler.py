@@ -746,9 +746,10 @@ class CacheAwareScheduler:
         db: Session,
         provider: Provider,
         model_name: str,
+        api_format: Optional[str] = None,
         is_stream: bool = False,
         capability_requirements: Optional[Dict[str, bool]] = None,
-    ) -> Tuple[bool, Optional[str], Optional[List[str]]]:
+    ) -> Tuple[bool, Optional[str], Optional[List[str]], Optional[set[str]]]:
         """
         检查 Provider 是否支持指定模型（可选检查流式支持和能力需求）
 
@@ -768,20 +769,24 @@ class CacheAwareScheduler:
             capability_requirements: 能力需求（可选），用于检查模型是否支持所需能力
 
         Returns:
-            (is_supported, skip_reason, supported_capabilities) - 是否支持、跳过原因、模型支持的能力列表
+            (is_supported, skip_reason, supported_capabilities, provider_model_names)
+            - is_supported: 是否支持
+            - skip_reason: 跳过原因
+            - supported_capabilities: 模型支持的能力列表
+            - provider_model_names: Provider 侧可用的模型名称集合（主名称 + 映射名称，按 api_format 过滤）
         """
         # 使用 ModelCacheService 解析模型名称（支持映射名）
         global_model = await ModelCacheService.resolve_global_model_by_name_or_alias(db, model_name)
 
         if not global_model:
             # 完全未找到匹配
-            return False, "模型不存在或 Provider 未配置此模型", None
+            return False, "模型不存在或 Provider 未配置此模型", None, None
 
         # 找到 GlobalModel 后，检查当前 Provider 是否支持
-        is_supported, skip_reason, caps = await self._check_model_support_for_global_model(
-            db, provider, global_model, model_name, is_stream, capability_requirements
+        is_supported, skip_reason, caps, provider_model_names = await self._check_model_support_for_global_model(
+            db, provider, global_model, model_name, api_format, is_stream, capability_requirements
         )
-        return is_supported, skip_reason, caps
+        return is_supported, skip_reason, caps, provider_model_names
 
     async def _check_model_support_for_global_model(
         self,
@@ -789,9 +794,10 @@ class CacheAwareScheduler:
         provider: Provider,
         global_model: "GlobalModel",
         model_name: str,
+        api_format: Optional[str] = None,
         is_stream: bool = False,
         capability_requirements: Optional[Dict[str, bool]] = None,
-    ) -> Tuple[bool, Optional[str], Optional[List[str]]]:
+    ) -> Tuple[bool, Optional[str], Optional[List[str]], Optional[set[str]]]:
         """
         检查 Provider 是否支持指定的 GlobalModel
 
@@ -804,7 +810,7 @@ class CacheAwareScheduler:
             capability_requirements: 能力需求
 
         Returns:
-            (is_supported, skip_reason, supported_capabilities)
+            (is_supported, skip_reason, supported_capabilities, provider_model_names)
         """
         # 确保 global_model 附加到当前 Session
         # 注意：从缓存重建的对象是 transient 状态，不能使用 load=False
@@ -833,7 +839,7 @@ class CacheAwareScheduler:
                 if is_stream:
                     supports_streaming = model.get_effective_supports_streaming()
                     if not supports_streaming:
-                        return False, f"模型 {model_name} 在此 Provider 不支持流式", None
+                        return False, f"模型 {model_name} 在此 Provider 不支持流式", None, None
 
                 # 检查模型是否支持所需的能力（在 Provider 级别检查，而不是 Key 级别）
                 # 只有当 model_supported_capabilities 非空时才进行检查
@@ -845,11 +851,32 @@ class CacheAwareScheduler:
                                 False,
                                 f"模型 {model_name} 不支持能力: {cap_name}",
                                 list(model_supported_capabilities),
+                                None,
                             )
 
-                return True, None, list(model_supported_capabilities)
+                provider_model_names: set[str] = {model.provider_model_name}
+                raw_mappings = model.provider_model_mappings
+                if isinstance(raw_mappings, list):
+                    for raw in raw_mappings:
+                        if not isinstance(raw, dict):
+                            continue
+                        name = raw.get("name")
+                        if not isinstance(name, str) or not name.strip():
+                            continue
 
-        return False, "Provider 未实现此模型", None
+                        mapping_api_formats = raw.get("api_formats")
+                        if api_format and mapping_api_formats:
+                            if (
+                                isinstance(mapping_api_formats, list)
+                                and api_format not in mapping_api_formats
+                            ):
+                                continue
+
+                        provider_model_names.add(name.strip())
+
+                return True, None, list(model_supported_capabilities), provider_model_names
+
+        return False, "Provider 未实现此模型", None, None
 
     def _check_key_availability(
         self,
@@ -859,6 +886,7 @@ class CacheAwareScheduler:
         capability_requirements: Optional[Dict[str, bool]] = None,
         resolved_model_name: Optional[str] = None,
         model_aliases: Optional[List[str]] = None,
+        candidate_models: Optional[set[str]] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         检查 API Key 的可用性
@@ -872,6 +900,7 @@ class CacheAwareScheduler:
             capability_requirements: 能力需求（可选）
             resolved_model_name: 解析后的 GlobalModel.name（可选）
             model_aliases: GlobalModel 的别名列表（用于通配符匹配）
+            candidate_models: Provider 侧可用的模型名称集合（用于限制别名匹配范围）
 
         Returns:
             (is_available, skip_reason, alias_matched_model)
@@ -901,6 +930,7 @@ class CacheAwareScheduler:
                 api_format=api_format,
                 resolved_model_name=resolved_model_name,
                 model_aliases=model_aliases,
+                candidate_models=candidate_models,
             )
         except TimeoutError:
             # 正则匹配超时（可能是 ReDoS 攻击或复杂模式）
@@ -970,8 +1000,13 @@ class CacheAwareScheduler:
 
         for provider in providers:
             # 检查模型支持（同时检查流式支持和模型能力需求）
-            supports_model, skip_reason, _model_caps = await self._check_model_support(
-                db, provider, model_name, is_stream, capability_requirements
+            supports_model, skip_reason, _model_caps, provider_model_names = await self._check_model_support(
+                db,
+                provider,
+                model_name,
+                api_format=target_format_str,
+                is_stream=is_stream,
+                capability_requirements=capability_requirements,
             )
             if not supports_model:
                 logger.debug(f"Provider {provider.name} 不支持模型 {model_name}: {skip_reason}")
@@ -1022,6 +1057,7 @@ class CacheAwareScheduler:
                     capability_requirements,
                     resolved_model_name=resolved_model_name,
                     model_aliases=model_aliases,
+                    candidate_models=provider_model_names,
                 )
 
                 candidate = ProviderCandidate(

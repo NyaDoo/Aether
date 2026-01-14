@@ -258,8 +258,8 @@ class ModelCacheService:
 
         查找顺序：
         1. 检查缓存
-        2. 通过 provider_model_name 匹配（查询 Model 表）
-        3. 直接匹配 GlobalModel.name（兜底）
+        2. 直接匹配 GlobalModel.name
+        3. 通过 provider_model_name 匹配（查询 Model 表）
 
         注意：此方法不使用 provider_model_mappings 进行全局解析。
         provider_model_mappings 是 Provider 级别的映射配置，只在特定 Provider 上下文中生效，
@@ -301,7 +301,25 @@ class ModelCacheService:
                     logger.debug(f"GlobalModel 缓存命中(映射解析): {normalized_name}")
                     return ModelCacheService._dict_to_global_model(cached_data)
 
-            # 2. 通过 provider_model_name 匹配（不考虑 provider_model_mappings）
+            # 2. 直接通过 GlobalModel.name 匹配（优先级最高）
+            # 说明：如果存在同名 GlobalModel，应优先解析为 GlobalModel 本身，
+            # 避免被某个 Provider 的 provider_model_name 误导导致解析到错误的 GlobalModel。
+            global_model = (
+                db.query(GlobalModel)
+                .filter(GlobalModel.name == normalized_name, GlobalModel.is_active == True)
+                .first()
+            )
+
+            if global_model:
+                resolution_method = "direct_match"
+                global_model_dict = ModelCacheService._global_model_to_dict(global_model)
+                await CacheService.set(
+                    cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
+                )
+                logger.debug(f"GlobalModel 已缓存(映射解析-直接匹配): {normalized_name}")
+                return global_model
+
+            # 3. 通过 provider_model_name 匹配（不考虑 provider_model_mappings）
             # 重要：provider_model_mappings 是 Provider 级别的映射配置，只在特定 Provider 上下文中生效
             # 全局解析不应该受到某个 Provider 映射配置的影响
             # 例如：Provider A 把 "haiku" 映射到 "sonnet"，不应该影响 Provider B 的 "haiku" 解析
@@ -356,23 +374,6 @@ class ModelCacheService:
                     f"GlobalModel 已缓存(映射解析-{resolution_method}): {normalized_name} -> {result_global_model.name}"
                 )
                 return result_global_model
-
-            # 3. 如果通过 provider 映射没找到，最后尝试直接通过 GlobalModel.name 查找
-            global_model = (
-                db.query(GlobalModel)
-                .filter(GlobalModel.name == normalized_name, GlobalModel.is_active == True)
-                .first()
-            )
-
-            if global_model:
-                resolution_method = "direct_match"
-                # 缓存结果
-                global_model_dict = ModelCacheService._global_model_to_dict(global_model)
-                await CacheService.set(
-                    cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
-                )
-                logger.debug(f"GlobalModel 已缓存(映射解析-直接匹配): {normalized_name}")
-                return global_model
 
             # 4. 完全未找到
             resolution_method = "not_found"
