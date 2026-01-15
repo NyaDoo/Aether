@@ -677,8 +677,14 @@ watch(groupedTimeline, (newGroups) => {
     const group = newGroups[i]
     if (group.primaryStatus === 'failed') {
       selectedGroupIndex.value = i
-      // 选中最后一个失败的尝试
-      const failedIdx = group.allAttempts.findLastIndex((a: CandidateRecord) => a.status === 'failed')
+      // 选中最后一个失败的尝试（从后往前遍历）
+      let failedIdx = -1
+      for (let j = group.allAttempts.length - 1; j >= 0; j--) {
+        if (group.allAttempts[j].status === 'failed') {
+          failedIdx = j
+          break
+        }
+      }
       selectedAttemptIndex.value = failedIdx >= 0 ? failedIdx : group.allAttempts.length - 1
       return
     }
@@ -756,7 +762,7 @@ const getStatusColorClass = (status: string) => {
 .minimal-track {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   gap: 64px;
   padding: 2rem;
   overflow-x: auto;
