@@ -362,14 +362,41 @@
                             class="h-4 mx-1"
                           />
                         </template>
+
+                        <!-- 请求体/响应体专用：JSON/对话 视图切换（单按钮） -->
+                        <template v-if="supportsConversationView">
+                          <button
+                            :title="contentViewMode === 'json' ? '切换到对话视图' : '切换到 JSON 视图'"
+                            class="p-1.5 rounded transition-colors"
+                            :class="hasValidConversation || contentViewMode === 'conversation'
+                              ? 'text-muted-foreground hover:bg-muted'
+                              : 'text-muted-foreground/40 cursor-not-allowed'"
+                            :disabled="!hasValidConversation && contentViewMode === 'json'"
+                            @click="toggleContentView"
+                          >
+                            <Code2
+                              v-if="contentViewMode === 'conversation'"
+                              class="w-4 h-4"
+                            />
+                            <MessageSquareText
+                              v-else
+                              class="w-4 h-4"
+                            />
+                          </button>
+                          <Separator
+                            orientation="vertical"
+                            class="h-4 mx-1"
+                          />
+                        </template>
+
                         <!-- 展开/收缩 -->
                         <button
                           :title="currentExpandDepth === 0 ? '展开全部' : '收缩全部'"
                           class="p-1.5 rounded transition-colors"
-                          :class="viewMode === 'compare'
+                          :class="viewMode === 'compare' || contentViewMode === 'conversation'
                             ? 'text-muted-foreground/40 cursor-not-allowed'
                             : 'text-muted-foreground hover:bg-muted'"
-                          :disabled="viewMode === 'compare'"
+                          :disabled="viewMode === 'compare' || contentViewMode === 'conversation'"
                           @click="currentExpandDepth === 0 ? expandAll() : collapseAll()"
                         >
                           <Maximize2
@@ -389,7 +416,7 @@
                             ? 'text-muted-foreground/40 cursor-not-allowed'
                             : 'text-muted-foreground hover:bg-muted'"
                           :disabled="viewMode === 'compare'"
-                          @click="copyJsonToClipboard(activeTab)"
+                          @click="copyContent(activeTab)"
                         >
                           <Check
                             v-if="copiedStates[activeTab]"
@@ -420,7 +447,15 @@
                     </TabsContent>
 
                     <TabsContent value="request-body">
+                      <!-- 对话视图 -->
+                      <ConversationView
+                        v-if="contentViewMode === 'conversation'"
+                        :conversation="requestConversation"
+                        empty-message="无请求体信息"
+                      />
+                      <!-- JSON 视图 -->
                       <JsonContent
+                        v-else
                         :data="detail.request_body"
                         :view-mode="viewMode"
                         :expand-depth="currentExpandDepth"
@@ -440,7 +475,15 @@
                     </TabsContent>
 
                     <TabsContent value="response-body">
+                      <!-- 对话视图 -->
+                      <ConversationView
+                        v-if="contentViewMode === 'conversation'"
+                        :conversation="responseConversation"
+                        empty-message="无响应体信息"
+                      />
+                      <!-- JSON 视图 -->
                       <JsonContent
+                        v-else
                         :data="detail.response_body"
                         :view-mode="viewMode"
                         :expand-depth="currentExpandDepth"
@@ -480,14 +523,25 @@ import Separator from '@/components/ui/separator.vue'
 import Skeleton from '@/components/ui/skeleton.vue'
 import Tabs from '@/components/ui/tabs.vue'
 import TabsContent from '@/components/ui/tabs-content.vue'
-import { Copy, Check, Maximize2, Minimize2, Columns2, RefreshCw, X, Monitor, Server } from 'lucide-vue-next'
+import { Copy, Check, Maximize2, Minimize2, Columns2, RefreshCw, X, Monitor, Server, MessageSquareText, Code2 } from 'lucide-vue-next'
 import { dashboardApi, type RequestDetail } from '@/api/dashboard'
 import { log } from '@/utils/logger'
 
 // 子组件
 import RequestHeadersContent from './RequestDetailDrawer/RequestHeadersContent.vue'
 import JsonContent from './RequestDetailDrawer/JsonContent.vue'
+import ConversationView from './RequestDetailDrawer/ConversationView.vue'
 import HorizontalRequestTimeline from './HorizontalRequestTimeline.vue'
+
+// 消息提取工具
+import {
+  detectApiFormat,
+  extractRequestMessages,
+  extractResponseMessages,
+  formatConversationAsText,
+  type ExtractedConversation,
+  type ApiFormat,
+} from '../utils/messageExtractor'
 
 const props = defineProps<{
   isOpen: boolean
@@ -506,6 +560,7 @@ const copiedStates = ref<Record<string, boolean>>({})
 const viewMode = ref<'compare' | 'formatted' | 'raw'>('compare')
 const currentExpandDepth = ref(1)
 const dataSource = ref<'client' | 'provider'>('client')
+const contentViewMode = ref<'json' | 'conversation'>('json')
 const { copyToClipboard } = useClipboard()
 const historicalPricing = ref<{
   input_price: string
@@ -519,6 +574,10 @@ const historicalPricing = ref<{
 watch(activeTab, (newTab) => {
   if (newTab !== 'request-headers' && viewMode.value === 'compare') {
     viewMode.value = 'formatted'
+  }
+  // 切换到不支持对话视图的 Tab 时，重置为 JSON 视图
+  if (!['request-body', 'response-body'].includes(newTab)) {
+    contentViewMode.value = 'json'
   }
 })
 
@@ -539,6 +598,50 @@ const currentHeaderData = computed(() => {
   return dataSource.value === 'client'
     ? detail.value.request_headers
     : detail.value.provider_request_headers
+})
+
+// 检测到的 API 格式
+const detectedApiFormat = computed<ApiFormat>(() => {
+  if (!detail.value) return 'unknown'
+  return detectApiFormat(
+    detail.value.request_body,
+    detail.value.response_body,
+    detail.value.api_format
+  )
+})
+
+// 请求体对话提取结果
+const requestConversation = computed<ExtractedConversation>(() => {
+  if (!detail.value?.request_body) {
+    return { messages: [], isStream: false }
+  }
+  return extractRequestMessages(detail.value.request_body, detectedApiFormat.value)
+})
+
+// 响应体对话提取结果
+const responseConversation = computed<ExtractedConversation>(() => {
+  if (!detail.value?.response_body) {
+    return { messages: [], isStream: false }
+  }
+  return extractResponseMessages(detail.value.response_body, detectedApiFormat.value)
+})
+
+// 当前 Tab 是否支持对话视图
+const supportsConversationView = computed(() => {
+  return ['request-body', 'response-body'].includes(activeTab.value)
+})
+
+// 当前对话数据是否有效（用于禁用按钮）
+const hasValidConversation = computed(() => {
+  if (activeTab.value === 'request-body') {
+    return !requestConversation.value.parseError &&
+      (requestConversation.value.system || requestConversation.value.messages.length > 0)
+  }
+  if (activeTab.value === 'response-body') {
+    return !responseConversation.value.parseError &&
+      responseConversation.value.messages.length > 0
+  }
+  return false
 })
 
 // 价格来源标签
@@ -810,6 +913,67 @@ function copyJsonToClipboard(tabName: string) {
     setTimeout(() => {
       copiedStates.value[tabName] = false
     }, 2000)
+  }
+}
+
+// 复制内容（支持 JSON 和对话两种模式）
+function copyContent(tabName: string) {
+  if (!detail.value) return
+  if (viewMode.value === 'compare') return
+
+  let textToCopy = ''
+
+  // 对话视图模式：复制格式化的对话文本
+  if (contentViewMode.value === 'conversation') {
+    if (tabName === 'request-body') {
+      textToCopy = formatConversationAsText(requestConversation.value)
+    } else if (tabName === 'response-body') {
+      textToCopy = formatConversationAsText(responseConversation.value)
+    }
+  } else {
+    // JSON 视图模式：复制原始 JSON
+    let data: any = null
+    switch (tabName) {
+      case 'request-headers':
+        data = dataSource.value === 'provider'
+          ? detail.value.provider_request_headers
+          : detail.value.request_headers
+        break
+      case 'request-body':
+        data = detail.value.request_body
+        break
+      case 'response-headers':
+        data = actualResponseHeaders.value
+        break
+      case 'response-body':
+        data = detail.value.response_body
+        break
+      case 'metadata':
+        data = detail.value.metadata
+        break
+    }
+    if (data) {
+      textToCopy = JSON.stringify(data, null, 2)
+    }
+  }
+
+  if (textToCopy) {
+    copyToClipboard(textToCopy, false)
+    copiedStates.value[tabName] = true
+    setTimeout(() => {
+      copiedStates.value[tabName] = false
+    }, 2000)
+  }
+}
+
+// 切换内容视图模式
+function toggleContentView() {
+  if (contentViewMode.value === 'json') {
+    if (hasValidConversation.value) {
+      contentViewMode.value = 'conversation'
+    }
+  } else {
+    contentViewMode.value = 'json'
   }
 }
 
