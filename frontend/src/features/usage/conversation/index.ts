@@ -38,6 +38,11 @@ export type {
   FormatDetector,
   RequestParser,
   ResponseParser,
+  // 轮次相关类型
+  TurnStats,
+  TurnSummary,
+  ConversationTurn,
+  GroupedConversation,
 } from './types'
 
 // 导出渲染类型
@@ -102,3 +107,16 @@ export {
   renderRequest,
   renderResponse,
 } from './registry'
+
+// 导出轮次分组
+export {
+  groupMessagesIntoTurns,
+  groupConversation,
+  groupRenderBlocksIntoTurns,
+} from './grouper'
+
+// 导出转换器
+export {
+  contentBlockToRenderBlock,
+  contentBlocksToRenderBlocks,
+} from './converter'

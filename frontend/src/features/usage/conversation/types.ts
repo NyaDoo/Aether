@@ -285,3 +285,61 @@ export function createEmptyConversation(
 export function createMessage(role: MessageRole, content: ContentBlock[]): ParsedMessage {
   return { role, content }
 }
+
+// ============================================================
+// 对话轮次相关类型
+// ============================================================
+
+/** 轮次统计信息 */
+export interface TurnStats {
+  /** 用户消息字符数 */
+  userChars: number
+  /** 助手消息字符数 */
+  assistantChars: number
+  /** 是否包含思考过程 */
+  hasThinking: boolean
+  /** 是否包含工具调用 */
+  hasToolUse: boolean
+  /** 工具调用次数 */
+  toolCount: number
+  /** 是否包含图片 */
+  hasImage: boolean
+  /** 是否包含错误 */
+  hasError: boolean
+}
+
+/** 轮次摘要 */
+export interface TurnSummary {
+  /** 用户消息摘要 */
+  user?: string
+  /** 助手消息摘要 */
+  assistant?: string
+}
+
+/** 对话轮次 */
+export interface ConversationTurn {
+  /** 轮次序号（从 1 开始） */
+  index: number
+  /** 用户消息 */
+  user?: ParsedMessage
+  /** 助手回复 */
+  assistant?: ParsedMessage
+  /** 摘要文本（用于折叠预览） */
+  summary: TurnSummary
+  /** 统计信息 */
+  stats: TurnStats
+}
+
+/** 分组后的对话结构 */
+export interface GroupedConversation {
+  /** 系统提示词 */
+  system?: string
+  /** 对话轮次列表 */
+  turns: ConversationTurn[]
+  /** 总轮次数 */
+  totalTurns: number
+  /** 是否为流式响应 */
+  isStream: boolean
+  /** 原始 API 格式 */
+  apiFormat: ApiFormat
+}
