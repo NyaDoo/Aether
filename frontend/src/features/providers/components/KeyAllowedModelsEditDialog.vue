@@ -231,8 +231,15 @@
                     />
                     <span class="text-xs font-medium">上游模型</span>
                     <span class="text-xs text-muted-foreground">({{ upstreamModelNames.length }})</span>
+                    <span
+                      v-if="isAutoFetchMode"
+                      class="text-xs text-muted-foreground"
+                    >
+                      (自动同步)
+                    </span>
                   </div>
                   <button
+                    v-if="!isAutoFetchMode"
                     type="button"
                     class="text-xs text-primary hover:underline"
                     @click.stop="toggleAllUpstreamModels"
@@ -248,12 +255,16 @@
                   <div
                     v-for="model in filteredUpstreamModels"
                     :key="model"
-                    class="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted cursor-pointer"
-                    @click="toggleModel(model)"
+                    class="flex items-center gap-2 px-2 py-1.5 rounded"
+                    :class="isAutoFetchMode ? 'opacity-80' : 'hover:bg-muted cursor-pointer'"
+                    @click="handleUpstreamModelClick(model)"
                   >
                     <div
                       class="w-4 h-4 border rounded flex items-center justify-center shrink-0"
-                      :class="selectedModels.includes(model) ? 'bg-primary border-primary' : ''"
+                      :class="[
+                        selectedModels.includes(model) ? 'bg-primary border-primary' : '',
+                        isAutoFetchMode ? 'opacity-50' : ''
+                      ]"
                     >
                       <Check
                         v-if="selectedModels.includes(model)"
@@ -480,6 +491,13 @@ function toggleAllUpstreamModels() {
         selectedModels.value.push(id)
       }
     })
+  }
+}
+
+// 处理上游模型点击（自动同步模式下禁用）
+function handleUpstreamModelClick(model: string) {
+  if (!isAutoFetchMode.value) {
+    toggleModel(model)
   }
 }
 
