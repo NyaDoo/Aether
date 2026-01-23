@@ -389,12 +389,12 @@ class OpenAIToClaudeConverter:
 
         events: List[Dict[str, Any]] = []
 
-        choices = chunk.get("choices", [])
+        choices = chunk.get("choices") or []
         if not choices:
             return events
 
         choice = choices[0]
-        delta = choice.get("delta", {})
+        delta = choice.get("delta") or {}
         finish_reason = choice.get("finish_reason")
 
         # 处理角色（第一个 chunk）
@@ -429,7 +429,7 @@ class OpenAIToClaudeConverter:
             )
 
         # 处理工具调用
-        tool_calls = delta.get("tool_calls", [])
+        tool_calls = delta.get("tool_calls") or []
         for tool_call in tool_calls:
             index = tool_call.get("index", 0)
 

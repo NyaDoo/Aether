@@ -13,7 +13,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
-    from src.core.api_format import GeminiStreamConversionState, StreamConversionState
+    from src.core.api_format import (
+        ClaudeStreamConversionState,
+        GeminiStreamConversionState,
+        OpenAIStreamConversionState,
+        StreamConversionState,
+    )
 
 
 @dataclass
@@ -91,7 +96,12 @@ class StreamContext:
 
     # 流式格式转换状态（跨 chunk 追踪）
     stream_conversion_state: Optional[
-        Union["StreamConversionState", "GeminiStreamConversionState"]
+        Union[
+            "StreamConversionState",
+            "GeminiStreamConversionState",
+            "ClaudeStreamConversionState",
+            "OpenAIStreamConversionState",
+        ]
     ] = None
 
     def reset_for_retry(self) -> None:

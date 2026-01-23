@@ -36,6 +36,8 @@ class ApiFormatDefinition:
     - auth_type: 认证类型 ("header" 直接放值, "bearer" 加 Bearer 前缀)
     - extra_headers: 该格式必须携带的额外头部（如 anthropic-version）
     - protected_keys: 不应被 extra_headers 覆盖的头部（小写）
+    - model_in_body: 是否需要在请求体中包含 model 字段（Gemini 等格式通过 URL 传递模型名）
+    - stream_in_body: 是否需要在请求体中包含 stream 字段（Gemini 等格式通过 URL 端点区分流式）
     """
 
     api_format: APIFormat
@@ -46,6 +48,8 @@ class ApiFormatDefinition:
     auth_type: str = "bearer"  # "bearer" or "header"
     extra_headers: Mapping[str, str] = field(default_factory=dict)  # 格式必须的额外头部
     protected_keys: frozenset[str] = field(default_factory=frozenset)  # 受保护的头部 key（小写）
+    model_in_body: bool = True  # 是否需要在请求体中包含 model 字段
+    stream_in_body: bool = True  # 是否需要在请求体中包含 stream 字段
 
     def iter_aliases(self) -> Iterable[str]:
         """返回大小写统一后的别名集合，包含枚举名本身。"""
@@ -112,6 +116,8 @@ _DEFINITIONS: Dict[APIFormat, ApiFormatDefinition] = {
         auth_header="x-goog-api-key",
         auth_type="header",
         protected_keys=frozenset({"x-goog-api-key", "content-type"}),
+        model_in_body=False,  # Gemini 通过 URL 路径传递模型名
+        stream_in_body=False,  # Gemini 通过 URL 端点区分流式（streamGenerateContent vs generateContent）
     ),
     APIFormat.GEMINI_CLI: ApiFormatDefinition(
         api_format=APIFormat.GEMINI_CLI,
@@ -121,6 +127,8 @@ _DEFINITIONS: Dict[APIFormat, ApiFormatDefinition] = {
         auth_header="x-goog-api-key",
         auth_type="header",
         protected_keys=frozenset({"x-goog-api-key", "content-type"}),
+        model_in_body=False,  # Gemini 通过 URL 路径传递模型名
+        stream_in_body=False,  # Gemini 通过 URL 端点区分流式
     ),
 }
 

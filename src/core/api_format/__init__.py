@@ -13,6 +13,7 @@ API 格式核心模块
 """
 
 from src.core.api_format.conversion import (
+    ClaudeStreamConversionState,
     ClaudeToGeminiConverter,
     ClaudeToOpenAIConverter,
     FormatConversionError,
@@ -20,6 +21,7 @@ from src.core.api_format.conversion import (
     GeminiStreamConversionState,
     GeminiToClaudeConverter,
     GeminiToOpenAIConverter,
+    OpenAIStreamConversionState,
     OpenAIToClaudeConverter,
     OpenAIToGeminiConverter,
     RequestConverter,
@@ -137,6 +139,8 @@ __all__ = [
     # State
     "StreamConversionState",
     "GeminiStreamConversionState",
+    "ClaudeStreamConversionState",
+    "OpenAIStreamConversionState",
     # Exceptions
     "FormatConversionError",
     # Compatibility

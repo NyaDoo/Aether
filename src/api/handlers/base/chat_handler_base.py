@@ -245,6 +245,77 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         """
         return request_body
 
+    def _set_model_after_conversion(
+        self,
+        request_body: Dict[str, Any],
+        provider_api_format: str,
+        mapped_model: Optional[str],
+        fallback_model: str,
+    ) -> None:
+        """
+        跨格式转换后设置 model 字段
+
+        根据目标格式的 model_in_body 属性决定是否在请求体中设置 model 字段。
+        Gemini 等格式通过 URL 路径传递模型名，不需要在请求体中设置。
+
+        Args:
+            request_body: 请求体字典（会被原地修改）
+            provider_api_format: Provider 侧 API 格式
+            mapped_model: 映射后的模型名
+            fallback_model: 兜底模型名（无映射时使用）
+        """
+        from src.core.api_format import APIFormat
+        from src.core.api_format.metadata import API_FORMAT_DEFINITIONS
+
+        try:
+            target_format = APIFormat(provider_api_format.upper())
+            target_meta = API_FORMAT_DEFINITIONS.get(target_format)
+            if target_meta and target_meta.model_in_body:
+                request_body["model"] = mapped_model or fallback_model
+        except (ValueError, KeyError):
+            # 未知格式，默认设置 model 字段
+            request_body["model"] = mapped_model or fallback_model
+
+    def _set_stream_after_conversion(
+        self,
+        request_body: Dict[str, Any],
+        client_api_format: str,
+        provider_api_format: str,
+        is_stream: bool,
+    ) -> None:
+        """
+        跨格式转换后设置 stream 字段
+
+        当客户端格式不使用 stream 字段（如 Gemini 通过 URL 端点区分流式），
+        而 Provider 格式需要 stream 字段（如 OpenAI/Claude）时，需要显式设置。
+
+        Args:
+            request_body: 请求体字典（会被原地修改）
+            client_api_format: 客户端 API 格式
+            provider_api_format: Provider 侧 API 格式
+            is_stream: 是否为流式请求
+        """
+        from src.core.api_format import APIFormat
+        from src.core.api_format.metadata import API_FORMAT_DEFINITIONS
+
+        try:
+            client_format = APIFormat(client_api_format.upper())
+            provider_format = APIFormat(provider_api_format.upper())
+
+            client_meta = API_FORMAT_DEFINITIONS.get(client_format)
+            provider_meta = API_FORMAT_DEFINITIONS.get(provider_format)
+
+            # 如果客户端格式不使用 stream 字段，但 Provider 格式需要
+            client_uses_stream = client_meta.stream_in_body if client_meta else True
+            provider_uses_stream = provider_meta.stream_in_body if provider_meta else True
+
+            if not client_uses_stream and provider_uses_stream:
+                request_body["stream"] = is_stream
+        except (ValueError, KeyError):
+            # 未知格式，保守处理：如果请求体中没有 stream 字段则设置
+            if "stream" not in request_body:
+                request_body["stream"] = is_stream
+
     async def _get_mapped_model(
         self,
         source_model: str,
@@ -404,7 +475,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             # 透传提供商的响应头给客户端
             # 同时添加必要的 SSE 头以确保流式传输正常工作
             client_headers = filter_proxy_response_headers(ctx.response_headers)
-            # 添加/覆盖 SSE 必需的头
+            # 添加/覆盖 SSE 必需的头（所有格式统一使用 SSE）
             client_headers.update(build_sse_headers())
             client_headers["content-type"] = "text/event-stream"
 
@@ -487,6 +558,20 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 request_body,
                 str(client_api_format),
                 str(provider_api_format),
+            )
+            # 格式转换后，为需要 model 字段的格式设置模型名
+            self._set_model_after_conversion(
+                request_body,
+                str(provider_api_format),
+                mapped_model,
+                ctx.model,
+            )
+            # 格式转换后，为需要 stream 字段的格式设置流式标志
+            self._set_stream_after_conversion(
+                request_body,
+                str(client_api_format),
+                str(provider_api_format),
+                is_stream=True,
             )
         else:
             # 同格式：按原逻辑做轻量清理（子类可覆盖以移除不需要的字段）
@@ -745,6 +830,20 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                     client_api_format,
                     provider_api_format,
                 )
+                # 格式转换后，为需要 model 字段的格式设置模型名
+                self._set_model_after_conversion(
+                    request_body,
+                    provider_api_format,
+                    mapped_model,
+                    model,
+                )
+                # 格式转换后，为需要 stream 字段的格式设置流式标志
+                self._set_stream_after_conversion(
+                    request_body,
+                    client_api_format,
+                    provider_api_format,
+                    is_stream=False,
+                )
             else:
                 # 同格式：按原逻辑做轻量清理（子类可覆盖以移除不需要的字段）
                 request_body = self.prepare_provider_request_body(request_body)
@@ -776,9 +875,6 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 f"模型={model} -> {mapped_model or '无映射'}"
             )
             logger.debug(f"  [{self.request_id}] 请求URL: {redact_url_for_log(url)}")
-            logger.debug(
-                f"  [{self.request_id}] 请求体stream字段: {provider_payload.get('stream', 'N/A')}"
-            )
 
             # 获取复用的 HTTP 客户端（支持代理配置，从 Provider 读取）
             # 注意：使用 get_proxy_client 复用连接池，不再每次创建新客户端

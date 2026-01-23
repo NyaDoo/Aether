@@ -23,7 +23,12 @@ from src.core.metrics import format_conversion_duration_seconds, format_conversi
 from .exceptions import FormatConversionError
 
 if TYPE_CHECKING:
-    from .state import GeminiStreamConversionState, StreamConversionState
+    from .state import (
+        ClaudeStreamConversionState,
+        GeminiStreamConversionState,
+        OpenAIStreamConversionState,
+        StreamConversionState,
+    )
 
 
 @contextmanager
@@ -390,7 +395,14 @@ class FormatConverterRegistry:
         chunk: Dict[str, Any],
         source_format: str,
         target_format: str,
-        state: Optional[Union["StreamConversionState", "GeminiStreamConversionState"]] = None,
+        state: Optional[
+            Union[
+                "StreamConversionState",
+                "GeminiStreamConversionState",
+                "ClaudeStreamConversionState",
+                "OpenAIStreamConversionState",
+            ]
+        ] = None,
     ) -> list[Dict[str, Any]]:
         """
         严格模式流式块转换 - 失败时抛出异常

@@ -453,19 +453,32 @@ class StreamProcessor:
             if needs_conversion:
                 # 延迟导入：仅在需要转换时加载转换器模块
                 from src.core.api_format import (
+                    ClaudeStreamConversionState,
                     GeminiStreamConversionState,
+                    OpenAIStreamConversionState,
                     StreamConversionState,
                     converter_registry,
                 )
 
                 # 初始化流式转换状态（首次使用时，根据 Provider 格式选择状态类）
+                # 状态类对应 Provider 的响应格式，用于正确解析和累积流式数据
                 if ctx.stream_conversion_state is None:
                     if provider_format == "GEMINI":
                         ctx.stream_conversion_state = GeminiStreamConversionState(
                             model=ctx.mapped_model or ctx.model or "",
                             message_id=ctx.response_id or ctx.request_id or "",
                         )
+                    elif provider_format == "OPENAI":
+                        ctx.stream_conversion_state = OpenAIStreamConversionState(
+                            model=ctx.mapped_model or ctx.model or "",
+                        )
+                    elif provider_format == "CLAUDE":
+                        ctx.stream_conversion_state = ClaudeStreamConversionState(
+                            model=ctx.mapped_model or ctx.model or "",
+                            message_id=ctx.response_id or ctx.request_id or "",
+                        )
                     else:
+                        # 兜底：使用通用状态
                         ctx.stream_conversion_state = StreamConversionState(
                             model=ctx.mapped_model or ctx.model or "",
                             message_id=ctx.response_id or ctx.request_id or "",
@@ -545,6 +558,8 @@ class StreamProcessor:
                     skip_next_blank_line = True
                     out: list[bytes] = []
                     for evt in converted_events:
+                        # 统一使用 SSE 格式输出（Gemini streamGenerateContent 也使用 SSE）
+                        # 参考: https://ai.google.dev/api/generate-content
                         out.append(
                             f"data: {json.dumps(evt, ensure_ascii=False)}\n\n".encode("utf-8")
                         )

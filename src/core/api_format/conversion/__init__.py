@@ -33,7 +33,9 @@ from src.core.api_format.conversion.registry import (
     converter_registry,
 )
 from src.core.api_format.conversion.state import (
+    ClaudeStreamConversionState,
     GeminiStreamConversionState,
+    OpenAIStreamConversionState,
     StreamConversionState,
 )
 from src.core.logger import logger
@@ -72,6 +74,8 @@ __all__ = [
     # State
     "StreamConversionState",
     "GeminiStreamConversionState",
+    "ClaudeStreamConversionState",
+    "OpenAIStreamConversionState",
     # Exceptions
     "FormatConversionError",
     # Compatibility

@@ -63,7 +63,52 @@ class GeminiStreamConversionState:
         self.has_sent_usage = False
 
 
+@dataclass
+class ClaudeStreamConversionState:
+    """
+    Claude -> Gemini 流式转换状态
+
+    用于将 Claude SSE 事件流转换为 Gemini JSON 流式响应
+    """
+
+    message_id: str = ""
+    model: str = ""
+    current_block_type: str = ""  # 当前内容块类型（text/tool_use）
+    current_block_index: int = 0
+    current_tool_name: str = ""
+    current_tool_id: str = ""
+    accumulated_tool_input: str = ""  # 累积的工具输入 JSON
+
+    def reset(self) -> None:
+        """重置状态（重试时调用）"""
+        self.current_block_type = ""
+        self.current_block_index = 0
+        self.current_tool_name = ""
+        self.current_tool_id = ""
+        self.accumulated_tool_input = ""
+
+
+@dataclass
+class OpenAIStreamConversionState:
+    """
+    OpenAI -> Gemini 流式转换状态
+
+    用于将 OpenAI SSE 事件流转换为 Gemini JSON 流式响应
+    """
+
+    model: str = ""
+    current_tool_name: str = ""
+    accumulated_tool_args: str = ""  # 累积的工具参数 JSON
+
+    def reset(self) -> None:
+        """重置状态（重试时调用）"""
+        self.current_tool_name = ""
+        self.accumulated_tool_args = ""
+
+
 __all__ = [
     "StreamConversionState",
     "GeminiStreamConversionState",
+    "ClaudeStreamConversionState",
+    "OpenAIStreamConversionState",
 ]

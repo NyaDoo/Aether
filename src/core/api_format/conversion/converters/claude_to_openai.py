@@ -370,7 +370,7 @@ class ClaudeToOpenAIConverter:
             return None
 
         if event_type == "content_block_delta":
-            delta_payload = event.get("delta", {})
+            delta_payload = event.get("delta") or {}
             delta_type = delta_payload.get("type")
 
             if delta_type == "text_delta":
@@ -390,7 +390,7 @@ class ClaudeToOpenAIConverter:
             return None
 
         if event_type == "message_delta":
-            delta = event.get("delta", {})
+            delta = event.get("delta") or {}
             stop_reason = delta.get("stop_reason")
             finish_reason = self.STOP_REASON_MAP.get(stop_reason, stop_reason)
             return self._base_chunk(chunk_id, model, {}, finish_reason=finish_reason)
