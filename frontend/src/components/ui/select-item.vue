@@ -14,7 +14,9 @@ const props = defineProps<Props>()
 
 const itemClass = computed(() =>
   cn(
-    'relative flex w-full cursor-pointer select-none items-center rounded-lg py-1.5 pl-8 pr-2 text-sm outline-none hover:bg-primary/10 focus:bg-primary/15 text-foreground transition-colors data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
+    'relative flex w-full cursor-pointer select-none items-center rounded-lg py-1.5 pl-8 pr-2 text-sm outline-none',
+    'data-[highlighted]:bg-accent focus:bg-accent text-foreground',
+    'transition-colors data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
     props.class
   )
 )
