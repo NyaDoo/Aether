@@ -17,7 +17,7 @@ defineEmits<{
 const itemClass = computed(() =>
   cn(
     'relative flex cursor-pointer select-none items-center rounded-lg px-3 py-1.5 text-sm outline-none',
-    'hover:bg-accent focus:bg-accent focus:text-accent-foreground',
+    'data-[highlighted]:bg-accent focus:bg-accent text-foreground',
     'transition-colors data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
     props.class
   )

@@ -41,37 +41,60 @@
       <!-- 映射名称选择面板 -->
       <div class="space-y-1.5">
         <Label class="text-xs">映射名称</Label>
-        <div class="border rounded-lg overflow-hidden">
-          <!-- 搜索 + 操作栏 -->
-          <div class="flex items-center gap-2 p-2 border-b bg-muted/30">
-            <div class="relative flex-1">
-              <Search class="absolute left-2 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-              <Input
-                v-model="searchQuery"
-                placeholder="搜索或添加自定义映射名称..."
-                class="pl-8 h-8 text-sm"
-              />
-            </div>
-            <!-- 已选数量徽章 -->
-            <span
-              v-if="selectedNames.length === 0"
-              class="h-6 px-2 text-xs rounded flex items-center bg-muted text-muted-foreground shrink-0"
-            >
-              未选择
-            </span>
-            <span
-              v-else
-              class="h-6 px-2 text-xs rounded flex items-center bg-primary/10 text-primary shrink-0"
-            >
-              已选 {{ selectedNames.length }} 个
-            </span>
-            <Loader2
-              v-if="fetchingUpstreamModels"
-              class="w-4 h-4 animate-spin text-muted-foreground shrink-0"
+        <!-- 搜索栏 -->
+        <div class="flex items-center gap-2">
+          <div class="flex-1 relative">
+            <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              v-model="searchQuery"
+              placeholder="搜索或添加自定义映射名称..."
+              class="pl-8 h-9"
             />
           </div>
+          <!-- 已选数量徽章 -->
+          <span
+            v-if="selectedNames.length === 0"
+            class="h-7 px-2.5 text-xs rounded-md flex items-center bg-muted text-muted-foreground shrink-0"
+          >
+            未选择
+          </span>
+          <span
+            v-else
+            class="h-7 px-2.5 text-xs rounded-md flex items-center bg-primary/10 text-primary shrink-0"
+          >
+            已选 {{ selectedNames.length }} 个
+          </span>
+          <!-- 刷新上游模型按钮 -->
+          <button
+            v-if="upstreamModelsLoaded"
+            type="button"
+            class="p-2 hover:bg-muted rounded-md transition-colors shrink-0"
+            :disabled="fetchingUpstreamModels"
+            title="刷新上游模型"
+            @click="fetchUpstreamModels()"
+          >
+            <RefreshCw
+              class="w-4 h-4"
+              :class="{ 'animate-spin': fetchingUpstreamModels }"
+            />
+          </button>
+          <button
+            v-else-if="!fetchingUpstreamModels"
+            type="button"
+            class="p-2 hover:bg-muted rounded-md transition-colors shrink-0"
+            title="从提供商获取模型"
+            @click="fetchUpstreamModels()"
+          >
+            <Zap class="w-4 h-4" />
+          </button>
+          <Loader2
+            v-else
+            class="w-4 h-4 animate-spin text-muted-foreground shrink-0"
+          />
+        </div>
 
-          <!-- 分组列表 -->
+        <!-- 模型列表 -->
+        <div class="border rounded-lg overflow-hidden">
           <div class="max-h-80 overflow-y-auto">
             <!-- 加载中 -->
             <div
@@ -102,7 +125,7 @@
               <!-- 自定义映射名称 -->
               <div v-if="customNames.length > 0">
                 <div
-                  class="flex items-center justify-between px-3 h-9 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors border-b border-border/30"
+                  class="flex items-center justify-between px-3 py-2 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors"
                   @click="toggleGroupCollapse('custom')"
                 >
                   <div class="flex items-center gap-2">
@@ -141,7 +164,7 @@
               <!-- 上游模型 -->
               <template v-if="filteredUpstreamModels.length > 0">
                 <div
-                  class="flex items-center justify-between px-3 h-9 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors border-b border-border/30"
+                  class="flex items-center justify-between px-3 py-2 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors"
                   @click="toggleGroupCollapse('upstream')"
                 >
                   <div class="flex items-center gap-2">
@@ -226,7 +249,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { Tag, Loader2, Plus, Search, Check, ChevronDown } from 'lucide-vue-next'
+import { Tag, Loader2, Plus, Search, Check, ChevronDown, RefreshCw, Zap } from 'lucide-vue-next'
 import {
   Button,
   Input,
@@ -263,6 +286,7 @@ const props = defineProps<{
   models: Model[]
   editingGroup?: AliasGroup | null
   preselectedModelId?: string | null
+  hasAutoFetchKey?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -278,6 +302,7 @@ const submitting = ref(false)
 const modelSelectOpen = ref(false)
 const loadingModels = ref(false)
 const fetchingUpstreamModels = ref(false)
+const upstreamModelsLoaded = ref(false)
 
 // 搜索
 const searchQuery = ref('')
@@ -426,6 +451,7 @@ async function fetchUpstreamModels() {
     const result = await fetchCachedModels(props.providerId)
     if (result.models.length > 0) {
       upstreamModels.value = result.models
+      upstreamModelsLoaded.value = true
       // 获取上游模型后，将不在上游列表中的已选名称添加到自定义列表
       const upstreamIds = new Set(result.models.map(m => m.id))
       const customFromSelected = selectedNames.value.filter(name => !upstreamIds.has(name))
@@ -448,8 +474,10 @@ async function fetchUpstreamModels() {
 watch(() => props.open, async (isOpen) => {
   if (isOpen) {
     initForm()
-    // 加载上游模型
-    await fetchUpstreamModels()
+    // 只有在有 key 配置了自动获取时才自动加载上游模型
+    if (props.hasAutoFetchKey) {
+      await fetchUpstreamModels()
+    }
   }
 })
 
@@ -469,6 +497,8 @@ function initForm() {
     allCustomNames.value = []
   }
   searchQuery.value = ''
+  upstreamModels.value = []
+  upstreamModelsLoaded.value = false
   // 默认展开所有分组
   collapsedGroups.value = new Set()
 }

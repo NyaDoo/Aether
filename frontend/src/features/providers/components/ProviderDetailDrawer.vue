@@ -413,6 +413,7 @@
                 ref="modelMappingTabRef"
                 :key="`mapping-${provider.id}`"
                 :provider="provider"
+                :provider-keys="providerKeys"
                 @refresh="handleModelMappingChanged"
               />
             </div>

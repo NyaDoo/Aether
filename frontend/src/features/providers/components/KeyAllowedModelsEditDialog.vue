@@ -9,57 +9,66 @@
   >
     <template #default>
       <div class="space-y-4">
-        <!-- 常驻选择面板 -->
-        <div class="border rounded-lg overflow-hidden">
-          <!-- 搜索 + 操作栏 -->
-          <div class="flex items-center gap-2 p-2 border-b bg-muted/30">
-            <div class="relative flex-1">
-              <Search class="absolute left-2 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-              <Input
-                v-model="searchQuery"
-                placeholder="搜索模型或添加自定义模型..."
-                class="pl-8 h-8 text-sm"
-              />
-            </div>
-            <!-- 已选数量徽章 -->
-            <span
-              v-if="selectedModels.length === 0 && !isAutoFetchMode"
-              class="h-6 px-2 text-xs rounded flex items-center bg-muted text-muted-foreground shrink-0"
-            >
-              全部模型
-            </span>
-            <span
-              v-else-if="selectedModels.length === 0 && isAutoFetchMode"
-              class="h-6 px-2 text-xs rounded flex items-center bg-amber-500/10 text-amber-600 dark:text-amber-400 shrink-0"
-            >
-              未选择模型
-            </span>
-            <span
-              v-else
-              class="h-6 px-2 text-xs rounded flex items-center bg-primary/10 text-primary shrink-0"
-            >
-              已选 {{ selectedModels.length }} 个
-            </span>
-            <!-- 刷新上游模型按钮 -->
-            <button
-              type="button"
-              class="h-6 w-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors shrink-0"
-              :disabled="fetchingUpstreamModels"
-              title="刷新上游模型"
-              @click="refreshUpstreamModels"
-            >
-              <RefreshCw
-                v-if="!fetchingUpstreamModels"
-                class="w-3.5 h-3.5"
-              />
-              <Loader2
-                v-else
-                class="w-3.5 h-3.5 animate-spin"
-              />
-            </button>
+        <!-- 搜索栏 -->
+        <div class="flex items-center gap-2">
+          <div class="flex-1 relative">
+            <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              v-model="searchQuery"
+              placeholder="搜索模型或添加自定义模型..."
+              class="pl-8 h-9"
+            />
           </div>
+          <!-- 已选数量徽章 -->
+          <span
+            v-if="selectedModels.length === 0 && !isAutoFetchMode"
+            class="h-7 px-2.5 text-xs rounded-md flex items-center bg-muted text-muted-foreground shrink-0"
+          >
+            全部模型
+          </span>
+          <span
+            v-else-if="selectedModels.length === 0 && isAutoFetchMode"
+            class="h-7 px-2.5 text-xs rounded-md flex items-center bg-amber-500/10 text-amber-600 dark:text-amber-400 shrink-0"
+          >
+            未选择模型
+          </span>
+          <span
+            v-else
+            class="h-7 px-2.5 text-xs rounded-md flex items-center bg-primary/10 text-primary shrink-0"
+          >
+            已选 {{ selectedModels.length }} 个
+          </span>
+          <!-- 刷新上游模型按钮 -->
+          <button
+            v-if="upstreamModelsLoaded"
+            type="button"
+            class="p-2 hover:bg-muted rounded-md transition-colors shrink-0"
+            :disabled="fetchingUpstreamModels"
+            title="刷新上游模型"
+            @click="refreshUpstreamModels"
+          >
+            <RefreshCw
+              class="w-4 h-4"
+              :class="{ 'animate-spin': fetchingUpstreamModels }"
+            />
+          </button>
+          <button
+            v-else-if="!fetchingUpstreamModels"
+            type="button"
+            class="p-2 hover:bg-muted rounded-md transition-colors shrink-0"
+            title="从提供商获取模型"
+            @click="refreshUpstreamModels"
+          >
+            <Zap class="w-4 h-4" />
+          </button>
+          <Loader2
+            v-else
+            class="w-4 h-4 animate-spin text-muted-foreground shrink-0"
+          />
+        </div>
 
-          <!-- 分组列表 -->
+        <!-- 模型列表 -->
+        <div class="border rounded-lg overflow-hidden">
           <div class="max-h-96 overflow-y-auto">
             <!-- 加载中 -->
             <div
@@ -90,7 +99,7 @@
               <!-- 自定义模型 -->
               <div v-if="customModels.length > 0">
                 <div
-                  class="flex items-center justify-between px-3 h-9 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors border-b border-border/30"
+                  class="flex items-center justify-between px-3 py-2 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors"
                   @click="toggleGroupCollapse('custom')"
                 >
                   <div class="flex items-center gap-2">
@@ -146,7 +155,7 @@
               <template v-if="filteredGlobalModels.length > 0">
                 <!-- 标题 sticky top -->
                 <div
-                  class="flex items-center justify-between px-3 h-9 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors border-b border-border/30"
+                  class="flex items-center justify-between px-3 py-2 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors"
                   @click="toggleGroupCollapse('global')"
                 >
                   <div class="flex items-center gap-2">
@@ -215,13 +224,9 @@
 
               <!-- 上游模型 -->
               <template v-if="filteredUpstreamModels.length > 0">
-                <!-- 标题 sticky（双向粘性：top 和 bottom） -->
+                <!-- 标题 sticky -->
                 <div
-                  class="flex items-center justify-between px-3 h-9 bg-muted sticky z-20 cursor-pointer hover:bg-muted/80 transition-colors border-b border-border/30"
-                  :style="{
-                    top: filteredGlobalModels.length > 0 ? '36px' : '0px',
-                    bottom: '0px'
-                  }"
+                  class="flex items-center justify-between px-3 py-2 bg-muted sticky top-0 z-20 cursor-pointer hover:bg-muted/80 transition-colors"
                   @click="toggleGroupCollapse('upstream')"
                 >
                   <div class="flex items-center gap-2">
@@ -353,7 +358,8 @@ import {
   ChevronDown,
   Lock,
   LockOpen,
-  RefreshCw
+  RefreshCw,
+  Zap
 } from 'lucide-vue-next'
 import { Dialog, Button, Input } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
@@ -706,6 +712,8 @@ async function refreshUpstreamModels() {
   await fetchUpstreamModels(true)
   if (upstreamModels.value.length > 0) {
     success('上游模型已刷新')
+    // 获取成功后收缩所有分组
+    collapsedGroups.value = new Set(['global', 'upstream', 'custom'])
   }
 }
 
@@ -736,21 +744,19 @@ watch(() => props.open, async (open) => {
     upstreamModelsLoaded.value = false
     allCustomModels.value = []
 
-    // 默认全部收缩，自动获取模式下展开上游模型
+    // 自动获取模式下展开上游模型，其他收缩；非自动获取模式下全部展开
     if (props.apiKey.auto_fetch_models) {
       collapsedGroups.value = new Set(['global', 'custom'])
     } else {
-      collapsedGroups.value = new Set(['global', 'upstream', 'custom'])
+      collapsedGroups.value = new Set()
     }
 
     // 加载全局模型
     await loadGlobalModels()
 
-    // 自动获取上游模型
-    await fetchUpstreamModels()
-
-    // 自动获取模式下，用最新上游模型刷新（保留锁定的模型）
+    // 自动获取模式下，获取上游模型并刷新（保留锁定的模型）
     if (props.apiKey.auto_fetch_models) {
+      await fetchUpstreamModels()
       // 锁定的模型 + 最新上游模型（去重）
       const newSelected = new Set(lockedModels.value)
       upstreamModelNames.value.forEach(m => newSelected.add(m))

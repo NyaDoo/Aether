@@ -296,6 +296,7 @@
     :models="models"
     :editing-group="editingGroup"
     :preselected-model-id="preselectedModelId"
+    :has-auto-fetch-key="hasAutoFetchKey"
     @saved="onDialogSaved"
   />
 
@@ -362,6 +363,7 @@ interface CombinedMapping {
 
 const props = defineProps<{
   provider: any
+  providerKeys?: EndpointAPIKey[]
 }>()
 
 const emit = defineEmits<{
@@ -392,6 +394,12 @@ const formatMenuOpen = ref<Record<string, boolean>>({})
 
 // 展开状态
 const expandedItems = ref<Set<number>>(new Set())
+
+// 是否有 key 配置了自动获取上游模型
+const hasAutoFetchKey = computed(() => {
+  const keys = props.providerKeys || providerKeys.value
+  return keys.some(k => k.auto_fetch_models)
+})
 
 // 生成作用域唯一键
 function getApiFormatsKey(formats: string[] | undefined): string {

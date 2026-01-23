@@ -57,7 +57,7 @@
       </p>
       <p
         v-if="toast.message"
-        class="text-sm"
+        class="text-sm break-words"
         :class="messageClasses"
       >
         {{ toast.message }}
