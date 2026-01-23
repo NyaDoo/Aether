@@ -247,6 +247,11 @@ class ModelCacheService:
             await CacheService.delete(f"global_model:name:{name}")
             # 同时清除 resolve 缓存，因为 GlobalModel.name 也是一个 resolve key
             await CacheService.delete(f"global_model:resolve:{name}")
+        # 全量清除 resolve 缓存，确保映射规则变更后不命中旧缓存
+        try:
+            await CacheService.delete_pattern("global_model:resolve:*")
+        except Exception as e:
+            logger.error(f"GlobalModel resolve 缓存清除失败，可能导致映射不一致: {e}")
         logger.debug(f"GlobalModel 缓存已清除: {global_model_id}")
 
     @staticmethod
@@ -260,10 +265,11 @@ class ModelCacheService:
         1. 检查缓存
         2. 直接匹配 GlobalModel.name
         3. 通过 provider_model_name 匹配（查询 Model 表）
+        4. 通过 provider_model_mappings 匹配（查询 Model 表）
+        5. 通过 GlobalModel.config.model_mappings 匹配（支持正则）
 
-        注意：此方法不使用 provider_model_mappings 进行全局解析。
-        provider_model_mappings 是 Provider 级别的映射配置，只在特定 Provider 上下文中生效，
-        由 resolve_provider_model() 处理。
+        注意：provider_model_mappings 是 Provider 级别的映射配置，可能存在跨 Provider 冲突；
+        如匹配到多个 GlobalModel，将记录告警并选择第一个匹配结果。
 
         Args:
             db: 数据库会话
@@ -319,10 +325,7 @@ class ModelCacheService:
                 logger.debug(f"GlobalModel 已缓存(映射解析-直接匹配): {normalized_name}")
                 return global_model
 
-            # 3. 通过 provider_model_name 匹配（不考虑 provider_model_mappings）
-            # 重要：provider_model_mappings 是 Provider 级别的映射配置，只在特定 Provider 上下文中生效
-            # 全局解析不应该受到某个 Provider 映射配置的影响
-            # 例如：Provider A 把 "haiku" 映射到 "sonnet"，不应该影响 Provider B 的 "haiku" 解析
+            # 3. 通过 provider_model_name 匹配
             from src.models.database import Provider
 
             models_with_global = (
@@ -375,7 +378,123 @@ class ModelCacheService:
                 )
                 return result_global_model
 
-            # 4. 完全未找到
+            # 4. 通过 provider_model_mappings 匹配
+            models_with_mappings = (
+                db.query(Model, GlobalModel)
+                .join(Provider, Model.provider_id == Provider.id)
+                .join(GlobalModel, Model.global_model_id == GlobalModel.id)
+                .filter(
+                    Provider.is_active == True,
+                    Model.is_active == True,
+                    GlobalModel.is_active == True,
+                    Model.provider_model_mappings.isnot(None),
+                )
+                .all()
+            )
+
+            mapping_matched_global_models: List[GlobalModel] = []
+            mapping_seen_ids: set[str] = set()
+            for model, gm in models_with_mappings:
+                raw_mappings = model.provider_model_mappings
+                if not isinstance(raw_mappings, list):
+                    continue
+                for raw in raw_mappings:
+                    if not isinstance(raw, dict):
+                        continue
+                    name = raw.get("name")
+                    if not isinstance(name, str):
+                        continue
+                    if name.strip() != normalized_name:
+                        continue
+                    if gm.id not in mapping_seen_ids:
+                        mapping_seen_ids.add(gm.id)
+                        mapping_matched_global_models.append(gm)
+                        logger.debug(
+                            f"模型名称 '{normalized_name}' 通过 provider_model_mappings 匹配到 "
+                            f"GlobalModel: {gm.name} (Model: {model.id[:8]}...)"
+                        )
+                    break
+
+            if mapping_matched_global_models:
+                resolution_method = "provider_model_mappings"
+
+                if len(mapping_matched_global_models) > 1:
+                    model_names = [gm.name for gm in mapping_matched_global_models if gm.name]
+                    logger.warning(
+                        f"模型映射冲突: 名称 '{normalized_name}' 匹配到多个不同的 GlobalModel: "
+                        f"{', '.join(model_names)}，使用第一个匹配结果"
+                    )
+                    model_mapping_conflict_total.inc()
+
+                # 按名称排序确保确定性
+                result_global_model = sorted(
+                    mapping_matched_global_models, key=lambda gm: gm.name or ""
+                )[0]
+                global_model_dict = ModelCacheService._global_model_to_dict(result_global_model)
+                await CacheService.set(
+                    cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
+                )
+                logger.debug(
+                    f"GlobalModel 已缓存(映射解析-{resolution_method}): "
+                    f"{normalized_name} -> {result_global_model.name}"
+                )
+                return result_global_model
+
+            # 5. 通过 GlobalModel.config.model_mappings 匹配（支持正则）
+            from sqlalchemy import func
+
+            from src.core.model_permissions import match_model_with_pattern
+
+            mapping_rows = (
+                db.query(GlobalModel)
+                .filter(
+                    GlobalModel.is_active == True,
+                    GlobalModel.config.isnot(None),
+                    GlobalModel.config["model_mappings"].isnot(None),
+                    func.jsonb_array_length(GlobalModel.config["model_mappings"]) > 0,
+                )
+                .all()
+            )
+
+            mapping_matches: List[GlobalModel] = []
+            for gm in mapping_rows:
+                config = gm.config or {}
+                mappings = config.get("model_mappings")
+                if not isinstance(mappings, list):
+                    continue
+                for pattern in mappings:
+                    if isinstance(pattern, str) and match_model_with_pattern(
+                        pattern, normalized_name
+                    ):
+                        mapping_matches.append(gm)
+                        break
+
+            if mapping_matches:
+                resolution_method = "model_mappings"
+
+                if len(mapping_matches) > 1:
+                    model_names = [gm.name for gm in mapping_matches if gm.name]
+                    logger.warning(
+                        f"模型映射冲突: 名称 '{normalized_name}' 匹配到多个不同的 GlobalModel: "
+                        f"{', '.join(model_names)}，使用第一个匹配结果"
+                    )
+                    model_mapping_conflict_total.inc()
+
+                # 按名称排序确保确定性
+                result_global_model = sorted(
+                    mapping_matches, key=lambda gm: gm.name or ""
+                )[0]
+                global_model_dict = ModelCacheService._global_model_to_dict(result_global_model)
+                await CacheService.set(
+                    cache_key, global_model_dict, ttl_seconds=ModelCacheService.CACHE_TTL
+                )
+                logger.debug(
+                    f"GlobalModel 已缓存(映射解析-{resolution_method}): "
+                    f"{normalized_name} -> {result_global_model.name}"
+                )
+                return result_global_model
+
+            # 6. 完全未找到
             resolution_method = "not_found"
             # 未找到匹配，缓存负结果
             await CacheService.set(

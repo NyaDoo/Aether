@@ -70,6 +70,8 @@ def is_format_compatible(
         return False, False, "端点未配置格式转换"
 
     config = endpoint_format_acceptance_config
+    if not isinstance(config, dict):
+        return False, False, "端点格式配置无效"
     if not config.get("enabled", False):
         return False, False, "端点格式转换未启用"
 
