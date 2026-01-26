@@ -36,9 +36,8 @@
                 </Badge>
               </div>
               <div class="flex items-center gap-1.5">
-                <!-- 格式转换按钮（非 CLI 格式才显示） -->
+                <!-- 格式转换按钮 -->
                 <Button
-                  v-if="!endpoint.api_format.endsWith('_CLI')"
                   variant="ghost"
                   size="icon"
                   class="h-7 w-7 mr-1"

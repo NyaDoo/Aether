@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.api.handlers.base.stream_context import StreamContext
-from src.core.api_format import StreamConversionState
+from src.core.api_format.conversion.stream_state import StreamState
 
 
 # Mock CliMessageHandlerBase 用于测试
@@ -29,7 +29,12 @@ class MockCliHandler:
         events: list,
     ) -> List[str]:
         """复制自 CliMessageHandlerBase._convert_sse_line"""
-        from src.core.api_format import converter_registry
+        from src.core.api_format.conversion import (
+            format_conversion_registry,
+            register_default_normalizers,
+        )
+
+        register_default_normalizers()
 
         # 如果是空行或特殊控制行，直接返回
         if not line or line.strip() == "" or line == "data: [DONE]":
@@ -50,7 +55,7 @@ class MockCliHandler:
 
         # 初始化流式转换状态
         if ctx.stream_conversion_state is None:
-            ctx.stream_conversion_state = StreamConversionState(
+            ctx.stream_conversion_state = StreamState(
                 model=ctx.mapped_model or ctx.model,
                 message_id=ctx.response_id or ctx.request_id,
             )
@@ -59,18 +64,12 @@ class MockCliHandler:
         client_format = ctx.client_api_format or ""
 
         try:
-            converted_events = converter_registry.convert_stream_chunk_strict(
+            converted_events = format_conversion_registry.convert_stream_chunk(
                 data_obj,
                 provider_format,
                 client_format,
                 state=ctx.stream_conversion_state,
             )
-
-            if converted_events and not ctx.stream_conversion_state.message_started:
-                for evt in converted_events:
-                    if evt.get("type") == "message_start" or evt.get("choices"):
-                        ctx.stream_conversion_state.message_started = True
-                        break
 
             result = []
             for evt in converted_events:
@@ -168,24 +167,12 @@ class TestConvertSseLineOneInManyOut:
 
     @pytest.fixture(autouse=True)
     def setup_converters(self):
-        """注册测试用转换器"""
-        from src.core.api_format import (
-            ClaudeToOpenAIConverter,
-            OpenAIToClaudeConverter,
-            converter_registry,
-        )
+        """确保 Canonical normalizers 已注册"""
+        from src.core.api_format.conversion import register_default_normalizers
 
-        # 保存原始状态
-        original_converters = converter_registry._converters.copy()
-
-        # 注册转换器
-        converter_registry.register("OPENAI", "CLAUDE", OpenAIToClaudeConverter())
-        converter_registry.register("CLAUDE", "OPENAI", ClaudeToOpenAIConverter())
+        register_default_normalizers()
 
         yield
-
-        # 恢复原始状态
-        converter_registry._converters = original_converters
 
     def test_openai_to_claude_conversion(self) -> None:
         """测试 OpenAI -> Claude 流式转换"""
@@ -210,9 +197,6 @@ class TestConvertSseLineOneInManyOut:
         assert len(result1) >= 1
         first_event = json.loads(result1[0][6:])
         assert first_event.get("type") == "message_start"
-
-        # 状态应更新
-        assert ctx.stream_conversion_state.message_started is True
 
     def test_claude_to_openai_conversion(self) -> None:
         """测试 Claude -> OpenAI 流式转换"""
@@ -247,7 +231,6 @@ class TestConvertSseLineOneInManyOut:
         handler._convert_sse_line(ctx, f"data: {json.dumps(chunk1)}", [])
 
         state_after_first = ctx.stream_conversion_state
-        message_started_after_first = state_after_first.message_started
 
         # 第二个 chunk
         chunk2 = {"choices": [{"delta": {"content": "hello"}}]}
@@ -255,8 +238,6 @@ class TestConvertSseLineOneInManyOut:
 
         # 状态应该是同一个对象
         assert ctx.stream_conversion_state is state_after_first
-        # message_started 应该保持 True
-        assert ctx.stream_conversion_state.message_started is True
 
 
 class TestStreamContextIntegration:
@@ -265,9 +246,7 @@ class TestStreamContextIntegration:
     def test_stream_conversion_state_reset_on_retry(self) -> None:
         """测试重试时重置流式转换状态"""
         ctx = StreamContext(model="test", api_format="OPENAI")
-        ctx.stream_conversion_state = StreamConversionState(
-            model="test", message_id="123", message_started=True
-        )
+        ctx.stream_conversion_state = StreamState(model="test", message_id="123")
 
         ctx.reset_for_retry()
 

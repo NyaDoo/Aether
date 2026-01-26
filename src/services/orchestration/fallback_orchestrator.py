@@ -30,7 +30,8 @@ from redis import Redis
 from sqlalchemy.orm import Session
 
 from src.config.settings import config
-from src.core.api_format import APIFormat, FormatConversionError
+from src.core.api_format import APIFormat
+from src.core.api_format.conversion.exceptions import FormatConversionError
 from src.core.error_utils import extract_error_message
 from src.core.exceptions import (
     ConcurrencyLimitError,

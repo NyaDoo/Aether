@@ -1,7 +1,8 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from src.core.api_format import APIFormat, register_all_converters
+from src.core.api_format import APIFormat
+from src.core.api_format.conversion import register_default_normalizers
 from src.services.cache.aware_scheduler import CacheAwareScheduler
 
 
@@ -26,7 +27,7 @@ def _mock_endpoint(api_format: str, config: dict | None = None) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_build_candidates_blocks_cross_format_when_global_switch_off() -> None:
-    register_all_converters()
+    register_default_normalizers()
 
     scheduler = CacheAwareScheduler()
     scheduler._check_model_support = AsyncMock(return_value=(True, None, None, {"m"}))  # type: ignore[attr-defined]
@@ -56,7 +57,7 @@ async def test_build_candidates_blocks_cross_format_when_global_switch_off() -> 
 
 @pytest.mark.asyncio
 async def test_build_candidates_includes_cross_format_when_enabled() -> None:
-    register_all_converters()
+    register_default_normalizers()
 
     scheduler = CacheAwareScheduler()
     scheduler._check_model_support = AsyncMock(return_value=(True, None, None, {"m"}))  # type: ignore[attr-defined]
@@ -88,7 +89,7 @@ async def test_build_candidates_includes_cross_format_when_enabled() -> None:
 
 @pytest.mark.asyncio
 async def test_exact_matches_rank_before_convertible() -> None:
-    register_all_converters()
+    register_default_normalizers()
 
     scheduler = CacheAwareScheduler()
     scheduler._check_model_support = AsyncMock(return_value=(True, None, None, {"m"}))  # type: ignore[attr-defined]

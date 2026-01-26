@@ -22,7 +22,7 @@ Chat Handler Base - Chat API 格式的通用基类
 import asyncio
 import json
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Callable, Dict, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Optional, Union
 
 import httpx
 from fastapi import BackgroundTasks, Request
@@ -36,7 +36,11 @@ from src.api.handlers.base.response_parser import ResponseParser
 from src.api.handlers.base.stream_context import StreamContext
 from src.api.handlers.base.stream_processor import StreamProcessor
 from src.api.handlers.base.stream_telemetry import StreamTelemetryRecorder
-from src.api.handlers.base.utils import build_sse_headers, filter_proxy_response_headers
+from src.api.handlers.base.utils import (
+    build_sse_headers,
+    filter_proxy_response_headers,
+    get_format_converter_registry,
+)
 from src.config.settings import config
 from src.core.error_utils import extract_client_error_message
 from src.core.exceptions import (
@@ -46,6 +50,7 @@ from src.core.exceptions import (
     ProviderRateLimitException,
     ProviderTimeoutException,
     ThinkingSignatureException,
+    UpstreamClientException,
 )
 from src.core.logger import logger
 from src.models.database import (
@@ -57,6 +62,91 @@ from src.models.database import (
 )
 from src.services.cache.aware_scheduler import ProviderCandidate
 from src.services.provider.transport import build_provider_url, redact_url_for_log
+
+
+def _get_error_status_code(e: Exception, default: int = 400) -> int:
+    """从异常中提取 HTTP 状态码"""
+    code = getattr(e, "status_code", None)
+    return code if isinstance(code, int) and code > 0 else default
+
+
+def _convert_error_response_best_effort(
+    error_response: Dict[str, Any],
+    source_format: str,
+    target_format: str,
+) -> Dict[str, Any]:
+    """
+    将上游错误响应 best-effort 转换为客户端格式。
+
+    说明：错误转换走 Canonical registry。转换失败时构造安全的通用错误响应，
+    避免泄露上游原始错误详情。
+    """
+    try:
+        registry = get_format_converter_registry()
+        return registry.convert_error_response(error_response, source_format, target_format)
+    except Exception as e:
+        logger.debug(f"错误响应转换失败 ({source_format} -> {target_format}): {e}")
+        # 转换失败时构造安全的通用错误，避免泄露上游详情
+        return _build_client_error_response_best_effort("upstream error", target_format)
+
+
+def _build_client_error_response_best_effort(
+    message: str,
+    target_format: str,
+) -> Dict[str, Any]:
+    """
+    当无法解析上游错误 body 时，构造一个目标格式的错误响应（best-effort）。
+    """
+    try:
+        from src.core.api_format.conversion.internal import ErrorType, InternalError
+
+        registry = get_format_converter_registry()
+        normalizer = registry.get_normalizer(target_format)
+        if normalizer and normalizer.capabilities.supports_error_conversion:
+            return normalizer.error_from_internal(
+                InternalError(type=ErrorType.INVALID_REQUEST, message=message, retryable=False)
+            )
+    except Exception as e:
+        logger.debug(f"构建客户端错误响应失败 (target={target_format}): {e}")
+
+    return {"error": {"type": "upstream_client_error", "message": message}}
+
+
+def _build_error_json_payload(
+    e: Union[ThinkingSignatureException, UpstreamClientException],
+    client_format: str,
+    provider_format: str,
+    needs_conversion: bool = True,
+) -> Dict[str, Any]:
+    """
+    构建错误 JSON 响应 payload（公共逻辑）。
+
+    从异常中提取上游错误信息，尝试转换为客户端格式。
+
+    Args:
+        e: ThinkingSignatureException 或 UpstreamClientException
+        client_format: 客户端 API 格式
+        provider_format: Provider API 格式
+        needs_conversion: 是否需要格式转换
+
+    Returns:
+        格式化的错误响应字典
+    """
+    raw = getattr(e, "upstream_error", None)
+    message = getattr(e, "message", str(e))
+
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            if needs_conversion:
+                return _convert_error_response_best_effort(parsed, provider_format, client_format)
+            return parsed
+
+    return _build_client_error_response_best_effort(message, client_format)
 
 
 class ChatHandlerBase(BaseMessageHandler, ABC):
@@ -361,7 +451,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         original_headers: Dict[str, Any],
         original_request_body: Dict[str, Any],
         query_params: Optional[Dict[str, str]] = None,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, JSONResponse]:
         """处理流式响应"""
         logger.debug(f"开始流式响应处理 ({self.FORMAT_ID})")
 
@@ -486,12 +576,21 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 background=background_tasks,
             )
 
-        except ThinkingSignatureException as e:
-            # Thinking 签名错误：orchestrator 层已处理整流重试但仍失败
-            # 记录 original_request_body（客户端原始请求），便于排查问题根因
-            self._log_request_error("流式请求失败（签名错误）", e)
+        except (ThinkingSignatureException, UpstreamClientException) as e:
+            # ThinkingSignatureException: orchestrator 层已处理整流重试但仍失败
+            # UpstreamClientException: 上游客户端错误（HTTP 4xx），不重试，直接返回给客户端
+            error_type = "签名错误" if isinstance(e, ThinkingSignatureException) else "上游客户端错误"
+            self._log_request_error(f"流式请求失败（{error_type}）", e)
             await self._record_stream_failure(ctx, e, original_headers, original_request_body)
-            raise
+            client_format = (ctx.client_api_format or "").upper()
+            provider_format = (ctx.provider_api_format or client_format).upper()
+            payload = _build_error_json_payload(
+                e, client_format, provider_format, needs_conversion=ctx.needs_conversion
+            )
+            return JSONResponse(
+                status_code=_get_error_status_code(e),
+                content=payload,
+            )
 
         except Exception as e:
             self._log_request_error("流式请求失败", e)
@@ -550,11 +649,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         else:
             request_body = dict(original_request_body)
 
-        # 跨格式：先做请求体转换（严格模式，失败触发 failover）
+        # 跨格式：先做请求体转换（失败触发 failover）
         if needs_conversion:
-            from src.core.api_format import converter_registry
-
-            request_body = converter_registry.convert_request_strict(
+            registry = get_format_converter_registry()
+            request_body = registry.convert_request(
                 request_body,
                 str(client_api_format),
                 str(provider_api_format),
@@ -726,6 +824,8 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         status_code = 503
         if isinstance(error, ThinkingSignatureException):
             status_code = 400
+        elif isinstance(error, UpstreamClientException):
+            status_code = _get_error_status_code(error)
         elif isinstance(error, ProviderAuthException):
             status_code = 503
         elif isinstance(error, ProviderRateLimitException):
@@ -783,6 +883,9 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         response_headers: Dict[str, str] = {}
         provider_request_headers: Dict[str, str] = {}
         provider_request_body: Optional[Dict[str, Any]] = None
+        provider_api_format_for_error: Optional[str] = None
+        client_api_format_for_error: Optional[str] = None
+        needs_conversion_for_error: bool = False
         provider_id: Optional[str] = None  # Provider ID（用于失败记录）
         endpoint_id: Optional[str] = None  # Endpoint ID（用于失败记录）
         key_id: Optional[str] = None  # Key ID（用于失败记录）
@@ -796,6 +899,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         ) -> Dict[str, Any]:
             nonlocal provider_name, response_json, status_code, response_headers
             nonlocal provider_request_headers, provider_request_body, mapped_model_result
+            nonlocal provider_api_format_for_error, client_api_format_for_error, needs_conversion_for_error
 
             provider_name = str(provider.name)
             provider_api_format = str(endpoint.api_format or api_format)
@@ -804,6 +908,9 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 api_format.value if hasattr(api_format, "value") else str(api_format)
             )
             needs_conversion = bool(getattr(candidate, "needs_conversion", False))
+            provider_api_format_for_error = provider_api_format
+            client_api_format_for_error = client_api_format
+            needs_conversion_for_error = needs_conversion
 
             # 获取模型映射（优先使用映射匹配到的模型，其次是 Provider 级别的映射）
             mapped_model = candidate.mapping_matched_model if candidate else None
@@ -821,11 +928,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             else:
                 request_body = dict(request_body_ref["body"])
 
-            # 跨格式：先做请求体转换（严格模式，失败触发 failover）
+            # 跨格式：先做请求体转换（失败触发 failover）
             if needs_conversion:
-                from src.core.api_format import converter_registry
-
-                request_body = converter_registry.convert_request_strict(
+                registry = get_format_converter_registry()
+                request_body = registry.convert_request(
                     request_body,
                     client_api_format,
                     provider_api_format,
@@ -898,46 +1004,18 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             status_code = resp.status_code
             response_headers = dict(resp.headers)
 
-            if resp.status_code == 401:
-                raise ProviderAuthException(str(provider.name))
-            elif resp.status_code == 429:
-                raise ProviderRateLimitException(
-                    "请求过于频繁，请稍后重试",
-                    provider_name=str(provider.name),
-                    response_headers=response_headers,
-                )
-            elif resp.status_code >= 500:
-                # 记录响应体以便调试
+            # 统一使用 HTTPStatusError，让 orchestrator/error_classifier 负责分类（客户端错误/兼容性错误/限流等）
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
                 error_body = ""
                 try:
-                    error_body = resp.text[:1000]
-                    logger.error(
-                        f"  [{self.request_id}] 上游返回5xx错误: status={resp.status_code}, body={error_body[:500]}"
-                    )
+                    error_body = resp.text[:4000] if resp.text else ""
                 except Exception:
-                    pass
-                raise ProviderNotAvailableException(
-                    f"上游服务暂时不可用 (HTTP {resp.status_code})",
-                    provider_name=str(provider.name),
-                    upstream_status=resp.status_code,
-                    upstream_response=error_body,
-                )
-            elif resp.status_code != 200:
-                # 记录非200响应以便调试
-                error_body = ""
-                try:
-                    error_body = resp.text[:1000]
-                    logger.warning(
-                        f"  [{self.request_id}] 上游返回非200: status={resp.status_code}, body={error_body[:500]}"
-                    )
-                except Exception:
-                    pass
-                raise ProviderNotAvailableException(
-                    f"上游服务返回错误 (HTTP {resp.status_code})",
-                    provider_name=str(provider.name),
-                    upstream_status=resp.status_code,
-                    upstream_response=error_body,
-                )
+                    error_body = ""
+                # 供 ErrorClassifier 优先读取
+                e.upstream_response = error_body  # type: ignore[attr-defined]
+                raise
 
             # 安全解析 JSON 响应，处理可能的编码错误
             try:
@@ -986,11 +1064,10 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                         error_status=parsed.error_type,
                     )
 
-            # 跨格式：响应转换回 client_format（严格模式，失败触发 failover）
+            # 跨格式：响应转换回 client_format（失败触发 failover）
             if needs_conversion and isinstance(response_json, dict):
-                from src.core.api_format import converter_registry
-
-                response_json = converter_registry.convert_response_strict(
+                registry = get_format_converter_registry()
+                response_json = registry.convert_response(
                     response_json,
                     provider_api_format,
                     client_api_format,
@@ -1100,7 +1177,43 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 error_message=str(e),
                 is_stream=False,
             )
-            raise
+            client_format = (client_api_format_for_error or "").upper()
+            provider_format = (provider_api_format_for_error or client_format).upper()
+            payload = _build_error_json_payload(
+                e, client_format, provider_format, needs_conversion=needs_conversion_for_error
+            )
+            return JSONResponse(
+                status_code=_get_error_status_code(e),
+                content=payload,
+            )
+
+        except UpstreamClientException as e:
+            response_time_ms = self.elapsed_ms()
+            actual_request_body = provider_request_body or original_request_body
+            await self.telemetry.record_failure(
+                provider=provider_name or "unknown",
+                model=model,
+                response_time_ms=response_time_ms,
+                status_code=_get_error_status_code(e),
+                request_headers=original_headers,
+                request_body=actual_request_body,
+                error_message=str(e),
+                is_stream=False,
+                api_format=api_format,
+                provider_request_headers=provider_request_headers,
+                response_headers=response_headers,
+                client_response_headers={"content-type": "application/json"},
+                target_model=mapped_model_result,
+            )
+            client_format = (client_api_format_for_error or "").upper()
+            provider_format = (provider_api_format_for_error or client_format).upper()
+            payload = _build_error_json_payload(
+                e, client_format, provider_format, needs_conversion=needs_conversion_for_error
+            )
+            return JSONResponse(
+                status_code=_get_error_status_code(e),
+                content=payload,
+            )
 
         except Exception as e:
             response_time_ms = self.elapsed_ms()

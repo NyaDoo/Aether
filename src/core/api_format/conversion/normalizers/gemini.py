@@ -1,0 +1,944 @@
+""" 
+Gemini (GenerateContent / streamGenerateContent) Normalizer
+
+负责：
+- Gemini request/response <-> Internal 表示转换
+- 可选：Gemini streaming chunk <-> InternalStreamEvent
+- 可选：Gemini error <-> InternalError
+
+说明：
+- 请求体字段在本项目中同时兼容 snake_case（历史转换器产物）与 camelCase（官方/客户端输入）。
+- 响应/流式通常为 camelCase（candidates/finishReason/usageMetadata/modelVersion）。
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from src.core.api_format.conversion.field_mappings import (
+    ERROR_TYPE_MAPPINGS,
+    RETRYABLE_ERROR_TYPES,
+    STOP_REASON_MAPPINGS,
+    USAGE_FIELD_MAPPINGS,
+)
+from src.core.api_format.conversion.internal import (
+    ContentBlock,
+    ContentType,
+    ErrorType,
+    FormatCapabilities,
+    ImageBlock,
+    InstructionSegment,
+    InternalError,
+    InternalMessage,
+    InternalRequest,
+    InternalResponse,
+    Role,
+    StopReason,
+    TextBlock,
+    ToolChoice,
+    ToolChoiceType,
+    ToolDefinition,
+    ToolResultBlock,
+    ToolUseBlock,
+    UnknownBlock,
+    UsageInfo,
+)
+from src.core.api_format.conversion.normalizer import FormatNormalizer
+from src.core.api_format.conversion.stream_events import (
+    ContentBlockStartEvent,
+    ContentBlockStopEvent,
+    ContentDeltaEvent,
+    ErrorEvent,
+    InternalStreamEvent,
+    MessageStartEvent,
+    MessageStopEvent,
+    ToolCallDeltaEvent,
+)
+from src.core.api_format.conversion.stream_state import StreamState
+
+
+class GeminiNormalizer(FormatNormalizer):
+    FORMAT_ID = "GEMINI"
+    capabilities = FormatCapabilities(
+        supports_stream=True,
+        supports_error_conversion=True,
+        supports_tools=True,
+        supports_images=True,
+    )
+
+    _FINISH_REASON_TO_STOP: Dict[str, StopReason] = {
+        "STOP": StopReason.END_TURN,
+        "MAX_TOKENS": StopReason.MAX_TOKENS,
+        "SAFETY": StopReason.CONTENT_FILTERED,
+        "RECITATION": StopReason.CONTENT_FILTERED,
+        "MALFORMED_FUNCTION_CALL": StopReason.TOOL_USE,
+        "OTHER": StopReason.UNKNOWN,
+    }
+
+    _ERROR_TYPE_TO_GEMINI_STATUS: Dict[ErrorType, str] = {
+        ErrorType.INVALID_REQUEST: "INVALID_ARGUMENT",
+        ErrorType.AUTHENTICATION: "UNAUTHENTICATED",
+        ErrorType.PERMISSION_DENIED: "PERMISSION_DENIED",
+        ErrorType.NOT_FOUND: "NOT_FOUND",
+        ErrorType.RATE_LIMIT: "RESOURCE_EXHAUSTED",
+        ErrorType.OVERLOADED: "UNAVAILABLE",
+        ErrorType.SERVER_ERROR: "INTERNAL",
+        ErrorType.CONTENT_FILTERED: "FAILED_PRECONDITION",
+        ErrorType.CONTEXT_LENGTH_EXCEEDED: "INVALID_ARGUMENT",
+        ErrorType.UNKNOWN: "INTERNAL",
+    }
+
+    # =========================
+    # Requests
+    # =========================
+
+    def request_to_internal(self, request: Dict[str, Any]) -> InternalRequest:
+        model = str(request.get("model") or "")
+        dropped: Dict[str, int] = {}
+
+        instructions: List[InstructionSegment] = []
+        system_text, sys_dropped = self._collapse_system_instruction(
+            request.get("system_instruction")
+            if "system_instruction" in request
+            else request.get("systemInstruction")
+        )
+        self._merge_dropped(dropped, sys_dropped)
+        if system_text:
+            instructions.append(InstructionSegment(role=Role.SYSTEM, text=system_text))
+
+        messages: List[InternalMessage] = []
+        contents = request.get("contents") or []
+        if isinstance(contents, list):
+            for content in contents:
+                if not isinstance(content, dict):
+                    dropped["gemini_content_non_dict"] = dropped.get("gemini_content_non_dict", 0) + 1
+                    continue
+                imsg, md = self._content_to_internal_message(content)
+                self._merge_dropped(dropped, md)
+                if imsg is not None:
+                    messages.append(imsg)
+        else:
+            dropped["gemini_contents_non_list"] = dropped.get("gemini_contents_non_list", 0) + 1
+
+        generation_config = self._get_generation_config(request)
+
+        max_tokens = self._optional_int(
+            generation_config.get("max_output_tokens")
+            if isinstance(generation_config, dict)
+            else None
+        )
+        temperature = self._optional_float(
+            generation_config.get("temperature")
+            if isinstance(generation_config, dict)
+            else None
+        )
+        top_p = self._optional_float(
+            generation_config.get("top_p") if isinstance(generation_config, dict) else None
+        )
+        top_k = self._optional_int(
+            generation_config.get("top_k") if isinstance(generation_config, dict) else None
+        )
+        stop_sequences = None
+        if isinstance(generation_config, dict):
+            stop_sequences = self._coerce_str_list(generation_config.get("stop_sequences"))
+
+        tools = self._gemini_tools_to_internal(request.get("tools"))
+        tool_choice = self._gemini_tool_config_to_tool_choice(
+            request.get("tool_config")
+            if "tool_config" in request
+            else request.get("toolConfig")
+        )
+
+        internal = InternalRequest(
+            model=model,
+            messages=messages,
+            instructions=instructions,
+            system=self._join_instructions(instructions),
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            stop_sequences=stop_sequences,
+            stream=bool(request.get("stream") or False),
+            tools=tools,
+            tool_choice=tool_choice,
+            extra={"gemini": self._extract_extra(request, {"contents"})},
+        )
+
+        if dropped:
+            internal.extra.setdefault("raw", {})["dropped_blocks"] = dropped
+
+        return internal
+
+    def request_from_internal(self, internal: InternalRequest) -> Dict[str, Any]:
+        system_text = internal.system or self._join_instructions(internal.instructions)
+
+        # tools/tool_choice
+        tools = None
+        if internal.tools:
+            tools = [
+                {
+                    "function_declarations": [
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters or {},
+                            **(t.extra.get("gemini_function_declaration") or {}),
+                        }
+                        for t in internal.tools
+                    ]
+                }
+            ]
+
+        tool_config = None
+        if internal.tool_choice:
+            tool_config = self._tool_choice_to_gemini_tool_config(internal.tool_choice)
+
+        generation_config: Dict[str, Any] = {}
+        if internal.max_tokens is not None:
+            generation_config["max_output_tokens"] = internal.max_tokens
+        if internal.temperature is not None:
+            generation_config["temperature"] = internal.temperature
+        if internal.top_p is not None:
+            generation_config["top_p"] = internal.top_p
+        if internal.top_k is not None:
+            generation_config["top_k"] = internal.top_k
+        if internal.stop_sequences:
+            generation_config["stop_sequences"] = list(internal.stop_sequences)
+
+        contents: List[Dict[str, Any]] = []
+        for msg in internal.messages:
+            contents.append(self._internal_message_to_content(msg))
+
+        result: Dict[str, Any] = {
+            "contents": contents,
+        }
+
+        # Gemini Chat 模式 model 可能在 URL 路径中；这里仅在 internal.model 存在时回写
+        if internal.model:
+            result["model"] = internal.model
+
+        if system_text:
+            result["system_instruction"] = {"parts": [{"text": system_text}]}
+
+        if generation_config:
+            result["generation_config"] = generation_config
+
+        if tools:
+            result["tools"] = tools
+
+        if tool_config:
+            result["tool_config"] = tool_config
+
+        return result
+
+    # =========================
+    # Responses
+    # =========================
+
+    def response_to_internal(self, response: Dict[str, Any]) -> InternalResponse:
+        rid = str(response.get("id") or "")
+        model = str(response.get("modelVersion") or response.get("model") or "")
+
+        candidates = response.get("candidates") or []
+        candidate0 = candidates[0] if isinstance(candidates, list) and candidates else {}
+        candidate0 = candidate0 if isinstance(candidate0, dict) else {}
+
+        content = candidate0.get("content") if isinstance(candidate0, dict) else None
+        content = content if isinstance(content, dict) else {}
+
+        blocks, dropped = self._parts_to_blocks(content.get("parts"))
+
+        finish_reason = candidate0.get("finishReason")
+        stop_reason = None
+        if finish_reason is not None:
+            stop_reason = self._FINISH_REASON_TO_STOP.get(str(finish_reason), StopReason.UNKNOWN)
+
+        usage_info = self._usage_metadata_to_internal(response.get("usageMetadata"))
+
+        extra: Dict[str, Any] = {}
+        if finish_reason is not None:
+            extra.setdefault("raw", {})["finishReason"] = finish_reason
+
+        internal = InternalResponse(
+            id=rid,
+            model=model,
+            content=blocks,
+            stop_reason=stop_reason,
+            usage=usage_info,
+            extra=extra,
+        )
+
+        if dropped:
+            internal.extra.setdefault("raw", {})["dropped_blocks"] = dropped
+
+        return internal
+
+    def response_from_internal(self, internal: InternalResponse) -> Dict[str, Any]:
+        parts: List[Dict[str, Any]] = []
+        for b in internal.content:
+            if isinstance(b, TextBlock):
+                if b.text:
+                    parts.append({"text": b.text})
+                continue
+            if isinstance(b, ToolUseBlock):
+                parts.append(
+                    {
+                        "functionCall": {
+                            "name": b.tool_name,
+                            "args": b.tool_input or {},
+                        }
+                    }
+                )
+                continue
+            if isinstance(b, ImageBlock):
+                if b.data and b.media_type:
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": b.media_type,
+                                "data": b.data,
+                            }
+                        }
+                    )
+                elif b.url:
+                    parts.append({"text": f"[Image: {b.url}]"})
+                continue
+            # Unknown/ToolResult 默认丢弃
+
+        finish_reason = None
+        if internal.stop_reason is not None:
+            finish_reason = STOP_REASON_MAPPINGS.get("GEMINI", {}).get(internal.stop_reason.value, "OTHER")
+
+        usage_metadata: Dict[str, Any] = {}
+        if internal.usage:
+            usage_metadata = {
+                "promptTokenCount": int(internal.usage.input_tokens),
+                "candidatesTokenCount": int(internal.usage.output_tokens),
+                "totalTokenCount": int(internal.usage.total_tokens or (internal.usage.input_tokens + internal.usage.output_tokens)),
+            }
+            if internal.usage.cache_read_tokens:
+                usage_metadata["cachedContentTokenCount"] = int(internal.usage.cache_read_tokens)
+
+        candidate: Dict[str, Any] = {
+            "content": {"parts": parts, "role": "model"},
+            "index": 0,
+        }
+        if finish_reason is not None:
+            candidate["finishReason"] = finish_reason
+
+        out: Dict[str, Any] = {
+            "candidates": [candidate],
+            "modelVersion": internal.model or "gemini",
+        }
+
+        if usage_metadata:
+            out["usageMetadata"] = usage_metadata
+
+        # id 不是 Gemini 标准字段，但内部可能携带；保守保留
+        if internal.id:
+            out["id"] = internal.id
+
+        return out
+
+    # =========================
+    # Streaming
+    # =========================
+
+    def stream_chunk_to_internal(self, chunk: Dict[str, Any], state: StreamState) -> List[InternalStreamEvent]:
+        ss = state.substate(self.FORMAT_ID)
+        events: List[InternalStreamEvent] = []
+
+        if not ss.get("message_started"):
+            # 保留初始化时设置的 model（客户端请求的模型），仅在空时用上游值
+            model = state.model or str(chunk.get("modelVersion") or "")
+            if not state.model:
+                state.model = model
+            state.message_id = state.message_id or "gemini"
+            ss["message_started"] = True
+            ss.setdefault("text_block_started", False)
+            ss.setdefault("accumulated_text", "")
+            ss.setdefault("next_block_index", 1)  # 0 预留给文本
+            events.append(MessageStartEvent(message_id=state.message_id, model=model))
+
+        candidates = chunk.get("candidates") or []
+        if not isinstance(candidates, list) or not candidates:
+            return events
+
+        candidate0 = candidates[0] if candidates else {}
+        candidate0 = candidate0 if isinstance(candidate0, dict) else {}
+
+        content = candidate0.get("content") if isinstance(candidate0, dict) else None
+        content = content if isinstance(content, dict) else {}
+        parts = content.get("parts") or []
+
+        # parts -> events
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+
+                # text（兼容：delta 或累积）
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    prev = str(ss.get("accumulated_text") or "")
+                    if text.startswith(prev):
+                        delta = text[len(prev) :]
+                        ss["accumulated_text"] = text
+                    else:
+                        delta = text
+                        ss["accumulated_text"] = prev + delta
+
+                    if delta:
+                        if not ss.get("text_block_started"):
+                            ss["text_block_started"] = True
+                            events.append(ContentBlockStartEvent(block_index=0, block_type=ContentType.TEXT))
+                        events.append(ContentDeltaEvent(block_index=0, text_delta=delta))
+                    continue
+
+                # functionCall（stream response 常见 camelCase）
+                func_call = part.get("functionCall")
+                if func_call is None:
+                    func_call = part.get("function_call")
+
+                if isinstance(func_call, dict):
+                    name = str(func_call.get("name") or "")
+                    args = func_call.get("args")
+                    if not isinstance(args, dict):
+                        args = {}
+
+                    block_index = int(ss.get("next_block_index") or 1)
+                    ss["next_block_index"] = block_index + 1
+
+                    events.append(
+                        ContentBlockStartEvent(
+                            block_index=block_index,
+                            block_type=ContentType.TOOL_USE,
+                            tool_id=None,
+                            tool_name=name or None,
+                        )
+                    )
+                    if args:
+                        events.append(
+                            ToolCallDeltaEvent(
+                                block_index=block_index,
+                                tool_id="",
+                                input_delta=json.dumps(args, ensure_ascii=False),
+                            )
+                        )
+                    events.append(ContentBlockStopEvent(block_index=block_index))
+                    continue
+
+        finish_reason = candidate0.get("finishReason")
+        if finish_reason is not None:
+            stop_reason = self._FINISH_REASON_TO_STOP.get(str(finish_reason), StopReason.UNKNOWN)
+            usage_info = self._usage_metadata_to_internal(chunk.get("usageMetadata"))
+            # 先补齐 content_block_stop（仅 text block），再发送 MessageStop
+            if ss.get("text_block_started") and not ss.get("text_block_stopped"):
+                ss["text_block_stopped"] = True
+                events.append(ContentBlockStopEvent(block_index=0))
+            events.append(MessageStopEvent(stop_reason=stop_reason, usage=usage_info))
+
+        if "error" in chunk:
+            events.append(ErrorEvent(error=self.error_to_internal(chunk)))
+
+        return events
+
+    def stream_event_from_internal(
+        self,
+        event: InternalStreamEvent,
+        state: StreamState,
+    ) -> List[Dict[str, Any]]:
+        ss = state.substate(self.FORMAT_ID)
+        out: List[Dict[str, Any]] = []
+
+        def base_chunk(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+            return {
+                "candidates": [
+                    {
+                        "content": {"parts": parts, "role": "model"},
+                        "index": 0,
+                    }
+                ],
+                "modelVersion": state.model or "",
+            }
+
+        if isinstance(event, MessageStartEvent):
+            state.message_id = event.message_id or state.message_id
+            state.model = event.model or state.model
+            ss.setdefault("tool_blocks", {})
+            return out
+
+        if isinstance(event, ContentDeltaEvent):
+            if event.text_delta:
+                out.append(base_chunk([{"text": event.text_delta}]))
+            return out
+
+        if isinstance(event, ContentBlockStartEvent) and event.block_type == ContentType.TOOL_USE:
+            tool_blocks = ss.get("tool_blocks")
+            if not isinstance(tool_blocks, dict):
+                tool_blocks = {}
+                ss["tool_blocks"] = tool_blocks
+
+            tool_blocks[int(event.block_index)] = {
+                "name": event.tool_name or "",
+                "json": "",
+            }
+            return out
+
+        if isinstance(event, ToolCallDeltaEvent):
+            tool_blocks = ss.get("tool_blocks")
+            if isinstance(tool_blocks, dict):
+                entry = tool_blocks.get(int(event.block_index))
+                if isinstance(entry, dict):
+                    entry["json"] = str(entry.get("json") or "") + (event.input_delta or "")
+            return out
+
+        if isinstance(event, ContentBlockStopEvent):
+            tool_blocks = ss.get("tool_blocks")
+            if not isinstance(tool_blocks, dict):
+                return out
+
+            entry = tool_blocks.get(int(event.block_index))
+            if not isinstance(entry, dict):
+                return out
+
+            name = str(entry.get("name") or "")
+            raw_json = str(entry.get("json") or "")
+            args: Dict[str, Any] = {}
+            if raw_json:
+                try:
+                    parsed = json.loads(raw_json)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except json.JSONDecodeError:
+                    args = {}
+
+            out.append(base_chunk([{"functionCall": {"name": name, "args": args}}]))
+            return out
+
+        if isinstance(event, MessageStopEvent):
+            finish_reason = None
+            if event.stop_reason is not None:
+                finish_reason = STOP_REASON_MAPPINGS.get("GEMINI", {}).get(event.stop_reason.value, "OTHER")
+
+            chunk: Dict[str, Any] = base_chunk([])
+            if finish_reason is not None:
+                chunk["candidates"][0]["finishReason"] = finish_reason
+
+            if event.usage:
+                chunk["usageMetadata"] = {
+                    "promptTokenCount": int(event.usage.input_tokens),
+                    "candidatesTokenCount": int(event.usage.output_tokens),
+                    "totalTokenCount": int(event.usage.total_tokens or (event.usage.input_tokens + event.usage.output_tokens)),
+                }
+                if event.usage.cache_read_tokens:
+                    chunk["usageMetadata"]["cachedContentTokenCount"] = int(event.usage.cache_read_tokens)
+
+            out.append(chunk)
+            return out
+
+        if isinstance(event, ErrorEvent):
+            out.append(self.error_from_internal(event.error))
+            return out
+
+        return out
+
+    # =========================
+    # Error conversion
+    # =========================
+
+    def is_error_response(self, response: Dict[str, Any]) -> bool:
+        return isinstance(response, dict) and "error" in response
+
+    def error_to_internal(self, error_response: Dict[str, Any]) -> InternalError:
+        err = error_response.get("error") if isinstance(error_response, dict) else None
+        err = err if isinstance(err, dict) else {}
+
+        raw_status = err.get("status")
+        mapped = ERROR_TYPE_MAPPINGS.get("GEMINI", {}).get(str(raw_status), ErrorType.UNKNOWN.value)
+        internal_type = self._error_type_from_value(mapped)
+        retryable = internal_type.value in RETRYABLE_ERROR_TYPES
+
+        code_value = err.get("code")
+        code_str = None
+        if code_value is not None:
+            code_str = str(code_value)
+
+        return InternalError(
+            type=internal_type,
+            message=str(err.get("message") or ""),
+            code=code_str,
+            param=None,
+            retryable=retryable,
+            extra={"gemini": {"error": err}, "raw": {"status": raw_status}},
+        )
+
+    def error_from_internal(self, internal: InternalError) -> Dict[str, Any]:
+        status = self._ERROR_TYPE_TO_GEMINI_STATUS.get(internal.type, "INTERNAL")
+        payload: Dict[str, Any] = {
+            "code": 400 if internal.type == ErrorType.INVALID_REQUEST else 500,
+            "message": internal.message,
+            "status": status,
+        }
+        return {"error": payload}
+
+    # =========================
+    # Helpers
+    # =========================
+
+    def _content_to_internal_message(self, content: Dict[str, Any]) -> Tuple[Optional[InternalMessage], Dict[str, int]]:
+        dropped: Dict[str, int] = {}
+
+        role_raw = str(content.get("role") or "user")
+        if role_raw == "model":
+            role = Role.ASSISTANT
+        elif role_raw == "user":
+            role = Role.USER
+        else:
+            role = Role.UNKNOWN
+
+        blocks, bd = self._parts_to_blocks(content.get("parts"))
+        self._merge_dropped(dropped, bd)
+
+        return (
+            InternalMessage(
+                role=role,
+                content=blocks,
+                extra=self._extract_extra(content, {"role", "parts"}),
+            ),
+            dropped,
+        )
+
+    def _parts_to_blocks(self, parts: Any) -> Tuple[List[ContentBlock], Dict[str, int]]:
+        dropped: Dict[str, int] = {}
+        if parts is None:
+            return [], dropped
+        if not isinstance(parts, list):
+            dropped["gemini_parts_non_list"] = dropped.get("gemini_parts_non_list", 0) + 1
+            return [], dropped
+
+        blocks: List[ContentBlock] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                dropped["gemini_part_non_dict"] = dropped.get("gemini_part_non_dict", 0) + 1
+                continue
+
+            if "text" in part:
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    blocks.append(TextBlock(text=text, extra=self._extract_extra(part, {"text"})))
+                continue
+
+            inline = part.get("inline_data")
+            if inline is None:
+                inline = part.get("inlineData")
+            if isinstance(inline, dict):
+                mime_type = inline.get("mime_type") if "mime_type" in inline else inline.get("mimeType")
+                data = inline.get("data")
+                if isinstance(mime_type, str) and mime_type and isinstance(data, str) and data:
+                    blocks.append(ImageBlock(data=data, media_type=mime_type))
+                else:
+                    dropped["gemini_inline_data_invalid"] = dropped.get("gemini_inline_data_invalid", 0) + 1
+                    blocks.append(UnknownBlock(raw_type="inline_data", payload=part))
+                continue
+
+            func_call = part.get("function_call")
+            if func_call is None:
+                func_call = part.get("functionCall")
+            if isinstance(func_call, dict):
+                name = str(func_call.get("name") or "")
+                args = func_call.get("args")
+                if not isinstance(args, dict):
+                    args = {}
+                blocks.append(
+                    ToolUseBlock(
+                        tool_id=f"toolu_{name}" if name else "toolu_0",
+                        tool_name=name,
+                        tool_input=args,
+                        extra={"gemini": part},
+                    )
+                )
+                continue
+
+            func_resp = part.get("function_response")
+            if func_resp is None:
+                func_resp = part.get("functionResponse")
+            if isinstance(func_resp, dict):
+                name = str(func_resp.get("name") or "")
+                response = func_resp.get("response")
+                output: Any = None
+                content_text: Optional[str] = None
+
+                # 兼容历史：response 常见结构为 {"result": ...}
+                if isinstance(response, dict) and "result" in response:
+                    output = response.get("result")
+                    if isinstance(output, str):
+                        content_text = output
+                        output = None
+                else:
+                    output = response
+
+                blocks.append(
+                    ToolResultBlock(
+                        tool_use_id=name,
+                        output=output,
+                        content_text=content_text,
+                        is_error=False,
+                        extra={"gemini": part},
+                    )
+                )
+                continue
+
+            # 其它：Unknown
+            raw_type = next(iter(part.keys()), "unknown")
+            dropped_key = f"gemini_part:{raw_type}"
+            dropped[dropped_key] = dropped.get(dropped_key, 0) + 1
+            blocks.append(UnknownBlock(raw_type=str(raw_type), payload=part))
+
+        return blocks, dropped
+
+    def _internal_message_to_content(self, msg: InternalMessage) -> Dict[str, Any]:
+        role = "model" if msg.role == Role.ASSISTANT else "user"
+
+        parts: List[Dict[str, Any]] = []
+        for b in msg.content:
+            if isinstance(b, UnknownBlock):
+                continue
+
+            if isinstance(b, TextBlock):
+                if b.text:
+                    parts.append({"text": b.text})
+                continue
+
+            if isinstance(b, ImageBlock):
+                if b.data and b.media_type:
+                    parts.append({"inline_data": {"mime_type": b.media_type, "data": b.data}})
+                elif b.url:
+                    parts.append({"text": f"[Image: {b.url}]"})
+                continue
+
+            if isinstance(b, ToolUseBlock) and role == "model":
+                parts.append({"function_call": {"name": b.tool_name, "args": b.tool_input or {}}})
+                continue
+
+            if isinstance(b, ToolResultBlock) and role == "user":
+                # 兼容旧转换器：name 直接使用 tool_use_id，response 固定包一层 result
+                value: Any
+                if b.content_text is not None:
+                    value = b.content_text
+                elif b.output is None:
+                    value = ""
+                else:
+                    value = b.output
+
+                parts.append(
+                    {
+                        "function_response": {
+                            "name": b.tool_use_id,
+                            "response": {"result": value},
+                        }
+                    }
+                )
+                continue
+
+        return {"role": role, "parts": parts}
+
+    def _collapse_system_instruction(self, system_instruction: Any) -> Tuple[Optional[str], Dict[str, int]]:
+        dropped: Dict[str, int] = {}
+        if system_instruction is None:
+            return None, dropped
+
+        # 支持 {"parts": [{"text": ...}, ...]}
+        if isinstance(system_instruction, dict):
+            parts = system_instruction.get("parts")
+            if isinstance(parts, list):
+                texts: List[str] = []
+                for part in parts:
+                    if isinstance(part, dict) and "text" in part and part.get("text"):
+                        texts.append(str(part.get("text")))
+                joined = "".join(texts)
+                return (joined or None), dropped
+
+        dropped["gemini_system_instruction_unsupported"] = dropped.get("gemini_system_instruction_unsupported", 0) + 1
+        return None, dropped
+
+    def _get_generation_config(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        # 兼容 snake_case 与 camelCase
+        gc = request.get("generation_config") if "generation_config" in request else request.get("generationConfig")
+        if not isinstance(gc, dict):
+            return {}
+
+        # 统一内部使用 snake_case key
+        def pick(*keys: str) -> Any:
+            for k in keys:
+                if k in gc:
+                    return gc.get(k)
+            return None
+
+        normalized: Dict[str, Any] = {}
+        normalized["max_output_tokens"] = pick("max_output_tokens", "maxOutputTokens")
+        normalized["temperature"] = pick("temperature")
+        normalized["top_p"] = pick("top_p", "topP")
+        normalized["top_k"] = pick("top_k", "topK")
+        normalized["stop_sequences"] = pick("stop_sequences", "stopSequences")
+        return {k: v for k, v in normalized.items() if v is not None}
+
+    def _gemini_tools_to_internal(self, tools: Any) -> Optional[List[ToolDefinition]]:
+        if not tools or not isinstance(tools, list):
+            return None
+
+        out: List[ToolDefinition] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+
+            decls = tool.get("function_declarations")
+            if decls is None:
+                decls = tool.get("functionDeclarations")
+
+            if not isinstance(decls, list):
+                continue
+
+            for decl in decls:
+                if not isinstance(decl, dict):
+                    continue
+                name = str(decl.get("name") or "")
+                if not name:
+                    continue
+                out.append(
+                    ToolDefinition(
+                        name=name,
+                        description=decl.get("description"),
+                        parameters=decl.get("parameters") if isinstance(decl.get("parameters"), dict) else None,
+                        extra={"gemini_function_declaration": self._extract_extra(decl, {"name", "description", "parameters"})},
+                    )
+                )
+
+        return out or None
+
+    def _gemini_tool_config_to_tool_choice(self, tool_config: Any) -> Optional[ToolChoice]:
+        if tool_config is None:
+            return None
+        if not isinstance(tool_config, dict):
+            return ToolChoice(type=ToolChoiceType.AUTO, extra={"raw": tool_config})
+
+        cfg = tool_config.get("function_calling_config")
+        if cfg is None:
+            cfg = tool_config.get("functionCallingConfig")
+
+        if not isinstance(cfg, dict):
+            return ToolChoice(type=ToolChoiceType.AUTO, extra={"gemini": tool_config})
+
+        mode = str(cfg.get("mode") or "AUTO").upper()
+        allowed = cfg.get("allowed_function_names")
+        if allowed is None:
+            allowed = cfg.get("allowedFunctionNames")
+
+        if mode == "NONE":
+            return ToolChoice(type=ToolChoiceType.NONE, extra={"gemini": tool_config})
+        if mode in ("ANY", "REQUIRED"):
+            return ToolChoice(type=ToolChoiceType.REQUIRED, extra={"gemini": tool_config})
+        if isinstance(allowed, list) and len(allowed) == 1:
+            return ToolChoice(type=ToolChoiceType.TOOL, tool_name=str(allowed[0] or ""), extra={"gemini": tool_config})
+
+        return ToolChoice(type=ToolChoiceType.AUTO, extra={"gemini": tool_config})
+
+    def _tool_choice_to_gemini_tool_config(self, tool_choice: ToolChoice) -> Dict[str, Any]:
+        mode = "AUTO"
+        cfg: Dict[str, Any] = {}
+
+        if tool_choice.type == ToolChoiceType.NONE:
+            mode = "NONE"
+        elif tool_choice.type == ToolChoiceType.REQUIRED:
+            mode = "ANY"
+        elif tool_choice.type == ToolChoiceType.TOOL:
+            mode = "ANY"
+            cfg["allowed_function_names"] = [tool_choice.tool_name or ""]
+
+        cfg["mode"] = mode
+        return {"function_calling_config": cfg}
+
+    def _usage_metadata_to_internal(self, usage_metadata: Any) -> Optional[UsageInfo]:
+        if not isinstance(usage_metadata, dict):
+            return None
+
+        mapping = USAGE_FIELD_MAPPINGS.get("GEMINI", {})
+        fields: Dict[str, int] = {}
+        extra = self._extract_extra(usage_metadata, set(mapping.keys()))
+
+        # promptTokenCount/candidatesTokenCount/totalTokenCount/cachedContentTokenCount
+        for provider_key, internal_key in mapping.items():
+            if provider_key in usage_metadata and usage_metadata.get(provider_key) is not None:
+                try:
+                    fields[internal_key] = int(usage_metadata.get(provider_key) or 0)
+                except (TypeError, ValueError):
+                    continue
+
+        # thoughtsTokenCount（如果存在，按 handler 的口径并入 output_tokens）
+        thoughts = usage_metadata.get("thoughtsTokenCount")
+        if thoughts is not None:
+            try:
+                fields["output_tokens"] = int(fields.get("output_tokens", 0) + int(thoughts or 0))
+            except (TypeError, ValueError):
+                pass
+
+        if "total_tokens" not in fields:
+            fields["total_tokens"] = int(fields.get("input_tokens", 0) + fields.get("output_tokens", 0))
+
+        return UsageInfo(
+            input_tokens=int(fields.get("input_tokens", 0)),
+            output_tokens=int(fields.get("output_tokens", 0)),
+            total_tokens=int(fields.get("total_tokens", 0)),
+            cache_read_tokens=int(fields.get("cache_read_tokens", 0)),
+            cache_write_tokens=0,
+            extra={"gemini": extra} if extra else {},
+        )
+
+    def _join_instructions(self, instructions: List[InstructionSegment]) -> Optional[str]:
+        parts = [seg.text for seg in instructions if seg.text]
+        joined = "\n\n".join(parts)
+        return joined or None
+
+    def _error_type_from_value(self, value: str) -> ErrorType:
+        try:
+            return ErrorType(value)
+        except ValueError:
+            return ErrorType.UNKNOWN
+
+    def _optional_int(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _optional_float(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _coerce_str_list(self, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(x) for x in value if x is not None]
+        return None
+
+    def _extract_extra(self, payload: Dict[str, Any], known_keys: set[str]) -> Dict[str, Any]:
+        return {k: v for k, v in payload.items() if k not in known_keys}
+
+    def _merge_dropped(self, target: Dict[str, int], source: Dict[str, int]) -> None:
+        for k, v in source.items():
+            target[k] = target.get(k, 0) + int(v)
+
+
+__all__ = ["GeminiNormalizer"]

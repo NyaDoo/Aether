@@ -2,12 +2,33 @@
 Handler 基础工具函数
 """
 
+from __future__ import annotations
+
 import json
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from src.core.exceptions import EmbeddedErrorException, ProviderNotAvailableException
 from src.core.api_format import filter_response_headers
 from src.core.logger import logger
+
+if TYPE_CHECKING:
+    from src.core.api_format.conversion.registry import FormatConversionRegistry
+
+
+def get_format_converter_registry() -> "FormatConversionRegistry":
+    """
+    获取格式转换注册表（线程安全）
+
+    该函数确保 normalizers 已注册后再返回全局注册表实例。
+    register_default_normalizers 内部已有双重检查锁，可安全多次调用。
+    """
+    from src.core.api_format.conversion.registry import (
+        format_conversion_registry,
+        register_default_normalizers,
+    )
+
+    register_default_normalizers()
+    return format_conversion_registry
 
 
 def extract_cache_creation_tokens(usage: Dict[str, Any]) -> int:

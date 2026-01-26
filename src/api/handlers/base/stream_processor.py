@@ -28,10 +28,11 @@ from src.api.handlers.base.stream_context import StreamContext
 from src.api.handlers.base.utils import (
     check_html_response,
     check_prefetched_response_error,
+    get_format_converter_registry,
 )
 from src.config.constants import StreamDefaults
 from src.config.settings import config
-from src.core.api_format import FormatConversionError, converter_registry
+from src.core.api_format.conversion.exceptions import FormatConversionError
 from src.core.exceptions import (
     EmbeddedErrorException,
     ProviderNotAvailableException,
@@ -306,7 +307,8 @@ class StreamProcessor:
                             try:
                                 # 试转换：传 state=None，不保留状态
                                 # 如果失败触发 failover，下一个候选会使用干净的 state
-                                converter_registry.convert_stream_chunk_strict(
+                                registry = get_format_converter_registry()
+                                registry.convert_stream_chunk(
                                     data,
                                     provider_format,
                                     client_format,
@@ -451,38 +453,17 @@ class StreamProcessor:
 
             # 处理预读数据
             if needs_conversion:
-                # 延迟导入：仅在需要转换时加载转换器模块
-                from src.core.api_format import (
-                    ClaudeStreamConversionState,
-                    GeminiStreamConversionState,
-                    OpenAIStreamConversionState,
-                    StreamConversionState,
-                    converter_registry,
-                )
+                registry = get_format_converter_registry()
 
-                # 初始化流式转换状态（首次使用时，根据 Provider 格式选择状态类）
-                # 状态类对应 Provider 的响应格式，用于正确解析和累积流式数据
+                # 初始化流式转换状态（Canonical）
                 if ctx.stream_conversion_state is None:
-                    if provider_format == "GEMINI":
-                        ctx.stream_conversion_state = GeminiStreamConversionState(
-                            model=ctx.mapped_model or ctx.model or "",
-                            message_id=ctx.response_id or ctx.request_id or "",
-                        )
-                    elif provider_format == "OPENAI":
-                        ctx.stream_conversion_state = OpenAIStreamConversionState(
-                            model=ctx.mapped_model or ctx.model or "",
-                        )
-                    elif provider_format == "CLAUDE":
-                        ctx.stream_conversion_state = ClaudeStreamConversionState(
-                            model=ctx.mapped_model or ctx.model or "",
-                            message_id=ctx.response_id or ctx.request_id or "",
-                        )
-                    else:
-                        # 兜底：使用通用状态
-                        ctx.stream_conversion_state = StreamConversionState(
-                            model=ctx.mapped_model or ctx.model or "",
-                            message_id=ctx.response_id or ctx.request_id or "",
-                        )
+                    from src.core.api_format.conversion.stream_state import StreamState
+
+                    # 使用客户端请求的模型（ctx.model），而非映射后的上游模型（ctx.mapped_model）
+                    ctx.stream_conversion_state = StreamState(
+                        model=ctx.model or "",
+                        message_id=ctx.response_id or ctx.request_id or "",
+                    )
 
                     skip_next_blank_line = False
                     empty_yield_count = 0  # 空转计数（防护异常情况）
@@ -545,7 +526,7 @@ class StreamProcessor:
                             return []
 
                         try:
-                            converted_events = converter_registry.convert_stream_chunk_strict(
+                            converted_events = registry.convert_stream_chunk(
                                 data_obj,
                                 provider_format,
                                 client_format,

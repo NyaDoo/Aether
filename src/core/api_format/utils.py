@@ -16,7 +16,8 @@ def is_cli_format(format_id: Union[str, "APIFormat", None]) -> bool:
     """
     判断是否为 CLI 透传格式
 
-    CLI 格式以 _CLI 结尾，不参与格式转换，请求直接透传。
+    CLI 格式以 _CLI 结尾，表示该入口更偏向“CLI 兼容层”（鉴权/UA/路径差异等）。
+    是否参与格式转换由转换层决定；当前项目已支持 CLI 格式参与转换。
 
     Args:
         format_id: 格式标识符（字符串或 APIFormat 枚举）
@@ -96,11 +97,13 @@ def is_same_format(
 
 def is_convertible_format(format_id: Union[str, "APIFormat", None]) -> bool:
     """
-    判断是否为可转换格式（非 CLI）
+    判断是否为可转换格式
 
-    可转换格式可以与其他格式进行双向转换。
-    CLI 格式为透传模式，不参与转换。
+    .. deprecated::
+        此函数语义已退化（对非 None 输入总返回 True）。
+        真正的可转换性应通过 format_conversion_registry.can_convert_*() 查询。
+        保留此函数仅为向后兼容，不建议新代码使用。
     """
     if format_id is None:
         return False
-    return not is_cli_format(format_id)
+    return True

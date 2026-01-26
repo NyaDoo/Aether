@@ -1,7 +1,7 @@
 """
 API 格式核心模块
 
-统一管理 API 格式相关的枚举、元数据、工具函数和格式转换功能。
+统一管理 API 格式相关的枚举、元数据、工具函数等。
 
 模块组成：
 - enums.py: APIFormat 枚举定义
@@ -9,29 +9,7 @@ API 格式核心模块
 - headers.py: 请求头处理（构建、过滤、脱敏）
 - utils.py: 工具函数（is_cli_format, get_base_format 等）
 - detection.py: 格式检测（从请求头、响应内容检测格式）
-- conversion/: 格式转换子模块
 """
-
-from src.core.api_format.conversion import (
-    ClaudeStreamConversionState,
-    ClaudeToGeminiConverter,
-    ClaudeToOpenAIConverter,
-    FormatConversionError,
-    FormatConverterRegistry,
-    GeminiStreamConversionState,
-    GeminiToClaudeConverter,
-    GeminiToOpenAIConverter,
-    OpenAIStreamConversionState,
-    OpenAIToClaudeConverter,
-    OpenAIToGeminiConverter,
-    RequestConverter,
-    ResponseConverter,
-    StreamChunkConverter,
-    StreamConversionState,
-    converter_registry,
-    is_format_compatible,
-    register_all_converters,
-)
 from src.core.api_format.detection import (
     detect_cli_format_from_path,
     detect_format_and_key_from_starlette,
@@ -128,33 +106,9 @@ __all__ = [
     "get_adapter_protected_keys",
     "extract_set_headers_from_rules",
     "get_extra_headers_from_endpoint",
-    # Registry
-    "FormatConverterRegistry",
-    "converter_registry",
-    "register_all_converters",
-    # Protocols
-    "RequestConverter",
-    "ResponseConverter",
-    "StreamChunkConverter",
-    # State
-    "StreamConversionState",
-    "GeminiStreamConversionState",
-    "ClaudeStreamConversionState",
-    "OpenAIStreamConversionState",
-    # Exceptions
-    "FormatConversionError",
-    # Compatibility
-    "is_format_compatible",
     # Detection
     "detect_format_from_request",
     "detect_format_and_key_from_starlette",
     "detect_format_from_response",
     "detect_cli_format_from_path",
-    # Converters
-    "OpenAIToClaudeConverter",
-    "ClaudeToOpenAIConverter",
-    "ClaudeToGeminiConverter",
-    "GeminiToClaudeConverter",
-    "OpenAIToGeminiConverter",
-    "GeminiToOpenAIConverter",
 ]

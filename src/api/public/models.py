@@ -27,8 +27,10 @@ from src.core.api_format import (
     ApiFormatDefinition,
     detect_format_and_key_from_starlette,
 )
-from src.core.api_format.conversion import converter_registry
-from src.core.api_format.utils import is_cli_format
+from src.core.api_format.conversion import (
+    format_conversion_registry,
+    register_default_normalizers,
+)
 from src.core.logger import logger
 from src.database import get_db
 from src.models.database import ApiKey, User
@@ -114,11 +116,8 @@ def _get_convertible_formats(client_format: str, global_conversion_enabled: bool
 
     client_format_upper = client_format.upper()
 
-    # CLI 格式不支持转换
-    if is_cli_format(client_format_upper):
-        return _get_formats_for_api(client_format)
-
     # 收集所有可转换的格式
+    register_default_normalizers()
     convertible_formats = []
     for target_format in _ALL_CHAT_FORMATS:
         # 相同格式始终可用
@@ -127,7 +126,11 @@ def _get_convertible_formats(client_format: str, global_conversion_enabled: bool
             continue
 
         # 检查是否有双向转换器
-        if converter_registry.can_convert_full(client_format_upper, target_format, require_stream=False):
+        if format_conversion_registry.can_convert_full(
+            client_format_upper,
+            target_format,
+            require_stream=False,
+        ):
             convertible_formats.append(target_format)
 
     return convertible_formats if convertible_formats else _get_formats_for_api(client_format)

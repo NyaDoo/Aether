@@ -3,7 +3,7 @@ is_format_compatible 单元测试
 
 覆盖：
 - 同格式透传
-- CLI 格式禁止转换
+- CLI 格式允许转换（按 registry 能力）
 - 全局开关/端点开关/白黑名单
 - 流式转换开关
 - 转换器能力校验
@@ -28,18 +28,21 @@ def test_same_format_is_compatible() -> None:
     assert reason is None
 
 
-def test_cli_format_not_convertible() -> None:
+def test_cli_format_convertible_when_converter_supports_full() -> None:
+    registry = MagicMock()
+    registry.can_convert_full.return_value = True
+
     ok, needs_conv, reason = is_format_compatible(
         "CLAUDE_CLI",
         "OPENAI",
         endpoint_format_acceptance_config={"enabled": True},
         is_stream=False,
         global_conversion_enabled=True,
-        registry=MagicMock(),
+        registry=registry,
     )
-    assert ok is False
-    assert needs_conv is False
-    assert reason and "CLI" in reason
+    assert ok is True
+    assert needs_conv is True
+    assert reason is None
 
 
 def test_global_switch_disabled_blocks_conversion() -> None:
@@ -158,4 +161,3 @@ def test_conversion_allowed_when_converter_supports_full() -> None:
     assert ok is True
     assert needs_conv is True
     assert reason is None
-

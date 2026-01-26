@@ -128,7 +128,7 @@ class ClaudeCliAdapter(CliAdapterBase):
         else:
             return f"{base_url}/v1/messages"
 
-    # build_request_body 使用基类实现，通过 converter_registry 自动转换 OPENAI -> CLAUDE_CLI
+    # build_request_body 使用基类实现，通过 format_conversion_registry 自动转换 OPENAI -> CLAUDE_CLI
 
     @classmethod
     def get_cli_user_agent(cls) -> Optional[str]:

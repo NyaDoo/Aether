@@ -73,9 +73,14 @@ class OpenAIChatHandler(ChatHandlerBase):
         Returns:
             OpenAIRequest 对象
         """
-        from src.core.api_format import ClaudeToOpenAIConverter
+        from src.core.api_format.conversion.registry import (
+            format_conversion_registry,
+            register_default_normalizers,
+        )
         from src.models.claude import ClaudeMessagesRequest
         from src.models.openai import OpenAIRequest
+
+        register_default_normalizers()
 
         # 如果已经是 OpenAI 格式，直接返回
         if isinstance(request, OpenAIRequest):
@@ -83,8 +88,8 @@ class OpenAIChatHandler(ChatHandlerBase):
 
         # 如果是 Claude 格式，转换为 OpenAI 格式
         if isinstance(request, ClaudeMessagesRequest):
-            converter = ClaudeToOpenAIConverter()
-            openai_dict = converter.convert_request(request.dict())
+            req_dict = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+            openai_dict = format_conversion_registry.convert_request(req_dict, "CLAUDE", "OPENAI")
             return OpenAIRequest(**openai_dict)
 
         # 如果是字典，尝试判断格式
@@ -93,8 +98,7 @@ class OpenAIChatHandler(ChatHandlerBase):
                 return OpenAIRequest(**request)
             except Exception:
                 try:
-                    converter = ClaudeToOpenAIConverter()
-                    openai_dict = converter.convert_request(request)
+                    openai_dict = format_conversion_registry.convert_request(request, "CLAUDE", "OPENAI")
                     return OpenAIRequest(**openai_dict)
                 except Exception:
                     return OpenAIRequest(**request)

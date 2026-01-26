@@ -169,14 +169,17 @@ class OpenAIResponseParser(ResponseParser):
 
         # 提取 usage 信息（某些 OpenAI 兼容 API 如豆包会在最后一个 chunk 中发送 usage）
         # 这个 chunk 通常 choices 为空数组，但包含完整的 usage 信息
+        # 使用取最大值策略确保正确统计
         usage = parsed.get("usage")
         if usage and isinstance(usage, dict):
             chunk.input_tokens = usage.get("prompt_tokens", 0)
             chunk.output_tokens = usage.get("completion_tokens", 0)
 
-            # 更新 stats
-            stats.input_tokens = chunk.input_tokens
-            stats.output_tokens = chunk.output_tokens
+            # 取最大值更新 stats
+            if chunk.input_tokens > stats.input_tokens:
+                stats.input_tokens = chunk.input_tokens
+            if chunk.output_tokens > stats.output_tokens:
+                stats.output_tokens = chunk.output_tokens
 
         stats.chunk_count += 1
         stats.data_count += 1
@@ -287,6 +290,9 @@ class ClaudeResponseParser(ResponseParser):
             stats.has_completion = True
 
         # 提取 usage
+        # Claude 流式响应的 usage 可能在首个 chunk（message_start）或最后一个 chunk（message_delta）中
+        # 首个 chunk 通常包含 input_tokens，最后一个 chunk 包含 output_tokens
+        # 使用取最大值策略确保正确统计
         usage = self._parser.extract_usage(parsed)
         if usage:
             chunk.input_tokens = usage.get("input_tokens", 0)
@@ -294,10 +300,15 @@ class ClaudeResponseParser(ResponseParser):
             chunk.cache_creation_tokens = usage.get("cache_creation_tokens", 0)
             chunk.cache_read_tokens = usage.get("cache_read_tokens", 0)
 
-            stats.input_tokens = chunk.input_tokens
-            stats.output_tokens = chunk.output_tokens
-            stats.cache_creation_tokens = chunk.cache_creation_tokens
-            stats.cache_read_tokens = chunk.cache_read_tokens
+            # 取最大值更新 stats
+            if chunk.input_tokens > stats.input_tokens:
+                stats.input_tokens = chunk.input_tokens
+            if chunk.output_tokens > stats.output_tokens:
+                stats.output_tokens = chunk.output_tokens
+            if chunk.cache_creation_tokens > stats.cache_creation_tokens:
+                stats.cache_creation_tokens = chunk.cache_creation_tokens
+            if chunk.cache_read_tokens > stats.cache_read_tokens:
+                stats.cache_read_tokens = chunk.cache_read_tokens
 
         # 检查错误
         if self._parser.is_error_event(parsed):
@@ -432,15 +443,21 @@ class GeminiResponseParser(ResponseParser):
             stats.has_completion = True
 
         # 提取 usage
+        # Gemini 流式响应的 usage 可能出现在多个 chunk 中
+        # 使用取最大值策略确保正确统计
         usage = self._parser.extract_usage(parsed)
         if usage:
             chunk.input_tokens = usage.get("input_tokens", 0)
             chunk.output_tokens = usage.get("output_tokens", 0)
             chunk.cache_read_tokens = usage.get("cached_tokens", 0)
 
-            stats.input_tokens = chunk.input_tokens
-            stats.output_tokens = chunk.output_tokens
-            stats.cache_read_tokens = chunk.cache_read_tokens
+            # 取最大值更新 stats
+            if chunk.input_tokens > stats.input_tokens:
+                stats.input_tokens = chunk.input_tokens
+            if chunk.output_tokens > stats.output_tokens:
+                stats.output_tokens = chunk.output_tokens
+            if chunk.cache_read_tokens > stats.cache_read_tokens:
+                stats.cache_read_tokens = chunk.cache_read_tokens
 
         # 检查错误
         if self._parser.is_error_event(parsed):

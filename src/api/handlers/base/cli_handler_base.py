@@ -15,18 +15,23 @@ import codecs
 import json
 import time
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Callable,
     Dict,
     List,
     Optional,
+    Tuple,
 )
 
 import httpx
 from fastapi import BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:
+    from src.core.api_format import ApiFormatDefinition
 
 from src.api.handlers.base.base_handler import (
     BaseMessageHandler,
@@ -46,6 +51,7 @@ from src.api.handlers.base.utils import (
     check_html_response,
     check_prefetched_response_error,
     filter_proxy_response_headers,
+    get_format_converter_registry,
 )
 from src.config.constants import StreamDefaults
 from src.config.settings import config
@@ -71,6 +77,108 @@ from src.services.cache.aware_scheduler import ProviderCandidate
 from src.services.provider.transport import build_provider_url
 from src.utils.sse_parser import SSEEventParser
 from src.utils.timeout import read_first_chunk_with_ttfb_timeout
+
+
+# ==============================================================================
+# SSE 行解析辅助函数
+# ==============================================================================
+
+
+def _parse_sse_data_line(line: str) -> Tuple[Optional[Any], str]:
+    """
+    解析标准 SSE data 行
+
+    Args:
+        line: 以 "data:" 开头的 SSE 行
+
+    Returns:
+        (parsed_json, status) 元组：
+        - (parsed_dict, "ok") - 解析成功
+        - (None, "empty") - 内容为空
+        - (None, "invalid") - JSON 解析失败，调用方应透传原始行
+    """
+    data_content = line[5:].strip()
+    if not data_content:
+        return None, "empty"
+    try:
+        return json.loads(data_content), "ok"
+    except json.JSONDecodeError:
+        return None, "invalid"
+
+
+def _parse_sse_event_data_line(line: str) -> Tuple[Optional[Any], str]:
+    """
+    解析 event + data 同行格式（如 "event: xxx data: {...}"）
+
+    Args:
+        line: 以 "event:" 开头且包含 " data:" 的 SSE 行
+
+    Returns:
+        (parsed_json, status) 元组
+    """
+    _event_part, data_part = line.split(" data:", 1)
+    data_content = data_part.strip()
+    try:
+        return json.loads(data_content), "ok"
+    except json.JSONDecodeError:
+        return None, "invalid"
+
+
+def _parse_gemini_json_array_line(line: str) -> Tuple[Optional[Any], str]:
+    """
+    解析 Gemini JSON-array 格式的裸 JSON 行
+
+    Gemini 流式响应可能是 JSON 数组格式，每行是数组元素。
+
+    Args:
+        line: 原始行（可能是 "[", "]", ",", 或 JSON 对象）
+
+    Returns:
+        (parsed_json, status) 元组
+    """
+    stripped = line.strip()
+    if stripped in ("", "[", "]", ","):
+        return None, "skip"
+
+    candidate = stripped.lstrip(",").rstrip(",").strip()
+    try:
+        return json.loads(candidate), "ok"
+    except json.JSONDecodeError:
+        logger.debug(f"Gemini JSON-array line skip: {stripped[:50]}")
+        return None, "invalid"
+
+
+def _format_converted_events_to_sse(
+    converted_events: List[Dict[str, Any]],
+    client_format: str,
+) -> List[str]:
+    """
+    将转换后的事件格式化为 SSE 行
+
+    Args:
+        converted_events: 转换后的事件列表
+        client_format: 客户端 API 格式
+
+    Returns:
+        SSE 行列表（每个元素是完整的 SSE 事件，包含尾部空行）
+    """
+    result: List[str] = []
+    needs_event_line = client_format.upper() in ("CLAUDE", "CLAUDE_CLI")
+
+    for evt in converted_events:
+        payload = json.dumps(evt, ensure_ascii=False)
+        if needs_event_line:
+            evt_type = evt.get("type") if isinstance(evt, dict) else None
+            if isinstance(evt_type, str) and evt_type:
+                # Claude 格式：event + data + 空行
+                result.append(f"event: {evt_type}\ndata: {payload}\n")
+            else:
+                result.append(f"data: {payload}\n")
+        else:
+            # OpenAI 格式：data + 空行
+            result.append(f"data: {payload}\n")
+
+    return result
 
 
 class CliMessageHandlerBase(BaseMessageHandler):
@@ -247,6 +355,111 @@ class CliMessageHandlerBase(BaseMessageHandler):
             准备好的请求体
         """
         return request_body
+
+    @staticmethod
+    def _get_format_metadata(format_id: str) -> Optional["ApiFormatDefinition"]:
+        """获取格式元数据（解析失败返回 None）"""
+        from src.core.api_format import APIFormat
+        from src.core.api_format.metadata import API_FORMAT_DEFINITIONS
+
+        try:
+            fmt = APIFormat(format_id.upper())
+            return API_FORMAT_DEFINITIONS.get(fmt)
+        except (ValueError, KeyError):
+            return None
+
+    def _finalize_converted_request(
+        self,
+        request_body: Dict[str, Any],
+        client_api_format: str,
+        provider_api_format: str,
+        mapped_model: Optional[str],
+        fallback_model: str,
+        is_stream: bool,
+    ) -> None:
+        """
+        跨格式转换后统一设置并清理 model/stream 字段（原地修改）
+
+        处理逻辑：
+        1. 根据目标格式决定是否在 body 中设置 model
+        2. 若客户端格式不含 stream 字段但 Provider 需要，则显式设置
+        3. 移除目标格式不允许在 body 中携带的字段（如 Gemini 的 model/stream）
+
+        Args:
+            request_body: 转换后的请求体（会被原地修改）
+            client_api_format: 客户端 API 格式
+            provider_api_format: Provider API 格式
+            mapped_model: 映射后的模型名
+            fallback_model: 备用模型名
+            is_stream: 是否流式请求
+        """
+        client_meta = self._get_format_metadata(client_api_format)
+        provider_meta = self._get_format_metadata(provider_api_format)
+
+        # 默认：model_in_body=True, stream_in_body=True（如 OpenAI/Claude）
+        client_uses_stream = client_meta.stream_in_body if client_meta else True
+        provider_model_in_body = provider_meta.model_in_body if provider_meta else True
+        provider_stream_in_body = provider_meta.stream_in_body if provider_meta else True
+
+        # 设置 model（仅当 Provider 允许且 body 中需要）
+        if provider_model_in_body:
+            request_body["model"] = mapped_model or fallback_model
+        else:
+            request_body.pop("model", None)
+
+        # 设置 stream（客户端不带但 Provider 需要时显式设置；Provider 不需要时移除）
+        if provider_stream_in_body:
+            if not client_uses_stream:
+                request_body["stream"] = is_stream
+        else:
+            request_body.pop("stream", None)
+
+    def _convert_request_for_cross_format(
+        self,
+        request_body: Dict[str, Any],
+        client_api_format: str,
+        provider_api_format: str,
+        mapped_model: Optional[str],
+        fallback_model: str,
+        is_stream: bool,
+    ) -> Tuple[Dict[str, Any], str]:
+        """
+        跨格式请求转换的公共逻辑
+
+        将客户端格式的请求体转换为 Provider 格式，并处理 model/stream 字段的补齐和清理。
+
+        Args:
+            request_body: 原始请求体（会被修改）
+            client_api_format: 客户端 API 格式
+            provider_api_format: Provider API 格式
+            mapped_model: 映射后的模型名
+            fallback_model: 备用模型名（通常是原始请求的 model）
+            is_stream: 是否流式请求
+
+        Returns:
+            (转换后的请求体, 用于 URL 的模型名)
+        """
+        registry = get_format_converter_registry()
+        converted_body = registry.convert_request(
+            request_body,
+            str(client_api_format),
+            str(provider_api_format),
+        )
+
+        # 先计算 URL 模型（在清理 body 中的 model 字段之前）
+        url_model = self.get_model_for_url(converted_body, mapped_model) or mapped_model or fallback_model
+
+        # 统一设置并清理 model/stream 字段
+        self._finalize_converted_request(
+            converted_body,
+            str(client_api_format),
+            str(provider_api_format),
+            mapped_model,
+            fallback_model,
+            is_stream,
+        )
+
+        return converted_body, url_model
 
     def get_model_for_url(
         self,
@@ -469,8 +682,29 @@ class CliMessageHandlerBase(BaseMessageHandler):
         else:
             request_body = original_request_body
 
-        # 准备发送给 Provider 的请求体（子类可覆盖以移除不需要的字段）
-        request_body = self.prepare_provider_request_body(request_body)
+        client_api_format = (
+            ctx.client_api_format.value
+            if hasattr(ctx.client_api_format, "value")
+            else str(ctx.client_api_format)
+        )
+        provider_api_format = str(ctx.provider_api_format or "")
+        needs_conversion = bool(getattr(candidate, "needs_conversion", False)) if candidate else False
+        ctx.needs_conversion = needs_conversion
+
+        # 跨格式：先做请求体转换（失败触发 failover）
+        if needs_conversion and provider_api_format:
+            request_body, url_model = self._convert_request_for_cross_format(
+                request_body,
+                client_api_format,
+                provider_api_format,
+                mapped_model,
+                ctx.model,
+                is_stream=True,
+            )
+        else:
+            # 同格式：按原逻辑做轻量清理（子类可覆盖）
+            request_body = self.prepare_provider_request_body(request_body)
+            url_model = self.get_model_for_url(request_body, mapped_model) or mapped_model or ctx.model
 
         # 使用 RequestBuilder 构建请求体和请求头
         # 注意：mapped_model 已经应用到 request_body，这里不再传递
@@ -486,10 +720,6 @@ class CliMessageHandlerBase(BaseMessageHandler):
         # 保存发送给 Provider 的请求信息（用于调试和统计）
         ctx.provider_request_headers = provider_headers
         ctx.provider_request_body = provider_payload
-
-        # 获取用于 URL 的模型名（子类可覆盖此方法，如 Gemini 需要特殊处理）
-        # 使用 ctx.model 作为 fallback（它已从 path_params 获取）
-        url_model = self.get_model_for_url(request_body, mapped_model) or ctx.model
 
         url = build_provider_url(
             endpoint,
@@ -658,6 +888,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                                 ctx,
                                 event.get("event"),
                                 event.get("data") or "",
+                                record_chunk=not needs_conversion,
                             )
                         self._mark_first_output(ctx, output_state)
                         yield b"\n"
@@ -689,7 +920,9 @@ class CliMessageHandlerBase(BaseMessageHandler):
 
                     # 格式转换或直接透传
                     if needs_conversion:
-                        converted_lines = self._convert_sse_line(ctx, line, events)
+                        converted_lines, converted_events = self._convert_sse_line(ctx, line, events)
+                        # 记录转换后的数据到 parsed_chunks
+                        self._record_converted_chunks(ctx, converted_events)
                         for converted_line in converted_lines:
                             if converted_line:
                                 self._mark_first_output(ctx, output_state)
@@ -703,6 +936,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                         ctx,
                         event.get("event"),
                         event.get("data") or "",
+                        record_chunk=not needs_conversion,
                     )
 
                 if ctx.data_count > 0:
@@ -714,6 +948,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                     ctx,
                     event.get("event"),
                     event.get("data") or "",
+                    record_chunk=not needs_conversion,
                 )
 
             # 检查是否收到数据
@@ -735,6 +970,10 @@ class CliMessageHandlerBase(BaseMessageHandler):
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode("utf-8")
             else:
                 logger.debug("流式数据转发完成")
+                # 为 OpenAI 客户端补齐 [DONE] 标记（非 CLI 格式）
+                client_fmt = (ctx.client_api_format or "").upper()
+                if needs_conversion and client_fmt == "OPENAI":
+                    yield b"data: [DONE]\n\n"
 
         except GeneratorExit:
             raise
@@ -1011,6 +1250,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                                 ctx,
                                 event.get("event"),
                                 event.get("data") or "",
+                                record_chunk=not needs_conversion,
                             )
                         self._mark_first_output(ctx, output_state)
                         yield b"\n"
@@ -1020,7 +1260,9 @@ class CliMessageHandlerBase(BaseMessageHandler):
 
                     # 格式转换或直接透传
                     if needs_conversion:
-                        converted_lines = self._convert_sse_line(ctx, line, events)
+                        converted_lines, converted_events = self._convert_sse_line(ctx, line, events)
+                        # 记录转换后的数据到 parsed_chunks
+                        self._record_converted_chunks(ctx, converted_events)
                         for converted_line in converted_lines:
                             if converted_line:
                                 self._mark_first_output(ctx, output_state)
@@ -1034,6 +1276,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                             ctx,
                             event.get("event"),
                             event.get("data") or "",
+                            record_chunk=not needs_conversion,
                         )
 
                     if ctx.data_count > 0:
@@ -1064,6 +1307,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                                 ctx,
                                 event.get("event"),
                                 event.get("data") or "",
+                                record_chunk=not needs_conversion,
                             )
                         self._mark_first_output(ctx, output_state)
                         yield b"\n"
@@ -1095,7 +1339,9 @@ class CliMessageHandlerBase(BaseMessageHandler):
 
                     # 格式转换或直接透传
                     if needs_conversion:
-                        converted_lines = self._convert_sse_line(ctx, line, events)
+                        converted_lines, converted_events = self._convert_sse_line(ctx, line, events)
+                        # 记录转换后的数据到 parsed_chunks
+                        self._record_converted_chunks(ctx, converted_events)
                         for converted_line in converted_lines:
                             if converted_line:
                                 self._mark_first_output(ctx, output_state)
@@ -1109,6 +1355,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                             ctx,
                             event.get("event"),
                             event.get("data") or "",
+                            record_chunk=not needs_conversion,
                         )
 
                     if ctx.data_count > 0:
@@ -1121,6 +1368,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                     ctx,
                     event.get("event"),
                     event.get("data") or "",
+                    record_chunk=not needs_conversion,
                 )
 
             # 检查是否收到数据
@@ -1144,6 +1392,10 @@ class CliMessageHandlerBase(BaseMessageHandler):
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode("utf-8")
             else:
                 logger.debug("流式数据转发完成")
+                # 为 OpenAI 客户端补齐 [DONE] 标记（非 CLI 格式）
+                client_fmt = (ctx.client_api_format or "").upper()
+                if needs_conversion and client_fmt == "OPENAI":
+                    yield b"data: [DONE]\n\n"
 
         except GeneratorExit:
             raise
@@ -1189,12 +1441,21 @@ class CliMessageHandlerBase(BaseMessageHandler):
         ctx: StreamContext,
         event_name: Optional[str],
         data_str: str,
+        record_chunk: bool = False,
     ) -> None:
         """
         处理 SSE 事件
 
         通用框架：解析 JSON、更新计数器
         子类可覆盖 _process_event_data() 实现格式特定逻辑
+
+        Args:
+            ctx: 流上下文
+            event_name: 事件名称（如 message_start, content_block_delta 等）
+            data_str: 事件数据字符串（JSON 格式）
+            record_chunk: 是否记录到 parsed_chunks（不需要格式转换时应为 True）
+                          当为 True 时，同时更新 data_count；
+                          当为 False 时，data_count 由 _record_converted_chunks 更新
         """
         if not data_str:
             return
@@ -1208,8 +1469,11 @@ class CliMessageHandlerBase(BaseMessageHandler):
         except json.JSONDecodeError:
             return
 
-        ctx.data_count += 1
-        ctx.parsed_chunks.append(data)
+        # 当不需要格式转换时，记录原始数据到 parsed_chunks 并更新 data_count
+        # 当需要格式转换时（record_chunk=False），data_count 由 _record_converted_chunks 更新
+        if record_chunk and isinstance(data, dict):
+            ctx.parsed_chunks.append(data)
+            ctx.data_count += 1
 
         if not isinstance(data, dict):
             return
@@ -1239,12 +1503,28 @@ class CliMessageHandlerBase(BaseMessageHandler):
                 ctx.response_id = data["id"]
 
         # 使用解析器提取 usage
+        # Claude/CLI 流式响应的 usage 可能在首个 chunk 或最后一个 chunk 中
+        # 首个 chunk 可能部分为 0，最后一个 chunk 包含完整值，因此取最大值确保正确计费
         usage = self.parser.extract_usage_from_response(data)
-        if usage and not ctx.final_usage:
-            ctx.input_tokens = usage.get("input_tokens", 0)
-            ctx.output_tokens = usage.get("output_tokens", 0)
-            ctx.cached_tokens = usage.get("cache_read_tokens", 0)
-            ctx.final_usage = usage
+        if usage:
+            new_input = usage.get("input_tokens", 0)
+            new_output = usage.get("output_tokens", 0)
+            new_cached = usage.get("cache_read_tokens", 0)
+            new_cache_creation = usage.get("cache_creation_tokens", 0)
+
+            # 取最大值更新
+            if new_input > ctx.input_tokens:
+                ctx.input_tokens = new_input
+            if new_output > ctx.output_tokens:
+                ctx.output_tokens = new_output
+            if new_cached > ctx.cached_tokens:
+                ctx.cached_tokens = new_cached
+            if new_cache_creation > ctx.cache_creation_tokens:
+                ctx.cache_creation_tokens = new_cache_creation
+
+            # 保存最后一个非空 usage 作为 final_usage
+            if any([new_input, new_output, new_cached, new_cache_creation]):
+                ctx.final_usage = usage
 
         # 提取文本内容
         text = self.parser.extract_text_content(data)
@@ -1257,6 +1537,41 @@ class CliMessageHandlerBase(BaseMessageHandler):
             response_obj = data.get("response")
             if isinstance(response_obj, dict):
                 ctx.final_response = response_obj
+
+    def _record_converted_chunks(
+        self,
+        ctx: StreamContext,
+        converted_events: List[Dict[str, Any]],
+    ) -> None:
+        """
+        记录转换后的 chunk 数据到 parsed_chunks，并更新统计信息
+
+        当需要格式转换时，记录的是转换后的数据（客户端实际收到的格式）；
+        同时更新 data_count、has_completion 等统计信息。
+
+        Args:
+            ctx: 流上下文
+            converted_events: 转换后的事件列表
+        """
+        for evt in converted_events:
+            if isinstance(evt, dict):
+                ctx.parsed_chunks.append(evt)
+                ctx.data_count += 1
+
+                # 检测完成事件（根据客户端格式判断）
+                # OpenAI 格式: choices[].finish_reason
+                # Claude 格式: type == "message_stop" 或 stop_reason
+                event_type = evt.get("type", "")
+                if event_type == "message_stop":
+                    ctx.has_completion = True
+                elif event_type == "response.completed":
+                    ctx.has_completion = True
+                elif "choices" in evt:
+                    choices = evt.get("choices", [])
+                    for choice in choices:
+                        if isinstance(choice, dict) and choice.get("finish_reason"):
+                            ctx.has_completion = True
+                            break
 
     def _finalize_stream_metadata(self, ctx: StreamContext) -> None:
         """
@@ -1634,8 +1949,25 @@ class CliMessageHandlerBase(BaseMessageHandler):
             else:
                 request_body = dict(request_body_ref["body"])
 
-            # 准备发送给 Provider 的请求体（子类可覆盖以移除不需要的字段）
-            request_body = self.prepare_provider_request_body(request_body)
+            client_api_format = (
+                api_format.value if hasattr(api_format, "value") else str(api_format)
+            )
+            needs_conversion = bool(getattr(candidate, "needs_conversion", False))
+
+            # 跨格式：先做请求体转换（失败触发 failover）
+            if needs_conversion and provider_api_format:
+                request_body, url_model = self._convert_request_for_cross_format(
+                    request_body,
+                    client_api_format,
+                    provider_api_format,
+                    mapped_model,
+                    model,
+                    is_stream=False,
+                )
+            else:
+                # 同格式：按原逻辑做轻量清理（子类可覆盖）
+                request_body = self.prepare_provider_request_body(request_body)
+                url_model = self.get_model_for_url(request_body, mapped_model) or mapped_model or model
 
             # 使用 RequestBuilder 构建请求体和请求头
             # 注意：mapped_model 已经应用到 request_body，这里不再传递
@@ -1651,9 +1983,6 @@ class CliMessageHandlerBase(BaseMessageHandler):
             # 保存发送给 Provider 的请求信息（用于调试和统计）
             provider_request_headers = provider_headers
             provider_request_body = provider_payload
-
-            # 获取用于 URL 的模型名（子类可覆盖此方法，如 Gemini 需要特殊处理）
-            url_model = self.get_model_for_url(request_body, mapped_model)
 
             url = build_provider_url(
                 endpoint,
@@ -1795,16 +2124,15 @@ class CliMessageHandlerBase(BaseMessageHandler):
             if response_json is None:
                 response_json = {}
 
-            # 检查是否需要格式转换
-            if (
-                provider_api_format
-                and api_format
-                and provider_api_format.upper() != api_format.upper()
-            ):
-                from src.core.api_format import converter_registry
+            # 检查是否需要格式转换（同族格式无需转换，如 CLAUDE 和 CLAUDE_CLI）
+            from src.core.api_format.utils import get_base_format
 
+            provider_base = get_base_format(provider_api_format) if provider_api_format else None
+            client_base = get_base_format(api_format) if api_format else None
+            if provider_base and client_base and provider_base != client_base:
                 try:
-                    response_json = converter_registry.convert_response(
+                    registry = get_format_converter_registry()
+                    response_json = registry.convert_response(
                         response_json,
                         provider_api_format,
                         api_format,
@@ -1954,10 +2282,30 @@ class CliMessageHandlerBase(BaseMessageHandler):
 
         当 Provider 的 API 格式与客户端请求的 API 格式不同时，需要转换响应。
         例如：客户端请求 Claude 格式，但 Provider 返回 OpenAI 格式。
+
+        注意：CLAUDE 和 CLAUDE_CLI、OPENAI 和 OPENAI_CLI 等同族格式在响应层面是兼容的，
+        因此使用 get_base_format 比较基础格式（去除 _CLI 后缀）。
         """
+        from src.core.api_format.utils import get_base_format
+
         if not ctx.provider_api_format or not ctx.client_api_format:
+            logger.debug(
+                f"[{getattr(ctx, 'request_id', 'unknown')}] _needs_format_conversion: "
+                f"provider_api_format={ctx.provider_api_format!r}, client_api_format={ctx.client_api_format!r} -> False (missing)"
+            )
             return False
-        return ctx.provider_api_format.upper() != ctx.client_api_format.upper()
+
+        # 比较基础格式（CLAUDE_CLI -> CLAUDE, OPENAI_CLI -> OPENAI）
+        provider_base = get_base_format(ctx.provider_api_format)
+        client_base = get_base_format(ctx.client_api_format)
+        result = provider_base != client_base
+
+        logger.debug(
+            f"[{getattr(ctx, 'request_id', 'unknown')}] _needs_format_conversion: "
+            f"provider={ctx.provider_api_format}(base={provider_base}), "
+            f"client={ctx.client_api_format}(base={client_base}) -> {result}"
+        )
+        return result
 
     def _mark_first_output(self, ctx: StreamContext, state: Dict[str, bool]) -> None:
         """
@@ -1983,7 +2331,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
         ctx: StreamContext,
         line: str,
         events: list,  # noqa: ARG002 - 预留给上下文感知转换
-    ) -> List[str]:
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
         """
         将 SSE 行从 Provider 格式转换为客户端格式
 
@@ -1993,76 +2341,118 @@ class CliMessageHandlerBase(BaseMessageHandler):
             events: 当前累积的事件列表（预留参数，用于未来上下文感知转换如合并相邻事件）
 
         Returns:
-            转换后的 SSE 行列表（一入多出），空列表表示跳过该行
+            (sse_lines, converted_events) 元组：
+            - sse_lines: 转换后的 SSE 行列表（一入多出），空列表表示跳过该行
+            - converted_events: 转换后的事件对象列表（用于记录到 parsed_chunks）
         """
-        from src.core.api_format import (
-            GeminiStreamConversionState,
-            StreamConversionState,
-            converter_registry,
-        )
+        # 空行直接返回
+        if not line or line.strip() == "":
+            return ([line] if line else [], [])
 
-        # 如果是空行或特殊控制行，直接返回
-        if not line or line.strip() == "" or line == "data: [DONE]":
-            return [line] if line else []
-
-        provider_format = (ctx.provider_api_format or "").upper()
         client_format = (ctx.client_api_format or "").upper()
 
-        # 兼容 Gemini 上游 JSON-array/chunks：可能是“裸 JSON 行”而非 `data: {...}`
-        if not line.startswith("data:"):
-            if provider_format != "GEMINI":
-                return [line]
-
-            stripped = line.strip()
-            if stripped in ("", "[", "]", ","):
-                return []
-
-            candidate = stripped.lstrip(",").rstrip(",").strip()
-            try:
-                data_obj = json.loads(candidate)
-            except json.JSONDecodeError:
-                # 不是可解析的 JSON 对象：不透传（避免把 Gemini 原始分块泄漏到目标 SSE）
-                logger.debug(f"Gemini JSON-array line skip: {stripped[:50]}")
-                return []
-        else:
-            # 提取 data 内容
-            data_content = line[5:].strip()  # 去掉 "data:" 前缀
-
-            # 尝试解析 JSON
-            try:
-                data_obj = json.loads(data_content)
-            except json.JSONDecodeError:
-                # 无法解析，直接透传
-                return [line]
-
-        # 初始化流式转换状态（首次调用时，根据 Provider 格式选择状态类）
-        if ctx.stream_conversion_state is None:
-            if provider_format == "GEMINI":
-                ctx.stream_conversion_state = GeminiStreamConversionState(
-                    model=ctx.mapped_model or ctx.model or "",
-                    message_id=ctx.response_id or ctx.request_id or "",
-                )
+        # [DONE] 标记处理：只有 OpenAI 客户端需要，Claude 客户端不需要
+        if line == "data: [DONE]":
+            if client_format.startswith("OPENAI"):
+                return [line], []
             else:
-                ctx.stream_conversion_state = StreamConversionState(
-                    model=ctx.mapped_model or ctx.model or "",
-                    message_id=ctx.response_id or ctx.request_id or "",
-                )
+                # Claude/Gemini 客户端不需要 [DONE] 标记
+                return [], []
 
-        # 使用注册表进行格式转换（严格模式，返回 List[Dict]）
+        provider_format = (ctx.provider_api_format or "").upper()
+
+        # 过滤上游控制行（id/retry），避免与目标格式混淆
+        if line.startswith(("id:", "retry:")):
+            return [], []
+
+        # 解析 SSE 行为 JSON 对象
+        data_obj, status = self._parse_sse_line_to_json(line, provider_format)
+
+        # 根据解析状态决定行为
+        if status == "empty" or status == "skip":
+            return [], []
+        if status == "invalid" or status == "passthrough":
+            return [line], []
+
+        # 初始化流式转换状态
+        if ctx.stream_conversion_state is None:
+            from src.core.api_format.conversion.stream_state import StreamState
+
+            # 使用客户端请求的模型（ctx.model），而非映射后的上游模型（ctx.mapped_model）
+            init_model = ctx.model or ""
+            logger.debug(
+                f"[{ctx.request_id}] StreamState init: ctx.model={ctx.model!r}, "
+                f"mapped_model={ctx.mapped_model!r}, using={init_model!r}"
+            )
+            ctx.stream_conversion_state = StreamState(
+                model=init_model,
+                message_id=ctx.response_id or ctx.request_id or "",
+            )
+
+        # 执行格式转换
         try:
-            converted_events = converter_registry.convert_stream_chunk_strict(
+            registry = get_format_converter_registry()
+            # status == "ok" 时 data_obj 必定是有效的 dict（防御性检查）
+            if data_obj is None:
+                return [], []
+            converted_events = registry.convert_stream_chunk(
                 data_obj,
                 provider_format,
                 client_format,
                 state=ctx.stream_conversion_state,
             )
-
-            # 转换为 SSE 行列表
-            result = []
-            for evt in converted_events:
-                result.append(f"data: {json.dumps(evt, ensure_ascii=False)}")
-            return result
+            result = _format_converted_events_to_sse(converted_events, client_format)
+            if result:
+                logger.debug(
+                    f"[{getattr(ctx, 'request_id', 'unknown')}] 流式转换: "
+                    f"{provider_format}->{client_format}, events={len(converted_events)}, "
+                    f"first_output={result[0][:100] if result else 'empty'}..."
+                )
+            return result, converted_events
 
         except Exception as e:
             logger.warning(f"格式转换失败，透传原始数据: {e}")
-            return [line]
+            return [line], []
+
+    def _parse_sse_line_to_json(
+        self, line: str, provider_format: str
+    ) -> Tuple[Optional[Any], str]:
+        """
+        解析 SSE 行为 JSON 对象
+
+        支持多种格式：
+        - 标准 SSE: "data: {...}"
+        - event+data 同行: "event: xxx data: {...}"
+        - Gemini JSON-array: 裸 JSON 行
+
+        Args:
+            line: 原始 SSE 行
+            provider_format: Provider API 格式
+
+        Returns:
+            (parsed_json, status) 元组：
+            - (obj, "ok") - 解析成功
+            - (None, "empty") - 内容为空，应跳过
+            - (None, "invalid") - JSON 解析失败，应透传原始行
+            - (None, "skip") - 应跳过（如纯 event 行）
+            - (None, "passthrough") - 无法识别，应透传原始行
+        """
+        # 标准 SSE: data: {...}
+        if line.startswith("data:"):
+            return _parse_sse_data_line(line)
+
+        # event + data 同行: event: xxx data: {...}
+        if line.startswith("event:") and " data:" in line:
+            return _parse_sse_event_data_line(line)
+
+        # 纯 event 行不参与转换
+        if line.startswith("event:"):
+            return None, "skip"
+
+        # Gemini JSON-array 格式
+        if provider_format == "GEMINI":
+            return _parse_gemini_json_array_line(line)
+
+        # 其他格式：无法识别，透传
+        return None, "passthrough"
+

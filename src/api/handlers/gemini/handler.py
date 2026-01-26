@@ -62,13 +62,15 @@ class GeminiChatHandler(ChatHandlerBase):
         Returns:
             GeminiRequest 对象
         """
-        from src.core.api_format import (
-            ClaudeToGeminiConverter,
-            OpenAIToGeminiConverter,
+        from src.core.api_format.conversion.registry import (
+            format_conversion_registry,
+            register_default_normalizers,
         )
         from src.models.claude import ClaudeMessagesRequest
         from src.models.gemini import GeminiRequest
         from src.models.openai import OpenAIRequest
+
+        register_default_normalizers()
 
         # 如果已经是 Gemini 格式，直接返回
         if isinstance(request, GeminiRequest):
@@ -76,14 +78,14 @@ class GeminiChatHandler(ChatHandlerBase):
 
         # 如果是 Claude 格式，转换为 Gemini 格式
         if isinstance(request, ClaudeMessagesRequest):
-            converter = ClaudeToGeminiConverter()
-            gemini_dict = converter.convert_request(request.model_dump())
+            req_dict = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+            gemini_dict = format_conversion_registry.convert_request(req_dict, "CLAUDE", "GEMINI")
             return GeminiRequest(**gemini_dict)
 
         # 如果是 OpenAI 格式，转换为 Gemini 格式
         if isinstance(request, OpenAIRequest):
-            converter = OpenAIToGeminiConverter()
-            gemini_dict = converter.convert_request(request.model_dump())
+            req_dict = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+            gemini_dict = format_conversion_registry.convert_request(req_dict, "OPENAI", "GEMINI")
             return GeminiRequest(**gemini_dict)
 
         # 如果是字典，根据内容判断格式并转换
@@ -100,13 +102,11 @@ class GeminiChatHandler(ChatHandlerBase):
                 messages = request.get("messages", [])
                 if messages and isinstance(messages[0].get("content"), list):
                     # 可能是 Claude 格式
-                    converter = ClaudeToGeminiConverter()
-                    gemini_dict = converter.convert_request(request)
+                    gemini_dict = format_conversion_registry.convert_request(request, "CLAUDE", "GEMINI")
                     return GeminiRequest(**gemini_dict)
                 else:
                     # 可能是 OpenAI 格式
-                    converter = OpenAIToGeminiConverter()
-                    gemini_dict = converter.convert_request(request)
+                    gemini_dict = format_conversion_registry.convert_request(request, "OPENAI", "GEMINI")
                     return GeminiRequest(**gemini_dict)
 
             # 默认尝试作为 Gemini 格式

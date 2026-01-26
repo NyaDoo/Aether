@@ -223,7 +223,7 @@ class GeminiChatAdapter(ChatAdapterBase):
         else:
             return f"{base_url}/v1beta"
 
-    # build_request_body 使用基类实现，通过 converter_registry 自动转换 OPENAI -> GEMINI
+    # build_request_body 使用基类实现，通过 format_conversion_registry 自动转换 OPENAI -> GEMINI
 
     @classmethod
     async def check_endpoint(

@@ -65,7 +65,7 @@ def build_test_request_body(
 ) -> Dict[str, Any]:
     """构建测试请求体，自动处理格式转换
 
-    使用 converter_registry 将 OpenAI 格式的测试请求转换为目标格式。
+    使用格式转换注册表将 OpenAI 格式的测试请求转换为目标格式。
 
     Args:
         format_id: 目标 API 格式 ID（如 "CLAUDE", "GEMINI", "OPENAI_CLI"）
@@ -74,18 +74,22 @@ def build_test_request_body(
     Returns:
         转换为目标 API 格式的请求体
     """
-    from src.core.api_format.conversion import converter_registry
+    from src.core.api_format.conversion import (
+        format_conversion_registry,
+        register_default_normalizers,
+    )
     from src.core.api_format.utils import get_base_format
+
+    register_default_normalizers()
 
     # 获取测试请求数据（OpenAI 格式）
     source_data = get_test_request_data(request_data)
 
     # CLI 格式使用基础格式进行转换（CLAUDE_CLI -> CLAUDE）
-    # 因为 converter_registry 只注册了基础格式之间的转换器
     target_format = get_base_format(format_id) or format_id
 
     # 使用注册表进行格式转换 (OPENAI -> 目标基础格式)
-    return converter_registry.convert_request(source_data, "OPENAI", target_format)
+    return format_conversion_registry.convert_request(source_data, "OPENAI", target_format)
 
 
 # ==============================================================================

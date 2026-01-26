@@ -9,10 +9,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
-from src.core.api_format.utils import is_cli_format
-
 if TYPE_CHECKING:
-    from src.core.api_format.conversion.registry import FormatConverterRegistry
+    from src.core.api_format.conversion.registry import FormatConversionRegistry
+
+from src.core.api_format.utils import get_base_format
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ def is_format_compatible(
     endpoint_format_acceptance_config: Optional[dict],
     is_stream: bool,
     global_conversion_enabled: bool,
-    registry: Optional["FormatConverterRegistry"] = None,
+    registry: Optional["FormatConversionRegistry"] = None,
 ) -> Tuple[bool, bool, Optional[str]]:
     """
     检查端点是否兼容客户端格式
@@ -44,9 +44,13 @@ def is_format_compatible(
     """
     # 延迟导入避免循环依赖
     if registry is None:
-        from src.core.api_format.conversion.registry import converter_registry
+        from src.core.api_format.conversion.registry import (
+            format_conversion_registry,
+            register_default_normalizers,
+        )
 
-        registry = converter_registry
+        register_default_normalizers()
+        registry = format_conversion_registry
 
     provider_format = endpoint_api_format.upper()
     client_format_upper = client_format.upper()
@@ -55,11 +59,12 @@ def is_format_compatible(
     if provider_format == client_format_upper:
         return True, False, None
 
-    # 2. CLI 格式不参与转换
-    if is_cli_format(client_format_upper):
-        return False, False, "CLI 格式不支持转换"
-    if is_cli_format(provider_format):
-        return False, False, "Provider 为 CLI 格式，不支持转换"
+    # 2. 同族格式匹配（CLAUDE 和 CLAUDE_CLI、OPENAI 和 OPENAI_CLI 等）
+    #    这些格式在响应层面是兼容的，只是认证方式不同
+    provider_base = get_base_format(provider_format)
+    client_base = get_base_format(client_format_upper)
+    if provider_base == client_base:
+        return True, False, None
 
     # 3. 检查全局开关
     if not global_conversion_enabled:
