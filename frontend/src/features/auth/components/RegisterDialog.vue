@@ -397,9 +397,6 @@ const canSubmit = computed(() => {
   // 用户名格式验证
   if (usernameError.value) return false
 
-  // 检查用户名格式
-  if (usernameError.value) return false
-
   // 如果需要邮箱验证，邮箱和验证都必须完成
   if (props.requireEmailVerification) {
     if (!formData.value.email || !emailVerified.value) {
