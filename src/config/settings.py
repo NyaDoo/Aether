@@ -141,8 +141,8 @@ class Config:
 
         # HTTP 请求超时配置（秒）
         self.http_connect_timeout = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10.0"))
-        self.http_read_timeout = float(os.getenv("HTTP_READ_TIMEOUT", "60.0"))
-        self.http_write_timeout = float(os.getenv("HTTP_WRITE_TIMEOUT", "60.0"))
+        self.http_read_timeout = float(os.getenv("HTTP_READ_TIMEOUT", "3600.0"))
+        self.http_write_timeout = float(os.getenv("HTTP_WRITE_TIMEOUT", "3600.0"))
         self.http_pool_timeout = float(os.getenv("HTTP_POOL_TIMEOUT", "10.0"))
         # HTTP_REQUEST_TIMEOUT: 非流式请求整体超时（秒），默认 300 秒
         self.http_request_timeout = float(os.getenv("HTTP_REQUEST_TIMEOUT", "300.0"))
@@ -152,6 +152,14 @@ class Config:
         # 注意：即使开启，也需要端点配置 format_acceptance_config.enabled=true 才能生效
         self.format_conversion_enabled = os.getenv(
             "FORMAT_CONVERSION_ENABLED", "true"
+        ).lower() == "true"
+
+        # KEEP_PRIORITY_ON_CONVERSION: 格式转换时是否保持提供商原优先级，默认关闭
+        # - false（默认）: 需要格式转换的候选整体降级到不需要转换的候选之后
+        # - true: 所有提供商保持原优先级，不因格式转换降级
+        # 注意：即使全局关闭，单个提供商也可以通过 keep_priority_on_conversion 字段保持自己的优先级
+        self.keep_priority_on_conversion = os.getenv(
+            "KEEP_PRIORITY_ON_CONVERSION", "false"
         ).lower() == "true"
 
         # HTTP 连接池配置

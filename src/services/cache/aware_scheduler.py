@@ -1162,9 +1162,22 @@ class CacheAwareScheduler:
                     candidate.is_cached = False
                 return candidates
 
-            # 按是否匹配缓存亲和性分类候选
-            cached_candidates: List[ProviderCandidate] = []
-            other_candidates: List[ProviderCandidate] = []
+            # 判断候选是否应该被降级（用于分组）
+            from src.config.settings import config
+            global_keep_priority = config.keep_priority_on_conversion
+
+            def should_demote(c: ProviderCandidate) -> bool:
+                """判断候选是否应该被降级"""
+                if global_keep_priority:
+                    return False  # 全局开启时，所有候选都不降级
+                if not c.needs_conversion:
+                    return False  # exact 候选不降级
+                if getattr(c.provider, "keep_priority_on_conversion", False):
+                    return False  # 提供商配置了保持优先级
+                return True  # 需要降级
+
+            # 按是否匹配缓存亲和性分类候选，同时记录是否降级
+            matched_candidate: Optional[ProviderCandidate] = None
             matched = False
 
             for candidate in candidates:
@@ -1178,7 +1191,7 @@ class CacheAwareScheduler:
                     and key.id == affinity.key_id
                 ):
                     candidate.is_cached = True
-                    cached_candidates.append(candidate)
+                    matched_candidate = candidate
                     matched = True
                     logger.debug(
                         f"检测到缓存亲和性: affinity_key={affinity_key[:8]}..., "
@@ -1189,18 +1202,57 @@ class CacheAwareScheduler:
                     )
                 else:
                     candidate.is_cached = False
-                    other_candidates.append(candidate)
 
             if not matched:
                 logger.debug(f"API格式 {api_format_str} 的缓存亲和性存在但组合不可用")
+                return candidates
 
-            # 重新排序：缓存候选优先
-            if cached_candidates:
-                result = cached_candidates + other_candidates
-                logger.debug(f"{len(cached_candidates)} 个缓存组合已提升至优先级")
+            # 缓存亲和性命中且该候选可用（未被跳过）时，无条件优先使用
+            # 理由：1) 它之前成功过；2) 它有 prompt cache 优势
+            # 只有当缓存亲和性的候选被跳过（健康度太低/熔断）时，才按 exact 优先排序
+            assert matched_candidate is not None  # guaranteed by matched=True
+
+            if not matched_candidate.is_skipped:
+                # 缓存命中且健康，无条件提升到最前面
+                other_candidates = [c for c in candidates if c is not matched_candidate]
+                result = [matched_candidate] + other_candidates
+                logger.debug(
+                    f"缓存亲和性命中且健康，无条件优先使用 "
+                    f"(needs_conversion={matched_candidate.needs_conversion})"
+                )
                 return result
 
-            return candidates
+            # 缓存命中但被跳过（不健康），按 exact 优先排序
+            # 缓存候选在其所属类别内提升到最前面
+            logger.debug(
+                f"缓存亲和性命中但不健康 (skip_reason={matched_candidate.skip_reason})，"
+                f"按 exact 优先排序"
+            )
+            matched_should_demote = should_demote(matched_candidate)
+
+            # 分组：非降级类 和 降级类
+            keep_priority_candidates: List[ProviderCandidate] = []
+            demote_candidates: List[ProviderCandidate] = []
+
+            for c in candidates:
+                if c is matched_candidate:
+                    continue  # 先跳过缓存命中的候选
+                if should_demote(c):
+                    demote_candidates.append(c)
+                else:
+                    keep_priority_candidates.append(c)
+
+            # 将缓存命中的候选插入到其所属类别的最前面
+            if matched_should_demote:
+                # 缓存命中的是降级类，插入到降级类最前面
+                demote_candidates.insert(0, matched_candidate)
+            else:
+                # 缓存命中的是非降级类，插入到非降级类最前面
+                keep_priority_candidates.insert(0, matched_candidate)
+
+            result = keep_priority_candidates + demote_candidates
+            logger.debug(f"缓存组合已提升至其类别内优先级 (demote={matched_should_demote})")
+            return result
 
         except Exception as e:
             logger.warning(f"检查缓存亲和性失败: {e}，继续使用默认排序")
@@ -1249,31 +1301,59 @@ class CacheAwareScheduler:
         """
         根据优先级模式对候选列表排序（数字越小越优先）
 
-        排序规则：
-        1. exact 候选（needs_conversion=False）优先于 convertible 候选
-        2. 在同一类型内，按优先级模式排序：
-           - provider: 提供商优先模式，按 Provider.provider_priority -> Key.internal_priority 排序
-           - global_key: 全局 Key 优先模式，按 Key.global_priority_by_format 排序
+        排序规则（受 KEEP_PRIORITY_ON_CONVERSION 配置影响）：
+        1. 如果全局配置 keep_priority_on_conversion=True，所有候选保持原优先级
+        2. 否则，按 needs_conversion 和 provider.keep_priority_on_conversion 分组：
+           - 保持优先级的候选（exact 或 provider.keep_priority_on_conversion=True）按原优先级排序
+           - 需要降级的候选（convertible 且 provider.keep_priority_on_conversion=False）整体排在后面
+        3. 在同一组内，按优先级模式排序：
+           - provider: 按 Provider.provider_priority -> Key.internal_priority 排序
+           - global_key: 按 Key.global_priority_by_format 排序
         """
         if not candidates:
             return candidates
 
-        # 按 needs_conversion 分组：exact 优先
-        exact_candidates = [c for c in candidates if not c.needs_conversion]
-        convertible_candidates = [c for c in candidates if c.needs_conversion]
+        from src.config.settings import config
+
+        # 全局配置：如果开启，所有候选保持原优先级
+        global_keep_priority = config.keep_priority_on_conversion
+
+        if global_keep_priority:
+            # 全局开启：不分组，直接按优先级模式排序
+            if self.priority_mode == self.PRIORITY_MODE_GLOBAL_KEY:
+                return self._sort_by_global_priority_with_hash(candidates, affinity_key, api_format)
+            # 提供商优先模式：保持构建时的顺序（已按 provider_priority 排序）
+            return candidates
+
+        # 全局未开启：按是否需要降级分组
+        # - 不需要降级：exact 候选 或 provider.keep_priority_on_conversion=True 的 convertible 候选
+        # - 需要降级：convertible 且 provider.keep_priority_on_conversion=False
+        keep_priority_candidates: List[ProviderCandidate] = []
+        demote_candidates: List[ProviderCandidate] = []
+
+        for c in candidates:
+            if not c.needs_conversion:
+                # exact 候选：不需要降级
+                keep_priority_candidates.append(c)
+            elif getattr(c.provider, "keep_priority_on_conversion", False):
+                # convertible 但提供商配置了保持优先级
+                keep_priority_candidates.append(c)
+            else:
+                # convertible 且未配置保持优先级：降级
+                demote_candidates.append(c)
 
         if self.priority_mode == self.PRIORITY_MODE_GLOBAL_KEY:
             # 全局 Key 优先模式：分别对两组排序后合并
-            sorted_exact = self._sort_by_global_priority_with_hash(
-                exact_candidates, affinity_key, api_format
+            sorted_keep = self._sort_by_global_priority_with_hash(
+                keep_priority_candidates, affinity_key, api_format
             )
-            sorted_convertible = self._sort_by_global_priority_with_hash(
-                convertible_candidates, affinity_key, api_format
+            sorted_demote = self._sort_by_global_priority_with_hash(
+                demote_candidates, affinity_key, api_format
             )
-            return sorted_exact + sorted_convertible
+            return sorted_keep + sorted_demote
 
-        # 提供商优先模式：exact 在前，convertible 在后（各组内部顺序已由构建时保证）
-        return exact_candidates + convertible_candidates
+        # 提供商优先模式：保持优先级的在前，降级的在后（各组内部顺序已由构建时保证）
+        return keep_priority_candidates + demote_candidates
 
     def _sort_by_global_priority_with_hash(
         self,

@@ -309,6 +309,7 @@ export interface ProviderWithEndpointsSummary {
   description?: string
   website?: string
   provider_priority: number
+  keep_priority_on_conversion: boolean  // 格式转换时是否保持优先级
   billing_type?: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
   monthly_quota_usd?: number
   monthly_used_usd?: number

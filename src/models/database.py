@@ -645,6 +645,12 @@ class Provider(Base):
     # 101+: 备用(高成本或限制严格的)
     provider_priority = Column(Integer, default=100)
 
+    # 格式转换时是否保持优先级（默认 False）
+    # - False: 需要格式转换时，该提供商的候选会被降级到不需要转换的候选之后
+    # - True: 即使需要格式转换，也保持原优先级排名
+    # 注意：如果全局配置 KEEP_PRIORITY_ON_CONVERSION=true，此字段被忽略（所有提供商都保持优先级）
+    keep_priority_on_conversion = Column(Boolean, default=False, nullable=False)
+
     # 状态
     is_active = Column(Boolean, default=True, nullable=False)
 

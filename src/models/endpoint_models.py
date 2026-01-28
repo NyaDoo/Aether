@@ -613,6 +613,10 @@ class ProviderUpdateRequest(BaseModel):
     description: Optional[str] = None
     website: Optional[str] = Field(None, max_length=500, description="主站网站")
     provider_priority: Optional[int] = Field(None, description="提供商优先级(数字越小越优先)")
+    keep_priority_on_conversion: Optional[bool] = Field(
+        None,
+        description="格式转换时是否保持优先级（True=保持原优先级，False=需要转换时降级）",
+    )
     is_active: Optional[bool] = None
     billing_type: Optional[str] = Field(
         None, description="计费类型：monthly_quota/pay_as_you_go/free_tier"
@@ -637,6 +641,10 @@ class ProviderWithEndpointsSummary(BaseModel):
     description: Optional[str] = None
     website: Optional[str] = None
     provider_priority: int = Field(default=100, description="提供商优先级(数字越小越优先)")
+    keep_priority_on_conversion: bool = Field(
+        default=False,
+        description="格式转换时是否保持优先级（True=保持原优先级，False=需要转换时降级）",
+    )
     is_active: bool
 
     # 计费相关字段
