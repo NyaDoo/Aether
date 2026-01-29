@@ -29,7 +29,7 @@
 
         <!-- Description -->
         <p
-          class="text-lg text-[#666663] dark:text-gray-300 mb-4 transition-all duration-700"
+          class="text-lg text-[#666663] dark:text-[#c9c3b4] mb-4 transition-all duration-700"
           :style="descStyle"
         >
           {{ description }}
@@ -81,7 +81,7 @@
           >
             <div :class="panelClasses.panelHeader">
               <div class="flex items-center justify-between">
-                <span class="text-xs font-medium text-[#666663] dark:text-muted-foreground">
+                <span class="text-xs font-medium text-[#666663] dark:text-[#c9c3b4]">
                   {{ config.path }}
                 </span>
                 <button

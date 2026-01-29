@@ -183,7 +183,7 @@
             欢迎使用 <span class="text-primary typewriter">{{ aetherText }}<span class="cursor" :class="{ 'cursor-hidden': !showCursor }">_</span></span>
           </h1>
           <p
-            class="mb-8 text-base sm:text-lg md:text-xl text-[#666663] dark:text-gray-300 max-w-2xl mx-auto transition-all duration-700"
+            class="mb-8 text-base sm:text-lg md:text-xl text-[#666663] dark:text-[#c9c3b4] max-w-2xl mx-auto transition-all duration-700"
             :style="getDescStyle(SECTIONS.HOME)"
           >
             AI 开发工具统一接入平台<br>
@@ -207,7 +207,7 @@
         description="直接在您的终端中释放Claude的原始力量。瞬间搜索百万行代码库。将数小时的流程转化为单一命令。您的工具。您的流程。您的代码库,以思维速度进化。"
         :badge-icon="Code2"
         badge-text="IDE 集成"
-        badge-class="bg-[#cc785c]/10 dark:bg-amber-900/30 border border-[#cc785c]/20 dark:border-amber-800 text-[#cc785c] dark:text-amber-400"
+        badge-class="bg-[#cc785c]/10 dark:bg-[#cc785c]/20 border border-[#cc785c]/20 dark:border-[#d4a27f]/30 text-[#cc785c] dark:text-[#d4a27f]"
         :platform-options="platformPresets.claude.options"
         :install-command="claudeInstallCommand"
         :config-files="[{ path: '~/.claude/settings.json', content: claudeConfig, language: 'json' }]"
@@ -227,7 +227,7 @@
         description="Codex CLI 是一款可在本地终端运行的编程助手工具，它能够读取、修改并执行用户指定目录中的代码。"
         :badge-icon="Terminal"
         badge-text="命令行工具"
-        badge-class="bg-[#cc785c]/10 dark:bg-emerald-900/30 border border-[#cc785c]/20 dark:border-emerald-800 text-[#cc785c] dark:text-emerald-400"
+        badge-class="bg-[#cc785c]/10 dark:bg-[#cc785c]/20 border border-[#cc785c]/20 dark:border-[#d4a27f]/30 text-[#cc785c] dark:text-[#d4a27f]"
         :platform-options="platformPresets.codex.options"
         :install-command="codexInstallCommand"
         :config-files="[
@@ -250,7 +250,7 @@
         description="Gemini CLI 是一款开源人工智能代理，可将 Gemini 的强大功能直接带入你的终端。它提供了对 Gemini 的轻量级访问，为你提供了从提示符到我们模型的最直接路径。"
         :badge-icon="Sparkles"
         badge-text="多模态 AI"
-        badge-class="bg-[#cc785c]/10 dark:bg-primary/20 border border-[#cc785c]/20 dark:border-primary/30 text-[#cc785c] dark:text-primary"
+        badge-class="bg-[#cc785c]/10 dark:bg-[#cc785c]/20 border border-[#cc785c]/20 dark:border-[#d4a27f]/30 text-[#cc785c] dark:text-[#d4a27f]"
         :platform-options="platformPresets.gemini.options"
         :install-command="geminiInstallCommand"
         :config-files="[
@@ -272,7 +272,7 @@
       >
         <div class="max-w-4xl mx-auto text-center relative z-10">
           <div
-            class="inline-flex items-center gap-1.5 md:gap-2 rounded-full bg-[#cc785c]/10 dark:bg-purple-500/20 border border-[#cc785c]/20 dark:border-purple-500/40 px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-medium text-[#cc785c] dark:text-purple-300 mb-4 md:mb-6 backdrop-blur-sm transition-all duration-500"
+            class="inline-flex items-center gap-1.5 md:gap-2 rounded-full bg-[#cc785c]/10 dark:bg-[#cc785c]/20 border border-[#cc785c]/20 dark:border-[#d4a27f]/30 px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-medium text-[#cc785c] dark:text-[#d4a27f] mb-4 md:mb-6 backdrop-blur-sm transition-all duration-500"
             :style="getBadgeStyle(SECTIONS.FEATURES)"
           >
             <Sparkles class="h-3.5 w-3.5 md:h-4 md:w-4" />
@@ -287,7 +287,7 @@
           </h2>
 
           <p
-            class="text-base md:text-lg text-[#666663] dark:text-gray-300 mb-6 md:mb-12 max-w-2xl mx-auto transition-all duration-700"
+            class="text-base md:text-lg text-[#666663] dark:text-[#c9c3b4] mb-6 md:mb-12 max-w-2xl mx-auto transition-all duration-700"
             :style="getDescStyle(SECTIONS.FEATURES)"
           >
             核心 API 代理功能已完成，正在载入更多功能
@@ -297,59 +297,69 @@
             <div
               v-for="(feature, idx) in featureCards"
               :key="idx"
-              class="bg-white/70 dark:bg-[#262624]/80 backdrop-blur-sm rounded-xl md:rounded-2xl p-4 md:p-6 border border-[#e5e4df] dark:border-[rgba(227,224,211,0.16)] hover:border-[#cc785c]/30 dark:hover:border-[#d4a27f]/40 transition-all duration-700"
+              class="group bg-white/90 dark:bg-[#262624]/80 backdrop-blur-sm rounded-xl md:rounded-2xl p-4 md:p-6 border transition-all duration-700"
+              :class="feature.status === 'completed'
+                ? 'border-[#cc785c]/20 dark:border-[#d4a27f]/20'
+                : 'border-[#e5e4df] dark:border-[rgba(227,224,211,0.16)] border-dashed'"
               :style="getFeatureCardStyle(SECTIONS.FEATURES, idx)"
             >
               <div
-                class="flex h-10 w-10 md:h-12 md:w-12 items-center justify-center rounded-lg md:rounded-xl mb-2 md:mb-4 mx-auto"
-                :class="feature.status === 'completed'
-                  ? 'bg-emerald-500/10 dark:bg-emerald-500/15'
-                  : 'bg-[#cc785c]/10 dark:bg-[#cc785c]/15'"
+                class="flex h-10 w-10 md:h-12 md:w-12 items-center justify-center rounded-lg md:rounded-xl mb-2 md:mb-4 mx-auto bg-[#cc785c]/8 dark:bg-[#cc785c]/12"
               >
                 <component
                   :is="feature.icon"
-                  class="h-5 w-5 md:h-6 md:w-6"
-                  :class="feature.status === 'completed'
-                    ? 'text-emerald-500 dark:text-emerald-400'
-                    : 'text-[#cc785c] dark:text-[#d4a27f] animate-spin'"
+                  class="h-5 w-5 md:h-6 md:w-6 text-[#cc785c] dark:text-[#d4a27f]"
+                  :class="{ 'opacity-50': feature.status !== 'completed' }"
                 />
               </div>
-              <h3 class="text-base md:text-lg font-bold text-[#191919] dark:text-white mb-1 md:mb-2">
+              <h3
+                class="text-base md:text-lg font-bold mb-1 md:mb-2"
+                :class="feature.status === 'completed'
+                  ? 'text-[#191919] dark:text-white'
+                  : 'text-[#666663] dark:text-[#a0a0a0]'"
+              >
                 {{ feature.title }}
               </h3>
               <p class="text-xs md:text-sm text-[#666663] dark:text-[#c9c3b4]">
                 {{ feature.desc }}
               </p>
               <div
-                class="mt-2 md:mt-3 inline-flex items-center gap-1.5 px-2 md:px-2.5 py-0.5 md:py-1 rounded-full text-xs font-medium"
+                class="mt-2 md:mt-3 inline-flex items-center gap-1.5 px-2 md:px-2.5 py-0.5 md:py-1 rounded-full text-xs font-medium border"
                 :class="feature.status === 'completed'
-                  ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                  : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'"
+                  ? 'bg-[#cc785c]/5 text-[#cc785c] dark:text-[#d4a27f] border-[#cc785c]/20 dark:border-[#d4a27f]/20'
+                  : 'bg-transparent text-[#91918d] dark:text-[#808080] border-[#e5e4df] dark:border-[rgba(227,224,211,0.12)]'"
               >
-                {{ feature.status === 'completed' ? '已完成' : '进行中' }}
+                {{ feature.status === 'completed' ? '已完成' : '开发中' }}
               </div>
             </div>
           </div>
 
           <div
-            class="mt-6 md:mt-12 transition-all duration-700"
+            class="mt-6 md:mt-12 transition-all duration-700 flex items-center justify-center gap-4"
             :style="getButtonsStyle(SECTIONS.FEATURES)"
           >
             <RouterLink
+              to="/guide"
+              class="inline-flex items-center justify-center gap-2 rounded-xl bg-transparent border-2 border-[#cc785c] px-6 py-3 text-base font-semibold text-[#cc785c] dark:text-[#d4a27f] dark:border-[#d4a27f] transition hover:bg-[#cc785c]/10 dark:hover:bg-[#d4a27f]/10 hover:scale-105 w-[160px]"
+            >
+              <BookOpen class="h-5 w-5" />
+              配置教程
+            </RouterLink>
+            <RouterLink
               v-if="authStore.isAuthenticated"
               :to="dashboardPath"
-              class="inline-flex items-center gap-2 rounded-xl bg-primary hover:bg-primary/90 px-6 py-3 text-base font-semibold text-white shadow-lg shadow-primary/30 transition hover:shadow-primary/50 hover:scale-105"
+              class="inline-flex items-center justify-center gap-2 rounded-xl bg-transparent border-2 border-[#cc785c] px-6 py-3 text-base font-semibold text-[#cc785c] dark:text-[#d4a27f] dark:border-[#d4a27f] transition hover:bg-[#cc785c]/10 dark:hover:bg-[#d4a27f]/10 hover:scale-105 w-[160px]"
             >
               <Rocket class="h-5 w-5" />
-              立即开始使用
+              立即开始
             </RouterLink>
             <button
               v-else
-              class="inline-flex items-center gap-2 rounded-xl bg-primary hover:bg-primary/90 px-6 py-3 text-base font-semibold text-white shadow-lg shadow-primary/30 transition hover:shadow-primary/50 hover:scale-105"
+              class="inline-flex items-center justify-center gap-2 rounded-xl bg-transparent border-2 border-[#cc785c] px-6 py-3 text-base font-semibold text-[#cc785c] dark:text-[#d4a27f] dark:border-[#d4a27f] transition hover:bg-[#cc785c]/10 dark:hover:bg-[#d4a27f]/10 hover:scale-105 w-[160px]"
               @click="showLoginDialog = true"
             >
               <Rocket class="h-5 w-5" />
-              立即开始使用
+              立即开始
             </button>
           </div>
         </div>
@@ -364,6 +374,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import {
+  BookOpen,
   ChevronDown,
   Code2,
   Moon,

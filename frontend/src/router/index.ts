@@ -14,6 +14,12 @@ const routes: RouteRecordRaw[] = [
   },
 
   {
+    path: '/guide',
+    name: 'Guide',
+    component: () => importWithRetry(() => import('@/views/public/Guide.vue')),
+    meta: { requiresAuth: false }
+  },
+  {
     path: '/logo-demo',
     name: 'LogoColorDemo',
     component: () => importWithRetry(() => import('@/views/public/LogoColorDemo.vue')),

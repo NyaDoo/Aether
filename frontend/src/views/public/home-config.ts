@@ -1,5 +1,5 @@
 import { computed, type Ref } from 'vue'
-import { Apple, Box, Check, Loader2, Monitor, Terminal } from 'lucide-vue-next'
+import { Apple, Box, Layers, Monitor, Puzzle, Terminal, Users } from 'lucide-vue-next'
 import type { Component } from 'vue'
 
 // Section index constants
@@ -25,21 +25,21 @@ export const sections = [
 // Feature cards data
 export const featureCards = [
   {
-    icon: Check,
+    icon: Layers,
     title: 'Claude / OpenAI / Gemini',
     desc: '已完整接入三大主流 AI 编程助手的标准 API',
     status: 'completed' as const
   },
   {
-    icon: Check,
-    title: '灵活的 API 扩展',
-    desc: '插件化架构，可快速接入其他 LLM Provider',
+    icon: Puzzle,
+    title: '格式转换',
+    desc: '开启/关闭API格式相互转换、自定义请求头',
     status: 'completed' as const
   },
   {
-    icon: Loader2,
-    title: '项目追踪',
-    desc: '开发日志、代码 Review、文档生成等功能即将到来',
+    icon: Users,
+    title: '协同开发',
+    desc: '远程开发、Skill分享、Playground等功能即将到来',
     status: 'in-progress' as const
   }
 ]

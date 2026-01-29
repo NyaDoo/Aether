@@ -206,6 +206,11 @@ function highlightPlaceholders(html: string): string {
   font-weight: 500;
 }
 
+.code-highlight :deep(.hljs-section) {
+  color: #cc785c;
+  font-weight: 500;
+}
+
 .code-highlight :deep(.hljs-number) {
   color: #005cc5;
 }
@@ -314,7 +319,13 @@ body[theme-mode='dark'] .code-highlight :deep(.hljs-comment) {
 .dark .code-highlight :deep(.hljs-title),
 body[theme-mode='dark'] .code-highlight :deep(.hljs-function),
 body[theme-mode='dark'] .code-highlight :deep(.hljs-title) {
-  color: #dcdcaa;
+  color: #d4a27f;
+  font-weight: 500;
+}
+
+.dark .code-highlight :deep(.hljs-section),
+body[theme-mode='dark'] .code-highlight :deep(.hljs-section) {
+  color: #d4a27f;
   font-weight: 500;
 }
 
@@ -329,7 +340,7 @@ body[theme-mode='dark'] .code-highlight :deep(.hljs-number) {
 body[theme-mode='dark'] .code-highlight :deep(.hljs-literal),
 body[theme-mode='dark'] .code-highlight :deep(.language-json .hljs-literal),
 body[theme-mode='dark'] .code-highlight :deep(.language-json .hljs-literal .hljs-keyword) {
-  color: #e1e4e8;
+  color: #e3e0d3;
   font-weight: normal;
 }
 
@@ -342,7 +353,7 @@ body[theme-mode='dark'] .code-highlight :deep(.hljs-property) {
 
 .dark .code-highlight :deep(.hljs-punctuation),
 body[theme-mode='dark'] .code-highlight :deep(.hljs-punctuation) {
-  color: #d4d4d4;
+  color: #c9c3b4;
   opacity: 0.7;
 }
 
@@ -392,12 +403,12 @@ body[theme-mode='dark'] .code-highlight :deep(.language-bash .hljs-literal) {
 
 .dark .code-highlight :deep(.language-bash),
 body[theme-mode='dark'] .code-highlight :deep(.language-bash) {
-  color: #e1e4e8;
+  color: #e3e0d3;
 }
 
 .dark .code-highlight :deep(.language-bash .hljs-string),
 body[theme-mode='dark'] .code-highlight :deep(.language-bash .hljs-string) {
-  color: #e1e4e8;
+  color: #e3e0d3;
   font-weight: 400;
 }
 </style>
