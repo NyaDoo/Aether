@@ -402,7 +402,7 @@
           </div>
 
           <div
-            class="mt-6 md:mt-12 transition-all duration-700 flex items-center justify-center gap-4"
+            class="mt-6 md:mt-12 transition-all duration-700 flex items-center justify-center gap-4 relative z-30"
             :style="getButtonsStyle(SECTIONS.FEATURES)"
           >
             <RouterLink

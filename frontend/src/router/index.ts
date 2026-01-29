@@ -15,9 +15,46 @@ const routes: RouteRecordRaw[] = [
 
   {
     path: '/guide',
-    name: 'Guide',
-    component: () => importWithRetry(() => import('@/views/public/Guide.vue')),
-    meta: { requiresAuth: false }
+    component: () => importWithRetry(() => import('@/views/public/guide/GuideLayout.vue')),
+    meta: { requiresAuth: false },
+    children: [
+      {
+        path: '',
+        name: 'GuideOverview',
+        component: () => importWithRetry(() => import('@/views/public/guide/Overview.vue')),
+        meta: { requiresAuth: false }
+      },
+      {
+        path: 'provider',
+        name: 'GuideProvider',
+        component: () => importWithRetry(() => import('@/views/public/guide/ProviderGuide.vue')),
+        meta: { requiresAuth: false }
+      },
+      {
+        path: 'model',
+        name: 'GuideModel',
+        component: () => importWithRetry(() => import('@/views/public/guide/ModelGuide.vue')),
+        meta: { requiresAuth: false }
+      },
+      {
+        path: 'user-key',
+        name: 'GuideUserKey',
+        component: () => importWithRetry(() => import('@/views/public/guide/UserKeyGuide.vue')),
+        meta: { requiresAuth: false }
+      },
+      {
+        path: 'advanced',
+        name: 'GuideAdvanced',
+        component: () => importWithRetry(() => import('@/views/public/guide/AdvancedGuide.vue')),
+        meta: { requiresAuth: false }
+      },
+      {
+        path: 'faq',
+        name: 'GuideFaq',
+        component: () => importWithRetry(() => import('@/views/public/guide/GuideFaq.vue')),
+        meta: { requiresAuth: false }
+      }
+    ]
   },
   {
     path: '/logo-demo',
