@@ -2,6 +2,8 @@
 ProviderEndpoint 相关的 API 模型定义
 """
 
+from __future__ import annotations
+
 import re
 from datetime import datetime
 from typing import Any, Literal
@@ -171,7 +173,7 @@ class EndpointAPIKeyCreate(BaseModel):
         default="api_key",
         description="认证类型：api_key（标准 API Key）或 vertex_ai（Vertex AI Service Account）"
     )
-    auth_config: Optional[Dict[str, Any]] = Field(
+    auth_config: dict[str, Any] | None = Field(
         default=None,
         description="认证配置（JSON）：vertex_ai 时存储完整 Service Account JSON"
     )

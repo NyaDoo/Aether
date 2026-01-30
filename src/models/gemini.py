@@ -5,6 +5,8 @@ Google Gemini API 请求/响应模型
 作为 API 网关，采用宽松类型定义以支持 API 新特性透传
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field

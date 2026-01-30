@@ -17,6 +17,8 @@ Gemini Files API 代理端点
 https://ai.google.dev/api/files
 """
 
+from __future__ import annotations
+
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 

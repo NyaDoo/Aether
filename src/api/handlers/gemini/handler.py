@@ -4,6 +4,8 @@ Gemini Chat Handler
 处理 Gemini API 格式的请求
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 from src.api.handlers.base.chat_handler_base import ChatHandlerBase

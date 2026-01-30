@@ -5,6 +5,8 @@ Gemini Files API - 文件与 Key 绑定缓存
 并在后续 generateContent 请求中优先使用同一 Key。
 """
 
+from __future__ import annotations
+
 from typing import Any, Dict, Optional, Set
 
 from src.core.cache_service import CacheService

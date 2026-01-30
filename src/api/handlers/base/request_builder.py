@@ -11,6 +11,7 @@
     payload, headers = builder.build(original_body, original_headers, endpoint, key)
 """
 
+from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
@@ -316,7 +317,7 @@ def build_passthrough_request(
 async def get_provider_auth(
     endpoint: "ProviderEndpoint",
     key: "ProviderAPIKey",
-) -> Optional[ProviderAuthInfo]:
+) -> ProviderAuthInfo | None:
     """
     获取 Provider 的认证信息
 

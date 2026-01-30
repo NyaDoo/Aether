@@ -5,6 +5,8 @@ Vertex AI Service Account 认证服务
 Access Token 会被缓存，直到过期前 60 秒才刷新。
 """
 
+from __future__ import annotations
+
 import json
 import time
 from collections import OrderedDict

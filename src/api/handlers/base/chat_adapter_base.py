@@ -16,6 +16,8 @@ Chat Adapter 通用基类
 - compute_total_input_context(): 可选覆盖总输入上下文计算（用于阶梯计费判定）
 """
 
+from __future__ import annotations
+
 import time
 import traceback
 from abc import abstractmethod

@@ -4,6 +4,8 @@ Gemini Chat Adapter
 处理 Gemini API 格式的请求适配
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 import httpx
