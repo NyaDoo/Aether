@@ -1867,3 +1867,4 @@ class StatsUserDaily(Base):
 
 
 # 导入扩展的数据库模型
+from .database_extensions import ApiKeyProviderMapping, ProviderUsageTracking
