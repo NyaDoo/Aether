@@ -1,17 +1,21 @@
 import apiClient from './client'
 
-// 视频任务状态
-export type VideoTaskStatus = 'pending' | 'submitted' | 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled'
+// 异步任务状态
+export type AsyncTaskStatus = 'pending' | 'submitted' | 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled'
 
-// 视频任务列表项
-export interface VideoTaskItem {
+// 异步任务类型
+export type AsyncTaskType = 'video'
+
+// 异步任务列表项
+export interface AsyncTaskItem {
   id: string
   external_task_id: string
   user_id: string
   username: string
+  task_type: AsyncTaskType
   model: string
   prompt: string
-  status: VideoTaskStatus
+  status: AsyncTaskStatus
   progress_percent: number
   progress_message: string | null
   provider_id: string
@@ -44,7 +48,7 @@ export interface CandidateKeyInfo {
 }
 
 // 请求元数据
-export interface VideoTaskRequestMetadata {
+export interface AsyncTaskRequestMetadata {
   candidate_keys: CandidateKeyInfo[]
   selected_key_id: string
   selected_endpoint_id: string
@@ -52,10 +56,12 @@ export interface VideoTaskRequestMetadata {
   user_agent: string
   request_id: string
   request_headers?: Record<string, string>
+  poll_raw_response?: any  // 轮询完成时的原始响应
+  billing_snapshot?: any   // 计费快照
 }
 
-// 视频任务详情
-export interface VideoTaskDetail extends VideoTaskItem {
+// 异步任务详情
+export interface AsyncTaskDetail extends AsyncTaskItem {
   api_key_id: string
   endpoint_id: string
   key_id: string
@@ -81,73 +87,76 @@ export interface VideoTaskDetail extends VideoTaskItem {
     base_url: string
     api_format: string
   } | null
-  request_metadata: VideoTaskRequestMetadata | null
+  request_metadata: AsyncTaskRequestMetadata | null
 }
 
-// 视频任务列表响应
-export interface VideoTaskListResponse {
-  items: VideoTaskItem[]
+// 异步任务列表响应
+export interface AsyncTaskListResponse {
+  items: AsyncTaskItem[]
   total: number
   page: number
   page_size: number
   pages: number
 }
 
-// 视频任务统计响应
-export interface VideoTaskStatsResponse {
+// 异步任务统计响应
+export interface AsyncTaskStatsResponse {
   total: number
-  by_status: Record<VideoTaskStatus, number>
+  by_status: Record<AsyncTaskStatus, number>
   by_model: Record<string, number>
   today_count: number
   active_users?: number  // 仅管理员
   processing_count?: number  // 仅管理员
 }
 
-// 视频任务查询参数
-export interface VideoTaskQueryParams {
-  status?: VideoTaskStatus
+// 异步任务查询参数
+export interface AsyncTaskQueryParams {
+  status?: AsyncTaskStatus
+  task_type?: AsyncTaskType
   user_id?: string
   model?: string
   page?: number
   page_size?: number
 }
 
-export const videoTasksApi = {
+export const asyncTasksApi = {
   /**
-   * 获取视频任务列表
+   * 获取异步任务列表
    */
-  async list(params: VideoTaskQueryParams = {}): Promise<VideoTaskListResponse> {
+  async list(params: AsyncTaskQueryParams = {}): Promise<AsyncTaskListResponse> {
     const searchParams = new URLSearchParams()
     if (params.status) searchParams.append('status', params.status)
+    if (params.task_type) searchParams.append('task_type', params.task_type)
     if (params.user_id) searchParams.append('user_id', params.user_id)
     if (params.model) searchParams.append('model', params.model)
     if (params.page) searchParams.append('page', params.page.toString())
     if (params.page_size) searchParams.append('page_size', params.page_size.toString())
 
     const query = searchParams.toString()
+    // 后端 API 路径保持不变，前端抽象为异步任务
     const url = query ? `/api/admin/video-tasks?${query}` : '/api/admin/video-tasks'
     const response = await apiClient.get(url)
     return response.data
   },
 
   /**
-   * 获取视频任务统计
+   * 获取异步任务统计
    */
-  async getStats(): Promise<VideoTaskStatsResponse> {
+  async getStats(): Promise<AsyncTaskStatsResponse> {
     const response = await apiClient.get('/api/admin/video-tasks/stats')
     return response.data
   },
 
   /**
-   * 获取视频任务详情
+   * 获取异步任务详情
    */
-  async getDetail(taskId: string): Promise<VideoTaskDetail> {
+  async getDetail(taskId: string): Promise<AsyncTaskDetail> {
     const response = await apiClient.get(`/api/admin/video-tasks/${taskId}`)
     return response.data
   },
 
   /**
-   * 取消视频任务
+   * 取消异步任务
    */
   async cancel(taskId: string): Promise<{ id: string; status: string; message: string }> {
     const response = await apiClient.post(`/api/admin/video-tasks/${taskId}/cancel`)
@@ -155,4 +164,4 @@ export const videoTasksApi = {
   },
 }
 
-export default videoTasksApi
+export default asyncTasksApi

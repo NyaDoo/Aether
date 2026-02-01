@@ -39,6 +39,10 @@ MAX_CONCURRENT_REQUESTS = 5
 # 单个 Key 处理的超时时间（秒）
 KEY_FETCH_TIMEOUT_SECONDS = 120
 
+# 模型获取 HTTP 请求超时时间（秒）
+# 使用较短的超时（10秒），避免不支持 /models 端点的提供商长时间阻塞
+MODEL_FETCH_HTTP_TIMEOUT = 10.0
+
 # 上游模型缓存 TTL（与定时任务间隔保持一致）
 UPSTREAM_MODELS_CACHE_TTL_SECONDS = MODEL_FETCH_INTERVAL_MINUTES * 60
 
@@ -260,7 +264,48 @@ class ModelFetchScheduler:
             logger.exception(f"更新 Key {key_id} 错误信息失败")
 
     async def _fetch_models_for_key_by_id(self, key_id: str) -> str:
-        """根据 Key ID 获取模型并更新，返回结果状态"""
+        """
+        根据 Key ID 获取模型并更新，返回结果状态
+
+        优化：分两个阶段处理，HTTP 请求期间不持有数据库连接，避免阻塞其他请求
+        """
+        # ========== 阶段 1：准备数据（短暂持有连接）==========
+        fetch_context = self._prepare_fetch_context(key_id)
+        if fetch_context is None:
+            return "skip"
+        if isinstance(fetch_context, str):
+            return fetch_context  # "error" or "skip"
+
+        key_id, provider_id, provider_name, api_key_value, endpoint_configs = fetch_context
+
+        # ========== 阶段 2：HTTP 请求（不持有数据库连接）==========
+        # 使用较短的超时时间（10秒），避免长时间阻塞
+        all_models, errors, has_success = await fetch_models_from_endpoints(
+            endpoint_configs, timeout=MODEL_FETCH_HTTP_TIMEOUT
+        )
+
+        # ========== 阶段 3：更新数据库（获取新连接）==========
+        return await self._update_key_after_fetch(
+            key_id=key_id,
+            provider_id=provider_id,
+            provider_name=provider_name,
+            all_models=all_models,
+            errors=errors,
+            has_success=has_success,
+        )
+
+    def _prepare_fetch_context(
+        self, key_id: str
+    ) -> tuple[str, str, str, str, list[dict]] | str | None:
+        """
+        准备获取模型所需的上下文数据
+
+        Returns:
+            - tuple: (key_id, provider_id, provider_name, api_key_value, endpoint_configs)
+            - "skip": 跳过该 Key
+            - "error": 出错
+            - None: Key 不存在
+        """
         with create_session() as db:
             key = (
                 db.query(ProviderAPIKey)
@@ -271,142 +316,154 @@ class ModelFetchScheduler:
 
             if not key:
                 logger.warning(f"Key {key_id} 不存在，跳过")
-                return "skip"
+                return None
 
             if not key.is_active or not key.auto_fetch_models:
                 logger.debug(f"Key {key_id} 已禁用或关闭自动获取，跳过")
                 return "skip"
 
-            try:
-                result = await self._fetch_models_for_key(db, key)
+            now = datetime.now(timezone.utc)
+            provider_id = key.provider_id
+
+            # 获取 Provider 和 Endpoints
+            provider = (
+                db.query(Provider)
+                .options(joinedload(Provider.endpoints))
+                .filter(Provider.id == provider_id)
+                .first()
+            )
+
+            if not provider:
+                logger.warning(f"Provider {provider_id} 不存在，跳过 Key {key.id}")
+                key.last_models_fetch_error = "Provider not found"
+                key.last_models_fetch_at = now
                 db.commit()
-                return result
+                return "error"
+
+            # Vertex AI 类型不支持自动获取模型
+            auth_type = getattr(key, "auth_type", "api_key") or "api_key"
+            if auth_type == "vertex_ai":
+                key.last_models_fetch_error = "auto_fetch_models 暂不支持 Vertex AI 类型的 Key"
+                key.last_models_fetch_at = now
+                db.commit()
+                logger.info(f"Key {key.id} 为 Vertex AI 类型，跳过自动获取模型")
+                return "skip"
+
+            # 解密 API Key
+            if not key.api_key:
+                logger.warning(f"Key {key.id} 没有 API Key，跳过")
+                key.last_models_fetch_error = "No API key configured"
+                key.last_models_fetch_at = now
+                db.commit()
+                return "error"
+
+            try:
+                api_key_value = crypto_service.decrypt(key.api_key)
             except Exception:
-                db.rollback()
-                raise
+                logger.error(f"解密 Key {key.id} 失败")
+                key.last_models_fetch_error = "Decrypt error"
+                key.last_models_fetch_at = now
+                db.commit()
+                return "error"
 
-    async def _fetch_models_for_key(
+            # 构建 api_format -> endpoint 映射
+            format_to_endpoint: dict[str, object] = {}
+            for endpoint in provider.endpoints:  # type: ignore[attr-defined]
+                if endpoint.is_active:
+                    format_to_endpoint[endpoint.api_format] = endpoint
+
+            if not format_to_endpoint:
+                logger.warning(f"Provider {provider.name} 没有活跃的端点，跳过 Key {key.id}")
+                key.last_models_fetch_error = "No active endpoints"
+                key.last_models_fetch_at = now
+                db.commit()
+                return "error"
+
+            # 使用公共函数构建所有格式的端点配置
+            endpoint_configs = build_all_format_configs(api_key_value, format_to_endpoint)  # type: ignore[arg-type]
+
+            return (key_id, provider_id, provider.name, api_key_value, endpoint_configs)
+
+    async def _update_key_after_fetch(
         self,
-        db: Session,
-        key: ProviderAPIKey,
+        key_id: str,
+        provider_id: str,
+        provider_name: str,
+        all_models: list[dict],
+        errors: list[str],
+        has_success: bool,
     ) -> str:
-        """为单个 Key 获取模型并更新 allowed_models，返回结果状态"""
+        """
+        HTTP 请求完成后更新数据库
+
+        使用新的数据库连接来更新 Key 的 allowed_models
+        """
         now = datetime.now(timezone.utc)
-        provider_id = key.provider_id
 
-        # 获取 Provider 和 Endpoints
-        provider = (
-            db.query(Provider)
-            .options(joinedload(Provider.endpoints))
-            .filter(Provider.id == provider_id)
-            .first()
-        )
+        with create_session() as db:
+            # 重新获取 Key（因为之前的连接已关闭）
+            key = db.query(ProviderAPIKey).filter(ProviderAPIKey.id == key_id).first()
+            if not key:
+                logger.warning(f"Key {key_id} 在更新时不存在")
+                return "error"
 
-        if not provider:
-            logger.warning(f"Provider {provider_id} 不存在，跳过 Key {key.id}")
-            key.last_models_fetch_error = "Provider not found"
+            # 记录获取时间
             key.last_models_fetch_at = now
-            return "error"
 
-        # Vertex AI 类型不支持自动获取模型（需要使用 Service Account 认证）
-        auth_type = getattr(key, "auth_type", "api_key") or "api_key"
-        if auth_type == "vertex_ai":
-            key.last_models_fetch_error = "auto_fetch_models 暂不支持 Vertex AI 类型的 Key"
-            key.last_models_fetch_at = now
-            logger.info(f"Key {key.id} 为 Vertex AI 类型，跳过自动获取模型")
-            return "skip"
+            # 如果没有任何成功的响应，不更新 allowed_models（保留旧数据）
+            if not has_success:
+                error_msg = "; ".join(errors) if errors else "All endpoints failed"
+                key.last_models_fetch_error = error_msg
+                logger.warning(
+                    f"Provider {provider_name} Key {key.id} 所有端点获取失败，保留现有模型列表"
+                )
+                db.commit()
+                return "error"
 
-        # 解密 API Key
-        if not key.api_key:
-            logger.warning(f"Key {key.id} 没有 API Key，跳过")
-            key.last_models_fetch_error = "No API key configured"
-            key.last_models_fetch_at = now
-            return "error"
+            # 有成功的响应，清除错误状态
+            key.last_models_fetch_error = None
 
-        try:
-            api_key_value = crypto_service.decrypt(key.api_key)
-        except Exception:
-            # 不记录异常详情，避免泄露密钥信息
-            logger.error(f"解密 Key {key.id} 失败")
-            key.last_models_fetch_error = "Decrypt error"
-            key.last_models_fetch_at = now
-            return "error"
+            # 去重获取模型 ID 列表
+            fetched_model_ids: set[str] = set()
+            for model in all_models:
+                model_id = model.get("id")
+                if model_id:
+                    fetched_model_ids.add(model_id)
 
-        # 构建 api_format -> endpoint 映射
-        format_to_endpoint: dict[str, object] = {}
-        for endpoint in provider.endpoints:  # type: ignore[attr-defined]
-            if endpoint.is_active:
-                format_to_endpoint[endpoint.api_format] = endpoint
-
-        if not format_to_endpoint:
-            logger.warning(f"Provider {provider.name} 没有活跃的端点，跳过 Key {key.id}")
-            key.last_models_fetch_error = "No active endpoints"
-            key.last_models_fetch_at = now
-            return "error"
-
-        # 使用公共函数构建所有格式的端点配置
-        endpoint_configs = build_all_format_configs(api_key_value, format_to_endpoint)  # type: ignore[arg-type]
-
-        # 并发获取模型
-        all_models, errors, has_success = await fetch_models_from_endpoints(endpoint_configs)
-
-        # 记录获取时间
-        key.last_models_fetch_at = now
-
-        # 如果没有任何成功的响应，不更新 allowed_models（保留旧数据）
-        if not has_success:
-            # 所有端点都失败时，记录错误
-            error_msg = "; ".join(errors) if errors else "All endpoints failed"
-            key.last_models_fetch_error = error_msg
-            logger.warning(
-                f"Provider {provider.name} Key {key.id} 所有端点获取失败，保留现有模型列表"
-            )
-            return "error"
-
-        # 有成功的响应，清除错误状态（部分失败不算失败）
-        key.last_models_fetch_error = None
-
-        # 去重获取模型 ID 列表
-        fetched_model_ids: set[str] = set()
-        for model in all_models:
-            model_id = model.get("id")
-            if model_id:
-                fetched_model_ids.add(model_id)
-
-        logger.info(
-            f"Provider {provider.name} Key {key.id} 获取到 {len(fetched_model_ids)} 个唯一模型"
-        )
-
-        # 写入上游模型缓存（按 model id + api_format 去重后的完整模型信息）
-        seen_keys: set[str] = set()
-        unique_models: list[dict] = []
-        for model in all_models:
-            model_id = model.get("id")
-            api_format = model.get("api_format", "")
-            unique_key = f"{model_id}:{api_format}"
-            if model_id and unique_key not in seen_keys:
-                seen_keys.add(unique_key)
-                unique_models.append(model)
-        await set_upstream_models_to_cache(
-            provider_id,  # type: ignore[arg-type]
-            key.id,  # type: ignore[arg-type]
-            unique_models,
-        )
-
-        # 更新 allowed_models（保留 locked_models）
-        has_changed = self._update_key_allowed_models(key, fetched_model_ids)
-
-        # 如果白名单有变化，触发缓存失效和自动关联检查
-        if has_changed and provider_id:
-            from src.services.model.global_model import on_key_allowed_models_changed
-
-            await on_key_allowed_models_changed(
-                db=db,
-                provider_id=provider_id,
-                allowed_models=list(key.allowed_models or []),
+            logger.info(
+                f"Provider {provider_name} Key {key.id} 获取到 {len(fetched_model_ids)} 个唯一模型"
             )
 
-        return "success"
+            # 写入上游模型缓存（按 model id + api_format 去重后的完整模型信息）
+            seen_keys: set[str] = set()
+            unique_models: list[dict] = []
+            for model in all_models:
+                model_id = model.get("id")
+                api_format = model.get("api_format", "")
+                unique_key = f"{model_id}:{api_format}"
+                if model_id and unique_key not in seen_keys:
+                    seen_keys.add(unique_key)
+                    unique_models.append(model)
+            await set_upstream_models_to_cache(provider_id, key.id, unique_models)
+
+            # 更新 allowed_models（保留 locked_models）
+            has_changed = self._update_key_allowed_models(key, fetched_model_ids)
+
+            db.commit()
+
+            # 如果白名单有变化，触发缓存失效和自动关联检查
+            if has_changed and provider_id:
+                from src.services.model.global_model import on_key_allowed_models_changed
+
+                # 使用新会话处理后续操作
+                with create_session() as db2:
+                    await on_key_allowed_models_changed(
+                        db=db2,
+                        provider_id=provider_id,
+                        allowed_models=list(key.allowed_models or []),
+                    )
+
+            return "success"
 
     def _update_key_allowed_models(self, key: ProviderAPIKey, fetched_model_ids: set[str]) -> bool:
         """

@@ -20,6 +20,7 @@ from src.core.logger import logger
 from src.database.database import get_db
 from src.models.database import Provider, ProviderEndpoint, User
 from src.services.model.fetch_scheduler import (
+    MODEL_FETCH_HTTP_TIMEOUT,
     get_upstream_models_from_cache,
     set_upstream_models_to_cache,
 )
@@ -135,7 +136,9 @@ async def query_available_models(
             return [], f"Key {api_key.name or api_key.id}: decrypt failed", False
 
         endpoint_configs = build_all_format_configs(api_key_value, format_to_endpoint)
-        models, errors, has_success = await fetch_models_from_endpoints(endpoint_configs)
+        models, errors, has_success = await fetch_models_from_endpoints(
+            endpoint_configs, timeout=MODEL_FETCH_HTTP_TIMEOUT
+        )
 
         # 写入缓存
         if models:
@@ -274,7 +277,9 @@ async def _fetch_models_for_single_key(
         raise HTTPException(status_code=500, detail="Failed to decrypt API key")
 
     endpoint_configs = build_all_format_configs(api_key_value, format_to_endpoint)
-    all_models, errors, has_success = await fetch_models_from_endpoints(endpoint_configs)
+    all_models, errors, has_success = await fetch_models_from_endpoints(
+        endpoint_configs, timeout=MODEL_FETCH_HTTP_TIMEOUT
+    )
 
     # 按 model id 聚合，合并所有 api_format
     unique_models = _aggregate_models_by_id(all_models)

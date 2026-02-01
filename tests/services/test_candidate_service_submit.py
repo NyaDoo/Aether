@@ -6,11 +6,8 @@ import httpx
 import pytest
 
 from src.config.settings import config
-from src.services.task.orchestrator import (
-    AllCandidatesFailedError,
-    AsyncTaskOrchestrator,
-    UpstreamClientRequestError,
-)
+from src.services.candidate.service import CandidateService
+from src.services.candidate.submit import AllCandidatesFailedError, UpstreamClientRequestError
 
 
 def _make_candidate(
@@ -46,10 +43,10 @@ async def test_submit_with_failover_skips_http_500_then_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = MagicMock()
-    orch = AsyncTaskOrchestrator(db)
+    svc = CandidateService(db)
 
     # bypass init
-    orch._candidate_resolver = SimpleNamespace(
+    svc._resolver = SimpleNamespace(
         fetch_candidates=AsyncMock(
             return_value=(
                 [
@@ -60,8 +57,8 @@ async def test_submit_with_failover_skips_http_500_then_succeeds(
             )
         )
     )
-    orch._error_classifier = SimpleNamespace(is_client_error=lambda _text: False)
-    orch._ensure_initialized = AsyncMock(return_value=None)
+    svc._error_classifier = SimpleNamespace(is_client_error=lambda _text: False)
+    svc._ensure_initialized = AsyncMock(return_value=None)
 
     responses = [
         httpx.Response(500, text='{"error": {"message": "server"}}'),
@@ -69,12 +66,12 @@ async def test_submit_with_failover_skips_http_500_then_succeeds(
     ]
     submit = AsyncMock(side_effect=responses)
 
-    outcome = await orch.submit_with_failover(
+    outcome = await svc.submit_with_failover(
         api_format="openai:video",
         model_name="sora",
         affinity_key="a1",
         user_api_key=MagicMock(),
-        request_id="req-1",
+        request_id=None,
         task_type="video",
         submit_func=submit,
         extract_external_task_id=lambda payload: payload.get("id"),
@@ -92,13 +89,13 @@ async def test_submit_with_failover_skips_http_500_then_succeeds(
 @pytest.mark.asyncio
 async def test_submit_with_failover_stops_on_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
     db = MagicMock()
-    orch = AsyncTaskOrchestrator(db)
+    svc = CandidateService(db)
 
-    orch._candidate_resolver = SimpleNamespace(
+    svc._resolver = SimpleNamespace(
         fetch_candidates=AsyncMock(return_value=([_make_candidate()], "gm1"))
     )
-    orch._error_classifier = SimpleNamespace(is_client_error=lambda _text: True)
-    orch._ensure_initialized = AsyncMock(return_value=None)
+    svc._error_classifier = SimpleNamespace(is_client_error=lambda _text: True)
+    svc._ensure_initialized = AsyncMock(return_value=None)
 
     response = httpx.Response(
         400,
@@ -107,12 +104,12 @@ async def test_submit_with_failover_stops_on_client_error(monkeypatch: pytest.Mo
     submit = AsyncMock(return_value=response)
 
     with pytest.raises(UpstreamClientRequestError):
-        await orch.submit_with_failover(
+        await svc.submit_with_failover(
             api_format="openai:video",
             model_name="sora",
             affinity_key="a1",
             user_api_key=MagicMock(),
-            request_id="req-2",
+            request_id=None,
             task_type="video",
             submit_func=submit,
             extract_external_task_id=lambda payload: payload.get("id"),
@@ -127,21 +124,21 @@ async def test_submit_with_failover_no_eligible_candidates_due_to_auth_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = MagicMock()
-    orch = AsyncTaskOrchestrator(db)
+    svc = CandidateService(db)
 
-    orch._candidate_resolver = SimpleNamespace(
+    svc._resolver = SimpleNamespace(
         fetch_candidates=AsyncMock(return_value=([_make_candidate(auth_type="vertex_ai")], "gm1"))
     )
-    orch._error_classifier = SimpleNamespace(is_client_error=lambda _text: False)
-    orch._ensure_initialized = AsyncMock(return_value=None)
+    svc._error_classifier = SimpleNamespace(is_client_error=lambda _text: False)
+    svc._ensure_initialized = AsyncMock(return_value=None)
 
     with pytest.raises(AllCandidatesFailedError) as excinfo:
-        await orch.submit_with_failover(
+        await svc.submit_with_failover(
             api_format="openai:video",
             model_name="sora",
             affinity_key="a1",
             user_api_key=MagicMock(),
-            request_id="req-3",
+            request_id=None,
             task_type="video",
             submit_func=AsyncMock(),
             extract_external_task_id=lambda payload: payload.get("id"),
@@ -158,9 +155,9 @@ async def test_submit_with_failover_filters_missing_billing_rule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = MagicMock()
-    orch = AsyncTaskOrchestrator(db)
+    svc = CandidateService(db)
 
-    orch._candidate_resolver = SimpleNamespace(
+    svc._resolver = SimpleNamespace(
         fetch_candidates=AsyncMock(
             return_value=(
                 [
@@ -171,8 +168,8 @@ async def test_submit_with_failover_filters_missing_billing_rule(
             )
         )
     )
-    orch._error_classifier = SimpleNamespace(is_client_error=lambda _text: False)
-    orch._ensure_initialized = AsyncMock(return_value=None)
+    svc._error_classifier = SimpleNamespace(is_client_error=lambda _text: False)
+    svc._ensure_initialized = AsyncMock(return_value=None)
 
     # enable require_rule
     old = config.billing_require_rule
@@ -185,16 +182,16 @@ async def test_submit_with_failover_filters_missing_billing_rule(
             return None if provider_id == "p1" else object()
 
         monkeypatch.setattr(
-            "src.services.task.orchestrator.BillingRuleService.find_rule", _find_rule
+            "src.services.candidate.service.BillingRuleService.find_rule", _find_rule
         )
 
         submit = AsyncMock(return_value=httpx.Response(200, json={"id": "task-999"}))
-        outcome = await orch.submit_with_failover(
+        outcome = await svc.submit_with_failover(
             api_format="openai:video",
             model_name="sora",
             affinity_key="a1",
             user_api_key=MagicMock(),
-            request_id="req-4",
+            request_id=None,
             task_type="video",
             submit_func=submit,
             extract_external_task_id=lambda payload: payload.get("id"),

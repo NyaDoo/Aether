@@ -242,25 +242,41 @@
     </form>
 
     <template #footer>
-      <Button
-        variant="outline"
-        @click="$emit('update:open', false)"
-      >
-        取消
-      </Button>
-      <Button
-        :disabled="isSaving || !canSave"
-        @click="handleSave"
-      >
-        {{ isSaving ? '保存中...' : '保存' }}
-      </Button>
-      <Button
-        variant="outline"
-        :disabled="isVerifying || !canVerify"
-        @click="handleVerify"
-      >
-        {{ isVerifying ? '验证中...' : '验证' }}
-      </Button>
+      <div class="flex w-full items-center justify-between">
+        <!-- 左侧：清除按钮（仅在已有配置时显示） -->
+        <div>
+          <Button
+            v-if="hasExistingConfig"
+            variant="destructive"
+            :disabled="isClearing"
+            @click="handleClear"
+          >
+            {{ isClearing ? '清除中...' : '清除' }}
+          </Button>
+        </div>
+        <!-- 右侧：验证、保存、取消按钮 -->
+        <div class="flex gap-2">
+          <Button
+            variant="outline"
+            :disabled="isVerifying || !canVerify"
+            @click="handleVerify"
+          >
+            {{ isVerifying ? '验证中...' : '验证' }}
+          </Button>
+          <Button
+            :disabled="isSaving || !canSave"
+            @click="handleSave"
+          >
+            {{ isSaving ? '保存中...' : '保存' }}
+          </Button>
+          <Button
+            variant="outline"
+            @click="$emit('update:open', false)"
+          >
+            取消
+          </Button>
+        </div>
+      </div>
     </template>
   </Dialog>
 </template>
@@ -281,8 +297,9 @@ import {
   SelectValue,
   Switch,
 } from '@/components/ui'
-import { saveProviderOpsConfig, verifyProviderAuth, getProviderOpsConfig } from '@/api/providerOps'
+import { saveProviderOpsConfig, verifyProviderAuth, getProviderOpsConfig, deleteProviderOpsConfig } from '@/api/providerOps'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import {
   authTemplateRegistry,
   type AuthTemplate,
@@ -305,11 +322,13 @@ const emit = defineEmits<{
 const SENSITIVE_FIELDS = ['api_key', 'password', 'session_token', 'session_cookie', 'token_cookie', 'auth_cookie', 'cookie_string', 'cookie', 'proxy_password'] as const
 
 const { success: showSuccess, error: showError } = useToast()
+const { confirmDanger } = useConfirm()
 
 // State
 const isSaving = ref(false)
 const isVerifying = ref(false)
 const isLoadingConfig = ref(false)
+const isClearing = ref(false)
 const verifyStatus = ref<'success' | 'error' | null>(null)
 const formChanged = ref(false)
 
@@ -540,6 +559,40 @@ async function handleSave() {
     showError(error.response?.data?.detail || error.message, '保存失败')
   } finally {
     isSaving.value = false
+  }
+}
+
+async function handleClear() {
+  if (!props.providerId) return
+
+  const confirmed = await confirmDanger(
+    '确定要清除该提供商的认证配置吗？清除后将无法进行余额查询、签到等操作。',
+    '清除认证',
+    '清除'
+  )
+  if (!confirmed) return
+
+  isClearing.value = true
+  try {
+    const result = await deleteProviderOpsConfig(props.providerId)
+    if (result.success) {
+      showSuccess(result.message || '认证信息已清除', '清除成功')
+      // 重置状态
+      hasExistingConfig.value = false
+      sensitivePlaceholders.value = {}
+      verifyStatus.value = null
+      formChanged.value = false
+      selectedTemplateId.value = 'new_api'
+      resetFormData()
+      emit('saved')
+      emit('update:open', false)
+    } else {
+      showError(result.message || '清除失败')
+    }
+  } catch (error: any) {
+    showError(error.response?.data?.detail || error.message, '清除失败')
+  } finally {
+    isClearing.value = false
   }
 }
 

@@ -79,15 +79,23 @@ class VideoAdapterBase(ApiAdapter):
                 path_params=path_params,
             )
 
-        # Cancel task
-        if method in {"DELETE", "POST"} and (
-            path.endswith("/cancel") or path_params.get("action") == "cancel"
-        ):
+        # Cancel task (POST /videos/{id}/cancel or explicit action=cancel)
+        if (method == "POST" and path.endswith("/cancel")) or path_params.get("action") == "cancel":
             if not task_id:
                 raise HTTPException(
                     status_code=400, detail="Task ID is required for cancel operation"
                 )
             return await handler.handle_cancel_task(
+                task_id=task_id,
+                http_request=http_request,
+                original_headers=context.original_headers,
+                query_params=context.query_params,
+                path_params=path_params,
+            )
+
+        # Delete task (DELETE /videos/{id})
+        if method == "DELETE" and task_id:
+            return await handler.handle_delete_task(
                 task_id=task_id,
                 http_request=http_request,
                 original_headers=context.original_headers,

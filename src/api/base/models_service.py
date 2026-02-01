@@ -311,7 +311,7 @@ def get_compatible_provider_formats(
             endpoint_format,
             format_acceptance_config,
             is_stream=False,
-            global_conversion_enabled=global_conversion_enabled,
+            effective_conversion_enabled=global_conversion_enabled,
         )
         if not is_compatible:
             continue

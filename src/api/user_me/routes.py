@@ -736,6 +736,7 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         from sqlalchemy import or_
+        from sqlalchemy.orm import load_only
 
         from src.models.database import ProviderEndpoint
         from src.utils.database_helpers import escape_like_pattern, safe_truncate_escaped
@@ -877,7 +878,44 @@ class GetUsageAdapter(AuthenticatedApiAdapter):
                 )
 
         # 计算总数用于分页
-        total_records = query.count()
+        # Perf: avoid Query.count() building a subquery selecting many columns
+        total_records = int(query.with_entities(func.count(Usage.id)).scalar() or 0)
+
+        # Perf: do not load large request/response columns for list view
+        query = query.options(
+            load_only(
+                Usage.id,
+                Usage.user_id,
+                Usage.api_key_id,
+                Usage.provider_name,
+                Usage.model,
+                Usage.target_model,
+                Usage.input_tokens,
+                Usage.output_tokens,
+                Usage.total_tokens,
+                Usage.total_cost_usd,
+                Usage.response_time_ms,
+                Usage.first_byte_time_ms,
+                Usage.is_stream,
+                Usage.status,
+                Usage.created_at,
+                Usage.cache_creation_input_tokens,
+                Usage.cache_read_input_tokens,
+                Usage.status_code,
+                Usage.error_message,
+                Usage.api_format,
+                Usage.endpoint_api_format,
+                Usage.has_format_conversion,
+                Usage.input_price_per_1m,
+                Usage.output_price_per_1m,
+                Usage.cache_creation_price_per_1m,
+                Usage.cache_read_price_per_1m,
+                Usage.actual_total_cost_usd,
+                Usage.rate_multiplier,
+            ),
+            load_only(ApiKey.id, ApiKey.name, ApiKey.key_encrypted),
+            load_only(ProviderEndpoint.id, ProviderEndpoint.api_format),
+        )
         usage_records = (
             query.order_by(Usage.created_at.desc()).offset(self.offset).limit(self.limit).all()
         )
@@ -1231,7 +1269,7 @@ class ListAvailableModelsAdapter(AuthenticatedApiAdapter):
                     endpoint_format,
                     format_acceptance_config,
                     is_stream=False,
-                    global_conversion_enabled=global_conversion_enabled,
+                    effective_conversion_enabled=global_conversion_enabled,
                 )
                 if is_compatible:
                     provider_to_formats.setdefault(provider_id, set()).add(endpoint_format)

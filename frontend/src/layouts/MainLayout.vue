@@ -366,6 +366,8 @@ import {
   Mail,
   Puzzle,
   Video,
+  Zap,
+  FileUp,
   type LucideIcon,
 } from 'lucide-vue-next'
 
@@ -511,6 +513,27 @@ const navigation = computed(() => {
     { name: '邮件配置', href: '/admin/email', icon: Mail },
   ]
 
+  // 动态添加已激活模块的菜单项
+  // 图标映射
+  const iconMap: Record<string, LucideIcon> = {
+    'Key': Key,
+    'FileUp': FileUp,
+    'Shield': Shield,
+    'Puzzle': Puzzle,
+  }
+
+  // 添加模块菜单项（按 admin_menu_order 排序，只显示已激活的）
+  const moduleMenuItems = Object.values(moduleStore.modules)
+    .filter(m => m.active && m.admin_route && m.admin_menu_group === 'system')
+    .sort((a, b) => a.admin_menu_order - b.admin_menu_order)
+    .map(m => ({
+      name: m.display_name,
+      href: m.admin_route!,
+      icon: iconMap[m.admin_menu_icon || ''] || Puzzle
+    }))
+
+  systemItems.push(...moduleMenuItems)
+
   // 模块管理和系统设置放在最后
   systemItems.push({ name: '模块管理', href: '/admin/modules', icon: Puzzle })
   systemItems.push({ name: '系统设置', href: '/admin/system', icon: Cog })
@@ -531,7 +554,7 @@ const navigation = computed(() => {
         { name: '模型管理', href: '/admin/models', icon: Layers },
         { name: '独立密钥', href: '/admin/keys', icon: Key },
         { name: '访问令牌', href: '/admin/management-tokens', icon: KeyRound },
-        { name: '视频任务', href: '/admin/video-tasks', icon: Video },
+        { name: '异步任务', href: '/admin/async-tasks', icon: Zap },
         { name: '使用记录', href: '/admin/usage', icon: BarChart3 },
       ]
     },
@@ -580,6 +603,18 @@ const breadcrumbs = computed((): BreadcrumbItem[] => {
         { label: activeItem.name }
       ]
     }
+  }
+
+  // Special case: module pages not in navigation (module not active)
+  // Check if current path matches a module's admin_route
+  const currentModule = Object.values(moduleStore.modules).find(
+    m => m.admin_route && route.path === m.admin_route
+  )
+  if (currentModule) {
+    return [
+      { label: '模块管理', href: '/admin/modules' },
+      { label: currentModule.display_name }
+    ]
   }
 
   return [{ label: '仪表盘' }]

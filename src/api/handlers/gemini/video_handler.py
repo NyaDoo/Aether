@@ -4,6 +4,7 @@ Gemini Video Handler - Veo 视频生成实现
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 from uuid import uuid4
@@ -34,12 +35,14 @@ from src.core.api_format.conversion.internal_video import (
     VideoStatus,
 )
 from src.core.api_format.conversion.normalizers.gemini import GeminiNormalizer
+from src.core.api_format.conversion.registry import format_conversion_registry
 from src.core.api_format.headers import HOP_BY_HOP_HEADERS
 from src.core.crypto import crypto_service
 from src.core.logger import logger
 from src.models.database import ApiKey, ProviderAPIKey, ProviderEndpoint, User, VideoTask
 from src.services.billing.rule_service import BillingRuleLookupResult, BillingRuleService
 from src.services.cache.aware_scheduler import ProviderCandidate
+from src.services.usage.service import UsageService
 
 
 class GeminiVeoHandler(VideoHandlerBase):
@@ -92,20 +95,93 @@ class GeminiVeoHandler(VideoHandlerBase):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        # 异步任务：提前创建 pending usage，便于前端看到“处理中”
+        try:
+            UsageService.create_pending_usage(
+                db=self.db,
+                request_id=self.request_id,
+                user=self.user,
+                api_key=self.api_key,
+                model=internal_request.model,
+                is_stream=False,
+                request_type="video",
+                api_format=self.FORMAT_ID,
+                request_headers=original_headers,
+                request_body=original_request_body,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to create pending usage for video request_id=%s: %s",
+                self.request_id,
+                sanitize_error_message(str(exc)),
+            )
+
+        # 用于跟踪是否发生了格式转换
+        format_conversion_info: dict[str, Any] = {
+            "converted": False,
+            "provider_format": None,
+        }
+
         async def _submit(candidate: ProviderCandidate) -> Any:
             upstream_key, endpoint, _key, auth_info = await self._resolve_upstream_key(candidate)
-            upstream_url = self._build_upstream_url(endpoint.base_url, internal_request.model)
-            headers = self._build_upstream_headers(
-                original_headers, upstream_key, endpoint, auth_info
+
+            # 检测目标格式
+            provider_format = make_signature_key(
+                str(getattr(endpoint, "api_family", "")).strip().lower(),
+                str(getattr(endpoint, "endpoint_kind", "")).strip().lower(),
             )
-            client = await HTTPClientPool.get_default_client_async()
-            return await client.post(upstream_url, headers=headers, json=original_request_body)
+            needs_conversion = provider_format.upper() != self.FORMAT_ID.upper()
+            format_conversion_info["provider_format"] = provider_format
+            format_conversion_info["converted"] = needs_conversion
+
+            if needs_conversion and provider_format.upper().startswith("OPENAI:"):
+                # Gemini -> OpenAI 格式转换
+                converted_body = format_conversion_registry.convert_video_request(
+                    original_request_body,
+                    self.FORMAT_ID,
+                    provider_format,
+                )
+                # 确保 seconds 字段为字符串类型（上游 Go 服务要求 string）
+                if "seconds" in converted_body and converted_body["seconds"] is not None:
+                    converted_body["seconds"] = str(converted_body["seconds"])
+
+                # 构建 OpenAI 风格的 URL
+                upstream_url = self._build_openai_upstream_url(endpoint.base_url)
+
+                # 构建 OpenAI 风格的请求头
+                headers = self._build_openai_upstream_headers(
+                    original_headers, upstream_key, endpoint
+                )
+
+                client = await HTTPClientPool.get_default_client_async()
+                return await client.post(upstream_url, headers=headers, json=converted_body)
+            else:
+                # 原始 Gemini 格式
+                upstream_url = self._build_upstream_url(endpoint.base_url, internal_request.model)
+                headers = self._build_upstream_headers(
+                    original_headers, upstream_key, endpoint, auth_info
+                )
+                client = await HTTPClientPool.get_default_client_async()
+                return await client.post(upstream_url, headers=headers, json=original_request_body)
 
         def _extract_task_id(payload: dict[str, Any]) -> str | None:
-            value = payload.get("name")
-            if not value:
-                return None
-            return normalize_gemini_operation_id(str(value))
+            # 根据响应格式提取 task ID
+            # Gemini: {"name": "operations/..."}
+            # OpenAI: {"id": "..."}
+            if "name" in payload:
+                value = payload.get("name")
+                logger.debug(
+                    "[GeminiVeoHandler] Upstream response name=%s, keys=%s",
+                    value,
+                    list(payload.keys()) if isinstance(payload, dict) else type(payload),
+                )
+                if not value:
+                    return None
+                return normalize_gemini_operation_id(str(value))
+            if "id" in payload:
+                # OpenAI 格式
+                return str(payload["id"])
+            return None
 
         outcome_or_response = await self._submit_with_failover(
             api_format=self.FORMAT_ID,
@@ -114,7 +190,7 @@ class GeminiVeoHandler(VideoHandlerBase):
             submit_func=_submit,
             extract_external_task_id=_extract_task_id,
             supported_auth_types={"api_key", "vertex_ai"},
-            allow_format_conversion=False,
+            allow_format_conversion=True,
             max_candidates=10,
         )
         if isinstance(outcome_or_response, JSONResponse):
@@ -135,35 +211,92 @@ class GeminiVeoHandler(VideoHandlerBase):
 
         external_task_id = outcome.external_task_id
 
+        # 如果发生了格式转换，记录转换后的请求体
+        converted_request_body = original_request_body
+        if format_conversion_info["converted"]:
+            try:
+                converted_request_body = format_conversion_registry.convert_video_request(
+                    original_request_body,
+                    self.FORMAT_ID,
+                    format_conversion_info["provider_format"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[GeminiVeoHandler] Failed to record converted request: %s",
+                    sanitize_error_message(str(e)),
+                )
+
         task = self._create_task_record(
             external_task_id=external_task_id,
             candidate=outcome.candidate,
             original_request_body=original_request_body,
+            converted_request_body=converted_request_body,
             internal_request=internal_request,
             candidate_keys=outcome.candidate_keys,
             original_headers=original_headers,
             billing_rule_snapshot=billing_rule_snapshot,
+            format_converted=format_conversion_info["converted"],
         )
         try:
             self.db.add(task)
             self.db.flush()  # 先 flush 检测冲突
             self.db.commit()
             self.db.refresh(task)
-            logger.info(
-                f"[GeminiVeoHandler] Task created: id={task.id}, external_task_id={task.external_task_id}, user_id={task.user_id}"
+            logger.debug(
+                "[GeminiVeoHandler] Task created: id=%s, external_task_id=%s",
+                task.id,
+                task.external_task_id,
             )
         except IntegrityError:
             self.db.rollback()
             raise HTTPException(status_code=409, detail="Task already exists")
 
+        # 先构建返回给客户端的响应（使用短 ID 对外暴露）
         internal_task = InternalVideoTask(
-            id=task.id,
+            id=task.short_id,
             external_id=external_task_id,
             status=VideoStatus.SUBMITTED,
             created_at=task.created_at,
             original_request=internal_request,
         )
         response_body = self._normalizer.video_task_from_internal(internal_task)
+
+        # 提交成功后立即结算 Usage（费用暂时为 0，轮询完成后更新）
+        response_time_ms = int((time.time() - self.start_time) * 1000)
+        try:
+            # 构建发送给上游的请求头（脱敏）
+            upstream_request_headers = self._build_upstream_headers(
+                original_headers,
+                "",  # key 不重要，只是用于记录
+                outcome.candidate.endpoint,
+                None,  # auth_info
+            )
+
+            UsageService.finalize_submitted(
+                self.db,
+                request_id=self.request_id,
+                provider_name=outcome.candidate.provider.name,
+                provider_id=outcome.candidate.provider.id,
+                provider_endpoint_id=outcome.candidate.endpoint.id,
+                provider_api_key_id=outcome.candidate.key.id,
+                response_time_ms=response_time_ms,
+                status_code=outcome.upstream_status_code or 200,
+                endpoint_api_format=make_signature_key(
+                    str(getattr(outcome.candidate.endpoint, "api_family", "")).strip().lower(),
+                    str(getattr(outcome.candidate.endpoint, "endpoint_kind", "")).strip().lower(),
+                ),
+                provider_request_headers=upstream_request_headers,
+                response_headers=outcome.upstream_headers,
+                response_body=response_body,  # 使用我们转换后的响应（包含我们的 ID）
+            )
+            self.db.commit()
+        except Exception as exc:
+            logger.warning(
+                "Failed to finalize submitted usage for video request_id=%s: %s",
+                self.request_id,
+                sanitize_error_message(str(exc)),
+            )
+
         return JSONResponse(response_body)
 
     async def handle_get_task(
@@ -234,6 +367,28 @@ class GeminiVeoHandler(VideoHandlerBase):
 
         task.status = VideoStatus.CANCELLED.value
         task.updated_at = datetime.now(timezone.utc)
+
+        # 将 Usage 作废（不收费）
+        # 尝试 finalize_void（处理 pending）和 void_settled（处理已 settled）
+        try:
+            voided = UsageService.finalize_void(
+                self.db,
+                request_id=task.request_id,
+                reason="cancelled_by_user",
+            )
+            if not voided:
+                # pending 状态未找到，尝试处理已 settled 的记录
+                UsageService.void_settled(
+                    self.db,
+                    request_id=task.request_id,
+                    reason="cancelled_by_user",
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to void usage for cancelled task=%s: %s",
+                task.id,
+                sanitize_error_message(str(exc)),
+            )
         self.db.commit()
         return JSONResponse({})
 
@@ -275,12 +430,38 @@ class GeminiVeoHandler(VideoHandlerBase):
             if task.video_expires_at < now:
                 raise HTTPException(status_code=410, detail="Video URL has expired")
 
+        # 获取 provider 的认证信息（Gemini 下载视频需要带 API Key）
+        endpoint, key = self._get_endpoint_and_key(task)
+        download_headers: dict[str, str] = {}
+        if key.api_key:
+            try:
+                upstream_key = crypto_service.decrypt(key.api_key)
+                # Gemini API 使用 x-goog-api-key 头进行认证
+                download_headers["x-goog-api-key"] = upstream_key
+
+                # 如果是 Vertex AI，需要使用 OAuth Bearer token
+                auth_info = await get_provider_auth(endpoint, key)
+                if auth_info:
+                    download_headers.pop("x-goog-api-key", None)
+                    download_headers[auth_info.auth_header] = auth_info.auth_value
+            except Exception as exc:
+                logger.warning(
+                    "[VideoDownload] Failed to get auth for download task=%s: %s",
+                    task.id,
+                    sanitize_error_message(str(exc)),
+                )
+                # 继续尝试无认证下载（某些 URL 可能是预签名的）
+
         # 代理下载而非直接重定向，避免暴露上游存储 URL
-        client = await HTTPClientPool.get_default_client_async()
+        # 使用 httpx 支持重定向（Gemini 视频 URL 会重定向到实际存储位置）
+        import httpx
+
         try:
-            request = client.build_request("GET", task.video_url)
-            # 视频下载可能较大，设置 5 分钟超时
-            response = await client.send(request, stream=True, timeout=300.0)
+            # 使用 follow_redirects=True 跟随重定向
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=httpx.Timeout(300.0)
+            ) as client:
+                response = await client.get(task.video_url, headers=download_headers)
         except Exception as exc:
             logger.error(
                 "[VideoDownload] Upstream fetch failed user=%s task=%s: %s",
@@ -291,21 +472,14 @@ class GeminiVeoHandler(VideoHandlerBase):
             raise HTTPException(status_code=502, detail="Failed to fetch video")
 
         if response.status_code >= 400:
-            await response.aclose()
             raise HTTPException(status_code=response.status_code, detail="Upstream error")
 
-        async def _iter_bytes() -> AsyncIterator[bytes]:
-            try:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-            finally:
-                await response.aclose()
-
+        # 返回完整的视频内容（非 streaming，因为需要跟随重定向）
         safe_headers = {
             k: v for k, v in response.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
         }
-        return StreamingResponse(
-            _iter_bytes(),
+        return Response(
+            content=response.content,
             status_code=response.status_code,
             headers=safe_headers,
             media_type=response.headers.get("content-type", "video/mp4"),
@@ -375,6 +549,36 @@ class GeminiVeoHandler(VideoHandlerBase):
             "status": error.get("status", "BAD_GATEWAY"),
         }
 
+    # ------------------------------------------------------------------
+    # OpenAI format conversion helpers
+    # ------------------------------------------------------------------
+
+    def _build_openai_upstream_url(self, base_url: str | None) -> str:
+        """构建 OpenAI Sora API 的上游 URL"""
+        base = (base_url or "https://api.openai.com").rstrip("/")
+        if base.endswith("/v1"):
+            return f"{base}/videos"
+        return f"{base}/v1/videos"
+
+    def _build_openai_upstream_headers(
+        self,
+        original_headers: dict[str, str],
+        upstream_key: str,
+        endpoint: ProviderEndpoint,
+    ) -> dict[str, str]:
+        """构建 OpenAI 格式的请求头"""
+        extra_headers = get_extra_headers_from_endpoint(endpoint)
+        endpoint_sig = make_signature_key(
+            str(getattr(endpoint, "api_family", "")).strip().lower(),
+            str(getattr(endpoint, "endpoint_kind", "")).strip().lower(),
+        )
+        return build_upstream_headers_for_endpoint(
+            original_headers,
+            endpoint_sig,
+            upstream_key,
+            endpoint_headers=extra_headers,
+        )
+
     def _create_task_record(
         self,
         *,
@@ -385,6 +589,8 @@ class GeminiVeoHandler(VideoHandlerBase):
         candidate_keys: list[dict[str, Any]] | None = None,
         original_headers: dict[str, str] | None = None,
         billing_rule_snapshot: dict[str, Any] | None = None,
+        converted_request_body: dict[str, Any] | None = None,
+        format_converted: bool = False,
     ) -> VideoTask:
         now = datetime.now(timezone.utc)
 
@@ -407,8 +613,14 @@ class GeminiVeoHandler(VideoHandlerBase):
             }
             request_metadata["request_headers"] = safe_headers
 
+        provider_api_format = make_signature_key(
+            str(getattr(candidate.endpoint, "api_family", "")).strip().lower(),
+            str(getattr(candidate.endpoint, "endpoint_kind", "")).strip().lower(),
+        )
+
         return VideoTask(
             id=str(uuid4()),
+            request_id=self.request_id,
             external_task_id=external_task_id,
             user_id=self.user.id,
             api_key_id=self.api_key.id,
@@ -416,15 +628,12 @@ class GeminiVeoHandler(VideoHandlerBase):
             endpoint_id=candidate.endpoint.id,
             key_id=candidate.key.id,
             client_api_format=self.FORMAT_ID,
-            provider_api_format=make_signature_key(
-                str(getattr(candidate.endpoint, "api_family", "")).strip().lower(),
-                str(getattr(candidate.endpoint, "endpoint_kind", "")).strip().lower(),
-            ),
-            format_converted=False,
+            provider_api_format=provider_api_format,
+            format_converted=format_converted,
             model=internal_request.model,
             prompt=internal_request.prompt,
             original_request_body=original_request_body,
-            converted_request_body=original_request_body,
+            converted_request_body=converted_request_body or original_request_body,
             duration_seconds=internal_request.duration_seconds,
             resolution=internal_request.resolution,
             aspect_ratio=internal_request.aspect_ratio,
@@ -438,30 +647,45 @@ class GeminiVeoHandler(VideoHandlerBase):
             request_metadata=request_metadata,
         )
 
-    def _get_task_by_external_id(self, external_id: str) -> VideoTask:
-        """按 external_task_id 查找任务（Gemini 使用 operations/{id} 格式）"""
-        normalized_id = normalize_gemini_operation_id(external_id)
-
-        logger.info(
-            f"[GeminiVeoHandler] Looking for task: normalized_id={normalized_id}, user_id={self.user.id}"
+    def _task_to_internal(self, task: VideoTask) -> InternalVideoTask:
+        """覆盖父类方法，Gemini 使用 short_id 作为对外暴露的 ID"""
+        try:
+            status = VideoStatus(task.status)
+        except ValueError:
+            status = VideoStatus.PENDING
+        return InternalVideoTask(
+            id=task.short_id,  # Gemini 使用短 ID
+            external_id=task.external_task_id,
+            status=status,
+            progress_percent=task.progress_percent or 0,
+            progress_message=task.progress_message,
+            video_url=task.video_url,
+            video_urls=task.video_urls or [],
+            created_at=task.created_at,
+            completed_at=task.completed_at,
+            error_code=task.error_code,
+            error_message=task.error_message,
+            extra={"model": task.model},
         )
 
+    def _get_task_by_external_id(self, external_id: str) -> VideoTask:
+        """按 short_id 查找任务（我们对外暴露的 operation 格式是 models/{model}/operations/{short_id}）"""
+        from src.api.handlers.base.video_handler_base import extract_short_id_from_operation
+
+        short_id = extract_short_id_from_operation(external_id)
+
+        # 通过 short_id 查找任务
         task = (
             self.db.query(VideoTask)
             .filter(
-                VideoTask.external_task_id == normalized_id,
+                VideoTask.short_id == short_id,
                 VideoTask.user_id == self.user.id,
             )
             .first()
         )
         if not task:
-            logger.warning(
-                f"[GeminiVeoHandler] Task not found: normalized_id={normalized_id}, user_id={self.user.id}"
-            )
+            logger.debug("[GeminiVeoHandler] Task not found: short_id=%s", short_id)
             raise HTTPException(status_code=404, detail="Video task not found")
-        logger.info(
-            f"[GeminiVeoHandler] Task found: id={task.id}, external_task_id={task.external_task_id}"
-        )
         return task
 
 

@@ -340,6 +340,7 @@ export interface ProviderWithEndpointsSummary {
   website?: string
   provider_priority: number
   keep_priority_on_conversion: boolean  // 格式转换时是否保持优先级
+  enable_format_conversion: boolean  // 是否允许格式转换（提供商级别开关）
   billing_type?: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
   monthly_quota_usd?: number
   monthly_used_usd?: number

@@ -5,7 +5,7 @@
       <Card variant="default" class="p-4">
         <div class="flex items-center gap-3">
           <div class="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center">
-            <Video class="w-5 h-5 text-primary" />
+            <Zap class="w-5 h-5 text-primary" />
           </div>
           <div>
             <p class="text-2xl font-bold">{{ stats?.total ?? '-' }}</p>
@@ -53,7 +53,7 @@
       <!-- 标题和筛选器 -->
       <div class="px-4 sm:px-6 py-3.5 border-b border-border/60">
         <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <h3 class="text-base font-semibold">视频任务</h3>
+          <h3 class="text-base font-semibold">异步任务</h3>
           <div class="flex items-center gap-2">
             <!-- 状态筛选 -->
             <Select v-model="filterStatus">
@@ -98,8 +98,8 @@
 
       <!-- 空状态 -->
       <div v-else-if="!tasks.length" class="p-8 text-center">
-        <Video class="w-12 h-12 mx-auto text-muted-foreground/50" />
-        <p class="mt-2 text-sm text-muted-foreground">暂无视频任务</p>
+        <Zap class="w-12 h-12 mx-auto text-muted-foreground/50" />
+        <p class="mt-2 text-sm text-muted-foreground">暂无异步任务</p>
       </div>
 
       <!-- 任务列表 -->
@@ -114,6 +114,7 @@
             <div class="flex-1 min-w-0">
               <!-- 模型和状态 -->
               <div class="flex items-center gap-2 mb-1">
+                <Video v-if="isVideoTask(task)" class="w-4 h-4 text-muted-foreground" />
                 <span class="font-medium text-sm">{{ task.model }}</span>
                 <Badge :variant="getStatusVariant(task.status)">
                   {{ getStatusLabel(task.status) }}
@@ -389,17 +390,85 @@
           </div>
 
           <!-- 视频结果 -->
-          <div v-if="selectedTask.video_url" class="space-y-3">
-            <h4 class="text-sm font-medium">视频结果</h4>
-            <div class="space-y-2">
+          <div v-if="selectedTask.status === 'completed' || selectedTask.video_url || selectedTask.video_urls?.length" class="space-y-3">
+            <h4 class="text-sm font-medium flex items-center gap-2">
+              <Video class="w-4 h-4" />
+              视频结果
+            </h4>
+            
+            <!-- 主视频 -->
+            <div v-if="selectedTask.video_url" class="space-y-2">
               <video
                 :src="selectedTask.video_url"
                 controls
                 class="w-full rounded-lg"
               />
+              <!-- 视频链接 -->
+              <div class="p-2 bg-muted/50 rounded text-xs">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-muted-foreground truncate flex-1" :title="selectedTask.video_url">
+                    {{ selectedTask.video_url }}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    class="h-6 px-2 text-xs"
+                    @click="copyToClipboard(selectedTask.video_url)"
+                  >
+                    复制链接
+                  </Button>
+                </div>
+              </div>
               <p v-if="selectedTask.video_expires_at" class="text-xs text-muted-foreground">
                 过期时间: {{ formatDate(selectedTask.video_expires_at) }}
               </p>
+            </div>
+
+            <!-- 多个视频（如果有） -->
+            <div v-else-if="selectedTask.video_urls?.length" class="space-y-3">
+              <div v-for="(url, index) in selectedTask.video_urls" :key="index" class="space-y-2">
+                <p class="text-xs text-muted-foreground">视频 {{ index + 1 }}</p>
+                <video :src="url" controls class="w-full rounded-lg" />
+                <div class="p-2 bg-muted/50 rounded text-xs">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-muted-foreground truncate flex-1" :title="url">{{ url }}</span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      class="h-6 px-2 text-xs"
+                      @click="copyToClipboard(url)"
+                    >
+                      复制链接
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 任务完成但无视频 -->
+            <div v-else-if="selectedTask.status === 'completed'" class="p-4 bg-amber-50 dark:bg-amber-900/20 rounded-lg text-center">
+              <p class="text-sm text-amber-600 dark:text-amber-400">任务已完成，但视频链接不可用或已过期</p>
+            </div>
+          </div>
+
+          <!-- 任务完成响应体 -->
+          <div v-if="selectedTask.request_metadata?.poll_raw_response" class="space-y-3">
+            <div class="flex items-center justify-between">
+              <h4 class="text-sm font-medium flex items-center gap-2">
+                <FileJson class="w-4 h-4" />
+                任务响应
+              </h4>
+              <Button
+                variant="ghost"
+                size="sm"
+                class="h-6 px-2 text-xs"
+                @click="copyToClipboard(JSON.stringify(selectedTask.request_metadata.poll_raw_response, null, 2))"
+              >
+                复制
+              </Button>
+            </div>
+            <div class="p-3 bg-muted/50 rounded-lg overflow-x-auto">
+              <pre class="text-xs font-mono whitespace-pre-wrap break-all">{{ formatJson(selectedTask.request_metadata.poll_raw_response) }}</pre>
             </div>
           </div>
 
@@ -447,7 +516,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { videoTasksApi, type VideoTaskItem, type VideoTaskDetail, type VideoTaskStatsResponse, type VideoTaskStatus } from '@/api/video-tasks'
+import { asyncTasksApi, type AsyncTaskItem, type AsyncTaskDetail, type AsyncTaskStatsResponse, type AsyncTaskStatus } from '@/api/async-tasks'
 import { useToast } from '@/composables/useToast'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
@@ -459,8 +528,10 @@ import SelectValue from '@/components/ui/select-value.vue'
 import SelectContent from '@/components/ui/select-content.vue'
 import SelectItem from '@/components/ui/select-item.vue'
 import {
+  Zap,
   Video,
   Loader2,
+  FileJson,
   CheckCircle,
   Calendar,
   RefreshCw,
@@ -478,24 +549,29 @@ const { toast } = useToast()
 
 // 状态
 const loading = ref(false)
-const tasks = ref<VideoTaskItem[]>([])
-const stats = ref<VideoTaskStatsResponse | null>(null)
+const tasks = ref<AsyncTaskItem[]>([])
+const stats = ref<AsyncTaskStatsResponse | null>(null)
 const total = ref(0)
 const currentPage = ref(1)
 const pageSize = ref(20)
 const filterStatus = ref('all')
 const filterModel = ref('')
 const showDetail = ref(false)
-const selectedTask = ref<VideoTaskDetail | null>(null)
+const selectedTask = ref<AsyncTaskDetail | null>(null)
 
 const totalPages = computed(() => Math.ceil(total.value / pageSize.value))
+
+// 判断是否为视频任务
+function isVideoTask(task: AsyncTaskItem): boolean {
+  return task.task_type === 'video' || !!task.video_url || !!task.duration_seconds
+}
 
 // 获取任务列表
 async function fetchTasks() {
   loading.value = true
   try {
-    const response = await videoTasksApi.list({
-      status: filterStatus.value !== 'all' ? filterStatus.value as VideoTaskStatus : undefined,
+    const response = await asyncTasksApi.list({
+      status: filterStatus.value !== 'all' ? filterStatus.value as AsyncTaskStatus : undefined,
       model: filterModel.value || undefined,
       page: currentPage.value,
       page_size: pageSize.value,
@@ -516,16 +592,16 @@ async function fetchTasks() {
 // 获取统计数据
 async function fetchStats() {
   try {
-    stats.value = await videoTasksApi.getStats()
+    stats.value = await asyncTasksApi.getStats()
   } catch (error) {
     console.error('Failed to fetch stats:', error)
   }
 }
 
 // 打开任务详情
-async function openTaskDetail(task: VideoTaskItem) {
+async function openTaskDetail(task: AsyncTaskItem) {
   try {
-    selectedTask.value = await videoTasksApi.getDetail(task.id)
+    selectedTask.value = await asyncTasksApi.getDetail(task.id)
     showDetail.value = true
   } catch (error: any) {
     toast({
@@ -537,10 +613,10 @@ async function openTaskDetail(task: VideoTaskItem) {
 }
 
 // 取消任务
-async function cancelTask(task: VideoTaskItem | VideoTaskDetail) {
+async function cancelTask(task: AsyncTaskItem | AsyncTaskDetail) {
   if (!confirm('确定要取消这个任务吗？')) return
   try {
-    await videoTasksApi.cancel(task.id)
+    await asyncTasksApi.cancel(task.id)
     toast({
       title: '任务已取消',
     })
@@ -600,6 +676,30 @@ function formatDate(dateStr: string | null): string {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+// 复制到剪贴板
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast({
+      title: '已复制到剪贴板',
+    })
+  } catch (error) {
+    toast({
+      title: '复制失败',
+      variant: 'destructive',
+    })
+  }
+}
+
+// 格式化 JSON
+function formatJson(obj: any): string {
+  try {
+    return JSON.stringify(obj, null, 2)
+  } catch {
+    return String(obj)
+  }
 }
 
 // 分页

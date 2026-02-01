@@ -26,7 +26,7 @@ from src.services.cache.aware_scheduler import ProviderCandidate
 if TYPE_CHECKING:
     import httpx
 
-    from src.services.task.orchestrator import SubmitOutcome
+    from src.services.candidate.submit import SubmitOutcome
 
 # 敏感信息匹配正则（预编译提升性能）
 _SENSITIVE_PATTERN = re.compile(
@@ -53,21 +53,39 @@ def sanitize_error_message(message: str, max_length: int = 200) -> str:
     return sanitized[:max_length]
 
 
+def extract_short_id_from_operation(operation_id: str) -> str:
+    """
+    从 operation ID 中提取短 ID
+
+    我们对外暴露的 operation name 格式是:
+    - models/{model}/operations/{short_id}
+
+    此函数提取最后一部分作为 short_id，用于在数据库中查找任务。
+
+    Args:
+        operation_id: 原始 operation ID（如 "models/veo-3.1/operations/abc123"）
+
+    Returns:
+        short_id（如 "abc123"）
+    """
+    # 格式: models/{model}/operations/{short_id}
+    # 或者直接是 short_id
+    if "/" in operation_id:
+        # 提取最后一部分
+        return operation_id.rsplit("/", 1)[-1]
+    return operation_id
+
+
 def normalize_gemini_operation_id(operation_id: str) -> str:
     """
-    规范化 Gemini operation ID，确保以 "operations/" 开头
-
-    Gemini API 返回的任务 ID 格式可能是 "operations/xxx" 或 "xxx"，
-    此函数统一规范化为 "operations/xxx" 格式。
+    规范化 Gemini operation ID（保留用于向后兼容）
 
     Args:
         operation_id: 原始 operation ID
 
     Returns:
-        规范化后的 operation ID
+        规范化后的 operation ID（原样返回）
     """
-    if not operation_id.startswith("operations/"):
-        return f"operations/{operation_id}"
     return operation_id
 
 
@@ -143,6 +161,18 @@ class VideoHandlerBase(ABC):
     ) -> JSONResponse:
         """取消任务"""
 
+    async def handle_delete_task(
+        self,
+        *,
+        task_id: str,
+        http_request: Request,
+        original_headers: dict[str, str],
+        query_params: dict[str, str] | None = None,
+        path_params: dict[str, Any] | None = None,
+    ) -> JSONResponse:
+        """删除已完成或失败的视频任务 - 可选实现"""
+        raise HTTPException(status_code=501, detail="Delete not supported for this provider")
+
     async def handle_remix_task(
         self,
         *,
@@ -205,6 +235,7 @@ class VideoHandlerBase(ABC):
         }
 
     def _get_task(self, task_id: str) -> VideoTask:
+        """通过 UUID 查找任务（OpenAI Sora 风格）"""
         task = (
             self.db.query(VideoTask)
             .filter(VideoTask.id == task_id, VideoTask.user_id == self.user.id)
@@ -229,7 +260,7 @@ class VideoHandlerBase(ABC):
         except ValueError:
             status = VideoStatus.PENDING
         return InternalVideoTask(
-            id=task.id,
+            id=task.id,  # OpenAI Sora 使用 UUID
             external_id=task.external_task_id,
             status=status,
             progress_percent=task.progress_percent or 0,
@@ -242,6 +273,52 @@ class VideoHandlerBase(ABC):
             error_message=task.error_message,
             extra={"model": task.model},
         )
+
+    def _finalize_usage_on_submit_failure(
+        self,
+        candidate_keys: list[dict[str, Any]],
+        status_code: int | None,
+    ) -> None:
+        """
+        提交失败时结算 pending usage（避免遗留 pending 状态）。
+
+        从 candidate_keys 中提取最后尝试的 provider 信息，更新 Usage 记录。
+        """
+        from src.services.usage.service import UsageService
+
+        # 提取 provider 信息：优先取最后一个有 attempt 的候选
+        provider_name = "unknown"
+        provider_id = None
+        endpoint_id = None
+        key_id = None
+
+        for ck in reversed(candidate_keys):
+            if ck.get("attempt_status") or ck.get("selected"):
+                provider_name = ck.get("provider_name") or "unknown"
+                provider_id = ck.get("provider_id")
+                endpoint_id = ck.get("endpoint_id")
+                key_id = ck.get("key_id")
+                break
+
+        try:
+            # 更新 usage 状态并设置 provider 信息
+            UsageService.update_usage_status(
+                self.db,
+                request_id=self.request_id,
+                status="failed",
+                error_message=f"submit_failed (status_code={status_code or 'unknown'})",
+                provider=provider_name,
+                provider_id=provider_id,
+                provider_endpoint_id=endpoint_id,
+                provider_api_key_id=key_id,
+                status_code=status_code,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to finalize usage on submit failure: request_id=%s, error=%s",
+                self.request_id,
+                sanitize_error_message(str(exc)),
+            )
 
     def _build_billing_rule_snapshot(
         self, rule_lookup: BillingRuleLookupResult | None
@@ -290,16 +367,16 @@ class VideoHandlerBase(ABC):
         - 无可用候选 / 全部失败：抛 HTTPException(503)
         """
         # 延迟导入，避免 handler 基类层引入过多依赖导致循环
-        from src.services.task.orchestrator import (
+        from src.services.candidate.service import CandidateService
+        from src.services.candidate.submit import (
             AllCandidatesFailedError,
-            AsyncTaskOrchestrator,
             SubmitOutcome,
             UpstreamClientRequestError,
         )
 
-        orchestrator = AsyncTaskOrchestrator(self.db)
+        candidate_service = CandidateService(self.db)
         try:
-            return await orchestrator.submit_with_failover(
+            return await candidate_service.submit_with_failover(
                 api_format=api_format,
                 model_name=model_name,
                 affinity_key=str(self.api_key.id),
@@ -314,8 +391,12 @@ class VideoHandlerBase(ABC):
                 max_candidates=max_candidates,
             )
         except UpstreamClientRequestError as exc:
+            # 将 pending usage 结算为 failed，并记录 provider 信息
+            self._finalize_usage_on_submit_failure(exc.candidate_keys, exc.response.status_code)
             return self._build_error_response(exc.response)
         except AllCandidatesFailedError as exc:
+            # 将 pending usage 结算为 failed
+            self._finalize_usage_on_submit_failure(exc.candidate_keys, exc.last_status_code)
             detail = "No available provider for video generation"
             if config.billing_require_rule:
                 detail = "No available provider with billing rule for video generation"

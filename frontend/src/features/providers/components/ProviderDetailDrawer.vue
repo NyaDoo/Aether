@@ -58,6 +58,15 @@
                   <Button
                     variant="ghost"
                     size="icon"
+                    :title="provider.enable_format_conversion ? '已启用格式转换（点击关闭）' : '启用格式转换'"
+                    :class="provider.enable_format_conversion ? 'text-primary' : ''"
+                    @click="toggleFormatConversion"
+                  >
+                    <Shuffle class="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     title="编辑提供商"
                     @click="$emit('edit', provider)"
                   >
@@ -502,7 +511,8 @@ import {
   Power,
   GripVertical,
   Copy,
-  Shield
+  Shield,
+  Shuffle
 } from 'lucide-vue-next'
 import { useEscapeKey } from '@/composables/useEscapeKey'
 import Button from '@/components/ui/button.vue'
@@ -511,7 +521,7 @@ import Card from '@/components/ui/card.vue'
 import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
 import { useCountdownTimer, formatCountdown } from '@/composables/useCountdownTimer'
-import { getProvider, getProviderEndpoints } from '@/api/endpoints'
+import { getProvider, getProviderEndpoints, updateProvider } from '@/api/endpoints'
 import {
   KeyFormDialog,
   KeyAllowedModelsEditDialog,
@@ -699,6 +709,20 @@ function handleBackdropClick() {
 function handleClose() {
   if (!hasBlockingDialogOpen.value) {
     emit('update:open', false)
+  }
+}
+
+// 切换格式转换开关
+async function toggleFormatConversion() {
+  if (!provider.value) return
+  const newValue = !provider.value.enable_format_conversion
+  try {
+    await updateProvider(provider.value.id, { enable_format_conversion: newValue })
+    provider.value.enable_format_conversion = newValue
+    showSuccess(newValue ? '已启用格式转换' : '已禁用格式转换')
+    emit('refresh')
+  } catch {
+    showError('切换格式转换失败')
   }
 }
 

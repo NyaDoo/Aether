@@ -18,7 +18,6 @@ from src.core.api_format import ApiFamily, get_auth_handler
 from src.core.api_format.enums import AuthMethod
 from src.core.logger import logger
 from src.models.gemini import GeminiRequest
-from src.services.gemini_files_mapping import extract_file_names_from_request
 from src.services.provider.transport import redact_url_for_log
 
 
@@ -63,11 +62,9 @@ class GeminiChatAdapter(ChatAdapterBase):
     def detect_capability_requirements(
         self,
         headers: dict[str, str],  # noqa: ARG002 - 预留
-        request_body: dict[str, Any] | None = None,
+        request_body: dict[str, Any] | None = None,  # noqa: ARG002 - 预留
     ) -> dict[str, bool]:
-        """检测是否需要 Gemini Files API 能力"""
-        if request_body and extract_file_names_from_request(request_body):
-            return {"gemini_files_api": True}
+        """Gemini API 无特殊能力要求"""
         return {}
 
     def _merge_path_params(

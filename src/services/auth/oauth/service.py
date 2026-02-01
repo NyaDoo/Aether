@@ -804,8 +804,33 @@ class OAuthService:
 
         cfg = OAuthService._get_provider_config(db, provider_type)
 
+        # Read all required fields first, then release DB connection before any awaits.
+        # This prevents holding a pooled connection while doing network I/O.
         auth_url = provider.get_effective_authorization_url(cfg)
         token_url = provider.get_effective_token_url(cfg)
+        redirect_uri = cfg.redirect_uri
+        client_id = cfg.client_id
+        has_secret = bool(cfg.client_secret_encrypted)
+        client_secret = cfg.get_client_secret() if has_secret else None
+
+        # Release DB connection (safe only when session has no pending changes).
+        try:
+            has_pending_changes = bool(db.new) or bool(db.dirty) or bool(db.deleted)
+        except Exception:
+            has_pending_changes = False
+        if not has_pending_changes:
+            original_expire_on_commit = getattr(db, "expire_on_commit", True)
+            db.expire_on_commit = False
+            try:
+                if db.in_transaction():
+                    db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            finally:
+                db.expire_on_commit = original_expire_on_commit
 
         async def _reachable(url: str) -> bool:
             try:
@@ -823,7 +848,7 @@ class OAuthService:
         secret_status = "unknown"
         details = ""
 
-        if cfg.client_secret_encrypted:
+        if has_secret and client_secret:
             # 使用无效 code 做一次 token 请求（仅做粗略判定）
             try:
                 async with httpx.AsyncClient(
@@ -834,9 +859,9 @@ class OAuthService:
                         data={
                             "grant_type": "authorization_code",
                             "code": "invalid",
-                            "redirect_uri": cfg.redirect_uri,
-                            "client_id": cfg.client_id,
-                            "client_secret": cfg.get_client_secret(),
+                            "redirect_uri": redirect_uri,
+                            "client_id": client_id,
+                            "client_secret": client_secret,
                         },
                     )
                 try:

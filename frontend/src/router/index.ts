@@ -209,9 +209,19 @@ const routes: RouteRecordRaw[] = [
         component: () => importWithRetry(() => import('@/views/user/Announcements.vue'))
       },
       {
+        path: 'async-tasks',
+        name: 'AsyncTasks',
+        component: () => importWithRetry(() => import('@/views/admin/AsyncTasks.vue'))
+      },
+      {
+        path: 'gemini-files',
+        name: 'GeminiFilesManagement',
+        component: () => importWithRetry(() => import('@/views/admin/GeminiFilesManagement.vue'))
+      },
+      // 保留旧路由兼容性
+      {
         path: 'video-tasks',
-        name: 'VideoTasks',
-        component: () => importWithRetry(() => import('@/views/admin/VideoTasks.vue'))
+        redirect: '/admin/async-tasks'
       }
     ]
   }

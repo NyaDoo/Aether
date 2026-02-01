@@ -635,6 +635,10 @@ class ProviderUpdateRequest(BaseModel):
         None,
         description="格式转换时是否保持优先级（True=保持原优先级，False=需要转换时降级）",
     )
+    enable_format_conversion: bool | None = Field(
+        None,
+        description="是否允许格式转换（提供商级别开关）",
+    )
     is_active: bool | None = None
     billing_type: str | None = Field(
         None, description="计费类型：monthly_quota/pay_as_you_go/free_tier"
@@ -666,6 +670,10 @@ class ProviderWithEndpointsSummary(BaseModel):
     keep_priority_on_conversion: bool = Field(
         default=False,
         description="格式转换时是否保持优先级（True=保持原优先级，False=需要转换时降级）",
+    )
+    enable_format_conversion: bool = Field(
+        default=True,
+        description="是否允许格式转换（提供商级别开关）",
     )
     is_active: bool
 

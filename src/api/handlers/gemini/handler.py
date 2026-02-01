@@ -40,28 +40,31 @@ class GeminiChatHandler(ChatHandlerBase):
         Gemini 文件与上传它的 API Key 绑定，必须使用同一 Key 访问。
         此方法从缓存中查找文件→Key 映射，优先使用正确的 Key。
 
+        当同一源文件被上传到多个 Key 时，会返回所有可用的 Key ID，
+        让系统能够选择任意可用的 Key。
+
         注意事项：
         - 如果映射缺失（缓存过期/重启），会记录警告，请求可能失败
-        - 如果多个文件属于不同 Key，只能使用其中一个，其他文件可能无法访问
+        - 优先返回所有支持该文件的 Key，让调度器选择可用的
         """
         from src.core.logger import logger
         from src.services.gemini_files_mapping import (
             extract_file_names_from_request,
-            get_file_key_mapping,
+            get_all_key_ids_for_file,
         )
 
         file_names = extract_file_names_from_request(request_body or {})
         if not file_names:
             return None
 
-        preferred_key_ids: list[str] = []
-        unmapped_files: list[str] = []  # 记录找不到映射的文件
+        all_key_ids: set[str] = set()
+        unmapped_files: list[str] = []
 
         for file_name in file_names:
-            key_id = await get_file_key_mapping(file_name)
-            if key_id:
-                if key_id not in preferred_key_ids:
-                    preferred_key_ids.append(key_id)
+            # 获取所有支持该文件的 Key（包括通过 source_hash 关联的）
+            key_ids = await get_all_key_ids_for_file(file_name)
+            if key_ids:
+                all_key_ids.update(key_ids)
             else:
                 unmapped_files.append(file_name)
 
@@ -72,14 +75,10 @@ class GeminiChatHandler(ChatHandlerBase):
                 "请求可能失败（文件属于其他 Key 或映射已过期）"
             )
 
-        # 警告：多个文件属于不同 Key
-        if len(preferred_key_ids) > 1:
-            logger.warning(
-                f"[{self.request_id}] 请求使用了多个文件，但它们属于不同的 Key: "
-                f"{preferred_key_ids}，只能使用第一个 Key，其他文件可能无法访问"
-            )
+        if all_key_ids:
+            logger.debug(f"[{self.request_id}] 文件引用可用的 Key: {list(all_key_ids)}")
 
-        return preferred_key_ids or None
+        return list(all_key_ids) if all_key_ids else None
 
     def extract_model_from_request(
         self,

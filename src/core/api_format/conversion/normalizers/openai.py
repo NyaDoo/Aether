@@ -752,9 +752,20 @@ class OpenAINormalizer(FormatNormalizer):
                 "message": internal.error_message,
             }
 
-        for key in ["model", "size", "seconds"]:
-            if key in internal.extra:
+        # 基本字段
+        for key in ["model", "size", "prompt"]:
+            if internal.extra.get(key):
                 payload[key] = internal.extra[key]
+
+        # seconds 必须是字符串类型
+        seconds = internal.extra.get("seconds")
+        if seconds is not None:
+            payload["seconds"] = str(seconds)
+
+        # remix 相关字段
+        remixed_from = internal.extra.get("remixed_from_video_id")
+        if remixed_from:
+            payload["remixed_from_video_id"] = remixed_from
 
         return payload
 
@@ -764,14 +775,18 @@ class OpenAINormalizer(FormatNormalizer):
 
         if status == "completed":
             expires_at = response.get("expires_at")
-            # 使用任务 ID 构建内容路径，由调用方拼接完整 URL
-            # 如果 task_id 不存在，说明上游响应异常
-            video_url = f"videos/{task_id}/content" if task_id else None
+            # 优先使用上游返回的直接 URL（某些代理如 API易 会返回 CDN URL）
+            # 回退到构建相对路径（标准 OpenAI API 通过 /content 端点下载）
+            direct_url = (
+                response.get("video_url") or response.get("url") or response.get("result_url")
+            )
+            # 使用直接 URL 或回退到相对路径
+            video_url = direct_url or (f"videos/{task_id}/content" if task_id else None)
             if not video_url:
                 return InternalVideoPollResult(
                     status=VideoStatus.FAILED,
-                    error_code="missing_task_id",
-                    error_message="Upstream response missing task id",
+                    error_code="missing_video_url",
+                    error_message="Upstream response missing video url",
                     raw_response=response,
                 )
             return InternalVideoPollResult(

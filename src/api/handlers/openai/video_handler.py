@@ -5,6 +5,7 @@ OpenAI Video Handler - Sora 视频生成实现
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
 from uuid import uuid4
@@ -14,6 +15,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.api.handlers.base.request_builder import get_provider_auth
 from src.api.handlers.base.video_handler_base import VideoHandlerBase, sanitize_error_message
 from src.clients.http_client import HTTPClientPool
 from src.config.settings import config
@@ -30,6 +32,7 @@ from src.core.api_format.conversion.internal_video import (
     VideoStatus,
 )
 from src.core.api_format.conversion.normalizers.openai import OpenAINormalizer
+from src.core.api_format.conversion.registry import format_conversion_registry
 from src.core.api_format.headers import HOP_BY_HOP_HEADERS
 from src.core.crypto import crypto_service
 from src.core.logger import logger
@@ -91,16 +94,91 @@ class OpenAIVideoHandler(VideoHandlerBase):
             )
             raise HTTPException(status_code=400, detail=str(e))
 
+        # 异步任务：提前创建 pending usage，便于前端看到“处理中”
+        try:
+            UsageService.create_pending_usage(
+                db=self.db,
+                request_id=self.request_id,
+                user=self.user,
+                api_key=self.api_key,
+                model=internal_request.model,
+                is_stream=False,
+                request_type="video",
+                api_format=self.FORMAT_ID,
+                request_headers=original_headers,
+                request_body=original_request_body,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to create pending usage for video request_id=%s: %s",
+                self.request_id,
+                sanitize_error_message(str(exc)),
+            )
+
+        # 用于跟踪是否发生了格式转换
+        format_conversion_info: dict[str, Any] = {
+            "converted": False,
+            "provider_format": None,
+        }
+
         async def _submit(candidate: ProviderCandidate) -> Any:
             upstream_key, endpoint, _provider_key = await self._resolve_upstream_key(candidate)
-            upstream_url = self._build_upstream_url(endpoint.base_url)
-            headers = self._build_upstream_headers(original_headers, upstream_key, endpoint)
-            client = await HTTPClientPool.get_default_client_async()
-            return await client.post(upstream_url, headers=headers, json=original_request_body)
+
+            # 检测目标格式
+            provider_format = make_signature_key(
+                str(getattr(endpoint, "api_family", "")).strip().lower(),
+                str(getattr(endpoint, "endpoint_kind", "")).strip().lower(),
+            )
+            needs_conversion = provider_format.upper() != self.FORMAT_ID.upper()
+            format_conversion_info["provider_format"] = provider_format
+            format_conversion_info["converted"] = needs_conversion
+
+            # 确保 seconds 字段为字符串类型（上游 Go 服务要求 string）
+            request_body = original_request_body.copy()
+            if "seconds" in request_body and request_body["seconds"] is not None:
+                request_body["seconds"] = str(request_body["seconds"])
+
+            if needs_conversion and provider_format.upper().startswith("GEMINI:"):
+                # OpenAI -> Gemini 格式转换
+                converted_body = format_conversion_registry.convert_video_request(
+                    request_body,
+                    self.FORMAT_ID,
+                    provider_format,
+                )
+                # 如果 model 不在请求体中，从路径或内部请求中获取
+                if "model" not in converted_body:
+                    converted_body["model"] = internal_request.model
+
+                # 构建 Gemini 风格的 URL
+                upstream_url = self._build_gemini_upstream_url(
+                    endpoint.base_url, internal_request.model
+                )
+
+                # 构建 Gemini 风格的请求头
+                auth_info = await get_provider_auth(endpoint, _provider_key)
+                headers = self._build_gemini_upstream_headers(
+                    original_headers, upstream_key, endpoint, auth_info
+                )
+
+                client = await HTTPClientPool.get_default_client_async()
+                return await client.post(upstream_url, headers=headers, json=converted_body)
+            else:
+                # 原始 OpenAI 格式
+                upstream_url = self._build_upstream_url(endpoint.base_url)
+                headers = self._build_upstream_headers(original_headers, upstream_key, endpoint)
+                client = await HTTPClientPool.get_default_client_async()
+                return await client.post(upstream_url, headers=headers, json=request_body)
 
         def _extract_task_id(payload: dict[str, Any]) -> str | None:
-            value = payload.get("id")
-            return str(value) if value else None
+            # 根据响应格式提取 task ID
+            # OpenAI: {"id": "..."}
+            # Gemini: {"name": "operations/..."}
+            if "id" in payload:
+                return str(payload["id"])
+            if "name" in payload:
+                # Gemini 格式
+                return str(payload["name"])
+            return None
 
         # 捕获提交阶段的所有错误，记录失败任务
         try:
@@ -110,8 +188,8 @@ class OpenAIVideoHandler(VideoHandlerBase):
                 task_type="video",
                 submit_func=_submit,
                 extract_external_task_id=_extract_task_id,
-                supported_auth_types={"api_key"},
-                allow_format_conversion=False,
+                supported_auth_types={"api_key", "vertex_ai"},
+                allow_format_conversion=True,
                 max_candidates=10,
             )
         except HTTPException as exc:
@@ -156,14 +234,31 @@ class OpenAIVideoHandler(VideoHandlerBase):
 
         external_task_id = outcome.external_task_id
 
+        # 如果发生了格式转换，记录转换后的请求体
+        converted_request_body = original_request_body
+        if format_conversion_info["converted"]:
+            try:
+                converted_request_body = format_conversion_registry.convert_video_request(
+                    original_request_body,
+                    self.FORMAT_ID,
+                    format_conversion_info["provider_format"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[OpenAIVideoHandler] Failed to record converted request: %s",
+                    sanitize_error_message(str(e)),
+                )
+
         task = self._create_task_record(
             external_task_id=external_task_id,
             candidate=outcome.candidate,
             original_request_body=original_request_body,
+            converted_request_body=converted_request_body,
             internal_request=internal_request,
             candidate_keys=outcome.candidate_keys,
             original_headers=original_headers,
             billing_rule_snapshot=billing_rule_snapshot,
+            format_converted=format_conversion_info["converted"],
         )
         try:
             self.db.add(task)
@@ -174,6 +269,7 @@ class OpenAIVideoHandler(VideoHandlerBase):
             self.db.rollback()
             raise HTTPException(status_code=409, detail="Task already exists")
 
+        # 先构建返回给客户端的响应（OpenAI Sora 使用 UUID）
         internal_task = InternalVideoTask(
             id=task.id,
             external_id=external_task_id,
@@ -182,6 +278,42 @@ class OpenAIVideoHandler(VideoHandlerBase):
             original_request=internal_request,
         )
         response_body = self._normalizer.video_task_from_internal(internal_task)
+
+        # 提交成功后立即结算 Usage（费用暂时为 0，轮询完成后更新）
+        response_time_ms = int((time.time() - self.start_time) * 1000)
+        try:
+            # 构建发送给上游的请求头（脱敏）
+            upstream_request_headers = self._build_upstream_headers(
+                original_headers,
+                "",  # key 不重要，只是用于记录
+                outcome.candidate.endpoint,
+            )
+
+            UsageService.finalize_submitted(
+                self.db,
+                request_id=self.request_id,
+                provider_name=outcome.candidate.provider.name,
+                provider_id=outcome.candidate.provider.id,
+                provider_endpoint_id=outcome.candidate.endpoint.id,
+                provider_api_key_id=outcome.candidate.key.id,
+                response_time_ms=response_time_ms,
+                status_code=outcome.upstream_status_code or 200,
+                endpoint_api_format=make_signature_key(
+                    str(getattr(outcome.candidate.endpoint, "api_family", "")).strip().lower(),
+                    str(getattr(outcome.candidate.endpoint, "endpoint_kind", "")).strip().lower(),
+                ),
+                provider_request_headers=upstream_request_headers,
+                response_headers=outcome.upstream_headers,
+                response_body=response_body,  # 使用我们转换后的响应（包含我们的 ID）
+            )
+            self.db.commit()
+        except Exception as exc:
+            logger.warning(
+                "Failed to finalize submitted usage for video request_id=%s: %s",
+                self.request_id,
+                sanitize_error_message(str(exc)),
+            )
+
         return JSONResponse(response_body)
 
     async def handle_get_task(
@@ -206,17 +338,59 @@ class OpenAIVideoHandler(VideoHandlerBase):
         query_params: dict[str, str] | None = None,
         path_params: dict[str, Any] | None = None,
     ) -> JSONResponse:
-        tasks = (
-            self.db.query(VideoTask)
-            .filter(VideoTask.user_id == self.user.id)
-            .order_by(VideoTask.created_at.desc())
-            .limit(100)
-            .all()
-        )
+        params = query_params or {}
+
+        # 解析分页参数
+        after = params.get("after")
+        try:
+            limit = min(int(params.get("limit") or 20), 100)  # 默认 20，最大 100
+        except (ValueError, TypeError):
+            limit = 20
+        order = params.get("order", "desc").lower()
+        if order not in ("asc", "desc"):
+            order = "desc"
+
+        # 构建查询
+        query = self.db.query(VideoTask).filter(VideoTask.user_id == self.user.id)
+
+        # 处理游标分页（after 参数使用 UUID）
+        if after:
+            after_task = (
+                self.db.query(VideoTask)
+                .filter(VideoTask.id == after, VideoTask.user_id == self.user.id)
+                .first()
+            )
+            if after_task and after_task.created_at:
+                if order == "desc":
+                    query = query.filter(VideoTask.created_at < after_task.created_at)
+                else:
+                    query = query.filter(VideoTask.created_at > after_task.created_at)
+
+        # 排序
+        if order == "asc":
+            query = query.order_by(VideoTask.created_at.asc())
+        else:
+            query = query.order_by(VideoTask.created_at.desc())
+
+        # 获取 limit + 1 条记录以判断是否有更多数据
+        tasks = query.limit(limit + 1).all()
+        has_more = len(tasks) > limit
+        tasks = tasks[:limit]
+
         items = [
             self._normalizer.video_task_from_internal(self._task_to_internal(t)) for t in tasks
         ]
-        return JSONResponse({"object": "list", "data": items})
+
+        response_data: dict[str, Any] = {
+            "object": "list",
+            "data": items,
+            "has_more": has_more,
+        }
+        # 如果有更多数据，返回最后一条的 ID 作为下一页游标
+        if has_more and tasks:
+            response_data["last_id"] = tasks[-1].id
+
+        return JSONResponse(response_data)
 
     async def handle_cancel_task(
         self,
@@ -245,8 +419,79 @@ class OpenAIVideoHandler(VideoHandlerBase):
 
         task.status = VideoStatus.CANCELLED.value
         task.updated_at = datetime.now(timezone.utc)
+
+        # 将 Usage 作废（不收费）
+        # 尝试 finalize_void（处理 pending）和 void_settled（处理已 settled）
+        try:
+            voided = UsageService.finalize_void(
+                self.db,
+                request_id=task.request_id,
+                reason="cancelled_by_user",
+            )
+            if not voided:
+                # pending 状态未找到，尝试处理已 settled 的记录
+                UsageService.void_settled(
+                    self.db,
+                    request_id=task.request_id,
+                    reason="cancelled_by_user",
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to void usage for cancelled task=%s: %s",
+                task.id,
+                sanitize_error_message(str(exc)),
+            )
         self.db.commit()
         return JSONResponse({})
+
+    async def handle_delete_task(
+        self,
+        *,
+        task_id: str,
+        http_request: Request,
+        original_headers: dict[str, str],
+        query_params: dict[str, str] | None = None,
+        path_params: dict[str, Any] | None = None,
+    ) -> JSONResponse:
+        """删除已完成或失败的视频及其存储资源"""
+        task = self._get_task(task_id)
+
+        # 只能删除已完成或失败的视频
+        if task.status not in (VideoStatus.COMPLETED.value, VideoStatus.FAILED.value):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Can only delete completed or failed videos (current status: {task.status})",
+            )
+
+        # 如果有 external_task_id，向上游发送删除请求
+        if task.external_task_id:
+            try:
+                endpoint, key = self._get_endpoint_and_key(task)
+                if key.api_key:
+                    upstream_key = crypto_service.decrypt(key.api_key)
+                    upstream_url = self._build_upstream_url(
+                        endpoint.base_url, task.external_task_id
+                    )
+                    headers = self._build_upstream_headers(original_headers, upstream_key, endpoint)
+
+                    client = await HTTPClientPool.get_default_client_async()
+                    response = await client.delete(upstream_url, headers=headers)
+                    if response.status_code >= 400 and response.status_code != 404:
+                        # 404 表示上游已删除，不算错误
+                        return self._build_error_response(response)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to delete video from upstream task=%s: %s",
+                    task.id,
+                    sanitize_error_message(str(exc)),
+                )
+                # 继续删除本地记录
+
+        # 删除本地任务记录
+        self.db.delete(task)
+        self.db.commit()
+
+        return JSONResponse({"id": task_id, "object": "video", "deleted": True})
 
     async def handle_remix_task(
         self,
@@ -280,8 +525,13 @@ class OpenAIVideoHandler(VideoHandlerBase):
         )
         headers = self._build_upstream_headers(original_headers, upstream_key, endpoint)
 
+        # 确保 seconds 字段为字符串类型（上游 Go 服务要求 string）
+        request_body = original_request_body.copy()
+        if "seconds" in request_body and request_body["seconds"] is not None:
+            request_body["seconds"] = str(request_body["seconds"])
+
         client = await HTTPClientPool.get_default_client_async()
-        response = await client.post(upstream_url, headers=headers, json=original_request_body)
+        response = await client.post(upstream_url, headers=headers, json=request_body)
 
         if response.status_code >= 400:
             return self._build_error_response(response)
@@ -350,7 +600,7 @@ class OpenAIVideoHandler(VideoHandlerBase):
             raise HTTPException(status_code=409, detail="Task already exists")
 
         internal_task = InternalVideoTask(
-            id=task.id,
+            id=task.id,  # OpenAI Sora 使用 UUID
             external_id=external_task_id,
             status=VideoStatus.SUBMITTED,
             created_at=task.created_at,
@@ -389,15 +639,25 @@ class OpenAIVideoHandler(VideoHandlerBase):
         if task.status == VideoStatus.CANCELLED.value:
             raise HTTPException(status_code=404, detail="Video task was cancelled")
 
+        # 支持 variant 查询参数: video (默认), thumbnail, spritesheet
+        variant = (query_params or {}).get("variant", "video")
+
+        # 如果 video_url 是完整的 HTTP URL，直接代理该 URL（适用于不支持 /content 端点的上游如 API易）
+        # 保持流式代理而非重定向，确保客户端行为与官方 OpenAI 一致
+        if variant == "video" and task.video_url and task.video_url.startswith("http"):
+            logger.debug(
+                "[VideoDownload] Proxying direct URL task=%s url=%s",
+                task_id,
+                task.video_url,
+            )
+            return await self._proxy_direct_url(task.video_url, task_id)
+
         if not task.external_task_id:
             raise HTTPException(status_code=500, detail="Task missing external_task_id")
         endpoint, key = self._get_endpoint_and_key(task)
         if not key.api_key:
             raise HTTPException(status_code=500, detail="Provider key not configured")
         upstream_key = crypto_service.decrypt(key.api_key)
-
-        # 支持 variant 查询参数: video (默认), thumbnail, spritesheet
-        variant = (query_params or {}).get("variant", "video")
         if variant not in {"video", "thumbnail", "spritesheet"}:
             raise HTTPException(
                 status_code=400,
@@ -412,6 +672,12 @@ class OpenAIVideoHandler(VideoHandlerBase):
         headers = self._build_upstream_headers(original_headers, upstream_key, endpoint)
 
         client = await HTTPClientPool.get_default_client_async()
+        logger.debug(
+            "[VideoDownload] Requesting upstream url=%s task=%s external_task_id=%s",
+            upstream_url,
+            task_id,
+            task.external_task_id,
+        )
         try:
             # 使用 httpx 的 stream 方法并正确管理上下文
             # 视频下载可能较大，设置 5 分钟超时
@@ -419,8 +685,9 @@ class OpenAIVideoHandler(VideoHandlerBase):
             response = await client.send(request, stream=True, timeout=300.0)
         except Exception as exc:
             logger.warning(
-                "[VideoDownload] Upstream connection failed task=%s: %s",
+                "[VideoDownload] Upstream connection failed task=%s url=%s: %s",
                 task_id,
+                upstream_url,
                 sanitize_error_message(str(exc)),
             )
             raise HTTPException(status_code=502, detail="Upstream connection failed") from exc
@@ -483,6 +750,46 @@ class OpenAIVideoHandler(VideoHandlerBase):
             raise HTTPException(status_code=500, detail="Failed to decrypt provider key")
         return upstream_key, candidate.endpoint, candidate.key
 
+    async def _proxy_direct_url(self, url: str, task_id: str) -> Response | StreamingResponse:
+        """代理直接的视频 URL（如 CDN URL），保持与官方 API 一致的流式返回行为"""
+        client = await HTTPClientPool.get_default_client_async()
+        try:
+            request = client.build_request("GET", url)
+            response = await client.send(request, stream=True, timeout=300.0)
+        except Exception as exc:
+            logger.warning(
+                "[VideoDownload] Direct URL connection failed task=%s url=%s: %s",
+                task_id,
+                url,
+                sanitize_error_message(str(exc)),
+            )
+            raise HTTPException(status_code=502, detail="Video download failed") from exc
+
+        if response.status_code >= 400:
+            await response.aread()  # consume body before closing
+            await response.aclose()
+            return JSONResponse(
+                status_code=response.status_code,
+                content={"error": {"type": "upstream_error", "message": "Video not available"}},
+            )
+
+        async def _iter_bytes() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await response.aclose()
+
+        safe_headers = {
+            k: v for k, v in response.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
+        }
+        return StreamingResponse(
+            _iter_bytes(),
+            status_code=response.status_code,
+            headers=safe_headers,
+            media_type=response.headers.get("content-type", "video/mp4"),
+        )
+
     def _build_upstream_url(self, base_url: str | None, suffix: str | None = None) -> str:
         base = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
         if base.endswith("/v1"):
@@ -508,6 +815,42 @@ class OpenAIVideoHandler(VideoHandlerBase):
             endpoint_headers=extra_headers,
         )
 
+    # ------------------------------------------------------------------
+    # Gemini format conversion helpers
+    # ------------------------------------------------------------------
+
+    def _build_gemini_upstream_url(self, base_url: str | None, model: str) -> str:
+        """构建 Gemini Veo API 的上游 URL"""
+        base = (base_url or "https://generativelanguage.googleapis.com").rstrip("/")
+        if base.endswith("/v1beta"):
+            base = base[: -len("/v1beta")]
+        return f"{base}/v1beta/models/{model}:predictLongRunning"
+
+    def _build_gemini_upstream_headers(
+        self,
+        original_headers: dict[str, str],
+        upstream_key: str,
+        endpoint: ProviderEndpoint,
+        auth_info: Any | None,
+    ) -> dict[str, str]:
+        """构建 Gemini 格式的请求头"""
+        extra_headers = get_extra_headers_from_endpoint(endpoint)
+        endpoint_sig = make_signature_key(
+            str(getattr(endpoint, "api_family", "")).strip().lower(),
+            str(getattr(endpoint, "endpoint_kind", "")).strip().lower(),
+        )
+        headers = build_upstream_headers_for_endpoint(
+            original_headers,
+            endpoint_sig,
+            upstream_key,
+            endpoint_headers=extra_headers,
+        )
+        if auth_info:
+            # 覆盖为 OAuth2 Bearer（Vertex AI）
+            headers.pop("x-goog-api-key", None)
+            headers[auth_info.auth_header] = auth_info.auth_value
+        return headers
+
     # _build_error_response 继承自基类 VideoHandlerBase
 
     def _create_task_record(
@@ -520,6 +863,8 @@ class OpenAIVideoHandler(VideoHandlerBase):
         candidate_keys: list[dict[str, Any]] | None = None,
         original_headers: dict[str, str] | None = None,
         billing_rule_snapshot: dict[str, Any] | None = None,
+        converted_request_body: dict[str, Any] | None = None,
+        format_converted: bool = False,
     ) -> VideoTask:
         now = datetime.now(timezone.utc)
         size = internal_request.extra.get("original_size")
@@ -543,8 +888,14 @@ class OpenAIVideoHandler(VideoHandlerBase):
             }
             request_metadata["request_headers"] = safe_headers
 
+        provider_api_format = make_signature_key(
+            str(getattr(candidate.endpoint, "api_family", "")).strip().lower(),
+            str(getattr(candidate.endpoint, "endpoint_kind", "")).strip().lower(),
+        )
+
         return VideoTask(
             id=str(uuid4()),
+            request_id=self.request_id,
             external_task_id=external_task_id,
             user_id=self.user.id,
             api_key_id=self.api_key.id,
@@ -552,15 +903,12 @@ class OpenAIVideoHandler(VideoHandlerBase):
             endpoint_id=candidate.endpoint.id,
             key_id=candidate.key.id,
             client_api_format=self.FORMAT_ID,
-            provider_api_format=make_signature_key(
-                str(getattr(candidate.endpoint, "api_family", "")).strip().lower(),
-                str(getattr(candidate.endpoint, "endpoint_kind", "")).strip().lower(),
-            ),
-            format_converted=False,
+            provider_api_format=provider_api_format,
+            format_converted=format_converted,
             model=internal_request.model,
             prompt=internal_request.prompt,
             original_request_body=original_request_body,
-            converted_request_body=original_request_body,
+            converted_request_body=converted_request_body or original_request_body,
             duration_seconds=internal_request.duration_seconds,
             resolution=internal_request.resolution,
             aspect_ratio=internal_request.aspect_ratio,
@@ -580,8 +928,23 @@ class OpenAIVideoHandler(VideoHandlerBase):
             status = VideoStatus(task.status)
         except ValueError:
             status = VideoStatus.PENDING
+
+        # 构建 extra 字段
+        extra: dict[str, Any] = {
+            "model": task.model,
+            "size": task.size,
+            "seconds": str(task.duration_seconds) if task.duration_seconds else None,
+            "prompt": task.prompt,
+        }
+
+        # 检查是否是 remix 视频
+        if task.original_request_body and isinstance(task.original_request_body, dict):
+            remixed_from = task.original_request_body.get("remix_video_id")
+            if remixed_from:
+                extra["remixed_from_video_id"] = remixed_from
+
         return InternalVideoTask(
-            id=task.id,
+            id=task.id,  # OpenAI Sora 使用 UUID
             external_id=task.external_task_id,
             status=status,
             progress_percent=task.progress_percent or 0,
@@ -596,7 +959,7 @@ class OpenAIVideoHandler(VideoHandlerBase):
             expires_at=task.video_expires_at,
             error_code=task.error_code,
             error_message=task.error_message,
-            extra={"model": task.model, "size": task.size, "seconds": task.duration_seconds},
+            extra=extra,
         )
 
     async def _record_failed_usage(
@@ -609,8 +972,6 @@ class OpenAIVideoHandler(VideoHandlerBase):
         original_headers: dict[str, str],
     ) -> None:
         """记录失败请求的使用记录（无任务记录）"""
-        import time
-
         response_time_ms = int((time.time() - self.start_time) * 1000)
         safe_headers = {
             k: v
@@ -669,8 +1030,6 @@ class OpenAIVideoHandler(VideoHandlerBase):
         candidate_keys: list[dict[str, Any]] | None = None,
     ) -> None:
         """创建失败的任务记录和使用记录"""
-        import time
-
         now = datetime.now(timezone.utc)
         response_time_ms = int((time.time() - self.start_time) * 1000)
 
@@ -696,6 +1055,7 @@ class OpenAIVideoHandler(VideoHandlerBase):
         # 创建失败的任务记录
         task = VideoTask(
             id=str(uuid4()),
+            request_id=self.request_id,
             external_task_id=None,
             user_id=self.user.id,
             api_key_id=self.api_key.id,

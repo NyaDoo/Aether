@@ -156,6 +156,8 @@ class CandidateResolver:
         user_id: str,
         user_api_key: ApiKey,
         required_capabilities: dict[str, bool] | None = None,
+        *,
+        expand_retries: bool = True,
     ) -> dict[tuple[int, int], str]:
         """
         为所有候选预先创建 available 状态记录（批量插入优化）
@@ -211,9 +213,12 @@ class CandidateResolver:
                 candidate_record_map[(candidate_index, 0)] = record_id
             else:
                 # max_retries 已从 Endpoint 迁移到 Provider（Endpoint 仍可能保留旧字段用于兼容）
-                max_retries_for_candidate = (
-                    int(provider.max_retries or 2) if candidate.is_cached else 1
-                )
+                if not expand_retries:
+                    max_retries_for_candidate = 1
+                else:
+                    max_retries_for_candidate = (
+                        int(provider.max_retries or 2) if candidate.is_cached else 1
+                    )
 
                 for retry_index in range(max_retries_for_candidate):
                     record_id = str(uuid.uuid4())

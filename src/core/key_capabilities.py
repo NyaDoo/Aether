@@ -248,10 +248,10 @@ register_capability(
 )
 
 register_capability(
-    name="gemini_files_api",
-    display_name="Gemini文件上传",
-    description="支持 Gemini Files API（上传、查询、删除），第三方 Key 通常不支持",
-    match_mode=CapabilityMatchMode.COMPATIBLE,  # 需要时选有的，不需要时都可选
-    config_mode=CapabilityConfigMode.REQUEST_PARAM,  # 从请求路径检测
-    short_name="文件上传",
+    name="gemini_files",
+    display_name="Gemini 文件 API",
+    description="支持 Gemini Files API（文件上传/管理），仅 Google 官方 API 支持",
+    match_mode=CapabilityMatchMode.COMPATIBLE,
+    config_mode=CapabilityConfigMode.USER_CONFIGURABLE,
+    short_name="文件API",
 )

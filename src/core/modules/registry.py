@@ -236,15 +236,23 @@ class ModuleRegistry:
         # 获取启用状态
         enabled = self.is_enabled(name, db) if available else False
 
-        # 注意：配置验证失败时不自动禁用模块
-        # 自动禁用会在查询方法中产生写操作副作用，违反幂等性原则
-        # 配置验证状态通过 config_validated/config_error 字段返回，由调用方决定如何处理
+        # 配置验证失败时自动禁用模块
+        # 注意：此处故意在 get_status() 中写入，以确保模块状态与配置同步
+        # 场景：用户删除了模块所依赖的 Provider Key 后，模块应自动关闭
+        # 权衡：查询方法中的写操作副作用 vs 状态一致性保证
+        if enabled and not config_validated:
+            self.set_enabled(name, False, db)
+            enabled = False
+
+        # 计算激活状态：available && enabled && config_validated && 依赖模块都激活
+        is_active = self.is_active(name, db) if available else False
+        active = is_active and config_validated
 
         return ModuleStatus(
             name=name,
             available=available,
             enabled=enabled,
-            active=self.is_active(name, db) if available else False,
+            active=active,
             config_validated=config_validated,
             config_error=config_error,
             display_name=meta.display_name,

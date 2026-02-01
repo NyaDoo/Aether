@@ -8,6 +8,7 @@
 - 审计日志清理：定期清理过期的审计日志
 - 连接池监控：定期检查数据库连接池状态
 - Pending 状态清理：清理异常的 Pending 状态记录
+- Gemini 文件映射清理：清理过期的 Gemini 文件→Key 映射
 
 使用 APScheduler 进行任务调度，支持时区配置。
 """
@@ -103,6 +104,14 @@ class MaintenanceScheduler:
             name="审计日志清理",
         )
 
+        # Gemini 文件映射清理 - 每小时执行
+        scheduler.add_interval_job(
+            self._scheduled_gemini_file_mapping_cleanup,
+            hours=1,
+            job_id="gemini_file_mapping_cleanup",
+            name="Gemini文件映射清理",
+        )
+
         # Provider 签到任务 - 凌晨 1:05 执行
         scheduler.add_cron_job(
             self._scheduled_provider_checkin,
@@ -117,8 +126,9 @@ class MaintenanceScheduler:
 
     async def _run_startup_tasks(self) -> None:
         """启动时执行的初始化任务"""
-        # 延迟一点执行，确保系统完全启动
-        await asyncio.sleep(2)
+        # 延迟执行，等待系统完全启动（Redis 连接、其他后台任务稳定）
+        # 增加延迟时间避免与 UsageQueueConsumer 等后台任务竞争数据库连接
+        await asyncio.sleep(10)
 
         try:
             logger.info("启动时执行首次清理任务...")
@@ -169,6 +179,10 @@ class MaintenanceScheduler:
     async def _scheduled_audit_cleanup(self) -> None:
         """审计日志清理任务（定时调用）"""
         await self._perform_audit_cleanup()
+
+    async def _scheduled_gemini_file_mapping_cleanup(self) -> None:
+        """Gemini 文件映射清理任务（定时调用）"""
+        await self._perform_gemini_file_mapping_cleanup()
 
     async def _scheduled_provider_checkin(self) -> None:
         """Provider 签到任务（定时调用）"""
@@ -483,6 +497,26 @@ class MaintenanceScheduler:
         finally:
             db.close()
 
+    async def _perform_gemini_file_mapping_cleanup(self) -> None:
+        """清理过期的 Gemini 文件映射记录"""
+        db = create_session()
+        try:
+            from src.services.gemini_files_mapping import cleanup_expired_mappings
+
+            deleted_count = cleanup_expired_mappings(db)
+
+            if deleted_count > 0:
+                logger.info(f"清理了 {deleted_count} 条过期的 Gemini 文件映射")
+
+        except Exception as e:
+            logger.exception(f"Gemini 文件映射清理失败: {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        finally:
+            db.close()
+
     async def _perform_provider_checkin(self) -> None:
         """执行 Provider 签到任务
 
@@ -508,8 +542,21 @@ class MaintenanceScheduler:
 
             logger.info(f"开始执行 Provider 签到，共 {len(provider_ids)} 个...")
 
-            # 创建 ProviderOpsService 并执行批量余额查询（会触发签到）
-            service = ProviderOpsService(db)
+            # 释放主 session 的连接，避免在整个签到期间占用连接池
+            # （后续每个 provider 将使用独立短生命周期 session）
+            try:
+                if db.in_transaction():
+                    db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            try:
+                db.close()
+            except Exception:
+                pass
+            db = None
 
             # 使用信号量限制并发，避免同时发起过多请求
             concurrency = 3  # 签到任务并发数
@@ -518,7 +565,9 @@ class MaintenanceScheduler:
             async def _checkin_provider(provider_id: str) -> tuple[str, bool, str]:
                 """执行单个 Provider 的签到"""
                 async with semaphore:
+                    task_db = create_session()
                     try:
+                        service = ProviderOpsService(task_db)
                         # 触发余额查询（会先执行签到）
                         result = await service.query_balance(provider_id)
                         # 检查签到结果
@@ -537,6 +586,11 @@ class MaintenanceScheduler:
                     except Exception as e:
                         logger.warning(f"Provider {provider_id} 签到失败: {e}")
                         return provider_id, False, str(e)
+                    finally:
+                        try:
+                            task_db.close()
+                        except Exception:
+                            pass
 
             # 并行执行签到
             tasks = [_checkin_provider(pid) for pid in provider_ids]
@@ -556,7 +610,8 @@ class MaintenanceScheduler:
         except Exception as e:
             logger.exception(f"Provider 签到任务执行失败: {e}")
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
     async def _perform_cleanup(self) -> None:
         """执行清理任务"""

@@ -202,14 +202,14 @@ async def lifespan(app: FastAPI) -> Any:
     logger.info("启动月卡额度重置调度器...")
     from src.services.model.fetch_scheduler import get_model_fetch_scheduler
     from src.services.system.maintenance_scheduler import get_maintenance_scheduler
+    from src.services.task.task_poller import get_task_poller
     from src.services.usage.quota_scheduler import get_quota_scheduler
-    from src.services.video.task_poller import get_video_task_poller
     from src.utils.task_coordinator import StartupTaskCoordinator
 
     quota_scheduler = get_quota_scheduler()
     maintenance_scheduler = get_maintenance_scheduler()
     model_fetch_scheduler = get_model_fetch_scheduler()
-    video_task_poller = get_video_task_poller()
+    task_poller = get_task_poller()
     task_coordinator = StartupTaskCoordinator(redis_client)
 
     # 启动额度调度器
@@ -238,14 +238,14 @@ async def lifespan(app: FastAPI) -> Any:
         logger.info("检测到其他 worker 已运行模型获取调度器，本实例跳过")
         model_fetch_scheduler = None  # type: ignore[assignment]
 
-    # 启动视频任务轮询服务
-    video_poller_active = await task_coordinator.acquire("video_task_poller")
-    if video_poller_active:
-        logger.info("启动视频任务轮询服务...")
-        await video_task_poller.start()
+    # 启动异步任务轮询服务（当前仅视频）
+    task_poller_active = await task_coordinator.acquire("task_poller:video")
+    if task_poller_active:
+        logger.info("启动 TaskPoller（video）...")
+        await task_poller.start()
     else:
-        logger.info("检测到其他 worker 已运行视频任务轮询，本实例跳过")
-        video_task_poller = None  # type: ignore[assignment]
+        logger.info("检测到其他 worker 已运行 TaskPoller（video），本实例跳过")
+        task_poller = None  # type: ignore[assignment]
 
     # 启动统一的定时任务调度器
     from src.services.system.scheduler import get_scheduler
@@ -296,10 +296,10 @@ async def lifespan(app: FastAPI) -> Any:
         await model_fetch_scheduler.stop()
         await task_coordinator.release("model_fetch_scheduler")
 
-    if video_task_poller:
-        logger.info("停止视频任务轮询...")
-        await video_task_poller.stop()
-        await task_coordinator.release("video_task_poller")
+    if task_poller:
+        logger.info("停止 TaskPoller（video）...")
+        await task_poller.stop()
+        await task_coordinator.release("task_poller:video")
 
     # 停止统一的定时任务调度器
     logger.info("停止定时任务调度器...")

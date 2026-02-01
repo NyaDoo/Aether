@@ -29,6 +29,8 @@ from src.services.billing.models import (
     CostBreakdown,
     StandardizedUsage,
 )
+from src.services.billing.schema import BillingSnapshot, CostResult
+from src.services.billing.service import BillingService
 from src.services.billing.templates import BILLING_TEMPLATE_REGISTRY, BillingTemplates
 from src.services.billing.usage_mapper import UsageMapper, map_usage, map_usage_from_response
 
@@ -44,6 +46,10 @@ __all__ = [
     # 计算器
     "BillingCalculator",
     "calculate_request_cost",
+    # 统一入口（Phase2）
+    "BillingService",
+    "BillingSnapshot",
+    "CostResult",
     # 映射器
     "UsageMapper",
     "map_usage",

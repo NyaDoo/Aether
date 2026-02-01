@@ -736,10 +736,17 @@ class GeminiNormalizer(FormatNormalizer):
         instance = instances[0] if isinstance(instances[0], dict) else {}
         params = request.get("parameters") or {}
 
+        # 解析 image（用于 image-to-video 或第一帧）
+        # 官方格式: {"image": {"inlineData": {"mimeType": "image/png", "data": "base64..."}}}
         image = instance.get("image") if isinstance(instance, dict) else None
         image_ref = None
         if isinstance(image, dict):
-            image_ref = image.get("bytesBase64Encoded")
+            inline_data = image.get("inlineData", {})
+            if isinstance(inline_data, dict):
+                image_ref = inline_data.get("data")
+            # 兼容旧格式
+            if not image_ref:
+                image_ref = image.get("bytesBase64Encoded")
 
         prompt = instance.get("prompt") if isinstance(instance, dict) else None
         prompt_str = str(prompt).strip() if prompt else ""
@@ -747,7 +754,7 @@ class GeminiNormalizer(FormatNormalizer):
             raise ValueError("Video prompt is required")
 
         duration_raw = params.get("durationSeconds")
-        sample_count_raw = params.get("sampleCount")
+        sample_count_raw = params.get("sampleCount") or params.get("numberOfVideos")
 
         try:
             duration_seconds = int(duration_raw) if duration_raw else 8
@@ -760,6 +767,35 @@ class GeminiNormalizer(FormatNormalizer):
         except (ValueError, TypeError):
             sample_count = 1
 
+        # 构建 extra 字段，保留所有 Veo 特有的参数
+        extra: dict[str, Any] = {
+            "personGeneration": params.get("personGeneration"),
+            "sampleCount": sample_count,
+        }
+
+        # negativePrompt - 负面提示词
+        if params.get("negativePrompt"):
+            extra["negativePrompt"] = params["negativePrompt"]
+
+        # lastFrame - 最后一帧（用于插值）
+        last_frame = params.get("lastFrame")
+        if isinstance(last_frame, dict):
+            extra["lastFrame"] = last_frame
+
+        # referenceImages - 参考图像（最多3张，仅 Veo 3.1）
+        ref_images = params.get("referenceImages")
+        if isinstance(ref_images, list) and ref_images:
+            extra["referenceImages"] = ref_images
+
+        # video - 视频扩展输入（用于视频续写）
+        video_input = instance.get("video") if isinstance(instance, dict) else None
+        if isinstance(video_input, dict):
+            extra["video"] = video_input
+
+        # seed - 种子值（Veo 3）
+        if params.get("seed") is not None:
+            extra["seed"] = params["seed"]
+
         return InternalVideoRequest(
             prompt=prompt_str,
             model=str(request.get("model") or "veo-3.1-generate-preview"),
@@ -767,10 +803,7 @@ class GeminiNormalizer(FormatNormalizer):
             aspect_ratio=str(params.get("aspectRatio") or "16:9"),
             resolution=str(params.get("resolution") or "720p"),
             reference_image_url=image_ref,
-            extra={
-                "personGeneration": params.get("personGeneration"),
-                "sampleCount": sample_count,
-            },
+            extra=extra,
         )
 
     def video_request_from_internal(self, internal: InternalVideoRequest) -> dict[str, Any]:
@@ -783,14 +816,30 @@ class GeminiNormalizer(FormatNormalizer):
             "resolution": internal.resolution,
             "durationSeconds": internal.duration_seconds,
         }
-        for key in ["personGeneration", "sampleCount"]:
+        for key in ["personGeneration", "sampleCount", "negativePrompt", "seed"]:
             if key in internal.extra:
                 parameters[key] = internal.extra[key]
 
-        return {
+        # lastFrame 和 referenceImages 需要特殊处理
+        if internal.extra.get("lastFrame"):
+            parameters["lastFrame"] = internal.extra["lastFrame"]
+        if internal.extra.get("referenceImages"):
+            parameters["referenceImages"] = internal.extra["referenceImages"]
+
+        # video 输入（视频续写）
+        if internal.extra.get("video"):
+            instance["video"] = internal.extra["video"]
+
+        result: dict[str, Any] = {
             "instances": [instance],
             "parameters": parameters,
         }
+
+        # 模型信息（用于 URL 构建）
+        if internal.model:
+            result["model"] = internal.model
+
+        return result
 
     def video_task_to_internal(self, response: dict[str, Any]) -> InternalVideoTask:
         operation_name = str(response.get("name") or "")
@@ -824,20 +873,30 @@ class GeminiNormalizer(FormatNormalizer):
         )
 
     def video_task_from_internal(self, internal: InternalVideoTask) -> dict[str, Any]:
-        # 优先使用 external_id（上游返回的 operation name），否则用内部 id
-        operation_name = internal.external_id or f"operations/{internal.id}"
-        if not operation_name.startswith("operations/"):
-            operation_name = f"operations/{operation_name}"
+        # 从 external_id 中提取 model 名称，用于构建 operation name
+        # external_id 格式: models/{model}/operations/{gemini_id}
+        model_name = "unknown"
+        if internal.external_id:
+            parts = internal.external_id.split("/")
+            if len(parts) >= 2 and parts[0] == "models":
+                model_name = parts[1]
+
+        # 使用我们的内部 task_id 构建 operation name，不暴露 Gemini 的 operation ID
+        # 格式: models/{model}/operations/{our_task_id}
+        operation_name = f"models/{model_name}/operations/{internal.id}"
 
         if internal.status == VideoStatus.COMPLETED:
-            urls = internal.video_urls or ([internal.video_url] if internal.video_url else [])
+            # 使用我们的内部 task_id 构建下载 URL，不暴露真实的 Gemini file_id
+            # 使用 aev_ 前缀标识这是视频任务的下载链接
+            # 格式：/v1beta/files/aev_{task_id}:download?alt=media
+            proxy_download_url = f"/v1beta/files/aev_{internal.id}:download?alt=media"
             return {
                 "name": operation_name,
                 "done": True,
                 "response": {
                     "generateVideoResponse": {
                         "generatedSamples": [
-                            {"video": {"uri": url, "mimeType": "video/mp4"}} for url in urls
+                            {"video": {"uri": proxy_download_url, "mimeType": "video/mp4"}}
                         ]
                     }
                 },

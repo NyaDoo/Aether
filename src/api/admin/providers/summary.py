@@ -309,6 +309,7 @@ def _build_provider_summary(db: Session, provider: Provider) -> ProviderWithEndp
         website=provider.website,
         provider_priority=provider.provider_priority,
         keep_priority_on_conversion=provider.keep_priority_on_conversion,
+        enable_format_conversion=provider.enable_format_conversion,
         is_active=provider.is_active,
         billing_type=provider.billing_type.value if provider.billing_type else None,
         monthly_quota_usd=provider.monthly_quota_usd,

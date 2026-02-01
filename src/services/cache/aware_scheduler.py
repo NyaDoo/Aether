@@ -182,6 +182,43 @@ class CacheAwareScheduler:
             "last_reservation_result": None,
         }
 
+    @staticmethod
+    def _release_db_connection_before_await(db: Session) -> None:
+        """
+        Best-effort: end a read-only transaction before awaiting async I/O.
+
+        This scheduler does a lot of async work (cache/Redis) mixed with sync SQLAlchemy reads.
+        If a SELECT has already started a transaction, the pooled connection can remain checked
+        out while we await, causing pool pressure under concurrency.
+
+        Safety:
+        - Only commits when the Session has no ORM pending changes.
+        - Temporarily disables expire_on_commit to keep already-loaded ORM objects usable.
+        """
+        try:
+            if db is None:
+                return
+            has_pending_changes = bool(db.new) or bool(db.dirty) or bool(db.deleted)
+            if has_pending_changes:
+                return
+            if not db.in_transaction():
+                return
+
+            original_expire_on_commit = getattr(db, "expire_on_commit", True)
+            db.expire_on_commit = False
+            try:
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            finally:
+                db.expire_on_commit = original_expire_on_commit
+        except Exception:
+            # Never let this optimization break scheduling
+            return
+
     async def _ensure_initialized(self) -> None:
         """确保所有异步组件已初始化"""
         if self._affinity_manager is None:
@@ -577,6 +614,8 @@ class CacheAwareScheduler:
         Returns:
             (候选列表, global_model_id) - global_model_id 用于缓存亲和性
         """
+        # If the caller already touched the DB, release the connection before we do async work.
+        self._release_db_connection_before_await(db)
         await self._ensure_initialized()
 
         target_format = normalize_endpoint_signature(api_format)
@@ -648,6 +687,9 @@ class CacheAwareScheduler:
             provider_limit=provider_limit,
         )
 
+        # Provider query starts a transaction; release connection before entering async candidate build.
+        self._release_db_connection_before_await(db)
+
         logger.debug(
             "[Scheduler] Found %d active providers",
             len(providers),
@@ -680,8 +722,13 @@ class CacheAwareScheduler:
 
         # 2. 构建候选列表（传入 is_stream 和 capability_requirements 用于过滤）
         from src.config.settings import config
+        from src.services.system.config import SystemConfigService
 
-        global_conversion_enabled = config.format_conversion_enabled
+        # 全局格式转换开关：优先使用数据库配置，回退到环境变量
+        global_conversion_enabled = SystemConfigService.is_format_conversion_enabled(db)
+        # 如果环境变量明确禁用，则禁用（环境变量可作为强制禁用开关）
+        if not config.format_conversion_enabled:
+            global_conversion_enabled = False
         candidates = await self._build_candidates(
             db=db,
             providers=providers,
@@ -801,6 +848,9 @@ class CacheAwareScheduler:
             - supported_capabilities: 模型支持的能力列表
             - provider_model_names: Provider 侧可用的模型名称集合（主名称 + 映射名称，按 api_format 过滤）
         """
+        # Avoid holding a DB connection while awaiting cache/Redis inside ModelCacheService.
+        self._release_db_connection_before_await(db)
+
         # 使用 ModelCacheService 解析模型名称（支持映射名）
         global_model = await ModelCacheService.resolve_global_model_by_name_or_mapping(
             db, model_name
@@ -1120,18 +1170,34 @@ class CacheAwareScheduler:
                     str(getattr(endpoint, "endpoint_kind", "")).strip().lower(),
                 )
 
+                # 计算格式转换的有效开关状态（三层优先级）
+                # 全局 ON → 强制允许（跳过端点检查）
+                # 全局 OFF → 提供商 ON → 强制允许（跳过端点检查）
+                # 全局 OFF → 提供商 OFF → 看端点配置
+                provider_allows_conversion = getattr(provider, "enable_format_conversion", True)
+                effective_conversion_enabled = (
+                    global_conversion_enabled or provider_allows_conversion
+                )
+                # 如果全局或提供商开关为 ON，跳过端点配置检查
+                skip_endpoint_check = global_conversion_enabled or provider_allows_conversion
+
                 is_compatible, needs_conversion, _compat_reason = is_format_compatible(
                     client_format_str,
                     endpoint_format_str,
                     getattr(endpoint, "format_acceptance_config", None),
                     is_stream,
-                    global_conversion_enabled,
+                    effective_conversion_enabled,
+                    skip_endpoint_check=skip_endpoint_check,
                 )
                 logger.debug(
-                    "[Scheduler] Format compatibility: client=%s, endpoint=%s, compatible=%s, reason=%s",
+                    "[Scheduler] Format compatibility: client=%s, endpoint=%s, compatible=%s, "
+                    "global=%s, provider=%s, skip_endpoint=%s, reason=%s",
                     client_format_str,
                     endpoint_format_str,
                     is_compatible,
+                    global_conversion_enabled,
+                    provider_allows_conversion,
+                    skip_endpoint_check,
                     _compat_reason,
                 )
                 if not is_compatible:

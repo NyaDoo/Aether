@@ -4,6 +4,7 @@
 
 import time
 from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any, cast
 
 from sqlalchemy import create_engine, event
@@ -269,6 +270,31 @@ def create_session() -> Session:
     _ensure_engine()
     assert _SessionLocal is not None
     return _SessionLocal()
+
+
+@contextmanager
+def get_db_context() -> Generator[Session, None, None]:
+    """
+    获取数据库会话的上下文管理器
+
+    自动管理会话生命周期：创建、提交/回滚、关闭
+
+    示例:
+        with get_db_context() as db:
+            user = db.query(User).first()
+            # 事务在 with 块结束时自动提交或回滚
+    """
+    _ensure_engine()
+    assert _SessionLocal is not None
+    db = _SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def get_db_url() -> str:

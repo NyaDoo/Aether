@@ -1,25 +1,13 @@
 """
-异步任务服务层
+任务服务层（Phase2）
 
-提供视频/图片/音频等异步任务的：
-- 提交阶段故障转移（AsyncTaskOrchestrator）
-- 终态计费与 Usage 写入（VideoTelemetry 等）
+统一任务框架相关的应用层入口：
+- 候选提交阶段：`services.candidate.CandidateService`
+- 终态结算：`services.task.application.TaskApplicationService`
 """
 
-from .orchestrator import (
-    AllCandidatesFailedError,
-    AsyncTaskOrchestrator,
-    CandidateSubmissionError,
-    CandidateUnsupportedError,
-    SubmitOutcome,
-    UpstreamClientRequestError,
-)
+from .application import TaskApplicationService
 
 __all__ = [
-    "AsyncTaskOrchestrator",
-    "SubmitOutcome",
-    "AllCandidatesFailedError",
-    "UpstreamClientRequestError",
-    "CandidateUnsupportedError",
-    "CandidateSubmissionError",
+    "TaskApplicationService",
 ]

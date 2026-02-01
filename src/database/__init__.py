@@ -3,7 +3,7 @@
 """
 
 from ..models.database import ApiKey, Base, Usage, User, UserQuota
-from .database import create_session, get_db, get_db_url, init_db, log_pool_status
+from .database import create_session, get_db, get_db_context, get_db_url, init_db, log_pool_status
 
 __all__ = [
     "Base",
@@ -12,6 +12,7 @@ __all__ = [
     "Usage",
     "UserQuota",
     "get_db",
+    "get_db_context",
     "init_db",
     "create_session",
     "get_db_url",

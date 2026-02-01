@@ -272,6 +272,14 @@ class Usage(Base):
     """使用记录模型"""
 
     __tablename__ = "usage"
+    __table_args__ = (
+        # Composite indexes for common query patterns (analytics / list pages)
+        Index("idx_usage_user_created", "user_id", "created_at"),
+        Index("idx_usage_apikey_created", "api_key_id", "created_at"),
+        Index("idx_usage_provider_model_created", "provider_name", "model", "created_at"),
+        Index("idx_usage_provider_created", "provider_name", "created_at"),
+        Index("idx_usage_model_created", "model", "created_at"),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
     user_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -346,6 +354,13 @@ class Usage(Base):
     # failed: 请求失败
     # cancelled: 客户端主动断开连接
     status = Column(String(20), default="completed", nullable=False, index=True)
+
+    # 结算状态（与 status 解耦）
+    # - pending: 等待结算（任务未完成 / 流式未结束）
+    # - settled: 已结算（cost 已写入，可能 > 0 或 = 0）
+    # - void: 作废（不收费，如任务未开始就取消）
+    billing_status = Column(String(20), default="settled", nullable=False, index=True)
+    finalized_at = Column(DateTime(timezone=True), nullable=True)  # 结算完成时间（可选）
 
     # 完整请求和响应记录
     request_headers = Column(JSON, nullable=True)  # 客户端请求头
@@ -653,6 +668,14 @@ class Provider(Base):
     # - True: 即使需要格式转换，也保持原优先级排名
     # 注意：如果全局配置 KEEP_PRIORITY_ON_CONVERSION=true，此字段被忽略（所有提供商都保持优先级）
     keep_priority_on_conversion = Column(Boolean, default=False, nullable=False)
+
+    # 是否允许格式转换（默认 True）
+    # - True: 该提供商可以作为格式转换的目标（如 OpenAI 客户端请求可以路由到此 Gemini 提供商）
+    # - False: 该提供商不接受需要格式转换的请求
+    # 优先级逻辑：
+    # - 全局开关 ON → 强制允许所有提供商的格式转换（忽略此字段）
+    # - 全局开关 OFF → 由此字段决定是否允许该提供商的格式转换
+    enable_format_conversion = Column(Boolean, default=False, nullable=False)
 
     # 状态
     is_active = Column(Boolean, default=True, nullable=False)
@@ -1350,12 +1373,26 @@ class ProviderAPIKey(Base):
     provider = relationship("Provider", back_populates="api_keys")
 
 
+def _generate_short_id(length: int = 12) -> str:
+    """生成 Gemini 风格的短 ID（小写字母+数字）"""
+    import secrets
+    import string
+
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
 class VideoTask(Base):
     """视频生成任务"""
 
     __tablename__ = "video_tasks"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # Gemini 风格的短 ID，用于对外暴露（如 operations/xxx）
+    short_id = Column(String(16), unique=True, index=True, default=_generate_short_id)
+    request_id = Column(
+        String(100), unique=True, index=True, nullable=False
+    )  # 关联 Usage/RequestCandidate
     external_task_id = Column(String(200))
 
     # 关联
@@ -1865,6 +1902,7 @@ class RequestCandidate(Base):
         Index("idx_request_candidates_request_id", "request_id"),
         Index("idx_request_candidates_status", "status"),
         Index("idx_request_candidates_provider_id", "provider_id"),
+        Index("idx_request_candidates_created_at", "created_at"),
     )
 
     # 关系
@@ -2107,6 +2145,61 @@ class StatsUserDaily(Base):
 
     # 关系
     user = relationship("User")
+
+
+class GeminiFileMapping(Base):
+    """
+    Gemini Files API 文件与 Provider Key 的映射关系
+
+    用于持久化存储 file_id → key_id 的绑定关系，
+    确保后续 generateContent 请求使用上传时的同一 Key。
+
+    Gemini 文件有 48 小时有效期，此表中的记录也会在过期后被清理。
+    """
+
+    __tablename__ = "gemini_file_mappings"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+
+    # 文件名（如 files/abc123xyz）
+    file_name = Column(String(255), nullable=False, unique=True, index=True)
+
+    # Provider Key ID（关联到 provider_api_keys 表）
+    key_id = Column(
+        String(36),
+        ForeignKey("provider_api_keys.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # 用户 ID（用于权限验证，可选）
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+
+    # 文件元数据（可选，用于调试）
+    display_name = Column(String(255), nullable=True)
+    mime_type = Column(String(100), nullable=True)
+
+    # 源文件哈希（用于关联相同源文件的不同上传，可选）
+    # 当同一源文件上传到多个 Key 时，可通过此字段找到所有等效文件
+    source_hash = Column(String(64), nullable=True, index=True)
+
+    # 时间戳
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    # 过期时间（Gemini 文件 48 小时后过期）
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    # 关系
+    key = relationship("ProviderAPIKey")
+    user = relationship("User")
+
+    __table_args__ = (
+        Index("idx_gemini_file_mappings_expires", "expires_at"),
+        Index("idx_gemini_file_mappings_source_hash", "source_hash"),
+    )
 
 
 # 导入扩展的数据库模型

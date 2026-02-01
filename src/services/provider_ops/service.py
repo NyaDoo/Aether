@@ -38,6 +38,19 @@ BALANCE_CACHE_TTL = 86400
 # 认证失败缓存 TTL（60 秒，避免频繁重试但允许用户修正后快速重试）
 AUTH_FAILED_CACHE_TTL = 60
 
+# 后台余额刷新并发限制（避免启动时耗尽连接池）
+# 使用较小的值（3）确保不会对连接池造成过大压力
+_balance_refresh_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_balance_refresh_semaphore() -> asyncio.Semaphore:
+    """获取余额刷新信号量（延迟初始化）"""
+    global _balance_refresh_semaphore
+    if _balance_refresh_semaphore is None:
+        # 限制为 3 个并发，确保后台任务不会占用太多连接
+        _balance_refresh_semaphore = asyncio.Semaphore(3)
+    return _balance_refresh_semaphore
+
 
 def _get_batch_balance_concurrency() -> int:
     """
@@ -97,6 +110,44 @@ class ProviderOpsService:
 
         # 连接器缓存 {provider_id: ProviderConnector}
         self._connectors: dict[str, ProviderConnector] = {}
+
+    def _release_db_connection_before_await(self) -> None:
+        """
+        Release pooled DB connection before long awaits (network/Redis).
+
+        SQLAlchemy Session will keep a connection checked out while a transaction is open,
+        even for read-only queries. In async code, this can exhaust the pool if we `await`
+        network I/O while holding that transaction.
+
+        Safety:
+        - Only commits when the session has no pending changes (new/dirty/deleted).
+        - Temporarily disables expire_on_commit to avoid unexpected lazy reloads.
+        """
+        try:
+            has_pending_changes = bool(self.db.new) or bool(self.db.dirty) or bool(self.db.deleted)
+        except Exception:
+            has_pending_changes = False
+
+        if has_pending_changes:
+            return
+
+        try:
+            if not self.db.in_transaction():
+                return
+        except Exception:
+            return
+
+        original_expire_on_commit = getattr(self.db, "expire_on_commit", True)
+        self.db.expire_on_commit = False
+        try:
+            self.db.commit()
+        except Exception:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+        finally:
+            self.db.expire_on_commit = original_expire_on_commit
 
     # ==================== 配置管理 ====================
 
@@ -251,6 +302,9 @@ class ProviderOpsService:
         if not actual_credentials:
             return False, "未提供凭据"
 
+        # Avoid holding a DB connection while awaiting network I/O.
+        self._release_db_connection_before_await()
+
         # 建立连接
         logger.info(
             f"尝试连接: provider_id={provider_id}, "
@@ -333,6 +387,8 @@ class ProviderOpsService:
                 )
             connector = self._connectors.get(provider_id)
 
+        # Avoid holding a DB connection while awaiting authentication checks.
+        self._release_db_connection_before_await()
         if not connector or not await connector.is_authenticated():
             return ActionResult(
                 status=ActionStatus.AUTH_EXPIRED,
@@ -372,6 +428,9 @@ class ProviderOpsService:
 
         # 创建操作实例
         action = architecture.get_action(action_type, merged_config)
+
+        # Avoid holding a DB connection while awaiting the upstream action.
+        self._release_db_connection_before_await()
 
         # 执行操作
         async with connector.get_client() as client:
@@ -422,6 +481,9 @@ class ProviderOpsService:
         Returns:
             操作结果（可能是缓存的）
         """
+        # Avoid holding a DB connection while awaiting Redis/cache I/O.
+        self._release_db_connection_before_await()
+
         # 尝试从缓存获取
         cached = await self._get_cached_balance(provider_id)
 
@@ -453,7 +515,20 @@ class ProviderOpsService:
 
         注意：这是一个后台任务，使用独立的短生命周期 session，
         避免长时间占用连接池资源。
+
+        使用信号量限制并发数，避免启动时多个刷新任务同时运行导致连接池耗尽。
         """
+        semaphore = _get_balance_refresh_semaphore()
+
+        # 尝试获取信号量，如果无法立即获取则跳过本次刷新
+        # 这样可以避免在连接池紧张时阻塞
+        try:
+            # 使用 wait_for 设置超时，避免无限等待
+            await asyncio.wait_for(semaphore.acquire(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.debug(f"异步刷新余额跳过（并发限制）: provider_id={provider_id}")
+            return
+
         db = None
         try:
             # 后台任务需要创建独立的 session，因为原请求的 session 可能已关闭
@@ -469,6 +544,8 @@ class ProviderOpsService:
                     db.close()
                 except Exception:
                     pass
+            # 释放信号量
+            semaphore.release()
 
     async def _clear_balance_cache(self, provider_id: str) -> None:
         """清除余额缓存"""
@@ -762,6 +839,9 @@ class ProviderOpsService:
         if not provider_ids:
             return {}
 
+        # Release the DB connection before awaiting many async cache refreshes.
+        self._release_db_connection_before_await()
+
         # 使用信号量限制并发数，避免同时发起过多请求耗尽连接池
         concurrency = _get_batch_balance_concurrency()
         semaphore = asyncio.Semaphore(concurrency)
@@ -821,6 +901,9 @@ class ProviderOpsService:
         import httpx
 
         from src.utils.ssl_utils import get_ssl_context
+
+        # Avoid holding a DB connection while awaiting verify pre-processing / network.
+        self._release_db_connection_before_await()
 
         # 移除 base_url 末尾的斜杠
         base_url = base_url.rstrip("/")

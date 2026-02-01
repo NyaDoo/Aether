@@ -271,6 +271,9 @@ class AdminUsageStatsAdapter(AdminApiAdapter):
         self.end_date = end_date
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        # Perf: use a single aggregate query (avoid 3 full scans).
+        from sqlalchemy import case
+
         db = context.db
         query = db.query(Usage)
         if self.start_date:
@@ -278,26 +281,26 @@ class AdminUsageStatsAdapter(AdminApiAdapter):
         if self.end_date:
             query = query.filter(Usage.created_at <= self.end_date)
 
-        total_stats = query.with_entities(
+        stats = query.with_entities(
             func.count(Usage.id).label("total_requests"),
             func.sum(Usage.total_tokens).label("total_tokens"),
             func.sum(Usage.total_cost_usd).label("total_cost"),
             func.sum(Usage.actual_total_cost_usd).label("total_actual_cost"),
             func.avg(Usage.response_time_ms).label("avg_response_time_ms"),
-        ).first()
-
-        # 缓存统计
-        cache_stats = query.with_entities(
             func.sum(Usage.cache_creation_input_tokens).label("cache_creation_tokens"),
             func.sum(Usage.cache_read_input_tokens).label("cache_read_tokens"),
             func.sum(Usage.cache_creation_cost_usd).label("cache_creation_cost"),
             func.sum(Usage.cache_read_cost_usd).label("cache_read_cost"),
+            func.sum(
+                case(
+                    (
+                        (Usage.status_code >= 400) | (Usage.error_message.isnot(None)),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("error_count"),
         ).first()
-
-        # 错误统计
-        error_count = query.filter(
-            (Usage.status_code >= 400) | (Usage.error_message.isnot(None))
-        ).count()
 
         context.add_audit_metadata(
             action="usage_stats",
@@ -305,29 +308,26 @@ class AdminUsageStatsAdapter(AdminApiAdapter):
             end_date=self.end_date.isoformat() if self.end_date else None,
         )
 
-        total_requests = total_stats.total_requests if total_stats else 0
-        avg_response_time_ms = float(total_stats.avg_response_time_ms or 0) if total_stats else 0
+        total_requests = int(stats.total_requests or 0) if stats else 0
+        avg_response_time_ms = float(stats.avg_response_time_ms or 0) if stats else 0
         avg_response_time = avg_response_time_ms / 1000.0
+        error_count = int(stats.error_count or 0) if stats else 0
 
         return {
             "total_requests": total_requests,
-            "total_tokens": int(total_stats.total_tokens or 0),
-            "total_cost": float(total_stats.total_cost or 0),
-            "total_actual_cost": float(total_stats.total_actual_cost or 0),
+            "total_tokens": int(stats.total_tokens or 0) if stats else 0,
+            "total_cost": float(stats.total_cost or 0) if stats else 0,
+            "total_actual_cost": float(stats.total_actual_cost or 0) if stats else 0,
             "avg_response_time": round(avg_response_time, 2),
             "error_count": error_count,
             "error_rate": (
                 round((error_count / total_requests) * 100, 2) if total_requests > 0 else 0
             ),
             "cache_stats": {
-                "cache_creation_tokens": (
-                    int(cache_stats.cache_creation_tokens or 0) if cache_stats else 0
-                ),
-                "cache_read_tokens": int(cache_stats.cache_read_tokens or 0) if cache_stats else 0,
-                "cache_creation_cost": (
-                    float(cache_stats.cache_creation_cost or 0) if cache_stats else 0
-                ),
-                "cache_read_cost": float(cache_stats.cache_read_cost or 0) if cache_stats else 0,
+                "cache_creation_tokens": (int(stats.cache_creation_tokens or 0) if stats else 0),
+                "cache_read_tokens": int(stats.cache_read_tokens or 0) if stats else 0,
+                "cache_creation_cost": (float(stats.cache_creation_cost or 0) if stats else 0),
+                "cache_read_cost": float(stats.cache_read_cost or 0) if stats else 0,
             },
         }
 
@@ -637,6 +637,7 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         from sqlalchemy import or_
+        from sqlalchemy.orm import load_only
 
         from src.utils.database_helpers import escape_like_pattern, safe_truncate_escaped
 
@@ -677,13 +678,13 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
             escaped = escape_like_pattern(self.username)
             query = query.filter(User.username.ilike(f"%{escaped}%", escape="\\"))
         if self.model:
-            # 支持模型名模糊搜索
-            escaped = escape_like_pattern(self.model)
-            query = query.filter(Usage.model.ilike(f"%{escaped}%", escape="\\"))
+            # 模型筛选：前端为下拉框精确值，使用精确匹配以启用索引
+            # 如需模糊搜索，请使用 search 参数。
+            query = query.filter(Usage.model == self.model)
         if self.provider:
-            # 支持提供商名称搜索
-            escaped = escape_like_pattern(self.provider)
-            query = query.filter(Provider.name.ilike(f"%{escaped}%", escape="\\"))
+            # 提供商筛选：前端为下拉框精确值，使用精确匹配以启用索引
+            # 如需模糊搜索，请使用 search 参数。
+            query = query.filter(Provider.name == self.provider)
         if self.status:
             # 状态筛选
             # 旧的筛选值（基于 is_stream 和 status_code）：stream, standard, error
@@ -714,7 +715,51 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
         if self.end_date:
             query = query.filter(Usage.created_at <= self.end_date)
 
-        total = query.count()
+        # Perf: avoid Query.count() building a subquery selecting many columns
+        total = int(query.with_entities(func.count(Usage.id)).scalar() or 0)
+
+        # Perf: do not load large request/response columns for list view
+        query = query.options(
+            load_only(
+                Usage.id,
+                Usage.request_id,
+                Usage.user_id,
+                Usage.api_key_id,
+                Usage.provider_name,
+                Usage.provider_id,
+                Usage.provider_endpoint_id,
+                Usage.provider_api_key_id,
+                Usage.model,
+                Usage.target_model,
+                Usage.input_tokens,
+                Usage.output_tokens,
+                Usage.cache_creation_input_tokens,
+                Usage.cache_read_input_tokens,
+                Usage.total_tokens,
+                Usage.total_cost_usd,
+                Usage.actual_total_cost_usd,
+                Usage.rate_multiplier,
+                Usage.response_time_ms,
+                Usage.first_byte_time_ms,
+                Usage.created_at,
+                Usage.is_stream,
+                Usage.status_code,
+                Usage.error_message,
+                Usage.status,
+                Usage.api_format,
+                Usage.endpoint_api_format,
+                Usage.has_format_conversion,
+                Usage.request_metadata,
+                Usage.input_price_per_1m,
+                Usage.output_price_per_1m,
+                Usage.cache_creation_price_per_1m,
+                Usage.cache_read_price_per_1m,
+            ),
+            load_only(User.id, User.email, User.username),
+            load_only(ProviderEndpoint.id, ProviderEndpoint.api_format),
+            load_only(ProviderAPIKey.id, ProviderAPIKey.name),
+            load_only(ApiKey.id, ApiKey.name, ApiKey.key_encrypted),
+        )
         records = (
             query.order_by(Usage.created_at.desc()).offset(self.offset).limit(self.limit).all()
         )
@@ -779,7 +824,9 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
         )
 
         # 构建 provider_id -> Provider 名称的映射，避免 N+1 查询
-        provider_ids = [usage.provider_id for usage, _, _, _, _ in records if usage.provider_id]
+        provider_ids = list(
+            {usage.provider_id for usage, _, _, _, _ in records if usage.provider_id}
+        )
         provider_map = {}
         if provider_ids:
             providers_data = (
@@ -788,6 +835,7 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
             provider_map = {str(p.id): p.name for p in providers_data}
 
         data = []
+        api_key_display_cache: dict[str, str] = {}
         for usage, user, endpoint, provider_api_key, user_api_key in records:
             actual_cost = (
                 float(usage.actual_total_cost_usd)
@@ -829,7 +877,9 @@ class AdminUsageRecordsAdapter(AdminApiAdapter):
                         {
                             "id": user_api_key.id,
                             "name": user_api_key.name,
-                            "display": user_api_key.get_display_key(),
+                            "display": api_key_display_cache.setdefault(
+                                user_api_key.id, user_api_key.get_display_key()
+                            ),
                         }
                         if user_api_key
                         else None

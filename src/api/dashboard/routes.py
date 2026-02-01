@@ -813,23 +813,31 @@ class DashboardRecentRequestsAdapter(DashboardAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
         db = context.db
         user = context.user
-        query = db.query(Usage)
+        # Perf: select only required columns (avoid loading large JSON/BLOB fields).
+        query = db.query(
+            Usage.id,
+            Usage.user_id,
+            Usage.model,
+            Usage.total_tokens,
+            Usage.created_at,
+            Usage.is_stream,
+            DBUser.username,
+        ).outerjoin(DBUser, DBUser.id == Usage.user_id)
         if user.role != UserRole.ADMIN:
             query = query.filter(Usage.user_id == user.id)
 
-        recent_requests = query.order_by(Usage.created_at.desc()).limit(self.limit).all()
+        rows = query.order_by(Usage.created_at.desc()).limit(self.limit).all()
 
         results = []
-        for req in recent_requests:
-            owner = db.query(DBUser).filter(DBUser.id == req.user_id).first()
+        for req_id, _user_id, model, total_tokens, created_at, is_stream, username in rows:
             results.append(
                 {
-                    "id": req.id,
-                    "user": owner.username if owner else "Unknown",
-                    "model": req.model or "N/A",
-                    "tokens": req.total_tokens,
-                    "time": req.created_at.strftime("%H:%M") if req.created_at else None,
-                    "is_stream": req.is_stream,
+                    "id": req_id,
+                    "user": username or "Unknown",
+                    "model": model or "N/A",
+                    "tokens": int(total_tokens or 0),
+                    "time": created_at.strftime("%H:%M") if created_at else None,
+                    "is_stream": bool(is_stream),
                 }
             )
 
@@ -848,18 +856,25 @@ class DashboardProviderStatusAdapter(DashboardAdapter):
         providers = db.query(Provider).filter(Provider.is_active.is_(True)).all()
         since = datetime.now(timezone.utc) - timedelta(days=1)
 
+        # Avoid N+1: compute 24h request counts for all providers in one GROUP BY query.
+        provider_names = [p.name for p in providers if p and p.name]
+        counts: dict[str, int] = {}
+        if provider_names:
+            rows = (
+                db.query(Usage.provider_name, func.count(Usage.id))
+                .filter(and_(Usage.created_at >= since, Usage.provider_name.in_(provider_names)))
+                .group_by(Usage.provider_name)
+                .all()
+            )
+            counts = {str(name): int(cnt or 0) for name, cnt in rows if name}
+
         entries = []
         for provider in providers:
-            count = (
-                db.query(func.count(Usage.id))
-                .filter(and_(Usage.provider_name == provider.name, Usage.created_at >= since))
-                .scalar()
-            )
             entries.append(
                 {
                     "name": provider.name,
                     "status": "active" if provider.is_active else "inactive",
-                    "requests": count,
+                    "requests": int(counts.get(provider.name, 0)),
                 }
             )
 

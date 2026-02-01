@@ -136,6 +136,11 @@ class SystemConfigService:
             "value": [],
             "description": "邮箱后缀列表，配合 email_suffix_mode 使用",
         },
+        # 格式转换开关
+        "enable_format_conversion": {
+            "value": False,
+            "description": "全局格式转换开关：开启时强制允许所有提供商的格式转换；关闭时由各提供商自行决定",
+        },
         "audit_log_retention_days": {
             "value": 30,
             "description": "审计日志保留天数，超过此天数的审计日志将被自动清理",
@@ -357,6 +362,11 @@ class SystemConfigService:
     def get_sensitive_headers(cls, db: Session) -> list:
         """获取敏感请求头列表"""
         return cls.get_config(db, "sensitive_headers", [])
+
+    @classmethod
+    def is_format_conversion_enabled(cls, db: Session) -> bool:
+        """检查全局格式转换是否启用"""
+        return bool(cls.get_config(db, "enable_format_conversion", True))
 
     @classmethod
     def mask_sensitive_headers(cls, db: Session, headers: dict[str, Any]) -> dict[str, Any]:

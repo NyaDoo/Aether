@@ -155,6 +155,110 @@ class FormatConversionRegistry:
             except Exception as e:
                 raise FormatConversionError(source_format, target_format, str(e)) from e
 
+    # ==================== 视频格式转换 ====================
+
+    def convert_video_request(
+        self,
+        request: dict[str, Any],
+        source_format: str,
+        target_format: str,
+    ) -> dict[str, Any]:
+        """转换视频请求格式（OpenAI <-> Gemini）
+
+        Args:
+            request: 原始视频请求
+            source_format: 源格式（如 openai:video, gemini:video）
+            target_format: 目标格式
+
+        Returns:
+            转换后的视频请求
+        """
+        # 统一使用基础格式 ID（去掉 :video 后缀）
+        src_base = self._video_format_to_base(source_format)
+        tgt_base = self._video_format_to_base(target_format)
+
+        if src_base == tgt_base:
+            return request
+
+        src = self._require_normalizer(src_base)
+        tgt = self._require_normalizer(tgt_base)
+
+        with _track_conversion_metrics(
+            "video_request", str(source_format).upper(), str(target_format).upper()
+        ):
+            try:
+                internal = src.video_request_to_internal(request)
+                return tgt.video_request_from_internal(internal)
+            except Exception as e:
+                raise FormatConversionError(source_format, target_format, str(e)) from e
+
+    def convert_video_task(
+        self,
+        task_response: dict[str, Any],
+        source_format: str,
+        target_format: str,
+    ) -> dict[str, Any]:
+        """转换视频任务响应格式（OpenAI <-> Gemini）
+
+        Args:
+            task_response: 原始任务响应
+            source_format: 源格式
+            target_format: 目标格式
+
+        Returns:
+            转换后的任务响应
+        """
+        src_base = self._video_format_to_base(source_format)
+        tgt_base = self._video_format_to_base(target_format)
+
+        if src_base == tgt_base:
+            return task_response
+
+        src = self._require_normalizer(src_base)
+        tgt = self._require_normalizer(tgt_base)
+
+        with _track_conversion_metrics(
+            "video_task", str(source_format).upper(), str(target_format).upper()
+        ):
+            try:
+                internal = src.video_task_to_internal(task_response)
+                return tgt.video_task_from_internal(internal)
+            except Exception as e:
+                raise FormatConversionError(source_format, target_format, str(e)) from e
+
+    def can_convert_video(self, source_format: str, target_format: str) -> bool:
+        """检查是否支持视频格式转换"""
+        src_base = self._video_format_to_base(source_format)
+        tgt_base = self._video_format_to_base(target_format)
+
+        if src_base == tgt_base:
+            return True
+
+        src = self.get_normalizer(src_base)
+        tgt = self.get_normalizer(tgt_base)
+
+        if src is None or tgt is None:
+            return False
+
+        # 检查是否有视频转换方法
+        return (
+            hasattr(src, "video_request_to_internal")
+            and hasattr(src, "video_task_to_internal")
+            and hasattr(tgt, "video_request_from_internal")
+            and hasattr(tgt, "video_task_from_internal")
+        )
+
+    def _video_format_to_base(self, format_id: str) -> str:
+        """将视频格式 ID 转换为基础格式 ID
+
+        例如: openai:video -> openai:chat, gemini:video -> gemini:chat
+        """
+        upper = str(format_id).upper()
+        if upper.endswith(":VIDEO"):
+            base = upper[:-6]  # 去掉 :VIDEO
+            return f"{base}:CHAT"
+        return upper
+
     # ==================== 流式转换（严格） ====================
 
     def convert_stream_chunk(
