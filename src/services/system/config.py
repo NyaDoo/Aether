@@ -123,6 +123,18 @@ class SystemConfigService:
             "value": "01:05",
             "description": "Provider 自动签到执行时间（HH:MM 格式，24小时制）",
         },
+        "enable_user_quota_reset": {
+            "value": False,
+            "description": "是否启用用户配额自动重置任务（按配置时间触发，按周期执行）",
+        },
+        "user_quota_reset_time": {
+            "value": "05:00",
+            "description": "用户配额自动重置执行时间（HH:MM 格式，24小时制）",
+        },
+        "user_quota_reset_interval_days": {
+            "value": 1,
+            "description": "用户配额重置周期（天数）",
+        },
         "provider_priority_mode": {
             "value": "provider",
             "description": "优先级策略：provider(提供商优先模式) 或 global_key(全局Key优先模式)",

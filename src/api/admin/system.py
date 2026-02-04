@@ -624,6 +624,16 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
             except Exception as e:
                 logger.warning(f"更新签到任务时间失败: {e}")
 
+        # 如果更新的是用户配额重置任务时间，动态更新调度器
+        if self.key == "user_quota_reset_time" and value:
+            try:
+                from src.services.system.maintenance_scheduler import get_maintenance_scheduler
+
+                scheduler = get_maintenance_scheduler()
+                scheduler.update_user_quota_reset_time(value)
+            except Exception as e:
+                logger.warning(f"更新用户配额重置任务时间失败: {e}")
+
         # 返回时不暴露加密后的值
         display_value = "********" if self.key in self.ENCRYPTED_KEYS else config.value
 

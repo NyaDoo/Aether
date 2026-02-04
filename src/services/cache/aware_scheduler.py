@@ -626,13 +626,15 @@ class CacheAwareScheduler:
             target_format,
         )
 
-        # 0. 解析 model_name 到 GlobalModel（支持直接匹配和映射名匹配，使用 ModelCacheService）
-        global_model = await ModelCacheService.resolve_global_model_by_name_or_mapping(
-            db, model_name
-        )
+        # 0. 解析 model_name 到 GlobalModel（仅接受 GlobalModel.name）
+        normalized_name = model_name.strip() if isinstance(model_name, str) else ""
+        if not normalized_name:
+            logger.warning("GlobalModel not found: <empty model name>")
+            raise ModelNotSupportedException(model=model_name)
 
-        if not global_model:
-            logger.warning(f"GlobalModel not found: {model_name}")
+        global_model = await ModelCacheService.get_global_model_by_name(db, normalized_name)
+        if not global_model or not global_model.is_active:
+            logger.warning(f"GlobalModel not found or inactive: {normalized_name}")
             raise ModelNotSupportedException(model=model_name)
 
         logger.debug(
@@ -828,14 +830,12 @@ class CacheAwareScheduler:
         - 模型支持的能力是全局的，与具体的 Key 无关
         - 如果模型不支持某能力，整个 Provider 的所有 Key 都应该被跳过
 
-        支持两种匹配方式：
-        1. 直接匹配 GlobalModel.name
-        2. 通过 ModelCacheService 匹配映射名（全局查找）
+        仅支持直接匹配 GlobalModel.name（外部请求不接受映射名）
 
         Args:
             db: 数据库会话
             provider: Provider 对象
-            model_name: 模型名称（可以是 GlobalModel.name 或映射名）
+            model_name: 模型名称（必须是 GlobalModel.name）
             is_stream: 是否是流式请求，如果为 True 则同时检查流式支持
             capability_requirements: 能力需求（可选），用于检查模型是否支持所需能力
 
@@ -849,14 +849,14 @@ class CacheAwareScheduler:
         # Avoid holding a DB connection while awaiting cache/Redis inside ModelCacheService.
         self._release_db_connection_before_await(db)
 
-        # 使用 ModelCacheService 解析模型名称（支持映射名）
-        global_model = await ModelCacheService.resolve_global_model_by_name_or_mapping(
-            db, model_name
-        )
+        # 仅接受 GlobalModel.name（不允许映射名）
+        normalized_name = model_name.strip() if isinstance(model_name, str) else ""
+        if not normalized_name:
+            return False, "模型不存在或名称无效", None, None
 
-        if not global_model:
-            # 完全未找到匹配
-            return False, "模型不存在或 Provider 未配置此模型", None, None
+        global_model = await ModelCacheService.get_global_model_by_name(db, normalized_name)
+        if not global_model or not global_model.is_active:
+            return False, "模型不存在或已停用", None, None
 
         # 找到 GlobalModel 后，检查当前 Provider 是否支持
         is_supported, skip_reason, caps, provider_model_names = (

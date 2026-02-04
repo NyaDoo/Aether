@@ -86,30 +86,33 @@ class ModelMapperMiddleware:
         获取模型映射
 
         简化后的逻辑:
-        1. 通过 GlobalModel.name 或映射名解析 GlobalModel
+        1. 通过 GlobalModel.name 解析 GlobalModel
         2. 找到 GlobalModel 后，查找该 Provider 的 Model 实现
 
         Args:
-            source_model: 用户请求的模型名（可以是 GlobalModel.name 或映射名）
+            source_model: 用户请求的模型名（必须是 GlobalModel.name）
             provider_id: 提供商ID (UUID)
 
         Returns:
             模型映射对象（包含 model 字段），如果没有找到返回None
         """
-        # 检查缓存
-        cache_key = f"{provider_id}:{source_model}"
+        # 步骤 1: 规范化模型名称
+        normalized_name = source_model.strip() if isinstance(source_model, str) else ""
+        if not normalized_name:
+            logger.debug("GlobalModel not found: <empty model name>")
+            return None
+
+        # 检查缓存（使用规范化后的名称）
+        cache_key = f"{provider_id}:{normalized_name}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         mapping = None
 
-        # 步骤 1: 解析 GlobalModel（支持映射名）
-        global_model = await ModelCacheService.resolve_global_model_by_name_or_mapping(
-            self.db, source_model
-        )
+        global_model = await ModelCacheService.get_global_model_by_name(self.db, normalized_name)
 
-        if not global_model:
-            logger.debug(f"GlobalModel not found: {source_model}")
+        if not global_model or not global_model.is_active:
+            logger.debug(f"GlobalModel not found or inactive: {normalized_name}")
             self._cache[cache_key] = None
             return None
 
@@ -132,7 +135,7 @@ class ModelMapperMiddleware:
             )()
 
             logger.debug(
-                f"Found model mapping: {source_model} -> {model.provider_model_name} "
+                f"Found model mapping: {normalized_name} -> {model.provider_model_name} "
                 f"(provider={provider_id[:8]}...)"
             )
 

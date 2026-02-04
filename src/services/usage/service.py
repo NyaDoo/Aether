@@ -25,6 +25,7 @@ from src.models.database import (
     User,
     UserRole,
 )
+from src.services.billing.token_normalization import normalize_input_tokens_for_billing
 from src.services.model.cost import ModelCostService
 from src.services.system.config import SystemConfigService
 from src.services.usage.error_classifier import classify_error
@@ -843,9 +844,28 @@ class UsageService:
         Returns:
             (usage_params 字典, total_cost 总成本)
         """
+        # 计费口径以 Provider 为准（优先 endpoint_api_format）
+        billing_api_format: str | None = None
+        if params.endpoint_api_format:
+            try:
+                billing_api_format = normalize_signature_key(str(params.endpoint_api_format))
+            except Exception:
+                billing_api_format = None
+        if billing_api_format is None and params.api_format:
+            try:
+                billing_api_format = normalize_signature_key(str(params.api_format))
+            except Exception:
+                billing_api_format = None
+
+        input_tokens_for_billing = normalize_input_tokens_for_billing(
+            billing_api_format,
+            params.input_tokens,
+            params.cache_read_input_tokens,
+        )
+
         # 获取费率倍数和是否免费套餐（传递 api_format 支持按格式配置的倍率）
         actual_rate_multiplier, is_free_tier = await cls._get_rate_multiplier_and_free_tier(
-            params.db, params.provider_api_key_id, params.provider_id, params.api_format
+            params.db, params.provider_api_key_id, params.provider_id, billing_api_format
         )
 
         metadata = dict(params.metadata or {})
@@ -884,7 +904,7 @@ class UsageService:
 
             request_count = 0 if is_failed_request else 1
             dims: dict[str, Any] = {
-                "input_tokens": params.input_tokens,
+                "input_tokens": input_tokens_for_billing,
                 "output_tokens": params.output_tokens,
                 "cache_creation_input_tokens": params.cache_creation_input_tokens,
                 "cache_read_input_tokens": params.cache_read_input_tokens,
@@ -956,11 +976,11 @@ class UsageService:
                 db=params.db,
                 provider=params.provider,
                 model=params.model,
-                input_tokens=params.input_tokens,
+                input_tokens=input_tokens_for_billing,
                 output_tokens=params.output_tokens,
                 cache_creation_input_tokens=params.cache_creation_input_tokens,
                 cache_read_input_tokens=params.cache_read_input_tokens,
-                api_format=params.api_format,
+                api_format=billing_api_format,
                 cache_ttl_minutes=params.cache_ttl_minutes,
                 use_tiered_pricing=params.use_tiered_pricing,
                 is_failed_request=is_failed_request,
@@ -989,8 +1009,8 @@ class UsageService:
                         provider_id=params.provider_id,
                         model=params.model,
                         task_type=billing_task_type,
-                        api_format=params.api_format,
-                        input_tokens=params.input_tokens,
+                        api_format=billing_api_format,
+                        input_tokens=input_tokens_for_billing,
                         output_tokens=params.output_tokens,
                         cache_creation_input_tokens=params.cache_creation_input_tokens,
                         cache_read_input_tokens=params.cache_read_input_tokens,
@@ -1019,7 +1039,7 @@ class UsageService:
             api_key=params.api_key,
             provider=params.provider,
             model=params.model,
-            input_tokens=params.input_tokens,
+            input_tokens=input_tokens_for_billing,
             output_tokens=params.output_tokens,
             cache_creation_input_tokens=params.cache_creation_input_tokens,
             cache_read_input_tokens=params.cache_read_input_tokens,
