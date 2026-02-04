@@ -628,7 +628,17 @@ def _build_key_response(
     key_dict = key.__dict__.copy()
     key_dict.pop("_sa_instance_state", None)
     key_dict.pop("api_key", None)  # 移除敏感字段，避免泄露
-    key_dict.pop("auth_config", None)  # 移除敏感字段，避免泄露
+
+    # 提取 OAuth expires_at（如果是 OAuth 类型）
+    oauth_expires_at = None
+    encrypted_auth_config = key_dict.pop("auth_config", None)  # 移除敏感字段，避免泄露
+    if auth_type == "oauth" and encrypted_auth_config:
+        try:
+            decrypted_config = crypto_service.decrypt(encrypted_auth_config)
+            auth_config = json.loads(decrypted_config)
+            oauth_expires_at = auth_config.get("expires_at")
+        except Exception:
+            pass
 
     # 从 health_by_format 计算汇总字段（便于列表展示）
     health_by_format = key.health_by_format or {}
@@ -673,6 +683,8 @@ def _build_key_response(
             "consecutive_failures": max_consecutive,
             "last_failure_at": last_failure,
             "circuit_breaker_open": any_circuit_open,
+            # OAuth 相关
+            "oauth_expires_at": oauth_expires_at,
         }
     )
 

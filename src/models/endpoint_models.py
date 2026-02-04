@@ -513,6 +513,9 @@ class EndpointAPIKeyResponse(BaseModel):
     allowed_models: list[str] | None = None
     capabilities: dict[str, bool] | None = Field(default=None, description="Key 能力标签")
 
+    # OAuth 相关
+    oauth_expires_at: int | None = Field(default=None, description="OAuth Token 过期时间（Unix 时间戳）")
+
     # 缓存与熔断配置
     cache_ttl_minutes: int = Field(default=5, description="缓存 TTL（分钟），0=禁用")
     max_probe_interval_minutes: int = Field(default=32, description="熔断探测间隔（分钟）")

@@ -144,14 +144,14 @@
             {{ oauthHelpText }}
           </p>
 
-          <div class="flex flex-wrap gap-2">
+          <div class="flex flex-wrap gap-2 items-center">
             <Button
               size="sm"
               type="button"
               :disabled="!canStartOAuth"
               @click="handleStartOAuth"
             >
-              {{ oauth.starting ? '开始中...' : '开始授权' }}
+              {{ oauth.starting ? '开始中...' : (oauth.step === 'completed' ? '重新授权' : '开始授权') }}
             </Button>
 
             <Button
@@ -164,6 +164,14 @@
               <RefreshCw class="w-3.5 h-3.5 mr-1.5" />
               {{ oauth.refreshing ? '刷新中...' : '强制刷新' }}
             </Button>
+
+            <span
+              v-if="oauth.step === 'completed' && oauth.expires_at"
+              class="text-xs text-muted-foreground ml-2"
+              :class="isExpiredEpoch(oauth.expires_at) ? 'text-destructive' : ''"
+            >
+              到期: {{ formattedExpiresAt }}
+            </span>
           </div>
 
           <div
@@ -257,20 +265,6 @@
               >
                 {{ oauth.completing ? '完成中...' : '完成授权' }}
               </Button>
-            </div>
-          </div>
-
-          <div
-            v-if="oauth.step === 'completed'"
-            class="pt-2 border-t border-border/40 text-xs text-muted-foreground space-y-1"
-          >
-            <div class="flex items-center justify-between gap-2">
-              <span>expires_at</span>
-              <span class="font-mono">{{ formattedExpiresAt }}</span>
-            </div>
-            <div class="flex items-center justify-between gap-2">
-              <span>refresh token</span>
-              <span>{{ oauth.has_refresh_token ? '有' : '无' }}</span>
             </div>
           </div>
         </div>
@@ -881,6 +875,13 @@ function loadKeyData() {
     auto_fetch_models: props.editingKey.auto_fetch_models ?? false,
     model_include_patterns_text: (props.editingKey.model_include_patterns || []).join(', '),
     model_exclude_patterns_text: (props.editingKey.model_exclude_patterns || []).join(', ')
+  }
+
+  // 如果是 OAuth 类型且有 token（有 oauth_expires_at），初始化 OAuth 状态为 completed
+  if (props.editingKey.auth_type === 'oauth' && props.editingKey.oauth_expires_at != null) {
+    oauth.value.step = 'completed'
+    oauth.value.expires_at = props.editingKey.oauth_expires_at
+    oauth.value.has_refresh_token = null  // 后端不返回此字段，设为未知
   }
 }
 

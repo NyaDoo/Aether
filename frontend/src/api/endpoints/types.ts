@@ -247,6 +247,8 @@ export interface EndpointAPIKey {
   // 模型过滤规则（仅当 auto_fetch_models=true 时生效）
   model_include_patterns?: string[]  // 模型包含规则（支持 * 和 ? 通配符）
   model_exclude_patterns?: string[]  // 模型排除规则（支持 * 和 ? 通配符）
+  // OAuth 相关
+  oauth_expires_at?: number | null  // OAuth Token 过期时间（Unix 时间戳）
 }
 
 // 按格式的健康度数据
