@@ -38,21 +38,33 @@
                 <SelectValue placeholder="请选择" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="custom">
-                  自定义
-                </SelectItem>
-                <SelectItem value="claude_code">
-                  ClaudeCode
-                </SelectItem>
-                <SelectItem value="codex">
-                  Codex
-                </SelectItem>
-                <SelectItem value="gemini_cli">
-                  GeminiCli
-                </SelectItem>
-                <SelectItem value="antigravity">
-                  Antigravity
-                </SelectItem>
+                <!-- 新建模式：只允许自定义和 Codex -->
+                <template v-if="!isEditMode">
+                  <SelectItem value="custom">
+                    自定义
+                  </SelectItem>
+                  <SelectItem value="codex">
+                    Codex
+                  </SelectItem>
+                </template>
+                <!-- 编辑模式：显示所有类型（兼容已有数据） -->
+                <template v-else>
+                  <SelectItem value="custom">
+                    自定义
+                  </SelectItem>
+                  <SelectItem value="claude_code">
+                    ClaudeCode
+                  </SelectItem>
+                  <SelectItem value="codex">
+                    Codex
+                  </SelectItem>
+                  <SelectItem value="gemini_cli">
+                    GeminiCli
+                  </SelectItem>
+                  <SelectItem value="antigravity">
+                    Antigravity
+                  </SelectItem>
+                </template>
               </SelectContent>
             </Select>
             <p
