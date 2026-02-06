@@ -18,6 +18,18 @@ if TYPE_CHECKING:
     from src.core.api_format.conversion.stream_state import StreamState
 
 
+def is_format_converted(
+    provider_api_format: str | None,
+    client_api_format: str | None,
+) -> bool:
+    """client 与 provider 的 api_format 是否真正不同（用于 usage 展示层）"""
+    return bool(
+        provider_api_format
+        and client_api_format
+        and provider_api_format.strip().lower() != client_api_format.strip().lower()
+    )
+
+
 @dataclass
 class StreamContext:
     """
@@ -233,6 +245,15 @@ class StreamContext:
         """
         if self.first_byte_time_ms is None:
             self.first_byte_time_ms = int((time.time() - start_time) * 1000)
+
+    @property
+    def has_format_conversion(self) -> bool:
+        """是否发生了真正的格式转换（client 和 provider 的 api_format 不同）
+
+        区别于 needs_conversion：后者包含 envelope rewrite（如 Antigravity v1internal），
+        不代表客户端与上游的数据格式真正不同。此属性用于 usage 展示层。
+        """
+        return is_format_converted(self.provider_api_format, self.client_api_format)
 
     def is_success(self) -> bool:
         """检查请求是否成功"""

@@ -108,6 +108,115 @@ class StreamProcessor:
                 pass
         return self.default_parser
 
+    @staticmethod
+    def _maybe_mark_gemini_completion(ctx: StreamContext, data: dict[str, Any]) -> None:
+        """Gemini: mark completion based on candidates[].finishReason."""
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            finish_reason = candidate.get("finishReason")
+            if finish_reason is None:
+                continue
+            # UNSPECIFIED is the only clear "not done" sentinel across Gemini variants.
+            if str(finish_reason) != "FINISH_REASON_UNSPECIFIED":
+                ctx.has_completion = True
+                return
+
+    @staticmethod
+    def _extract_antigravity_usage_from_gemini_event(data: dict[str, Any]) -> dict[str, int] | None:
+        """Antigravity: lenient Gemini usage extraction (totalTokenCount may be missing)."""
+        usage_metadata = data.get("usageMetadata", {})
+        if not isinstance(usage_metadata, dict) or not usage_metadata:
+            return None
+
+        def _as_int(v: Any) -> int:
+            try:
+                return int(v or 0)
+            except Exception:
+                return 0
+
+        prompt = _as_int(usage_metadata.get("promptTokenCount"))
+        cached = _as_int(usage_metadata.get("cachedContentTokenCount"))
+        candidates = _as_int(usage_metadata.get("candidatesTokenCount"))
+        thoughts = _as_int(usage_metadata.get("thoughtsTokenCount"))
+
+        # Align with Gemini billing convention: input_tokens includes cached content.
+        return {
+            "input_tokens": max(0, prompt),
+            "output_tokens": max(0, candidates + thoughts),
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": max(0, cached),
+        }
+
+    def _unwrap_provider_envelope(self, ctx: StreamContext, data: dict[str, Any]) -> dict[str, Any]:
+        behavior = get_provider_behavior(
+            provider_type=str(getattr(ctx, "provider_type", "") or ""),
+            endpoint_sig=str(getattr(ctx, "provider_api_format", "") or ""),
+        )
+        envelope = behavior.envelope
+        if not envelope:
+            return data
+
+        try:
+            unwrapped = envelope.unwrap_response(data)
+            envelope.postprocess_unwrapped_response(
+                model=str(getattr(ctx, "model", "") or ""),
+                data=unwrapped,
+            )
+            return unwrapped if isinstance(unwrapped, dict) else data
+        except Exception:
+            return data
+
+    def _update_ctx_from_provider_event(
+        self,
+        ctx: StreamContext,
+        data: dict[str, Any],
+        *,
+        already_unwrapped: bool = False,
+    ) -> None:
+        # Unwrap provider-specific envelopes (e.g. Antigravity v1internal wrapper)
+        if not already_unwrapped:
+            data = self._unwrap_provider_envelope(ctx, data)
+
+        parser = self.get_parser_for_provider(ctx)
+
+        # Provider usage extraction (best-effort)
+        provider_type = str(getattr(ctx, "provider_type", "") or "").lower()
+        provider_format = str(getattr(ctx, "provider_api_format", "") or "").strip().lower()
+
+        usage: dict[str, int] | None = None
+        if provider_type == "antigravity" and provider_format.startswith("gemini:"):
+            usage = self._extract_antigravity_usage_from_gemini_event(data)
+        if usage is None:
+            try:
+                usage = parser.extract_usage_from_response(data)
+            except Exception:
+                usage = None
+
+        if usage:
+            ctx.update_usage(
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                cached_tokens=usage.get("cache_read_tokens"),
+                cache_creation_tokens=usage.get("cache_creation_tokens"),
+            )
+
+        # Provider completion detection (Gemini doesn't emit response.completed).
+        if provider_format.startswith("gemini:"):
+            self._maybe_mark_gemini_completion(ctx, data)
+
+        # Provider text extraction (optional)
+        if self.collect_text:
+            try:
+                text = parser.extract_text_content(data)
+            except Exception:
+                text = ""
+            if text:
+                ctx.append_text(text)
+
     def handle_sse_event(
         self,
         ctx: StreamContext,
@@ -115,6 +224,7 @@ class StreamProcessor:
         data_str: str,
         *,
         skip_record: bool = False,
+        skip_ctx_update: bool = False,
     ) -> None:
         """
         处理单个 SSE 事件
@@ -126,6 +236,7 @@ class StreamProcessor:
             event_name: 事件名称
             data_str: 事件数据字符串
             skip_record: 是否跳过记录到 parsed_chunks（当需要格式转换时应为 True）
+            skip_ctx_update: 跳过 usage/completion/text 提取（由调用方统一处理时使用）
         """
         if not data_str:
             return
@@ -142,30 +253,16 @@ class StreamProcessor:
         if not isinstance(data, dict):
             return
 
+        # Update usage/completion/text from provider event (envelope-aware).
+        # 在 needs_conversion 正常流中由 _emit_converted_line 统一处理，此处跳过以避免重复。
+        if not skip_ctx_update:
+            self._update_ctx_from_provider_event(ctx, data)
+
         # 统计数据事件数量（当需要格式转换时跳过，由 _emit_converted_line 统计/记录转换后的数据）
         if not skip_record:
             ctx.data_count += 1
             if ctx.record_parsed_chunks:
                 ctx.parsed_chunks.append(data)
-
-        # 根据 Provider 格式选择解析器
-        parser = self.get_parser_for_provider(ctx)
-
-        # 使用解析器提取 usage
-        usage = parser.extract_usage_from_response(data)
-        if usage:
-            ctx.update_usage(
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
-                cached_tokens=usage.get("cache_read_tokens"),
-                cache_creation_tokens=usage.get("cache_creation_tokens"),
-            )
-
-        # 提取文本
-        if self.collect_text:
-            text = parser.extract_text_content(data)
-            if text:
-                ctx.append_text(text)
 
         # 检查完成
         event_type = event_name or data.get("type", "")
@@ -476,14 +573,31 @@ class StreamProcessor:
                     self.on_streaming_start()
                     streaming_started = True
 
-            def _process_line_with_perf(line: str, *, skip_record: bool = False) -> None:
+            def _process_line_with_perf(
+                line: str,
+                *,
+                skip_record: bool = False,
+                skip_ctx_update: bool = False,
+            ) -> None:
                 nonlocal parse_time
                 if perf_capture:
                     t0 = time.perf_counter()
-                    self._process_line(ctx, sse_parser, line, skip_record=skip_record)
+                    self._process_line(
+                        ctx,
+                        sse_parser,
+                        line,
+                        skip_record=skip_record,
+                        skip_ctx_update=skip_ctx_update,
+                    )
                     parse_time += time.perf_counter() - t0
                     return
-                self._process_line(ctx, sse_parser, line, skip_record=skip_record)
+                self._process_line(
+                    ctx,
+                    sse_parser,
+                    line,
+                    skip_record=skip_record,
+                    skip_ctx_update=skip_ctx_update,
+                )
 
             def _build_stream_error_payload(message: str) -> dict:
                 if client_family == "openai":
@@ -589,6 +703,14 @@ class StreamProcessor:
                             data=data_obj,
                         )
 
+                    # Update usage/completion/text based on the unwrapped provider event.
+                    if isinstance(data_obj, dict):
+                        self._update_ctx_from_provider_event(
+                            ctx,
+                            data_obj,
+                            already_unwrapped=True,
+                        )
+
                     try:
                         converted_events = registry.convert_stream_chunk(
                             data_obj,
@@ -648,7 +770,9 @@ class StreamProcessor:
 
                             if line:
                                 # 需要格式转换时，跳过记录原始数据（由 _emit_converted_line 记录转换后的数据）
-                                _process_line_with_perf(line, skip_record=True)
+                                _process_line_with_perf(
+                                    line, skip_record=True, skip_ctx_update=True
+                                )
                             normalized_line = line.rstrip("\r\n") if line else ""
                             out_chunks = _emit_converted_line(normalized_line)
                             if not out_chunks:
@@ -878,6 +1002,7 @@ class StreamProcessor:
         line: str,
         *,
         skip_record: bool = False,
+        skip_ctx_update: bool = False,
     ) -> None:
         """
         处理单行数据
@@ -887,6 +1012,7 @@ class StreamProcessor:
             sse_parser: SSE 解析器
             line: 原始行数据
             skip_record: 是否跳过记录到 parsed_chunks（当需要格式转换时应为 True）
+            skip_ctx_update: 跳过 usage/completion/text 提取（由调用方统一处理时使用）
         """
         # SSEEventParser 以"去掉换行符"的单行文本作为输入；这里统一剔除 CR/LF，
         # 避免把空行误判成 "\n" 并导致事件边界解析错误。
@@ -898,7 +1024,11 @@ class StreamProcessor:
 
         for event in events:
             self.handle_sse_event(
-                ctx, event.get("event"), event.get("data") or "", skip_record=skip_record
+                ctx,
+                event.get("event"),
+                event.get("data") or "",
+                skip_record=skip_record,
+                skip_ctx_update=skip_ctx_update,
             )
 
     async def create_monitored_stream(

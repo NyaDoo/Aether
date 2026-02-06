@@ -193,7 +193,7 @@
           <div class="flex flex-col items-end flex-shrink-0">
             <span class="text-xs text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
             <span
-              v-if="showActualCost && record.actual_cost !== undefined"
+              v-if="showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
               class="text-[10px] text-muted-foreground"
             >{{ formatCurrency(record.actual_cost) }}</span>
           </div>
@@ -562,7 +562,7 @@
             <div class="flex flex-col items-end text-xs gap-0.5">
               <span class="text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
               <span
-                v-if="showActualCost && record.actual_cost !== undefined"
+                v-if="showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
                 class="text-muted-foreground"
               >
                 {{ formatCurrency(record.actual_cost) }}

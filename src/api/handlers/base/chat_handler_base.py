@@ -40,7 +40,7 @@ from src.api.handlers.base.base_handler import (
 from src.api.handlers.base.parsers import get_parser_for_format
 from src.api.handlers.base.request_builder import PassthroughRequestBuilder, get_provider_auth
 from src.api.handlers.base.response_parser import ResponseParser
-from src.api.handlers.base.stream_context import StreamContext
+from src.api.handlers.base.stream_context import StreamContext, is_format_converted
 from src.api.handlers.base.stream_processor import StreamProcessor
 from src.api.handlers.base.stream_telemetry import StreamTelemetryRecorder
 from src.api.handlers.base.upstream_stream_bridge import (
@@ -1322,7 +1322,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
             client_response_headers=client_response_headers,
             # 格式转换追踪
             endpoint_api_format=ctx.provider_api_format or None,
-            has_format_conversion=ctx.needs_conversion,
+            has_format_conversion=ctx.has_format_conversion,
             target_model=ctx.mapped_model,
         )
 
@@ -1367,7 +1367,7 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
         provider_request_body: dict[str, Any] | None = None
         provider_api_format_for_error: str | None = None
         client_api_format_for_error: str | None = None
-        needs_conversion_for_error: bool = False
+        needs_conversion_for_error: bool = False  # 用于构建错误 payload（含 envelope rewrite）
         provider_id: str | None = None  # Provider ID（用于失败记录）
         endpoint_id: str | None = None  # Endpoint ID（用于失败记录）
         key_id: str | None = None  # Key ID（用于失败记录）
@@ -1795,7 +1795,9 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 api_format=api_format,
                 # 格式转换追踪
                 endpoint_api_format=provider_api_format_for_error or None,
-                has_format_conversion=needs_conversion_for_error,
+                has_format_conversion=is_format_converted(
+                    provider_api_format_for_error, client_api_format_for_error
+                ),
                 provider_id=provider_id,
                 provider_endpoint_id=endpoint_id,
                 provider_api_key_id=key_id,
@@ -1865,7 +1867,9 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 client_response_headers={"content-type": "application/json"},
                 # 格式转换追踪
                 endpoint_api_format=provider_api_format_for_error or None,
-                has_format_conversion=needs_conversion_for_error,
+                has_format_conversion=is_format_converted(
+                    provider_api_format_for_error, client_api_format_for_error
+                ),
                 target_model=mapped_model_result,
                 request_metadata=request_metadata,
             )
@@ -1916,7 +1920,9 @@ class ChatHandlerBase(BaseMessageHandler, ABC):
                 client_response_headers={"content-type": "application/json"},
                 # 格式转换追踪
                 endpoint_api_format=provider_api_format_for_error or None,
-                has_format_conversion=needs_conversion_for_error,
+                has_format_conversion=is_format_converted(
+                    provider_api_format_for_error, client_api_format_for_error
+                ),
                 # 模型映射信息
                 target_model=mapped_model_result,
                 request_metadata=request_metadata,

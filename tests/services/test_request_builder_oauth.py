@@ -20,7 +20,7 @@ async def test_get_provider_auth_oauth_returns_decrypted_auth_config() -> None:
         "project_id": "project-1",
     }
 
-    endpoint = SimpleNamespace(api_format="gemini:cli")
+    endpoint = SimpleNamespace(api_format="gemini:chat")
     key = SimpleNamespace(
         id="k1",
         auth_type="oauth",

@@ -19,7 +19,7 @@ class _DummyEndpoint:
 def test_antigravity_uses_v1internal_path_and_sets_contextvar() -> None:
     endpoint = _DummyEndpoint(
         base_url="https://ignored.example.com",
-        api_format="gemini:cli",
+        api_format="gemini:chat",
         provider=SimpleNamespace(provider_type="antigravity"),
     )
 

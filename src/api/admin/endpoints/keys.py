@@ -1009,7 +1009,7 @@ class AdminRefreshProviderQuotaAdapter(AdminApiAdapter):
 
         # 获取端点：
         # - Codex: openai:cli
-        # - Antigravity: gemini:cli（用于触发 oauth 刷新 + 提供 auth_config.project_id）
+        # - Antigravity: gemini:chat（用于触发 oauth 刷新 + 提供 auth_config.project_id）
         endpoint = None
         if provider_type == ProviderType.CODEX:
             for ep in provider.endpoints:
@@ -1019,12 +1019,16 @@ class AdminRefreshProviderQuotaAdapter(AdminApiAdapter):
             if not endpoint:
                 raise InvalidRequestException("找不到有效的 openai:cli 端点")
         else:
-            for ep in provider.endpoints:
-                if ep.api_format == "gemini:cli" and ep.is_active:
-                    endpoint = ep
+            # Prefer the new signature, but keep backward-compat with existing DB rows.
+            for sig in ("gemini:chat", "gemini:cli"):
+                for ep in provider.endpoints:
+                    if ep.api_format == sig and ep.is_active:
+                        endpoint = ep
+                        break
+                if endpoint is not None:
                     break
             if not endpoint:
-                raise InvalidRequestException("找不到有效的 gemini:cli 端点")
+                raise InvalidRequestException("找不到有效的 gemini:chat/gemini:cli 端点")
 
         results: list[dict] = []
         success_count = 0

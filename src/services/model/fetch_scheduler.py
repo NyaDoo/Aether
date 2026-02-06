@@ -303,7 +303,9 @@ class ModelFetchScheduler:
             # Use request_builder's lazy refresh logic and persist refreshed token back to DB.
             # Endpoint signature is only used for tracing/debug; auth logic doesn't depend on it.
             endpoint_api_format = (
-                "gemini:cli" if prepared.provider_type.lower() == ProviderType.ANTIGRAVITY else None
+                "gemini:chat"
+                if prepared.provider_type.lower() == ProviderType.ANTIGRAVITY
+                else None
             )
             try:
                 resolved = await resolve_oauth_access_token(

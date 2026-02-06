@@ -66,13 +66,13 @@
                   variant="ghost"
                   size="icon"
                   class="h-8 w-8"
-                  :disabled="loading"
-                  title="刷新"
+                  :disabled="loading && !autoRefreshing"
+                  :title="autoRefreshing ? '停止自动刷新' : '刷新'"
                   @click="refreshDetail"
                 >
                   <RefreshCw
                     class="w-4 h-4"
-                    :class="{ 'animate-spin': loading }"
+                    :class="{ 'animate-spin': loading || autoRefreshing, 'text-primary': autoRefreshing }"
                   />
                 </Button>
                 <Button
@@ -275,25 +275,27 @@
                     </div>
                   </div>
 
-                  <!-- ========== 3. 按次计费（独立隔离） ========== -->
+                  <!-- ========== 3. 按次计费 ========== -->
                   <div
                     v-if="perRequestCost > 0 && !detail.video_billing"
-                    class="rounded-lg p-3 bg-amber-500/5 border border-amber-500/30 mb-3"
+                    class="space-y-2 mb-3"
                   >
-                    <div class="flex items-center justify-between text-xs mb-2">
-                      <span class="font-medium text-amber-600 dark:text-amber-400">按次计费</span>
-                      <span
-                        v-if="detail.price_per_request"
-                        class="text-muted-foreground"
-                      >
-                        单价 ${{ detail.price_per_request.toFixed(6) }}/次
-                      </span>
+                    <div class="flex items-center justify-between text-xs">
+                      <span class="font-medium text-foreground">按次计费</span>
                     </div>
-                    <div class="flex items-center">
-                      <div class="flex items-center flex-1">
-                        <span class="text-xs text-muted-foreground w-[56px]">请求次数</span>
-                        <span class="text-sm font-semibold font-mono flex-1 text-center">1</span>
-                        <span class="text-xs font-mono font-medium">${{ perRequestCost.toFixed(6) }}</span>
+                    <div class="rounded-lg p-3 bg-primary/5 border border-primary/30 space-y-2">
+                      <div
+                        v-if="detail.price_per_request"
+                        class="flex items-center justify-end text-xs"
+                      >
+                        <span class="text-muted-foreground">${{ detail.price_per_request.toFixed(6) }}/次</span>
+                      </div>
+                      <div class="flex items-center">
+                        <div class="flex items-center flex-1">
+                          <span class="text-xs text-muted-foreground w-[56px]">请求次数</span>
+                          <span class="text-sm font-semibold font-mono flex-1 text-center">1</span>
+                          <span class="text-xs font-mono font-medium">${{ perRequestCost.toFixed(6) }}</span>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -361,6 +363,7 @@
               <!-- 请求链路追踪卡片 -->
               <div v-if="detail.request_id || detail.id">
                 <HorizontalRequestTimeline
+                  ref="timelineRef"
                   :request-id="detail.request_id || detail.id"
                   :override-status-code="detail.status_code"
                 />
@@ -590,7 +593,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, computed } from 'vue'
+import { ref, watch, computed, onBeforeUnmount } from 'vue'
 import Button from '@/components/ui/button.vue'
 import { useEscapeKey } from '@/composables/useEscapeKey'
 import { useClipboard } from '@/composables/useClipboard'
@@ -631,6 +634,7 @@ const emit = defineEmits<{
 const loading = ref(false)
 const error = ref<string | null>(null)
 const detail = ref<RequestDetail | null>(null)
+const timelineRef = ref<InstanceType<typeof HorizontalRequestTimeline> | null>(null)
 const activeTab = ref('request-body')
 const copiedStates = ref<Record<string, boolean>>({})
 const viewMode = ref<'compare' | 'formatted' | 'raw'>('formatted')
@@ -645,6 +649,8 @@ const historicalPricing = ref<{
   cache_read_price: string
   request_price: string
 } | null>(null)
+const autoRefreshTimer = ref<ReturnType<typeof setInterval> | null>(null)
+const autoRefreshing = ref(false)
 
 // 监听标签页切换
 watch(activeTab, (newTab) => {
@@ -870,25 +876,37 @@ watch(() => props.requestId, async (newId) => {
 watch(() => props.isOpen, async (isOpen) => {
   if (isOpen && props.requestId) {
     await loadDetail(props.requestId)
+  } else if (!isOpen) {
+    stopAutoRefresh()
   }
 })
 
-async function loadDetail(id: string) {
-  loading.value = true
+async function loadDetail(id: string, silent = false) {
+  if (!silent) {
+    loading.value = true
+    historicalPricing.value = null
+  }
   error.value = null
-  historicalPricing.value = null
   try {
     detail.value = await dashboardApi.getRequestDetail(id)
 
-    // 默认显示有内容的第一个可见 tab
-    const visibleTabNames = visibleTabs.value.map(t => t.name)
-    if (detail.value.request_body && visibleTabNames.includes('request-body')) {
-      activeTab.value = 'request-body'
-    } else if (detail.value.response_body && visibleTabNames.includes('response-body')) {
-      activeTab.value = 'response-body'
-    } else if (visibleTabNames.length > 0) {
-      activeTab.value = visibleTabNames[0]
+    // 首次加载时选择默认 tab
+    if (!silent) {
+      const visibleTabNames = visibleTabs.value.map(t => t.name)
+      if (detail.value.request_body && visibleTabNames.includes('request-body')) {
+        activeTab.value = 'request-body'
+      } else if (detail.value.response_body && visibleTabNames.includes('response-body')) {
+        activeTab.value = 'response-body'
+      } else if (visibleTabNames.length > 0) {
+        activeTab.value = visibleTabNames[0]
+      }
     }
+
+    // 根据数据可用性自动选择请求头数据源
+    // provider_request_headers 在 streaming 完成后才写入，pending/streaming 期间为空
+    const hasProviderReqHeaders = detail.value.provider_request_headers &&
+      Object.keys(detail.value.provider_request_headers).length > 0
+    dataSource.value = hasProviderReqHeaders ? 'provider' : 'client'
 
     // 使用请求记录中保存的历史价格
     if (detail.value.input_price_per_1m || detail.value.output_price_per_1m || detail.value.price_per_request) {
@@ -900,23 +918,80 @@ async function loadDetail(id: string) {
         request_price: detail.value.price_per_request ? detail.value.price_per_request.toFixed(4) : 'N/A'
       }
     }
+
+    // 静默刷新时同步刷新链路追踪
+    if (silent) {
+      timelineRef.value?.refresh()
+    }
   } catch (err) {
     log.error('Failed to load request detail:', err)
-    error.value = '加载请求详情失败'
+    if (!silent) {
+      error.value = '加载请求详情失败'
+    }
   } finally {
-    loading.value = false
+    if (!silent) {
+      loading.value = false
+    }
   }
 }
 
 function handleClose() {
+  stopAutoRefresh()
   emit('close')
 }
 
-async function refreshDetail() {
-  if (props.requestId) {
-    await loadDetail(props.requestId)
-  }
+function isRequestCompleted(): boolean {
+  if (!detail.value?.status) return true
+  return !['pending', 'streaming'].includes(detail.value.status)
 }
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer.value) {
+    clearInterval(autoRefreshTimer.value)
+    autoRefreshTimer.value = null
+  }
+  autoRefreshing.value = false
+}
+
+async function refreshDetail() {
+  if (!props.requestId) return
+
+  // 已完成：单次静默刷新
+  if (isRequestCompleted()) {
+    await loadDetail(props.requestId, true)
+    return
+  }
+
+  // 未完成：如果已在自动刷新则停止，否则启动
+  if (autoRefreshing.value) {
+    stopAutoRefresh()
+    return
+  }
+
+  autoRefreshing.value = true
+  await loadDetail(props.requestId, true)
+
+  // 加载后可能已经完成了
+  if (isRequestCompleted()) {
+    stopAutoRefresh()
+    return
+  }
+
+  autoRefreshTimer.value = setInterval(async () => {
+    if (!props.requestId || !props.isOpen) {
+      stopAutoRefresh()
+      return
+    }
+    await loadDetail(props.requestId, true)
+    if (isRequestCompleted()) {
+      stopAutoRefresh()
+    }
+  }, 1000)
+}
+
+onBeforeUnmount(() => {
+  stopAutoRefresh()
+})
 
 function formatDateTime(dateStr: string | null | undefined): string {
   if (!dateStr) return 'N/A'

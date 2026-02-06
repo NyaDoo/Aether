@@ -249,7 +249,7 @@ async def fetch_models_antigravity(
                 "id": model_id,
                 "owned_by": "antigravity",
                 "display_name": display_name,
-                "api_format": "gemini:cli",
+                "api_format": "gemini:chat",
             }
         )
 
@@ -324,10 +324,14 @@ def register_all() -> None:
     from src.services.provider.transport import register_transport_hook
 
     # Envelope
+    register_envelope("antigravity", "gemini:chat", antigravity_v1internal_envelope)
+    # Backward compat: allow existing endpoints that still use the old signature.
     register_envelope("antigravity", "gemini:cli", antigravity_v1internal_envelope)
     register_envelope("antigravity", "", antigravity_v1internal_envelope)
 
     # Transport
+    register_transport_hook("antigravity", "gemini:chat", build_antigravity_url)
+    # Backward compat: allow existing endpoints that still use the old signature.
     register_transport_hook("antigravity", "gemini:cli", build_antigravity_url)
 
     # Auth

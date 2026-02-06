@@ -32,7 +32,7 @@ def test_antigravity_converts_claude_thinking_block_to_gemini_thought_part_prefe
     }
 
     registry = get_format_converter_registry()
-    out = registry.convert_request(req, "claude:chat", "gemini:cli", target_variant="antigravity")
+    out = registry.convert_request(req, "claude:chat", "gemini:chat", target_variant="antigravity")
 
     assert isinstance(out.get("contents"), list)
     model_turn = out["contents"][1]
@@ -63,7 +63,7 @@ def test_antigravity_uses_dummy_signature_for_gemini_when_missing() -> None:
     }
 
     registry = get_format_converter_registry()
-    out = registry.convert_request(req, "claude:chat", "gemini:cli", target_variant="antigravity")
+    out = registry.convert_request(req, "claude:chat", "gemini:chat", target_variant="antigravity")
 
     parts = out["contents"][1]["parts"]
     assert parts[0]["thought"] is True
@@ -91,7 +91,7 @@ def test_antigravity_drops_unsigned_thinking_for_non_gemini_models() -> None:
     }
 
     registry = get_format_converter_registry()
-    out = registry.convert_request(req, "claude:chat", "gemini:cli", target_variant="antigravity")
+    out = registry.convert_request(req, "claude:chat", "gemini:chat", target_variant="antigravity")
 
     parts = out["contents"][1]["parts"]
     assert all(p.get("thought") is not True for p in parts)
@@ -111,7 +111,7 @@ def test_antigravity_inserts_dummy_thought_for_last_assistant_when_thinking_enab
     }
 
     registry = get_format_converter_registry()
-    out = registry.convert_request(req, "claude:chat", "gemini:cli", target_variant="antigravity")
+    out = registry.convert_request(req, "claude:chat", "gemini:chat", target_variant="antigravity")
 
     parts = out["contents"][1]["parts"]
     assert parts[0]["thought"] is True

@@ -106,7 +106,7 @@ def cache_result(
                 if cached:
                     try:
                         result = json.loads(cached)
-                        logger.debug(f"缓存命中: {cache_key}")
+                        logger.trace(f"缓存命中: {cache_key}")
                         return result
                     except json.JSONDecodeError as e:
                         logger.warning(f"缓存解析失败，删除损坏缓存: {cache_key}, 错误: {e}")
@@ -123,7 +123,7 @@ def cache_result(
                     await redis_client.setex(
                         cache_key, ttl, json.dumps(result, ensure_ascii=False, default=str)
                     )
-                    logger.debug(f"缓存已保存: {cache_key}, TTL: {ttl}s")
+                    logger.trace(f"缓存已保存: {cache_key}, TTL: {ttl}s")
                 except Exception as e:
                     logger.warning(f"保存缓存失败: {e}")
 

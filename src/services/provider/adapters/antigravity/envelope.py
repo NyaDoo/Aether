@@ -1,6 +1,6 @@
 """Antigravity v1internal request/response envelope helpers.
 
-Antigravity reuses the `gemini:cli` endpoint signature but wraps the actual
+Antigravity reuses the `gemini:chat` endpoint signature but wraps the actual
 wire format:
 - Request: V1InternalRequest (top-level metadata + nested GeminiRequest)
 - Response: V1InternalResponse (top-level responseId + nested GeminiResponse)

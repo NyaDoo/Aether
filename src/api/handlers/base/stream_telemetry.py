@@ -227,7 +227,7 @@ class StreamTelemetryRecorder:
             request_type="chat",
             metadata=metadata,
             endpoint_api_format=ctx.provider_api_format,
-            has_format_conversion=ctx.needs_conversion,
+            has_format_conversion=ctx.has_format_conversion,
         )
 
         logger.debug(f"{self.format_id} 流式响应完成")
@@ -273,7 +273,7 @@ class StreamTelemetryRecorder:
             request_type="chat",
             metadata=metadata,
             endpoint_api_format=ctx.provider_api_format,
-            has_format_conversion=ctx.needs_conversion,
+            has_format_conversion=ctx.has_format_conversion,
         )
 
         logger.debug(f"{self.format_id} 流式响应中断")
@@ -320,7 +320,7 @@ class StreamTelemetryRecorder:
             request_type="chat",
             metadata=metadata,
             endpoint_api_format=ctx.provider_api_format,
-            has_format_conversion=ctx.needs_conversion,
+            has_format_conversion=ctx.has_format_conversion,
         )
 
         logger.debug(f"{self.format_id} 流式响应被客户端取消")

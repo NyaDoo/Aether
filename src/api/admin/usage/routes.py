@@ -1181,6 +1181,7 @@ class AdminUsageDetailAdapter(AdminApiAdapter):
             "is_stream": usage_record.is_stream,
             "status_code": usage_record.status_code,
             "error_message": usage_record.error_message,
+            "status": usage_record.status,
             "response_time_ms": usage_record.response_time_ms,
             "first_byte_time_ms": usage_record.first_byte_time_ms,  # 首字时间 (TTFB)
             "created_at": usage_record.created_at.isoformat() if usage_record.created_at else None,

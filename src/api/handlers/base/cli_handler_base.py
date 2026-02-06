@@ -43,7 +43,7 @@ from src.api.handlers.base.request_builder import PassthroughRequestBuilder, get
 from src.api.handlers.base.response_parser import (
     ResponseParser,
 )
-from src.api.handlers.base.stream_context import StreamContext
+from src.api.handlers.base.stream_context import StreamContext, is_format_converted
 from src.api.handlers.base.upstream_stream_bridge import (
     aggregate_upstream_stream_to_internal_response,
 )
@@ -2459,7 +2459,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                             response_headers=ctx.response_headers,
                             client_response_headers=client_response_headers,
                             endpoint_api_format=ctx.provider_api_format or None,
-                            has_format_conversion=ctx.needs_conversion,
+                            has_format_conversion=ctx.has_format_conversion,
                             target_model=ctx.mapped_model,
                             request_metadata=request_metadata,
                         )
@@ -2492,7 +2492,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                             client_response_headers=client_response_headers,
                             # 格式转换追踪
                             endpoint_api_format=ctx.provider_api_format or None,
-                            has_format_conversion=ctx.needs_conversion,
+                            has_format_conversion=ctx.has_format_conversion,
                             # 模型映射信息
                             target_model=ctx.mapped_model,
                             request_metadata=request_metadata,
@@ -2552,7 +2552,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                         api_format=ctx.api_format,
                         # 格式转换追踪
                         endpoint_api_format=ctx.provider_api_format or None,
-                        has_format_conversion=ctx.needs_conversion,
+                        has_format_conversion=ctx.has_format_conversion,
                         # Provider 侧追踪信息（用于记录真实成本）
                         provider_id=ctx.provider_id,
                         provider_endpoint_id=ctx.endpoint_id,
@@ -2709,7 +2709,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
             client_response_headers=client_response_headers,
             # 格式转换追踪
             endpoint_api_format=ctx.provider_api_format or None,
-            has_format_conversion=ctx.needs_conversion,
+            has_format_conversion=ctx.has_format_conversion,
             # 模型映射信息
             target_model=ctx.mapped_model,
             request_metadata=request_metadata,
@@ -3170,7 +3170,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                 api_format=api_format,
                 # 格式转换追踪
                 endpoint_api_format=provider_api_format or None,
-                has_format_conversion=needs_conversion,
+                has_format_conversion=is_format_converted(provider_api_format, str(api_format)),
                 # Provider 侧追踪信息（用于记录真实成本）
                 provider_id=provider_id,
                 provider_endpoint_id=endpoint_id,
@@ -3249,7 +3249,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                 client_response_headers={"content-type": "application/json"},
                 # 格式转换追踪
                 endpoint_api_format=provider_api_format or None,
-                has_format_conversion=needs_conversion,
+                has_format_conversion=is_format_converted(provider_api_format, str(api_format)),
                 # 模型映射信息
                 target_model=mapped_model_result,
                 request_metadata=request_metadata,
@@ -3364,7 +3364,7 @@ class CliMessageHandlerBase(BaseMessageHandler):
                         first_byte_time_ms=ctx.first_byte_time_ms,
                         api_format=ctx.api_format,
                         endpoint_api_format=ctx.provider_api_format or None,
-                        has_format_conversion=ctx.needs_conversion,
+                        has_format_conversion=ctx.has_format_conversion,
                     )
                 except Exception as e:
                     logger.warning(f"[{self.request_id}] 同步更新 streaming 状态失败: {e}")

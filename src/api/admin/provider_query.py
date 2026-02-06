@@ -70,7 +70,7 @@ async def _resolve_key_auth(
     auth_config: dict[str, Any] | None = None
 
     if auth_type == "oauth":
-        endpoint_api_format = "gemini:cli" if provider_type == ProviderType.ANTIGRAVITY else None
+        endpoint_api_format = "gemini:chat" if provider_type == ProviderType.ANTIGRAVITY else None
         try:
             resolved = await resolve_oauth_access_token(
                 key_id=str(api_key.id),

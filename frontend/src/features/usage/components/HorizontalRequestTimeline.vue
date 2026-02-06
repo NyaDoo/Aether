@@ -642,25 +642,40 @@ const navigateGroup = (direction: number) => {
 }
 
 // 加载请求追踪数据
-const loadTrace = async () => {
+const isSilentRefresh = ref(false)
+const loadTrace = async (silent = false) => {
   if (!props.requestId) return
 
-  loading.value = true
+  isSilentRefresh.value = silent
+
+  if (!silent) {
+    loading.value = true
+  }
   error.value = null
 
   try {
     trace.value = await requestTraceApi.getRequestTrace(props.requestId)
   } catch (err: any) {
-    error.value = err.response?.data?.detail || err.message || '加载失败'
+    if (!silent) {
+      error.value = err.response?.data?.detail || err.message || '加载失败'
+    }
     log.error('加载请求追踪失败:', err)
   } finally {
-    loading.value = false
+    if (!silent) {
+      loading.value = false
+    }
   }
 }
 
 // 监听 groupedTimeline 变化，自动选择最有意义的组
 watch(groupedTimeline, (newGroups) => {
   if (!newGroups || newGroups.length === 0) return
+
+  // 静默刷新时不重置选中状态
+  if (isSilentRefresh.value) {
+    isSilentRefresh.value = false
+    return
+  }
 
   // 查找成功的组
   const successIdx = newGroups.findIndex(g => g.primaryStatus === 'success')
@@ -711,6 +726,8 @@ watch(() => props.requestId, () => {
   selectedAttemptIndex.value = 0
   loadTrace()
 }, { immediate: true })
+
+defineExpose({ refresh: () => loadTrace(true) })
 
 // 格式化时间（详细）
 const formatTime = (dateStr: string) => {

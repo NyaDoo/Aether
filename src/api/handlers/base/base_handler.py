@@ -571,7 +571,7 @@ class BaseMessageHandler:
         api_format = ctx.api_format
         # 格式转换追踪
         endpoint_api_format = ctx.provider_api_format or None
-        has_format_conversion = ctx.needs_conversion
+        has_format_conversion = ctx.has_format_conversion
 
         # 如果 provider 为空，记录警告（不应该发生，但用于调试）
         if not provider:

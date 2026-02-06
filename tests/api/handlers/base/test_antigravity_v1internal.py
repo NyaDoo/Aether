@@ -62,7 +62,7 @@ def test_convert_sse_line_unwraps_before_convert_stream_chunk() -> None:
 
     ctx = StreamContext(model="gemini-2.0-flash", api_format="gemini:cli")
     ctx.provider_type = "antigravity"
-    ctx.provider_api_format = "gemini:cli"
+    ctx.provider_api_format = "gemini:chat"
     ctx.client_api_format = "gemini:cli"
 
     v1_line = (

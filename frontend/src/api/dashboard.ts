@@ -161,6 +161,7 @@ export interface RequestDetail {
   request_type: string
   is_stream: boolean
   status_code: number
+  status?: string  // pending, streaming, completed, failed, cancelled
   error_message?: string
   response_time_ms: number
   created_at: string
