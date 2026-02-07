@@ -1421,6 +1421,22 @@ class CliMessageHandlerBase(BaseMessageHandler):
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             else:
                 raise
+        except httpx.ReadError:
+            # 代理/上游连接读取失败（如 aether-proxy 中断），与 RemoteProtocolError 处理逻辑一致
+            self._flush_remaining_sse_data(
+                ctx, buffer, decoder, sse_parser, record_chunk=not needs_conversion
+            )
+            if ctx.data_count > 0:
+                error_event = {
+                    "type": "error",
+                    "error": {
+                        "type": "connection_error",
+                        "message": "代理或上游连接读取失败，部分响应已成功传输",
+                    },
+                }
+                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+            else:
+                raise
         finally:
             try:
                 await response_ctx.__aexit__(None, None, None)
@@ -1957,6 +1973,22 @@ class CliMessageHandlerBase(BaseMessageHandler):
                     "error": {
                         "type": "connection_error",
                         "message": "上游连接意外关闭，部分响应已成功传输",
+                    },
+                }
+                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+            else:
+                raise
+        except httpx.ReadError:
+            # 代理/上游连接读取失败（如 aether-proxy 中断），与 RemoteProtocolError 处理逻辑一致
+            self._flush_remaining_sse_data(
+                ctx, buffer, decoder, sse_parser, record_chunk=not needs_conversion
+            )
+            if ctx.data_count > 0:
+                error_event = {
+                    "type": "error",
+                    "error": {
+                        "type": "connection_error",
+                        "message": "代理或上游连接读取失败，部分响应已成功传输",
                     },
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
