@@ -7,6 +7,7 @@
 """
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -14,7 +15,6 @@ import httpx
 
 from src.core.api_format import get_extra_headers_from_endpoint
 from src.core.logger import logger
-from src.models.database import ProviderEndpoint
 from src.utils.ssl_utils import get_ssl_context
 
 # 并发请求限制
@@ -35,13 +35,42 @@ _ModelsFetcher = Callable[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class EndpointFetchConfig:
+    """端点获取配置（纯数据，不依赖 DB session）。
+
+    从 ProviderEndpoint ORM 对象提取必要字段，确保在 DB session 关闭后
+    仍可安全使用（避免 DetachedInstanceError）。
+    """
+
+    base_url: str
+    extra_headers: dict[str, str] | None = None
+
+
+def build_format_to_config(endpoints: Iterable[Any]) -> dict[str, EndpointFetchConfig]:
+    """将活跃的 ProviderEndpoint 转换为 api_format -> EndpointFetchConfig 映射。
+
+    应在 DB session 活跃时调用，提取 ORM 对象上的 base_url 和 header_rules，
+    转换为 session 无关的纯数据结构。
+    """
+    result: dict[str, EndpointFetchConfig] = {}
+    for ep in endpoints:
+        if not getattr(ep, "is_active", False):
+            continue
+        result[ep.api_format] = EndpointFetchConfig(
+            base_url=ep.base_url,
+            extra_headers=get_extra_headers_from_endpoint(ep),
+        )
+    return result
+
+
 @dataclass(frozen=True)
 class UpstreamModelsFetchContext:
     """上游模型获取上下文（Key 级别）。"""
 
     provider_type: str
     api_key_value: str
-    format_to_endpoint: dict[str, Any]
+    format_to_endpoint: dict[str, EndpointFetchConfig]
     proxy_config: dict[str, Any] | None = None
     auth_config: dict[str, Any] | None = None
 
@@ -149,7 +178,7 @@ def get_adapter_for_format(api_format: str) -> type | None:
 
 def build_all_format_configs(
     api_key_value: str,
-    format_to_endpoint: dict[str, ProviderEndpoint],
+    format_to_endpoint: dict[str, EndpointFetchConfig],
 ) -> list[dict]:
     """
     构建所有 API 格式的端点配置
@@ -159,7 +188,7 @@ def build_all_format_configs(
 
     Args:
         api_key_value: 解密后的 API Key
-        format_to_endpoint: API 格式到端点的映射
+        format_to_endpoint: API 格式到 EndpointFetchConfig 的映射
 
     Returns:
         端点配置列表，每个配置包含 api_key, base_url, api_format, extra_headers
@@ -172,13 +201,13 @@ def build_all_format_configs(
     for candidates in MODEL_FETCH_FORMAT_PRIORITY:
         fmt = next((f for f in candidates if f in format_to_endpoint), None)
         if fmt is not None:
-            ep = format_to_endpoint[fmt]
+            cfg = format_to_endpoint[fmt]
             configs.append(
                 {
                     "api_key": api_key_value,
-                    "base_url": ep.base_url,
+                    "base_url": cfg.base_url,
                     "api_format": fmt,
-                    "extra_headers": get_extra_headers_from_endpoint(ep),
+                    "extra_headers": cfg.extra_headers,
                 }
             )
     return configs

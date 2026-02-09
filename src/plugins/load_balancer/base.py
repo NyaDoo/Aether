@@ -28,6 +28,16 @@ class ProviderCandidate:
         if self.metadata is None:
             self.metadata = {}
 
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, ProviderCandidate):
+            return NotImplemented
+        # 优先级数字越大越优先，权重越大越优先
+        return (-self.priority, -self.weight, str(getattr(self.provider, "id", ""))) < (
+            -other.priority,
+            -other.weight,
+            str(getattr(other.provider, "id", "")),
+        )
+
 
 @dataclass
 class SelectionResult:

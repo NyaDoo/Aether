@@ -28,7 +28,9 @@ from src.core.provider_types import ProviderType
 from src.database import create_session
 from src.models.database import Provider, ProviderAPIKey
 from src.services.model.upstream_fetcher import (
+    EndpointFetchConfig,
     UpstreamModelsFetchContext,
+    build_format_to_config,
     fetch_models_for_key,
     merge_upstream_metadata,
 )
@@ -62,7 +64,7 @@ class PreparedModelsFetchContext:
     auth_type: str
     encrypted_api_key: str
     encrypted_auth_config: str | None
-    format_to_endpoint: dict[str, Any]
+    format_to_endpoint: dict[str, EndpointFetchConfig]
     proxy_config: dict[str, Any] | None
 
 
@@ -422,11 +424,8 @@ class ModelFetchScheduler:
                 db.commit()
                 return "error"
 
-            # 构建 api_format -> endpoint 映射
-            format_to_endpoint: dict[str, Any] = {}
-            for endpoint in provider.endpoints:  # type: ignore[attr-defined]
-                if endpoint.is_active:
-                    format_to_endpoint[endpoint.api_format] = endpoint
+            # 构建 api_format -> EndpointFetchConfig 映射（纯数据，session 无关）
+            format_to_endpoint = build_format_to_config(provider.endpoints)  # type: ignore[attr-defined]
 
             if not format_to_endpoint:
                 logger.warning(f"Provider {provider.name} 没有活跃的端点，跳过 Key {key.id}")

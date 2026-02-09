@@ -54,6 +54,8 @@ export function useUpstreamModelsCache() {
         if (response.success && response.data?.models) {
           return {
             models: response.data.models,
+            // 传递部分格式获取失败的 warning（后端 success=true 但仍可能附带 error）
+            error: response.data.error ? parseUpstreamModelError(response.data.error) : undefined,
             fromCache: response.data.from_cache
           }
         } else {

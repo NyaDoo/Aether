@@ -192,7 +192,6 @@ import Badge from '@/components/ui/badge.vue'
 import Checkbox from '@/components/ui/checkbox.vue'
 import { useToast } from '@/composables/useToast'
 import { parseUpstreamModelError } from '@/utils/errorParser'
-import { adminApi } from '@/api/admin'
 import {
   importModelsFromUpstream,
   getProviderModels,
@@ -200,6 +199,7 @@ import {
   type UpstreamModel,
   API_FORMAT_LABELS,
 } from '@/api/endpoints'
+import { useUpstreamModelsCache } from '../composables/useUpstreamModelsCache'
 
 const props = defineProps<{
   open: boolean
@@ -213,6 +213,7 @@ const emit = defineEmits<{
 }>()
 
 const { success, error: showError } = useToast()
+const { fetchModels: fetchCachedModels } = useUpstreamModelsCache()
 
 const isOpen = computed(() => props.open)
 const loading = ref(false)
@@ -275,7 +276,7 @@ async function loadExistingModels() {
   }
 }
 
-// 获取上游模型（获取所有 Key 的聚合结果）
+// 获取上游模型（获取所有 Key 的聚合结果，通过 useUpstreamModelsCache 统一管理）
 async function fetchUpstreamModels() {
   if (!props.providerId) return
 
@@ -285,27 +286,26 @@ async function fetchUpstreamModels() {
   try {
     // 不传 apiKeyId，后端会遍历所有 Key 并聚合结果。
     // 已查询过再点“刷新”时，强制跳过后端缓存，避免长期 TTL 导致模型列表不更新。
-    const response = await adminApi.queryProviderModels(props.providerId, undefined, hasQueried.value)
+    const result = await fetchCachedModels(props.providerId, undefined, hasQueried.value)
 
-    if (response.success && response.data?.models) {
-      upstreamModels.value = response.data.models
+    if (result.models.length > 0) {
+      upstreamModels.value = result.models
       // 默认选中所有新模型
-      selectedModels.value = response.data.models
+      selectedModels.value = result.models
         .filter((m: UpstreamModel) => !existingModelIds.value.has(m.id))
         .map((m: UpstreamModel) => m.id)
       hasQueried.value = true
       // 如果有部分失败，显示警告提示
-      if (response.data.error) {
-        // 使用友好的错误解析
-        showError(`部分格式获取失败: ${parseUpstreamModelError(response.data.error)}`, '警告')
+      if (result.error) {
+        showError(`部分格式获取失败: ${result.error}`, '警告')
       }
+    } else if (result.error) {
+      errorMessage.value = result.error
     } else {
-      // 使用友好的错误解析
-      const rawError = response.data?.error || '获取上游模型失败'
-      errorMessage.value = parseUpstreamModelError(rawError)
+      // 上游返回空列表但无错误
+      hasQueried.value = true
     }
   } catch (err: any) {
-    // 使用友好的错误解析
     const rawError = err.response?.data?.detail || err.message || '获取上游模型失败'
     errorMessage.value = parseUpstreamModelError(rawError)
   } finally {

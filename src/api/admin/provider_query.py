@@ -27,7 +27,9 @@ from src.services.model.fetch_scheduler import (
     set_upstream_models_to_cache,
 )
 from src.services.model.upstream_fetcher import (
+    EndpointFetchConfig,
     UpstreamModelsFetchContext,
+    build_format_to_config,
     fetch_models_for_key,
     get_adapter_for_format,
 )
@@ -171,11 +173,8 @@ async def query_available_models(
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    # 构建 api_format -> endpoint 映射
-    format_to_endpoint: dict[str, ProviderEndpoint] = {}
-    for endpoint in provider.endpoints:
-        if endpoint.is_active:
-            format_to_endpoint[endpoint.api_format] = endpoint
+    # 构建 api_format -> EndpointFetchConfig 映射（纯数据，不依赖 ORM session）
+    format_to_endpoint = build_format_to_config(provider.endpoints)
 
     if not format_to_endpoint:
         raise HTTPException(status_code=400, detail="No active endpoints found for this provider")
@@ -327,7 +326,7 @@ def _aggregate_models_by_id(models: list[dict]) -> list[dict]:
 async def _fetch_models_for_single_key(
     provider: Provider,
     api_key_id: str,
-    format_to_endpoint: dict[str, ProviderEndpoint],
+    format_to_endpoint: dict[str, EndpointFetchConfig],
     force_refresh: bool,
 ) -> Any:
     """获取单个 Key 的模型列表"""
