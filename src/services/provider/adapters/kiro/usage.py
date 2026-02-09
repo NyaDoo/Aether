@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from typing import Any
@@ -25,6 +26,21 @@ from src.services.provider.adapters.kiro.token_manager import (
     is_token_expired,
     refresh_access_token,
 )
+
+
+class KiroAccountBannedException(Exception):
+    """Kiro 账户被封禁异常"""
+
+    def __init__(
+        self,
+        message: str = "账户已封禁",
+        status_code: int = 403,
+        reason: str | None = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.reason = reason
 
 
 async def fetch_kiro_usage_limits(
@@ -97,9 +113,36 @@ async def fetch_kiro_usage_limits(
     response = await client.get(url, headers=headers, timeout=httpx.Timeout(30.0))
 
     if response.status_code != 200:
+        response_text = (response.text or "").strip()
+
+        # 检测账户封禁（403/423 + 特定错误信息）
+        is_banned = False
+        ban_reason = None
+        if response.status_code in (403, 423):
+            # 检测封禁相关错误（正则模式，通过 re.search 匹配）
+            banned_keywords = [
+                "AccountSuspendedException",
+                "account.*suspend",
+                "account.*banned",
+                "account.*disabled",
+                "account.*access.*denied",
+            ]
+            for keyword in banned_keywords:
+                if re.search(keyword, response_text, re.IGNORECASE):
+                    is_banned = True
+                    ban_reason = (
+                        response_text[:200] if response_text else f"HTTP {response.status_code}"
+                    )
+                    break
+            if not is_banned and response.status_code == 423:
+                # 423 Locked 通常表示账户被锁定/封禁
+                is_banned = True
+                ban_reason = response_text[:200] if response_text else "HTTP 423 Locked"
+
         error_msg = {
             401: "认证失败，Token 无效或已过期",
-            403: "权限不足，无法获取使用额度",
+            403: "账户已封禁" if is_banned else "权限不足，无法获取使用额度",
+            423: "账户已封禁",
             429: "请求过于频繁，已被限流",
         }.get(response.status_code, "获取使用额度失败")
         if 500 <= response.status_code < 600:
@@ -107,8 +150,17 @@ async def fetch_kiro_usage_limits(
         logger.debug(
             "kiro usage API error: HTTP {} | {}",
             response.status_code,
-            (response.text or "").strip()[:200],
+            response_text[:200],
         )
+
+        # 如果检测到封禁，抛出带有封禁标记的异常
+        if is_banned:
+            raise KiroAccountBannedException(
+                message=error_msg,
+                status_code=response.status_code,
+                reason=ban_reason,
+            )
+
         raise RuntimeError(f"{error_msg}: HTTP {response.status_code}")
 
     try:
@@ -178,6 +230,7 @@ def parse_kiro_usage_response(data: dict) -> dict | None:
 
 
 __all__ = [
+    "KiroAccountBannedException",
     "fetch_kiro_usage_limits",
     "parse_kiro_usage_response",
 ]
