@@ -170,8 +170,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=base
+          cache-to: type=gha,mode=max,scope=base
           platforms: linux/amd64,linux/arm64
 
   build-app:
@@ -208,12 +208,13 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }}
             docker.io/fawney19/aether
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=pre,enable=${{ contains(github.ref, '-') }}
+            type=raw,value=fix,enable=${{ contains(github.ref, '-fix') }}
             type=sha,prefix=
+          flavor: |
+            latest=auto
 
       - name: Extract version from tag
         id: version
@@ -250,6 +251,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          no-cache-filters: builder
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,mode=min,scope=app
           platforms: linux/amd64,linux/arm64
