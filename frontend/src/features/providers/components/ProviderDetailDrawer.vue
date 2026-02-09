@@ -234,7 +234,11 @@
                         </div>
                         <div class="flex flex-col min-w-0">
                           <div class="flex items-center gap-1.5">
-                            <span class="text-sm font-medium truncate">{{ key.name || '未命名密钥' }}</span>
+                            <span
+                              class="text-sm font-medium truncate cursor-pointer hover:text-primary transition-colors"
+                              title="点击复制"
+                              @click.stop="copyToClipboard(key.name || '未命名密钥')"
+                            >{{ key.name || '未命名密钥' }}</span>
                             <!-- OAuth 订阅类型标签 (Codex) -->
                             <Badge
                               v-if="key.oauth_plan_type"
