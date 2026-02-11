@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response};
@@ -113,6 +112,13 @@ pub async fn handle_delegate(
         .map(|v| v.eq_ignore_ascii_case("gzip"))
         .unwrap_or(false);
 
+    let req_content_length: u64 = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     let meta_ms = meta_start.elapsed().as_millis() as u64;
 
     // ── Target validation ──
@@ -143,54 +149,6 @@ pub async fn handle_delegate(
 
     debug!(method = %method_str, url = %target_url, is_gzip, "delegate request");
 
-    // ── Read body + decompress if gzip ──
-    let body_read_start = Instant::now();
-    const MAX_BODY: usize = 10 * 1024 * 1024;
-    let body_bytes = match Limited::new(req.into_body(), MAX_BODY).collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            warn!(error = %e, "delegate failed to read request body");
-            return error_response(413, "payload_too_large", "request body exceeds 10MB limit");
-        }
-    };
-    let body_read_ms = body_read_start.elapsed().as_millis() as u64;
-    let wire_size = body_bytes.len() as u64;
-
-    let decompress_start = Instant::now();
-    const MAX_DECOMPRESSED: usize = 50 * 1024 * 1024; // 50 MB
-    let upstream_body: Option<Vec<u8>> = if body_bytes.is_empty() {
-        None
-    } else if is_gzip {
-        let decoder = flate2::read::GzDecoder::new(&body_bytes[..]);
-        let mut decompressed = Vec::with_capacity((body_bytes.len() * 4).min(MAX_DECOMPRESSED));
-        match decoder
-            .take(MAX_DECOMPRESSED as u64 + 1)
-            .read_to_end(&mut decompressed)
-        {
-            Ok(n) if n > MAX_DECOMPRESSED => {
-                warn!(
-                    wire_size = body_bytes.len(),
-                    decompressed_size = n,
-                    "delegate decompressed body exceeds limit"
-                );
-                return error_response(
-                    413,
-                    "payload_too_large",
-                    "decompressed body exceeds 50MB limit",
-                );
-            }
-            Ok(_) => Some(decompressed),
-            Err(e) => {
-                warn!(error = %e, "delegate gzip decompression failed");
-                return error_response(400, "bad_request", "gzip decompression failed");
-            }
-        }
-    } else {
-        Some(body_bytes.to_vec())
-    };
-    let decompress_ms = decompress_start.elapsed().as_millis() as u64;
-    let body_size = upstream_body.as_ref().map(|b| b.len() as u64).unwrap_or(0);
-
     // ── Build upstream request ──
     let method = match method_str.parse::<reqwest::Method>() {
         Ok(m) => m,
@@ -211,8 +169,39 @@ pub async fn handle_delegate(
         upstream_req = upstream_req.header(name.as_str(), value.as_str());
     }
 
-    if let Some(body) = upstream_body {
-        upstream_req = upstream_req.body(body);
+    // ── Stream body passthrough ──
+    // When body is gzip-compressed, forward it directly to upstream with
+    // Content-Encoding: gzip header — no collect/decompress needed.
+    // All major AI API providers (Anthropic, OpenAI, Google) accept gzip request bodies.
+    let wire_size: u64;
+    if is_gzip {
+        // Passthrough: stream the gzip body directly to upstream
+        upstream_req = upstream_req.header("content-encoding", "gzip");
+        let body_stream = req.into_body();
+        let byte_stream = http_body_util::BodyStream::new(body_stream).filter_map(|result| async {
+            match result {
+                Ok(frame) => frame.into_data().ok().map(Ok),
+                Err(e) => Some(Err(e)),
+            }
+        });
+        let reqwest_body = reqwest::Body::wrap_stream(byte_stream);
+        upstream_req = upstream_req.body(reqwest_body);
+        // wire_size will be reported from Content-Length if available, otherwise 0
+        wire_size = req_content_length;
+    } else {
+        // Non-gzip: read body into memory (legacy path)
+        const MAX_BODY: usize = 10 * 1024 * 1024;
+        let body_bytes = match Limited::new(req.into_body(), MAX_BODY).collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                warn!(error = %e, "delegate failed to read request body");
+                return error_response(413, "payload_too_large", "request body exceeds 10MB limit");
+            }
+        };
+        wire_size = body_bytes.len() as u64;
+        if !body_bytes.is_empty() {
+            upstream_req = upstream_req.body(body_bytes.to_vec());
+        }
     }
 
     // ── Send upstream request ──
@@ -247,17 +236,15 @@ pub async fn handle_delegate(
         upstream_ms,
         total_ms,
         wire_size,
-        body_size,
+        is_gzip,
         "delegate upstream response"
     );
 
     let timing = serde_json::json!({
         "auth_ms": auth_ms,
         "meta_ms": meta_ms,
-        "body_read_ms": body_read_ms,
-        "decompress_ms": decompress_ms,
         "wire_size": wire_size,
-        "body_size": body_size,
+        "passthrough": is_gzip,
         "dns_ms": dns_ms,
         "upstream_ms": upstream_ms,
         "total_ms": total_ms,
@@ -268,7 +255,7 @@ pub async fn handle_delegate(
         .map_ok(Frame::data)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) });
 
-    let stream_body: BoxBody = StreamBody::new(body_stream).boxed();
+    let stream_body: BoxBody = BodyExt::boxed(StreamBody::new(body_stream));
 
     let mut builder = Response::builder().status(status);
     for (name, value) in resp_headers.iter() {

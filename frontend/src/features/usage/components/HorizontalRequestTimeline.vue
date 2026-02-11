@@ -466,7 +466,7 @@ const proxyTimingBreakdown = (proxy: Record<string, any>): string => {
 
   const parts: string[] = []
 
-  // 读取 + 解压合并显示（含压缩率）
+  // 兼容旧版 timing（含 body_read_ms/decompress_ms）
   const readDecompress = (t.body_read_ms || 0) + (t.decompress_ms || 0)
   if (readDecompress > 0) {
     let label = `读取 ${formatLatency(readDecompress)}`
