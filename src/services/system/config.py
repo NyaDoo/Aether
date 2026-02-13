@@ -85,6 +85,15 @@ class SystemConfigService:
 
     # 默认配置
     DEFAULT_CONFIGS = {
+        # 站点信息
+        "site_name": {
+            "value": "Aether",
+            "description": "站点名称，显示在页面标题、导航栏、登录页面和邮件中",
+        },
+        "site_subtitle": {
+            "value": "AI Gateway",
+            "description": "站点副标题，显示在导航栏品牌名称下方",
+        },
         REQUEST_RECORD_LEVEL_KEY: {
             "value": RequestRecordLevel.BASIC.value,
             "description": "请求记录级别：basic(基本信息), headers(含请求/响应头), full(完整请求/响应)",

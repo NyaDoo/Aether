@@ -6,6 +6,60 @@
     />
 
     <div class="mt-6 space-y-6">
+      <!-- 站点信息 -->
+      <CardSection
+        title="站点信息"
+        description="自定义站点名称和副标题，影响导航栏、登录页、指南页面和邮件等全站显示"
+      >
+        <template #actions>
+          <Button
+            size="sm"
+            :disabled="siteInfoLoading || !hasSiteInfoChanges"
+            @click="saveSiteInfo"
+          >
+            {{ siteInfoLoading ? '保存中...' : '保存' }}
+          </Button>
+        </template>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div>
+            <Label
+              for="site-name"
+              class="block text-sm font-medium"
+            >
+              站点名称
+            </Label>
+            <Input
+              id="site-name"
+              v-model="systemConfig.site_name"
+              type="text"
+              placeholder="Aether"
+              class="mt-1"
+            />
+            <p class="mt-1 text-xs text-muted-foreground">
+              显示在导航栏、登录页标题和邮件中
+            </p>
+          </div>
+          <div>
+            <Label
+              for="site-subtitle"
+              class="block text-sm font-medium"
+            >
+              站点副标题
+            </Label>
+            <Input
+              id="site-subtitle"
+              v-model="systemConfig.site_subtitle"
+              type="text"
+              placeholder="AI Gateway"
+              class="mt-1"
+            />
+            <p class="mt-1 text-xs text-muted-foreground">
+              显示在导航栏品牌名称下方
+            </p>
+          </div>
+        </div>
+      </CardSection>
+
       <!-- 配置导出/导入 -->
       <CardSection
         title="配置管理"
@@ -1060,6 +1114,9 @@ const { success, error } = useToast()
 const proxyNodesStore = useProxyNodesStore()
 
 interface SystemConfig {
+  // 站点信息
+  site_name: string
+  site_subtitle: string
   // 网络代理
   system_proxy_node_id: string | null
   // 基础配置
@@ -1092,6 +1149,7 @@ interface SystemConfig {
   enable_oauth_token_refresh: boolean
 }
 
+const siteInfoLoading = ref(false)
 const proxyConfigLoading = ref(false)
 const basicConfigLoading = ref(false)
 const logConfigLoading = ref(false)
@@ -1123,6 +1181,9 @@ const usersMergeModeSelectOpen = ref(false)
 const systemVersion = ref<string>('')
 
 const systemConfig = ref<SystemConfig>({
+  // 站点信息
+  site_name: 'Aether',
+  site_subtitle: 'AI Gateway',
   // 网络代理
   system_proxy_node_id: null,
   // 基础配置
@@ -1159,6 +1220,14 @@ const systemConfig = ref<SystemConfig>({
 const originalConfig = ref<SystemConfig | null>(null)
 
 // 检测各模块是否有变动
+const hasSiteInfoChanges = computed(() => {
+  if (!originalConfig.value) return false
+  return (
+    systemConfig.value.site_name !== originalConfig.value.site_name ||
+    systemConfig.value.site_subtitle !== originalConfig.value.site_subtitle
+  )
+})
+
 const hasBasicConfigChanges = computed(() => {
   if (!originalConfig.value) return false
   return (
@@ -1238,6 +1307,9 @@ async function loadSystemVersion() {
 async function loadSystemConfig() {
   try {
     const configs = [
+      // 站点信息
+      'site_name',
+      'site_subtitle',
       // 网络代理
       'system_proxy_node_id',
       // 基础配置
@@ -1297,6 +1369,31 @@ const hasProxyConfigChanges = computed(() => {
   if (!originalConfig.value) return false
   return systemConfig.value.system_proxy_node_id !== originalConfig.value.system_proxy_node_id
 })
+
+async function saveSiteInfo() {
+  siteInfoLoading.value = true
+  try {
+    const configItems = [
+      { key: 'site_name', value: systemConfig.value.site_name, description: '站点名称' },
+      { key: 'site_subtitle', value: systemConfig.value.site_subtitle, description: '站点副标题' },
+    ]
+    await Promise.all(
+      configItems.map(item =>
+        adminApi.updateSystemConfig(item.key, item.value, item.description)
+      )
+    )
+    if (originalConfig.value) {
+      originalConfig.value.site_name = systemConfig.value.site_name
+      originalConfig.value.site_subtitle = systemConfig.value.site_subtitle
+    }
+    success('站点信息已保存，刷新页面后生效')
+  } catch (err) {
+    error('保存站点信息失败')
+    log.error('保存站点信息失败:', err)
+  } finally {
+    siteInfoLoading.value = false
+  }
+}
 
 async function saveProxyConfig() {
   proxyConfigLoading.value = true
@@ -1755,7 +1852,7 @@ async function handleExportConfig() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `aether-config-${new Date().toISOString().slice(0, 10)}.json`
+    a.download = `${systemConfig.value.site_name.toLowerCase()}-config-${new Date().toISOString().slice(0, 10)}.json`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
@@ -1847,7 +1944,7 @@ async function handleExportUsers() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `aether-users-${new Date().toISOString().slice(0, 10)}.json`
+    a.download = `${systemConfig.value.site_name.toLowerCase()}-users-${new Date().toISOString().slice(0, 10)}.json`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)

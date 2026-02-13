@@ -2,6 +2,9 @@
 import { RouterLink } from 'vue-router'
 import { ArrowRight, Server, Layers, Key, Box, ChevronRight } from 'lucide-vue-next'
 import { coreConcepts, apiFormats, configSteps, panelClasses } from './guide-config'
+import { useSiteInfo } from '@/composables/useSiteInfo'
+
+const { siteName } = useSiteInfo()
 
 withDefaults(
   defineProps<{
@@ -41,10 +44,10 @@ const conceptIconColors = {
     <!-- 标题区域 -->
     <div class="space-y-4">
       <h1 class="text-3xl font-bold text-[#262624] dark:text-[#f1ead8]">
-        欢迎使用 Aether
+        欢迎使用 {{ siteName }}
       </h1>
       <p class="text-lg text-[#666663] dark:text-[#a3a094]">
-        Aether 是一个 AI API 网关，帮助你统一管理多个 AI 服务供应商，实现负载均衡、访问控制和用量统计。
+        {{ siteName }} 是一个 AI API 网关，帮助你统一管理多个 AI 服务供应商，实现负载均衡、访问控制和用量统计。
       </p>
     </div>
 
@@ -54,7 +57,7 @@ const conceptIconColors = {
         核心概念
       </h2>
       <p class="text-[#666663] dark:text-[#a3a094]">
-        理解这四个核心概念，是配置 Aether 的基础：
+        理解这四个核心概念，是配置 {{ siteName }} 的基础：
       </p>
 
       <div class="grid gap-4 sm:grid-cols-2">
@@ -161,7 +164,7 @@ const conceptIconColors = {
         支持的 API 格式
       </h2>
       <p class="text-[#666663] dark:text-[#a3a094]">
-        Aether 支持多种 API 格式，可以作为不同客户端的统一入口：
+        {{ siteName }} 支持多种 API 格式，可以作为不同客户端的统一入口：
       </p>
 
       <div

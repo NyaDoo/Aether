@@ -2,6 +2,9 @@
 import { ref, computed } from 'vue'
 import { Search, ChevronDown, ExternalLink, HelpCircle } from 'lucide-vue-next'
 import { faqItems, panelClasses } from './guide-config'
+import { useSiteInfo } from '@/composables/useSiteInfo'
+
+const { siteName } = useSiteInfo()
 
 withDefaults(
   defineProps<{
@@ -70,7 +73,7 @@ function toggleAll() {
         常见问题
       </h1>
       <p class="text-lg text-[#666663] dark:text-[#a3a094]">
-        关于 Aether 使用和配置的常见问题解答。
+        关于 {{ siteName }} 使用和配置的常见问题解答。
       </p>
     </div>
 

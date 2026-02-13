@@ -41,9 +41,9 @@
           />
           <div class="flex flex-col justify-center">
             <h1 class="text-lg font-bold text-[#191919] dark:text-white leading-none">
-              Aether
+              {{ siteName }}
             </h1>
-            <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1.5 font-medium tracking-wide">Multi Private Gateway</span>
+            <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1.5 font-medium tracking-wide">{{ siteSubtitle }}</span>
           </div>
         </RouterLink>
       </div>
@@ -105,9 +105,9 @@
               />
               <div class="flex flex-col justify-center">
                 <h1 class="text-lg font-bold text-[#191919] dark:text-white leading-none">
-                  Aether
+                  {{ siteName }}
                 </h1>
-                <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1.5 font-medium tracking-wide">Multi Private Gateway</span>
+                <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1.5 font-medium tracking-wide">{{ siteSubtitle }}</span>
               </div>
             </RouterLink>
 
@@ -333,6 +333,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useModuleStore } from '@/stores/modules'
 import { useDarkMode } from '@/composables/useDarkMode'
+import { useSiteInfo } from '@/composables/useSiteInfo'
 import { isDemoMode } from '@/config/demo'
 import { adminApi, type CheckUpdateResponse } from '@/api/admin'
 import Button from '@/components/ui/button.vue'
@@ -378,6 +379,7 @@ const route = useRoute()
 const authStore = useAuthStore()
 const moduleStore = useModuleStore()
 const { themeMode, toggleDarkMode } = useDarkMode()
+const { siteName, siteSubtitle } = useSiteInfo()
 const isDemo = computed(() => isDemoMode())
 
 const showAuthError = ref(false)

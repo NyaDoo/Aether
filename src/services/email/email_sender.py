@@ -130,8 +130,10 @@ class EmailSenderService:
             return False, error
 
         # 生成邮件内容
-        # 优先使用 email_app_name，否则回退到 smtp_from_name
+        # 优先使用 email_app_name，否则回退到 site_name，最后回退到 smtp_from_name
         app_name = SystemConfigService.get_config(db, "email_app_name", default=None)
+        if not app_name:
+            app_name = SystemConfigService.get_config(db, "site_name", default=None)
         if not app_name:
             app_name = SystemConfigService.get_config(db, "smtp_from_name", default="Aether")
 

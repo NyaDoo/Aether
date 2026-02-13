@@ -39,9 +39,19 @@ from src.models.endpoint_models import (
     PublicHealthEvent,
 )
 from src.services.health.endpoint import EndpointHealthService
+from src.services.system.config import SystemConfigService
 
 router = APIRouter(prefix="/api/public", tags=["System Catalog"])
 pipeline = ApiRequestPipeline()
+
+
+@router.get("/site-info")
+def get_site_info(db: Session = Depends(get_db)) -> dict[str, str]:
+    """获取站点基本信息（公开接口，无需认证）"""
+    return {
+        "site_name": SystemConfigService.get_config(db, "site_name", default="Aether"),
+        "site_subtitle": SystemConfigService.get_config(db, "site_subtitle", default="AI Gateway"),
+    }
 
 
 @router.get("/providers", response_model=list[PublicProviderResponse])

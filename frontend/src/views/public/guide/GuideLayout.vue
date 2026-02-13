@@ -14,9 +14,9 @@
           />
           <div class="flex flex-col justify-center">
             <h1 class="text-base sm:text-lg font-bold text-[#191919] dark:text-white leading-none">
-              Aether
+              {{ siteName }}
             </h1>
-            <span class="text-[9px] sm:text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1 sm:mt-1.5 font-medium tracking-wide">AI Gateway</span>
+            <span class="text-[9px] sm:text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1 sm:mt-1.5 font-medium tracking-wide">{{ siteSubtitle }}</span>
           </div>
         </RouterLink>
 
@@ -157,7 +157,7 @@
           <!-- Base URL Input -->
           <div class="p-4 border-t border-[#e5e4df] dark:border-[rgba(227,224,211,0.12)]">
             <label class="block text-xs font-medium text-[#666663] dark:text-muted-foreground mb-2">
-              Aether Base URL
+              {{ siteName }} Base URL
             </label>
             <input
               v-model="baseUrl"
@@ -200,10 +200,12 @@ import {
 import GithubIcon from '@/components/icons/GithubIcon.vue'
 import HeaderLogo from '@/components/HeaderLogo.vue'
 import { useDarkMode } from '@/composables/useDarkMode'
+import { useSiteInfo } from '@/composables/useSiteInfo'
 import { guideNavItems } from './guide-config'
 
 const route = useRoute()
 const { themeMode, toggleDarkMode } = useDarkMode()
+const { siteName, siteSubtitle } = useSiteInfo()
 
 const showMobileNav = ref(false)
 const baseUrl = ref(typeof window !== 'undefined' ? window.location.origin : 'https://your-aether.com')

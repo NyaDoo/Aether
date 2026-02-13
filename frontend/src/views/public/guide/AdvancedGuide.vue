@@ -2,6 +2,9 @@
 import { RouterLink } from 'vue-router'
 import { ArrowRight, Shuffle, FileCode, Globe, Shield, Check, Info, AlertTriangle, Settings } from 'lucide-vue-next'
 import { panelClasses } from './guide-config'
+import { useSiteInfo } from '@/composables/useSiteInfo'
+
+const { siteName } = useSiteInfo()
 
 withDefaults(
   defineProps<{
@@ -162,7 +165,7 @@ const systemSettings = [
         高级功能
       </h1>
       <p class="text-lg text-[#666663] dark:text-[#a3a094]">
-        Aether 提供了一些高级功能，帮助你实现更灵活的 API 管理。
+        {{ siteName }} 提供了一些高级功能，帮助你实现更灵活的 API 管理。
       </p>
     </div>
 

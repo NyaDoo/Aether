@@ -34,9 +34,9 @@
           />
           <div class="flex flex-col justify-center">
             <h1 class="text-base sm:text-lg font-bold text-[#191919] dark:text-white leading-none">
-              Aether
+              {{ siteName }}
             </h1>
-            <span class="text-[9px] sm:text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1 sm:mt-1.5 font-medium tracking-wide">AI Gateway</span>
+            <span class="text-[9px] sm:text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1 sm:mt-1.5 font-medium tracking-wide">{{ siteSubtitle }}</span>
           </div>
         </div>
 
@@ -104,9 +104,9 @@
             />
             <div class="flex flex-col justify-center">
               <h1 class="text-lg font-bold text-[#191919] dark:text-white leading-none">
-                Aether
+                {{ siteName }}
               </h1>
-              <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1.5 font-medium tracking-wide">AI Gateway</span>
+              <span class="text-[10px] text-[#91918d] dark:text-muted-foreground leading-none mt-1.5 font-medium tracking-wide">{{ siteSubtitle }}</span>
             </div>
           </div>
 
@@ -458,6 +458,7 @@ import GithubIcon from '@/components/icons/GithubIcon.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useClipboard } from '@/composables/useClipboard'
+import { useSiteInfo } from '@/composables/useSiteInfo'
 import LoginDialog from '@/features/auth/components/LoginDialog.vue'
 import RippleLogo from '@/components/RippleLogo.vue'
 import HeaderLogo from '@/components/HeaderLogo.vue'
@@ -483,6 +484,7 @@ import {
 const authStore = useAuthStore()
 const { isDark, themeMode, toggleDarkMode } = useDarkMode()
 const { copyToClipboard } = useClipboard()
+const { siteName, siteSubtitle } = useSiteInfo()
 
 const dashboardPath = computed(() =>
   authStore.user?.role === 'admin' ? '/admin/dashboard' : '/dashboard'
@@ -566,10 +568,10 @@ const { claudeConfig, codexConfig, codexAuthConfig, geminiEnvConfig, geminiSetti
 // Dialog state
 const showLoginDialog = ref(false)
 
-// Typewriter effect for "Aether"
+// Typewriter effect for site name
 const aetherText = ref('')
 const showCursor = ref(true)
-const typewriterFullText = 'Aether'
+const typewriterFullText = computed(() => siteName.value)
 let typewriterTimer: ReturnType<typeof setTimeout> | null = null
 const hasTypewriterStarted = ref(false)
 
@@ -578,19 +580,20 @@ const startTypewriter = () => {
   hasTypewriterStarted.value = true
   aetherText.value = ''
   showCursor.value = true
-  
+
   const typeSpeed = 200
   const deleteSpeed = 120
   const pauseAfterType = 3500
   const pauseAfterDelete = 1000
-  
+
   const typeLoop = () => {
     let index = 0
-    
+    const fullText = typewriterFullText.value
+
     // Type phase
     const typeNextChar = () => {
-      if (index < typewriterFullText.length) {
-        aetherText.value = typewriterFullText.slice(0, index + 1)
+      if (index < fullText.length) {
+        aetherText.value = fullText.slice(0, index + 1)
         index++
         typewriterTimer = setTimeout(typeNextChar, typeSpeed)
       } else {
@@ -598,7 +601,7 @@ const startTypewriter = () => {
         typewriterTimer = setTimeout(deleteChars, pauseAfterType)
       }
     }
-    
+
     // Delete phase
     const deleteChars = () => {
       if (aetherText.value.length > 0) {
@@ -609,7 +612,7 @@ const startTypewriter = () => {
         typewriterTimer = setTimeout(typeLoop, pauseAfterDelete)
       }
     }
-    
+
     typeNextChar()
   }
   

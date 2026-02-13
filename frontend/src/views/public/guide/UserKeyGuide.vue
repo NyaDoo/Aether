@@ -2,6 +2,9 @@
 import { RouterLink } from 'vue-router'
 import { ArrowRight, Users, Key, Shield, Check, Info, AlertTriangle, Clock } from 'lucide-vue-next'
 import { panelClasses } from './guide-config'
+import { useSiteInfo } from '@/composables/useSiteInfo'
+
+const { siteName } = useSiteInfo()
 
 withDefaults(
   defineProps<{
@@ -46,7 +49,7 @@ const roleComparison = [
         用户与密钥
       </h1>
       <p class="text-lg text-[#666663] dark:text-[#a3a094]">
-        用户和 API Key 是 Aether 的访问控制核心。通过用户管理分配角色权限，通过 Key 管理控制 API 访问。
+        用户和 API Key 是 {{ siteName }} 的访问控制核心。通过用户管理分配角色权限，通过 Key 管理控制 API 访问。
       </p>
     </div>
 
@@ -192,7 +195,7 @@ const roleComparison = [
         <ul class="space-y-3 text-sm text-[#666663] dark:text-[#a3a094]">
           <li class="flex items-start gap-2">
             <Check class="h-4 w-4 text-green-500 mt-0.5 flex-shrink-0" />
-            <span>API Key 是用户调用 Aether API 的凭证</span>
+            <span>API Key 是用户调用 {{ siteName }} API 的凭证</span>
           </li>
           <li class="flex items-start gap-2">
             <Check class="h-4 w-4 text-green-500 mt-0.5 flex-shrink-0" />

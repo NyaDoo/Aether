@@ -9,11 +9,11 @@
       <div class="flex flex-col items-center text-center mb-8">
         <img
           src="/aether_adaptive.svg"
-          alt="Aether"
+          :alt="siteName"
           class="h-16 w-16 mb-4"
         >
         <h2 class="text-2xl font-semibold text-foreground">
-          登录到 Aether
+          登录到 {{ siteName }}
         </h2>
       </div>
 
@@ -236,6 +236,7 @@ import Input from '@/components/ui/input.vue'
 import Label from '@/components/ui/label.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/composables/useToast'
+import { useSiteInfo } from '@/composables/useSiteInfo'
 import { isDemoMode, DEMO_ACCOUNTS } from '@/config/demo'
 import RegisterDialog from './RegisterDialog.vue'
 import { authApi } from '@/api/auth'
@@ -254,6 +255,7 @@ const emit = defineEmits<{
 const router = useRouter()
 const authStore = useAuthStore()
 const { success: showSuccess, warning: showWarning, error: showError } = useToast()
+const { siteName } = useSiteInfo()
 
 const isOpen = ref(props.modelValue)
 const isDemo = computed(() => isDemoMode())

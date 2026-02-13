@@ -2,6 +2,9 @@
 import { RouterLink } from 'vue-router'
 import { ArrowRight, Server, Settings, Check, AlertTriangle, Info } from 'lucide-vue-next'
 import { apiFormats, panelClasses } from './guide-config'
+import { useSiteInfo } from '@/composables/useSiteInfo'
+
+const { siteName } = useSiteInfo()
 
 withDefaults(
   defineProps<{
@@ -73,7 +76,7 @@ const providerExamples = [
         供应商管理
       </h1>
       <p class="text-lg text-[#666663] dark:text-[#a3a094]">
-        供应商和端点是 Aether 的基础配置，决定了系统可以调用哪些 AI 服务。
+        供应商和端点是 {{ siteName }} 的基础配置，决定了系统可以调用哪些 AI 服务。
       </p>
     </div>
 
