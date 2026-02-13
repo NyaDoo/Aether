@@ -15,8 +15,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
-from src.core.api_format.conversion.internal import InternalRequest, ToolResultBlock, ToolUseBlock
 from src.core.api_format.conversion.exceptions import FormatConversionError
+from src.core.api_format.conversion.internal import InternalRequest, ToolResultBlock, ToolUseBlock
 from src.core.api_format.conversion.normalizer import FormatNormalizer
 from src.core.api_format.conversion.stream_state import StreamState
 from src.core.logger import logger
