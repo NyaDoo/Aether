@@ -8,6 +8,7 @@ aether-proxy 通过此端点建立 tunnel 连接。
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -37,11 +38,58 @@ def _get_node_lock(node_id: str) -> asyncio.Lock:
 # 单帧最大 64 MB -- AI API 请求体可能包含多张 base64 图片，需要足够余量
 _MAX_FRAME_SIZE = 64 * 1024 * 1024
 
-# WebSocket 空闲超时（秒）-- 需覆盖客户端 stale_timeout(45s) + 重连延迟(最长30s) 的窗口期
-_IDLE_TIMEOUT = 90.0
+# 默认 WebSocket 空闲超时（秒）-- 需覆盖客户端 stale_timeout(45s) + 重连延迟窗口
+_DEFAULT_IDLE_TIMEOUT = 90.0
 
-# 服务端应用层 ping 间隔（秒）-- 与客户端 ping 间隔一致，确保高频心跳
-_SERVER_PING_INTERVAL = 15.0
+# 默认服务端应用层 ping 间隔（秒）-- 与客户端 ping 间隔一致，确保高频心跳
+_DEFAULT_SERVER_PING_INTERVAL = 15.0
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    """读取并校验浮点环境变量，非法时回退默认值。"""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("invalid {}={}, fallback to {}", name, raw, default)
+        return default
+    if value < min_value or value > max_value:
+        logger.warning(
+            "{}={} out of range [{}, {}], fallback to {}",
+            name,
+            value,
+            min_value,
+            max_value,
+            default,
+        )
+        return default
+    return value
+
+
+# 允许通过环境变量在弱网环境下调大容忍窗口（无需改代码）
+_SERVER_PING_INTERVAL = _env_float(
+    "AETHER_PROXY_TUNNEL_SERVER_PING_INTERVAL",
+    _DEFAULT_SERVER_PING_INTERVAL,
+    min_value=5.0,
+    max_value=120.0,
+)
+_IDLE_TIMEOUT = _env_float(
+    "AETHER_PROXY_TUNNEL_SERVER_IDLE_TIMEOUT",
+    _DEFAULT_IDLE_TIMEOUT,
+    min_value=30.0,
+    max_value=600.0,
+)
+
+# 避免 idle timeout 过小导致 ping 尚未生效就被服务端断开
+if _IDLE_TIMEOUT <= _SERVER_PING_INTERVAL * 2:
+    adjusted_idle = max(_SERVER_PING_INTERVAL * 3, 30.0)
+    logger.warning(
+        "AETHER_PROXY_TUNNEL_SERVER_IDLE_TIMEOUT too low for ping interval, auto-adjust to {}",
+        adjusted_idle,
+    )
+    _IDLE_TIMEOUT = adjusted_idle
 
 
 async def _authenticate(ws: WebSocket) -> tuple[str, str] | None:

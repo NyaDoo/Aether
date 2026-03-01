@@ -202,21 +202,19 @@ pub struct Config {
     #[arg(long, env = "AETHER_PROXY_LOG_JSON", default_value_t = false)]
     pub log_json: bool,
 
-    /// Deprecated: reconnect now uses a fixed 1s delay. Kept for config compatibility.
+    /// Tunnel reconnect base delay in milliseconds (used by exponential backoff)
     #[arg(
         long,
         env = "AETHER_PROXY_TUNNEL_RECONNECT_BASE_MS",
-        default_value_t = 500,
-        hide = true
+        default_value_t = 500
     )]
     pub tunnel_reconnect_base_ms: u64,
 
-    /// Deprecated: reconnect now uses a fixed 1s delay. Kept for config compatibility.
+    /// Tunnel reconnect max delay in milliseconds (cap for exponential backoff)
     #[arg(
         long,
         env = "AETHER_PROXY_TUNNEL_RECONNECT_MAX_MS",
-        default_value_t = 30000,
-        hide = true
+        default_value_t = 30000
     )]
     pub tunnel_reconnect_max_ms: u64,
 

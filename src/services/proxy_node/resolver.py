@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import time
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -26,7 +27,10 @@ from src.core.logger import logger
 _proxy_node_cache: dict[str, tuple[dict[str, Any] | None, float]] = {}
 _PROXY_NODE_CACHE_TTL_SECONDS = 15.0
 _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS = 5.0  # 不可用节点使用更短的 TTL，加速恢复感知
+_PROXY_NODE_CACHE_TUNNEL_LOCAL_MISS_TTL_SECONDS = 0.5  # 本地 worker 无 tunnel 时，快速重试
 _PROXY_NODE_CACHE_MAX_SIZE = 256
+_TUNNEL_LOCAL_MISS_LOG_COOLDOWN_SECONDS = 30.0
+_tunnel_local_miss_log_next_at: dict[str, float] = {}
 
 
 def _get_proxy_node_info(node_id: str) -> dict[str, Any] | None:
@@ -74,9 +78,23 @@ def _get_proxy_node_info(node_id: str) -> dict[str, Any] | None:
 
             manager = get_tunnel_manager()
             if not manager.has_tunnel(node_id):
+                # 多 worker 部署时，DB 可能显示 ONLINE（其他 worker 有 tunnel），
+                # 但当前 worker 无本地连接，请求仍不可用。记录限频告警便于定位。
+                if now >= _tunnel_local_miss_log_next_at.get(node_id, 0.0):
+                    _tunnel_local_miss_log_next_at[node_id] = (
+                        now + _TUNNEL_LOCAL_MISS_LOG_COOLDOWN_SECONDS
+                    )
+                    logger.warning(
+                        "tunnel node {} has no local connection on pid={} "
+                        "(db_status={}, db_tunnel_connected={}), request may fail on this worker",
+                        node_id,
+                        os.getpid(),
+                        str(getattr(node, "status", "unknown")),
+                        bool(getattr(node, "tunnel_connected", False)),
+                    )
                 _proxy_node_cache[node_id] = (
                     None,
-                    now + _PROXY_NODE_CACHE_NEGATIVE_TTL_SECONDS,
+                    now + _PROXY_NODE_CACHE_TUNNEL_LOCAL_MISS_TTL_SECONDS,
                 )
                 return None
             value: dict[str, Any] = {
@@ -127,6 +145,7 @@ _SYSTEM_PROXY_CACHE_TTL = 60.0
 def invalidate_proxy_node_cache(node_id: str) -> None:
     """主动清除指定节点的信息缓存（tunnel 断开时调用，避免使用过期的连接状态）"""
     _proxy_node_cache.pop(node_id, None)
+    _tunnel_local_miss_log_next_at.pop(node_id, None)
 
 
 def invalidate_system_proxy_cache() -> None:
@@ -509,7 +528,10 @@ def resolve_proxy_info(proxy_config: dict[str, Any] | None) -> dict[str, Any] | 
         node_id = node_id.strip()
         node_info = _get_proxy_node_info(node_id)
         node_name = node_info.get("name", "unknown") if node_info else "offline"
-        return {"node_id": node_id, "node_name": node_name, "source": source}
+        info: dict[str, Any] = {"node_id": node_id, "node_name": node_name, "source": source}
+        if node_info and node_info.get("is_manual"):
+            info["is_manual"] = True
+        return info
 
     # 旧格式 URL 模式
     proxy_url = effective_config.get("url")

@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
-from src.models.database import ApiKey, Provider, Usage, User, UserModelUsageCount
+from src.models.database import ApiKey, Provider, ProxyNode, Usage, User, UserModelUsageCount
 from src.services.provider_keys.codex_quota_sync_dispatcher import (
     dispatch_codex_quota_sync_from_response_headers,
 )
@@ -20,6 +20,50 @@ from src.services.usage._recording_helpers import (
     update_existing_usage,
 )
 from src.services.usage._types import UsageCostInfo, UsageRecordParams
+
+
+def _extract_manual_proxy_node_id(metadata: dict[str, Any] | None) -> str | None:
+    """从 request_metadata 中提取手动代理节点 ID（仅 is_manual 节点）。
+
+    Tunnel 节点的统计由 aether-proxy 心跳上报，此处只处理手动节点以避免重复计数。
+    """
+    if not metadata:
+        return None
+    proxy = metadata.get("proxy")
+    if not isinstance(proxy, dict):
+        return None
+    if not proxy.get("is_manual"):
+        return None
+    node_id = proxy.get("node_id")
+    return node_id if isinstance(node_id, str) and node_id.strip() else None
+
+
+def _increment_proxy_node_requests(
+    db: Session,
+    node_counts: dict[str, int],
+    failed_counts: dict[str, int] | None = None,
+) -> None:
+    """批量递增手动代理节点的 total_requests 和 failed_requests（原子 SQL UPDATE）。"""
+    if not node_counts and not failed_counts:
+        return
+    from sqlalchemy import update
+
+    # 合并所有涉及的 node_id
+    all_ids = set(node_counts) | set(failed_counts or {})
+    for node_id in all_ids:
+        total = node_counts.get(node_id, 0)
+        failed = (failed_counts or {}).get(node_id, 0)
+        values: dict[str, Any] = {}
+        if total > 0:
+            values["total_requests"] = ProxyNode.total_requests + total
+        if failed > 0:
+            values["failed_requests"] = ProxyNode.failed_requests + failed
+        if values:
+            db.execute(
+                update(ProxyNode)
+                .where(ProxyNode.id == node_id, ProxyNode.is_manual == True)  # noqa: E712
+                .values(**values)
+            )
 
 
 class UsageRecordingMixin(UsageBillingIntegrationMixin):
@@ -404,6 +448,12 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 .values(monthly_used_usd=Provider.monthly_used_usd + actual_total_cost)
             )
 
+        # 更新手动代理节点请求计数（tunnel 节点由心跳上报，不在此处统计）
+        manual_node_id = _extract_manual_proxy_node_id(metadata)
+        if manual_node_id:
+            failed = {manual_node_id: 1} if status == "failed" else None
+            _increment_proxy_node_requests(db, {manual_node_id: 1}, failed)
+
         # 结算标记：终态请求写入 settled + finalized_at
         if status not in ("pending", "streaming"):
             usage.billing_status = "settled"
@@ -785,6 +835,8 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
             int
         )  # (user_id, model) -> count
         provider_costs: dict[str, float] = defaultdict(float)  # provider_id -> cost
+        proxy_node_counts: dict[str, int] = defaultdict(int)  # node_id -> request count
+        proxy_node_failed: dict[str, int] = defaultdict(int)  # node_id -> failed count
         quota_update_candidates: dict[str, dict[str, Any]] = {}
 
         # 合并所有需要处理的记录（用于预取 user/api_key）
@@ -944,6 +996,12 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     apikey_stats[key_id]["cost"] += total_cost
                     apikey_stats[key_id]["is_standalone"] = api_key.is_standalone
 
+                manual_nid = _extract_manual_proxy_node_id(record.get("metadata"))
+                if manual_nid:
+                    proxy_node_counts[manual_nid] += 1
+                    if record.get("status") == "failed":
+                        proxy_node_failed[manual_nid] += 1
+
                 provider_api_key_id = record.get("provider_api_key_id")
                 response_headers = record.get("response_headers")
                 if (
@@ -1004,6 +1062,12 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     apikey_stats[key_id]["requests"] += 1
                     apikey_stats[key_id]["cost"] += total_cost
                     apikey_stats[key_id]["is_standalone"] = api_key.is_standalone
+
+                manual_nid = _extract_manual_proxy_node_id(record.get("metadata"))
+                if manual_nid:
+                    proxy_node_counts[manual_nid] += 1
+                    if record.get("status") == "failed":
+                        proxy_node_failed[manual_nid] += 1
 
                 provider_api_key_id = record.get("provider_api_key_id")
                 response_headers = record.get("response_headers")
@@ -1129,6 +1193,9 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                         updated_at=sql_func.now(),
                     )
                 )
+
+        # 批量更新手动代理节点请求计数
+        _increment_proxy_node_requests(db, proxy_node_counts, proxy_node_failed)
 
         # 配额头实时同步：同一 key 仅取本批次最后一组响应头并执行一次对比更新。
         for provider_api_key_id, response_headers in quota_update_candidates.items():

@@ -76,15 +76,18 @@ async def _on_startup() -> None:
     """启动心跳检测调度器"""
     import logging
 
+    from src.config import config
     from src.services.proxy_node.health_scheduler import get_proxy_node_health_scheduler
     from src.utils.task_coordinator import StartupTaskCoordinator
 
     logger = logging.getLogger("aether.modules.proxy_nodes")
 
-    # 服务端启动时，TunnelManager 内存为空，所有 tunnel 连接都需要重新建立。
-    # 重置 DB 中残留的 tunnel_connected=True 状态，避免 health_scheduler
-    # 误将未连接的节点标记为 ONLINE。
-    _reset_tunnel_connected_on_startup()
+    if config.worker_processes > 1:
+        logger.warning(
+            "检测到 WEB_CONCURRENCY={}。Proxy tunnel 连接是进程内资源，"
+            "多 worker 场景可能出现节点显示 ONLINE 但当前 worker 无可用 tunnel 的情况。",
+            config.worker_processes,
+        )
 
     from src.clients import get_redis_client
 
@@ -94,6 +97,9 @@ async def _on_startup() -> None:
     proxy_node_health_scheduler = get_proxy_node_health_scheduler()
     active = await task_coordinator.acquire("proxy_node_health")
     if active:
+        # 仅 leader worker 执行启动重置，避免多 worker 并发启动/重启时
+        # 把其他 worker 已建立的 tunnel 状态错误重置为 OFFLINE。
+        _reset_tunnel_connected_on_startup()
         logger.info("启动 ProxyNode 心跳检测调度器...")
         await proxy_node_health_scheduler.start()
     else:
