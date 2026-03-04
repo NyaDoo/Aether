@@ -642,6 +642,10 @@ const normalizeTimelineStatus = (value: unknown): CandidateRecord['status'] => {
   return 'failed'
 }
 
+const isPlannedOnlyStatus = (status: CandidateRecord['status']): boolean => {
+  return status === 'available' || status === 'unused'
+}
+
 // 候选时间线（按实际执行顺序排序）
 const rawTimeline = computed<CandidateRecord[]>(() => {
   if (!trace.value) return []
@@ -656,6 +660,11 @@ const rawTimeline = computed<CandidateRecord[]>(() => {
       }
       return a.retry_index - b.retry_index
     })
+})
+
+// 仅保留“已进入执行链路”的节点，过滤预创建但未执行的 available/unused 占位记录。
+const executableTimeline = computed<CandidateRecord[]>(() => {
+  return rawTimeline.value.filter(candidate => !isPlannedOnlyStatus(candidate.status))
 })
 
 const schedulingAudit = computed<Record<string, unknown> | null>(() => {
@@ -677,7 +686,7 @@ const extractPoolGroupId = (candidate: CandidateRecord): string | null => {
 
 const poolAttemptCandidates = computed<CandidateRecord[]>(() => {
   // 新链路：优先使用后端写入的 extra_data.pool_group_id。
-  const fromTrace = rawTimeline.value.filter((candidate) => extractPoolGroupId(candidate) !== null)
+  const fromTrace = executableTimeline.value.filter((candidate) => extractPoolGroupId(candidate) !== null)
   if (fromTrace.length > 0) {
     return fromTrace
   }
@@ -765,8 +774,8 @@ const poolAttemptKeySet = computed<Set<string>>(() => {
 })
 
 const timeline = computed<CandidateRecord[]>(() => {
-  if (poolAttemptCandidates.value.length === 0) return rawTimeline.value
-  return rawTimeline.value.filter(
+  if (poolAttemptCandidates.value.length === 0) return executableTimeline.value
+  return executableTimeline.value.filter(
     (candidate) => !poolAttemptKeySet.value.has(makeAttemptKey(candidate.candidate_index, candidate.retry_index)),
   )
 })
