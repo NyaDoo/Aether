@@ -64,7 +64,6 @@ class PoolSchedulingReason(BaseModel):
     detail: str | None = None
 
 
-
 class PoolKeyDetail(BaseModel):
     """Detailed status of a single pool key."""
 
@@ -95,6 +94,7 @@ class PoolKeyDetail(BaseModel):
     model_include_patterns: list[str] | None = None
     model_exclude_patterns: list[str] | None = None
     proxy: dict[str, Any] | None = None
+    fingerprint: dict[str, Any] | None = None
     account_quota: str | None = None
     cooldown_reason: str | None = None
     cooldown_ttl_seconds: int | None = None
@@ -163,7 +163,7 @@ class BatchImportResponse(BaseModel):
 
 class BatchActionRequest(BaseModel):
     key_ids: list[str] = Field(..., max_length=500)
-    action: str  # enable / disable / delete / clear_cooldown / reset_cost
+    action: str  # enable / disable / delete / clear_cooldown / reset_cost / regenerate_fingerprint
 
 
 class BatchActionResponse(BaseModel):

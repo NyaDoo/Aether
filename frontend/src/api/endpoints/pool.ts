@@ -169,7 +169,13 @@ export interface PoolKeysQuery {
 
 export interface PoolBatchAction {
   key_ids: string[]
-  action: 'enable' | 'disable' | 'delete' | 'clear_cooldown' | 'reset_cost'
+  action:
+    | 'enable'
+    | 'disable'
+    | 'delete'
+    | 'clear_cooldown'
+    | 'reset_cost'
+    | 'regenerate_fingerprint'
 }
 
 export async function getPoolOverview(): Promise<PoolOverviewResponse> {

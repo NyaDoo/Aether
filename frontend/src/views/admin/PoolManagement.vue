@@ -310,7 +310,7 @@
                 v-for="key in keyPage.keys"
                 :key="key.key_id"
                 class="border-b border-border/40 last:border-b-0 hover:bg-muted/30 transition-colors"
-                :class="{ 'opacity-50': !key.is_active }"
+                :class="getRowClass(key)"
               >
                 <TableCell class="py-3">
                   <div class="max-w-[260px] min-w-0">
@@ -461,7 +461,7 @@
                     <div class="flex items-center justify-between gap-2">
                       <span class="text-muted-foreground">Token</span>
                       <span class="tabular-nums text-foreground/90">
-                        {{ formatStatInteger(key.total_tokens) }}
+                        {{ formatTokenCount(key.total_tokens) }}
                       </span>
                     </div>
                     <div class="flex items-center justify-between gap-2">
@@ -599,7 +599,7 @@
             v-for="key in keyPage.keys"
             :key="key.key_id"
             class="p-4 sm:p-5 hover:bg-muted/30 transition-colors"
-            :class="{ 'opacity-50': !key.is_active }"
+            :class="getRowClass(key)"
           >
             <div class="flex items-center gap-3">
               <div class="flex-1 min-w-0">
@@ -825,7 +825,7 @@
                   </div>
                   <div class="flex items-center justify-between gap-2">
                     <span class="text-muted-foreground">Token</span>
-                    <span class="tabular-nums">{{ formatStatInteger(key.total_tokens) }}</span>
+                    <span class="tabular-nums">{{ formatTokenCount(key.total_tokens) }}</span>
                   </div>
                   <div class="flex items-center justify-between gap-2">
                     <span class="text-muted-foreground">费用</span>
@@ -1837,7 +1837,7 @@ function getSchedulingBadgeVariant(key: PoolKeyDetail): PoolStatusVariant {
   if (getAccountAlertLabel(key)) return 'destructive'
 
   const reason = key.scheduling_reason
-  if (reason === 'manual_disabled') return 'dark'
+  if (reason === 'manual_disabled') return 'secondary'
   if (reason === 'cooldown' || reason === 'circuit_open' || reason === 'cost_exhausted') return 'destructive'
   if (reason === 'cost_soft' || reason === 'cost') return 'warning'
   if (reason === 'health_low' || reason === 'health_degraded' || reason === 'health') return 'warning'
@@ -1874,6 +1874,12 @@ function formatTTL(seconds: number): string {
   const m = Math.floor(seconds / 60)
   const s = seconds % 60
   return m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+
+function getRowClass(key: PoolKeyDetail): string {
+  const status = getSchedulingStatus(key)
+  if (!key.is_active || status === 'blocked') return 'bg-muted/50 opacity-60'
+  return ''
 }
 
 function getHealthScoreColor(score: number): string {
@@ -2116,6 +2122,14 @@ function formatStatInteger(value: number | null | undefined): string {
   return Math.round(n).toLocaleString('en-US')
 }
 
+function formatTokenCount(value: number | null | undefined): string {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(Math.round(n))
+}
+
 function formatStatUsd(value: number | null | undefined): string {
   const n = Number(value ?? 0)
   if (!Number.isFinite(n) || n <= 0) return '$0.00'
@@ -2126,11 +2140,13 @@ function formatStatUsd(value: number | null | undefined): string {
 }
 
 function formatRelativeTime(isoStr: string): string {
-  const diff = (Date.now() - new Date(isoStr).getTime()) / 1000
-  if (diff < 60) return '刚刚'
-  if (diff < 3600) return `${Math.floor(diff / 60)}m 前`
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h 前`
-  return `${Math.floor(diff / 86400)}d 前`
+  const date = new Date(isoStr)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const M = pad(date.getMonth() + 1)
+  const D = pad(date.getDate())
+  const h = pad(date.getHours())
+  const m = pad(date.getMinutes())
+  return `${M}-${D} ${h}:${m}`
 }
 
 // --- Init ---
