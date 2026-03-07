@@ -266,8 +266,8 @@ import { RefreshCw, Play, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
-import { listPoolKeys, type PoolKeyDetail } from '@/api/endpoints/pool'
-import { batchDeleteEndpointKeys, refreshProviderQuota, updateProviderKey } from '@/api/endpoints/keys'
+import { listPoolKeys, batchActionPoolKeys, type PoolKeyDetail } from '@/api/endpoints/pool'
+import { refreshProviderQuota } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import { hasNoFiveHourLimit as hasNoFiveHourLimitByQuota, hasNoWeeklyLimit as hasNoWeeklyLimitByQuota } from '@/features/pool/utils/quota-selectors'
@@ -619,10 +619,10 @@ async function executeAction(): Promise<void> {
 
         progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
       }
-    } else if (selectedAction.value === 'delete') {
-      // 使用批量删除 API，按 100 个一批分批调用（后端限制 max_length=100）
+    } else if (['delete', 'enable', 'disable', 'clear_proxy', 'set_proxy'].includes(selectedAction.value)) {
+      // 使用 batch-action API，每批最多 2000 个
       const targetIds = selectedKeys.map((key) => key.key_id)
-      const BATCH_SIZE = 100
+      const BATCH_SIZE = 2000
       const totalBatches = Math.ceil(targetIds.length / BATCH_SIZE)
 
       for (let i = 0; i < targetIds.length; i += BATCH_SIZE) {
@@ -632,10 +632,17 @@ async function executeAction(): Promise<void> {
           progressLabel.value = `正在${actionLabel}...（第 ${batchIndex}/${totalBatches} 批）`
         }
 
+        const payload = selectedAction.value === 'set_proxy'
+          ? { node_id: proxyNodeIdForAction.value, enabled: true }
+          : undefined
+
         try {
-          const result = await batchDeleteEndpointKeys(batch)
-          successCount += result.success_count
-          failedCount += result.failed_count
+          const result = await batchActionPoolKeys(props.providerId, {
+            key_ids: batch,
+            action: selectedAction.value,
+            ...(payload ? { payload } : {}),
+          })
+          successCount += result.affected
         } catch {
           failedCount += batch.length
         }
@@ -643,41 +650,19 @@ async function executeAction(): Promise<void> {
         progressDone.value = Math.min(i + BATCH_SIZE, targetIds.length)
       }
     } else {
+      // refresh_oauth: 逐个并发调用（涉及外部 OAuth 令牌刷新）
       const CONCURRENCY = props.batchConcurrency || 8
-      const taskForKey = (key: PoolKeyDetail): (() => Promise<'success' | 'skip'>) | null => {
-        if (selectedAction.value === 'refresh_oauth') {
-          if (normalizeText(key.auth_type) !== 'oauth') return null
-          return () => refreshProviderOAuth(key.key_id).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'clear_proxy') {
-          return () => updateProviderKey(key.key_id, { proxy: null }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'set_proxy') {
-          return () => updateProviderKey(key.key_id, {
-            proxy: { node_id: proxyNodeIdForAction.value, enabled: true },
-          }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'enable') {
-          return () => updateProviderKey(key.key_id, { is_active: true }).then(() => 'success' as const)
-        }
-        if (selectedAction.value === 'disable') {
-          return () => updateProviderKey(key.key_id, { is_active: false }).then(() => 'success' as const)
-        }
-        return null
-      }
-
       const tasks: Array<() => Promise<'success' | 'skip'>> = []
       for (const key of selectedKeys) {
-        const task = taskForKey(key)
-        if (task) tasks.push(task)
-        else {
+        if (selectedAction.value === 'refresh_oauth' && normalizeText(key.auth_type) !== 'oauth') {
           skippedCount += 1
           progressDone.value += 1
+          continue
         }
+        tasks.push(() => refreshProviderOAuth(key.key_id).then(() => 'success' as const))
       }
       progressTotal.value = selectedKeys.length
 
-      // 并发执行，限制并发数
       let cursor = 0
       const runNext = async (): Promise<void> => {
         while (cursor < tasks.length) {

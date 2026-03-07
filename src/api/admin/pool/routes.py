@@ -152,6 +152,8 @@ ALLOWED_ACTIONS = {
     "clear_cooldown",
     "reset_cost",
     "regenerate_fingerprint",
+    "clear_proxy",
+    "set_proxy",
 }
 
 _COOLDOWN_REASON_LABELS: dict[str, str] = {
@@ -988,6 +990,13 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
                 ),
             )
 
+        if self.body.action == "set_proxy":
+            if not isinstance(self.body.payload, dict) or not self.body.payload:
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_proxy action requires a non-empty payload with proxy config",
+                )
+
         db = context.db
         provider = db.query(Provider).filter(Provider.id == self.provider_id).first()
         if not provider:
@@ -1028,17 +1037,44 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
                 await pool_redis.clear_cost(pid, kid)
                 affected += 1
 
+            elif self.body.action == "clear_proxy":
+                key.proxy = None
+                affected += 1
+
+            elif self.body.action == "set_proxy":
+                key.proxy = self.body.payload
+                affected += 1
+
             elif self.body.action == "regenerate_fingerprint":
                 key.fingerprint = generate_fingerprint(seed=None)
                 affected += 1
 
-        if self.body.action in {"enable", "disable", "delete", "regenerate_fingerprint"}:
+        if self.body.action in {
+            "enable",
+            "disable",
+            "delete",
+            "regenerate_fingerprint",
+            "clear_proxy",
+            "set_proxy",
+        }:
             try:
                 db.commit()
             except Exception as exc:
                 db.rollback()
                 logger.error("batch action commit failed: {}", exc)
                 return BatchActionResponse(affected=0, message=f"commit failed: {exc}")
+
+        if self.body.action == "delete" and affected > 0:
+            from src.services.provider_keys.key_side_effects import run_delete_key_side_effects
+
+            try:
+                await run_delete_key_side_effects(
+                    db=db,
+                    provider_id=pid,
+                    deleted_key_allowed_models=None,
+                )
+            except Exception as exc:
+                logger.error("batch delete side effects failed: {}", exc)
 
         action_labels = {
             "enable": "enabled",
@@ -1047,6 +1083,8 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
             "clear_cooldown": "cooldown cleared",
             "reset_cost": "cost reset",
             "regenerate_fingerprint": "fingerprint regenerated",
+            "clear_proxy": "proxy cleared",
+            "set_proxy": "proxy set",
         }
 
         admin_name = context.user.username if context.user else "admin"
