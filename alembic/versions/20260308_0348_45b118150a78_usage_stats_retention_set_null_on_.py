@@ -112,7 +112,18 @@ def upgrade() -> None:
                                                        comment='API Key 名称快照（删除 Key 后仍可追溯）'))
 
     # --- Backfill: populate snapshots from existing FK joins ---
+    # Single UPDATE per table using LEFT JOINs to fill both columns in one pass.
     # (WHERE ... IS NULL makes these inherently idempotent)
+    op.execute("""
+        UPDATE usage u
+        SET username     = COALESCE(u.username, usr.username),
+            api_key_name = COALESCE(u.api_key_name, ak.name)
+        FROM users usr, api_keys ak
+        WHERE usr.id = u.user_id
+          AND ak.id = u.api_key_id
+          AND (u.username IS NULL OR u.api_key_name IS NULL)
+    """)
+    # Catch rows that have user_id but no api_key_id (or vice versa)
     op.execute("""
         UPDATE usage u
         SET username = usr.username

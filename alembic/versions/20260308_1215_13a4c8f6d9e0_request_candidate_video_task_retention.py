@@ -138,41 +138,66 @@ def upgrade() -> None:
     )
 
     # --- Backfill: populate snapshots from existing FK joins ---
+    # Single UPDATE per table using JOINs to fill both columns in one pass.
     # (WHERE ... IS NULL makes these inherently idempotent)
+
+    # request_candidates: fill both columns where both FKs exist
     op.execute(
         """
-        UPDATE request_candidates
-        SET username = (
-            SELECT users.username FROM users WHERE users.id = request_candidates.user_id
-        )
-        WHERE username IS NULL AND user_id IS NOT NULL
+        UPDATE request_candidates rc
+        SET username     = COALESCE(rc.username, usr.username),
+            api_key_name = COALESCE(rc.api_key_name, ak.name)
+        FROM users usr, api_keys ak
+        WHERE usr.id = rc.user_id
+          AND ak.id = rc.api_key_id
+          AND (rc.username IS NULL OR rc.api_key_name IS NULL)
+        """
+    )
+    # Catch rows with only user_id or only api_key_id
+    op.execute(
+        """
+        UPDATE request_candidates rc
+        SET username = usr.username
+        FROM users usr
+        WHERE usr.id = rc.user_id AND rc.username IS NULL
         """
     )
     op.execute(
         """
-        UPDATE request_candidates
-        SET api_key_name = (
-            SELECT api_keys.name FROM api_keys WHERE api_keys.id = request_candidates.api_key_id
-        )
-        WHERE api_key_name IS NULL AND api_key_id IS NOT NULL
+        UPDATE request_candidates rc
+        SET api_key_name = ak.name
+        FROM api_keys ak
+        WHERE ak.id = rc.api_key_id AND rc.api_key_name IS NULL
+        """
+    )
+
+    # video_tasks: fill both columns where both FKs exist
+    op.execute(
+        """
+        UPDATE video_tasks vt
+        SET username     = COALESCE(vt.username, usr.username),
+            api_key_name = COALESCE(vt.api_key_name, ak.name)
+        FROM users usr, api_keys ak
+        WHERE usr.id = vt.user_id
+          AND ak.id = vt.api_key_id
+          AND (vt.username IS NULL OR vt.api_key_name IS NULL)
+        """
+    )
+    # Catch rows with only user_id or only api_key_id
+    op.execute(
+        """
+        UPDATE video_tasks vt
+        SET username = usr.username
+        FROM users usr
+        WHERE usr.id = vt.user_id AND vt.username IS NULL
         """
     )
     op.execute(
         """
-        UPDATE video_tasks
-        SET username = (
-            SELECT users.username FROM users WHERE users.id = video_tasks.user_id
-        )
-        WHERE username IS NULL AND user_id IS NOT NULL
-        """
-    )
-    op.execute(
-        """
-        UPDATE video_tasks
-        SET api_key_name = (
-            SELECT api_keys.name FROM api_keys WHERE api_keys.id = video_tasks.api_key_id
-        )
-        WHERE api_key_name IS NULL AND api_key_id IS NOT NULL
+        UPDATE video_tasks vt
+        SET api_key_name = ak.name
+        FROM api_keys ak
+        WHERE ak.id = vt.api_key_id AND vt.api_key_name IS NULL
         """
     )
 
