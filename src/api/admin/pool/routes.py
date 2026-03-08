@@ -491,7 +491,7 @@ class AdminBatchDeleteTaskStatusAdapter(AdminApiAdapter):
 
         from src.services.provider_keys.batch_delete_task import get_batch_delete_task
 
-        task = get_batch_delete_task(self.task_id)
+        task = await get_batch_delete_task(self.task_id)
         if task is None or task.provider_id != self.provider_id:
             raise HTTPException(status_code=404, detail="Task not found")
         return BatchDeleteTaskResponse(
@@ -1111,7 +1111,7 @@ class AdminBatchActionKeysAdapter(AdminApiAdapter):
             from src.services.provider_keys.batch_delete_task import submit_batch_delete
 
             key_ids = list(dict.fromkeys(self.body.key_ids))
-            task_id = submit_batch_delete(pid, key_ids)
+            task_id = await submit_batch_delete(pid, key_ids)
             admin_name = context.user.username if context.user else "admin"
             logger.info(
                 "Pool batch delete submitted by {}: provider={}, keys={}, task_id={}",
