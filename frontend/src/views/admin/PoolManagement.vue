@@ -1284,7 +1284,11 @@ const poolSchedulingLabel = computed(() => {
   }
 
   const cfg = selectedProviderConfig.value
-  const presets = Array.isArray(cfg?.scheduling_presets) ? cfg.scheduling_presets : []
+
+  // No pool_advanced config at all: show default (cache_affinity + recent_refresh)
+  if (!cfg) return '2 维度'
+
+  const presets = Array.isArray(cfg.scheduling_presets) ? cfg.scheduling_presets : []
   const presetLabels = presetLabelsByName.value
 
   if (presets.length > 0) {
@@ -1307,12 +1311,12 @@ const poolSchedulingLabel = computed(() => {
   }
 
   // Fallback: legacy scheduling_mode field
-  if (cfg?.scheduling_mode === 'multi_score') {
+  if (cfg.scheduling_mode === 'multi_score') {
     return '多维评分'
   }
 
-  const lruEnabled = cfg?.lru_enabled !== false
-  const stickyTtl = Number(cfg?.sticky_session_ttl_seconds ?? 3600)
+  const lruEnabled = cfg.lru_enabled !== false
+  const stickyTtl = Number(cfg.sticky_session_ttl_seconds ?? 3600)
   const stickyEnabled = Number.isFinite(stickyTtl) && stickyTtl > 0
 
   if (lruEnabled && stickyEnabled) return 'LRU + 粘性'
