@@ -228,17 +228,17 @@
                             ? 'border-primary/30 bg-primary/5'
                             : 'border-border/50 bg-background hover:border-border hover:bg-muted/30'
                     ]"
-                    :draggable="!key.is_pool_aggregate && key.is_active && key.provider_active"
-                    @dragstart="(!key.is_pool_aggregate && key.is_active && key.provider_active) && handleKeyDragStart(format, key.id, $event)"
+                    :draggable="key.is_active && key.provider_active"
+                    @dragstart="(key.is_active && key.provider_active) && handleKeyDragStart(format, key.id, $event)"
                     @dragend="handleKeyDragEnd(format)"
-                    @dragover.prevent="!key.is_pool_aggregate && handleKeyDragOver(format, key.id)"
+                    @dragover.prevent="handleKeyDragOver(format, key.id)"
                     @dragleave="handleKeyDragLeave(format)"
-                    @drop="!key.is_pool_aggregate && handleKeyDrop(format, key.id)"
+                    @drop="handleKeyDrop(format, key.id)"
                   >
                     <!-- 拖拽手柄 -->
                     <div
                       class="p-0.5 rounded transition-colors shrink-0"
-                      :class="(!key.is_pool_aggregate && key.is_active && key.provider_active)
+                      :class="(key.is_active && key.provider_active)
                         ? 'cursor-grab active:cursor-grabbing text-muted-foreground/30 group-hover:text-muted-foreground'
                         : 'text-muted-foreground/15 cursor-default'"
                     >
@@ -248,7 +248,7 @@
                     <!-- 可编辑序号 -->
                     <div class="shrink-0">
                       <input
-                        v-if="!key.is_pool_aggregate && editingKeyPriority[format] === key.id"
+                        v-if="editingKeyPriority[format] === key.id"
                         type="number"
                         min="1"
                         :value="key.priority"
@@ -260,12 +260,9 @@
                       >
                       <div
                         v-else
-                        class="w-5 h-5 rounded bg-muted/50 flex items-center justify-center text-[11px] font-medium transition-colors"
-                        :class="key.is_pool_aggregate
-                          ? 'text-muted-foreground/60 cursor-not-allowed'
-                          : 'text-muted-foreground cursor-pointer hover:bg-primary/10 hover:text-primary'"
-                        :title="key.is_pool_aggregate ? '号池优先级请在号池调度中调整' : '点击编辑优先级'"
-                        @click.stop="!key.is_pool_aggregate && startEditKeyPriority(format, key)"
+                        class="w-5 h-5 rounded bg-muted/50 flex items-center justify-center text-[11px] font-medium transition-colors text-muted-foreground cursor-pointer hover:bg-primary/10 hover:text-primary"
+                        title="点击编辑优先级"
+                        @click.stop="startEditKeyPriority(format, key)"
                       >
                         {{ key.priority }}
                       </div>
@@ -720,6 +717,17 @@ function isPoolAggregateItem(key: KeyWithMeta): boolean {
   return key.is_pool_aggregate === true
 }
 
+// 将号池聚合项的优先级写回 provider 的 pool_advanced.global_priority（本地状态）
+function updatePoolGlobalPriority(providerId: string, priority: number) {
+  const provider = sortedProviders.value.find((p) => p.id === providerId)
+  if (!provider) return
+  if (provider.pool_advanced) {
+    provider.pool_advanced.global_priority = priority
+  } else {
+    provider.pool_advanced = { global_priority: priority }
+  }
+}
+
 function toNumberOrNull(value: unknown): number | null {
   const num = Number(value)
   return Number.isFinite(num) ? num : null
@@ -1025,7 +1033,6 @@ async function toggleKeyActive(format: string, key: KeyWithMeta) {
 
 // Key 优先级编辑
 function startEditKeyPriority(format: string, key: KeyWithMeta) {
-  if (isPoolAggregateItem(key)) return
   editingKeyPriority.value[format] = key.id
 }
 
@@ -1034,16 +1041,17 @@ function cancelEditKeyPriority(format: string) {
 }
 
 function finishEditKeyPriority(format: string, key: KeyWithMeta, event: FocusEvent) {
-  if (isPoolAggregateItem(key)) {
-    editingKeyPriority.value[format] = null
-    return
-  }
   const input = event.target as HTMLInputElement
   const newPriority = parseInt(input.value, 10)
 
   if (!isNaN(newPriority) && newPriority >= 1) {
-    // 每个格式独立管理优先级，只更新当前格式
-    key.priority = newPriority
+    if (isPoolAggregateItem(key) && key.provider_id) {
+      // 号池聚合项：写回 provider 的 pool_advanced.global_priority
+      updatePoolGlobalPriority(key.provider_id, newPriority)
+    } else {
+      // 普通 key：直接更新优先级
+      key.priority = newPriority
+    }
     // 重新排序当前格式
     keysByFormat.value[format] = sortKeysByActiveAndPriority(keysByFormat.value[format])
   }
@@ -1166,7 +1174,7 @@ function handleProviderDrop(dropIndex: number) {
 
 // Key 拖拽处理
 function getEditableKeysForFormat(format: string): KeyWithMeta[] {
-  return (keysByFormat.value[format] || []).filter((key) => !isPoolManagedKey(key))
+  return displayKeysByFormat.value[format] || []
 }
 
 function handleKeyDragStart(format: string, keyId: string, event: DragEvent) {
@@ -1267,7 +1275,7 @@ function handleKeyDrop(format: string, dropKeyId: string) {
     updatedPriorityById.set(key.id, key.priority)
   })
 
-  // 将新的优先级写回原始数据（含号池 key），但只修改非号池条目
+  // 将新的优先级写回原始数据（普通 key）
   keysByFormat.value[format] = sortKeysByActiveAndPriority(
     (keysByFormat.value[format] || []).map((key) => {
       const nextPriority = updatedPriorityById.get(key.id)
@@ -1278,6 +1286,14 @@ function handleKeyDrop(format: string, dropKeyId: string) {
       }
     })
   )
+
+  // 号池聚合项的优先级写回 provider 的 pool_advanced.global_priority
+  for (const item of items) {
+    if (item.is_pool_aggregate && item.provider_id) {
+      updatePoolGlobalPriority(item.provider_id, item.priority)
+    }
+  }
+
   draggedKey.value[format] = null
   dragOverKey.value[format] = null
 }
@@ -1291,9 +1307,16 @@ async function save() {
 
     // 第一步：先保存所有 Provider 和 Key 的优先级数据
     // 确保优先级数据全部到位后，再切换调度模式，避免瞬态不一致
-    const providerUpdates = sortedProviders.value.map((provider) =>
-      updateProvider(provider.id, { provider_priority: provider.provider_priority })
-    )
+    const providerUpdates = sortedProviders.value.map((provider) => {
+      const payload: Parameters<typeof updateProvider>[1] = {
+        provider_priority: provider.provider_priority,
+      }
+      // 号池 provider 同时保存 pool_advanced（含 global_priority）
+      if (provider.pool_advanced) {
+        payload.pool_advanced = provider.pool_advanced
+      }
+      return updateProvider(provider.id, payload)
+    })
 
     // 收集每个 Key 的按格式优先级（保留原有其他格式的配置）
     const keyPriorityByFormatMap = new Map<string, Record<string, number>>()
