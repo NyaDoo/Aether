@@ -300,6 +300,13 @@ def resolve_ops_proxy_config(
     return None, None
 
 
+async def resolve_ops_proxy_config_async(
+    connector_config: dict[str, Any] | None,
+) -> tuple[str | httpx.Proxy | None, str | None]:
+    """异步解析 ops connector 代理配置，避免同步 DB 查询阻塞事件循环。"""
+    return await asyncio.to_thread(resolve_ops_proxy_config, connector_config)
+
+
 def resolve_ops_proxy(
     connector_config: dict[str, Any] | None,
 ) -> str | httpx.Proxy | None:
