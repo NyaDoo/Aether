@@ -496,7 +496,7 @@
                         v-if="getOAuthOrgBadge(key)"
                         variant="secondary"
                         class="text-[9px] px-1 py-0 h-4 shrink-0"
-                        :title="getOAuthOrgBadge(key)?.id"
+                        :title="getOAuthOrgBadge(key)?.title"
                       >
                         {{ getOAuthOrgBadge(key)?.label }}
                       </Badge>
@@ -509,42 +509,43 @@
                 >
                   <div
                     v-if="quotaProgressMap[key.key_id]?.length"
-                    class="space-y-1 max-w-[220px]"
+                    class="max-w-[208px] space-y-2"
                   >
                     <div
                       v-for="(item, idx) in quotaProgressMap[key.key_id].slice(0, 2)"
                       :key="`${key.key_id}-quota-${idx}`"
-                      class="w-full"
+                      class="space-y-0.5"
                     >
-                      <div class="min-h-4 grid grid-cols-[20px_minmax(0,1fr)_80px] items-center gap-1 text-[10px] leading-tight">
+                      <div class="flex items-center justify-between gap-2 min-w-0">
                         <span
-                          class="text-muted-foreground whitespace-nowrap text-right tabular-nums"
+                          class="shrink-0 text-[10px] leading-none text-muted-foreground tabular-nums whitespace-nowrap"
                           :title="getQuotaProgressTooltip(item)"
                         >
                           {{ getQuotaProgressLabel(item.label) }}
                         </span>
-                        <div class="relative flex-1 h-1.5 bg-border rounded-full overflow-hidden">
+                        <span
+                          v-if="getQuotaProgressDisplayText(item)"
+                          class="min-w-0 truncate text-[9px] leading-none tabular-nums text-right"
+                          :class="getQuotaProgressDisplayClass(item)"
+                          :title="getQuotaProgressTooltip(item)"
+                        >
+                          {{ getQuotaProgressDisplayText(item) }}
+                        </span>
+                      </div>
+                      <div class="grid grid-cols-[minmax(0,1fr)_50px] items-center gap-2">
+                        <div class="relative h-1.5 rounded-full bg-border/80 overflow-hidden">
                           <div
-                            class="absolute left-0 top-0 h-full transition-all duration-300"
+                            class="absolute left-0 top-0 h-full rounded-full transition-all duration-300"
                             :class="getQuotaRemainingBarColorByRemaining(item.remainingPercent)"
                             :style="{ width: `${item.remainingPercent}%` }"
                           />
                         </div>
-                        <div class="flex flex-col items-end justify-center gap-0.5 text-right leading-tight">
-                          <span
-                            class="tabular-nums whitespace-nowrap"
-                            :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                          >
-                            {{ item.remainingPercent.toFixed(1) }}%
-                          </span>
-                          <span
-                            v-if="getQuotaProgressCountdownText(item)"
-                            class="text-[9px] text-muted-foreground whitespace-nowrap"
-                            :title="getQuotaProgressTooltip(item)"
-                          >
-                            {{ getQuotaProgressCountdownText(item) }}
-                          </span>
-                        </div>
+                        <span
+                          class="text-[11px] font-medium leading-none tabular-nums whitespace-nowrap text-right"
+                          :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
+                        >
+                          {{ item.remainingPercent.toFixed(1) }}%
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -815,7 +816,7 @@
                     v-if="getOAuthOrgBadge(key)"
                     variant="secondary"
                     class="text-[9px] px-1 py-0 h-4 shrink-0"
-                    :title="getOAuthOrgBadge(key)?.id"
+                    :title="getOAuthOrgBadge(key)?.title"
                   >
                     {{ getOAuthOrgBadge(key)?.label }}
                   </Badge>
@@ -973,42 +974,43 @@
                 </div>
                 <div
                   v-if="quotaProgressMap[key.key_id]?.length"
-                  class="space-y-1"
+                  class="space-y-2"
                 >
                   <div
                     v-for="(item, idx) in quotaProgressMap[key.key_id]"
                     :key="`${key.key_id}-quota-mobile-${idx}`"
-                    class="w-full"
+                    class="space-y-0.5"
                   >
-                    <div class="grid grid-cols-[20px_minmax(0,1fr)_80px] items-center gap-1 text-[10px] leading-tight">
+                    <div class="flex items-center justify-between gap-2 min-w-0">
                       <span
-                        class="text-muted-foreground whitespace-nowrap text-right tabular-nums"
+                        class="shrink-0 text-[10px] leading-none text-muted-foreground tabular-nums whitespace-nowrap"
                         :title="getQuotaProgressTooltip(item)"
                       >
                         {{ getQuotaProgressLabel(item.label) }}
                       </span>
-                      <div class="relative flex-1 h-1.5 bg-border rounded-full overflow-hidden">
+                      <span
+                        v-if="getQuotaProgressDisplayText(item)"
+                        class="min-w-0 truncate text-[9px] leading-none tabular-nums text-right"
+                        :class="getQuotaProgressDisplayClass(item)"
+                        :title="getQuotaProgressTooltip(item)"
+                      >
+                        {{ getQuotaProgressDisplayText(item) }}
+                      </span>
+                    </div>
+                    <div class="grid grid-cols-[minmax(0,1fr)_50px] items-center gap-2">
+                      <div class="relative h-1.5 rounded-full bg-border/80 overflow-hidden">
                         <div
-                          class="absolute left-0 top-0 h-full transition-all duration-300"
+                          class="absolute left-0 top-0 h-full rounded-full transition-all duration-300"
                           :class="getQuotaRemainingBarColorByRemaining(item.remainingPercent)"
                           :style="{ width: `${item.remainingPercent}%` }"
                         />
                       </div>
-                      <div class="flex flex-col items-end justify-center gap-0.5 text-right leading-tight">
-                        <span
-                          class="tabular-nums whitespace-nowrap"
-                          :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                        >
-                          {{ item.remainingPercent.toFixed(1) }}%
-                        </span>
-                        <span
-                          v-if="getQuotaProgressCountdownText(item)"
-                          class="text-[9px] text-muted-foreground whitespace-nowrap"
-                          :title="getQuotaProgressTooltip(item)"
-                        >
-                          {{ getQuotaProgressCountdownText(item) }}
-                        </span>
-                      </div>
+                      <span
+                        class="text-[11px] font-medium leading-none tabular-nums whitespace-nowrap text-right"
+                        :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
+                      >
+                        {{ item.remainingPercent.toFixed(1) }}%
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -2454,6 +2456,32 @@ function getQuotaProgressCountdownText(item: QuotaProgressItem): string {
   const status = getQuotaProgressCountdown(item)
   if (!status) return ''
   return status.isExpired ? status.text : `${status.text} 后重置`
+}
+
+function formatCompactQuotaCountdownText(text: string): string {
+  const normalized = text.trim()
+  const dayMatch = normalized.match(/^(\d+)天\s+(.+?)(?:\s+后重置)?$/)
+  if (dayMatch) {
+    return `${dayMatch[1]}天 ${dayMatch[2]}`
+  }
+  return normalized.replace(/\s+后重置$/, '')
+}
+
+function getQuotaProgressDisplayText(item: QuotaProgressItem): string {
+  const countdownText = getQuotaProgressCountdownText(item)
+  if (countdownText) return formatCompactQuotaCountdownText(countdownText)
+  // remainingPercent >= 100 时 getCodexResetCountdown 返回 null，倒计时为空，
+  // 但 UI 仍需展示"满额未消耗"的占位文本
+  if ((item.label === '5H' || item.label === '周') && item.remainingPercent >= 100) return '0天 00:00:00'
+  return item.detail?.trim() || ''
+}
+
+function getQuotaProgressDisplayClass(item: QuotaProgressItem): string {
+  const status = getQuotaProgressCountdown(item)
+  if (!status || status.isExpired) return 'text-muted-foreground/70'
+  if (status.isCritical) return 'text-destructive font-medium animate-pulse'
+  if (status.isUrgent) return 'text-amber-500 dark:text-amber-400'
+  return 'text-muted-foreground/70'
 }
 
 function getQuotaProgressTooltip(item: QuotaProgressItem): string {

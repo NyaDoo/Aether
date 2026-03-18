@@ -293,7 +293,7 @@
                               v-if="getOAuthOrgBadge(key)"
                               variant="secondary"
                               class="text-[10px] px-1.5 py-0 shrink-0"
-                              :title="getOAuthOrgBadge(key)?.id"
+                              :title="getOAuthOrgBadge(key)?.title"
                             >
                               {{ getOAuthOrgBadge(key)?.label }}
                             </Badge>

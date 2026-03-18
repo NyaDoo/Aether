@@ -1,7 +1,9 @@
 import type { OAuthOrganizationInfo } from '@/api/endpoints/types/provider'
 
 type OAuthIdentityDisplayValue = {
+  oauth_account_id?: string | null
   oauth_account_name?: string | null
+  oauth_account_user_id?: string | null
   oauth_organizations?: OAuthOrganizationInfo[] | null
 } | null | undefined
 
@@ -14,6 +16,14 @@ function formatOAuthIdentityShort(
   if (!normalized) return ''
   if (normalized.length <= head + tail + 3) return normalized
   return `${normalized.slice(0, head)}...${normalized.slice(-tail)}`
+}
+
+function readStr(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim() : ''
+}
+
+function formatOAuthAccountBadge(accountId: string): string {
+  return accountId.slice(0, 8)
 }
 
 function getPrimaryOAuthOrganization(
@@ -44,16 +54,30 @@ function getPrimaryOAuthOrganization(
 
 export function getOAuthOrgBadge(
   value: OAuthIdentityDisplayValue,
-): { id: string; label: string } | null {
+): { id: string; label: string; title: string } | null {
   const org = getPrimaryOAuthOrganization(value)
-  if (!org) return null
 
-  const accountName = typeof value?.oauth_account_name === 'string'
-    ? value.oauth_account_name.trim()
-    : ''
+  const accountId = readStr(value?.oauth_account_id)
+  const accountName = readStr(value?.oauth_account_name)
+  const accountUserId = readStr(value?.oauth_account_user_id)
+
+  const badgeId = accountId || org?.id || ''
+  const label = accountName
+    || (accountId ? formatOAuthAccountBadge(accountId) : '')
+    || (org?.id ? `org:${formatOAuthIdentityShort(org.id, 6, 4)}` : '')
+  if (!badgeId || !label) return null
+
+  const titleParts = [
+    accountName ? `name: ${accountName}` : '',
+    accountId ? `account_id: ${accountId}` : '',
+    accountUserId ? `account_user_id: ${accountUserId}` : '',
+    org?.id ? `org_id: ${org.id}` : '',
+    org?.title ? `org_title: ${org.title}` : '',
+  ].filter(Boolean)
 
   return {
-    id: org.id,
-    label: accountName || org.title || formatOAuthIdentityShort(org.id),
+    id: badgeId,
+    label,
+    title: titleParts.join(' | '),
   }
 }

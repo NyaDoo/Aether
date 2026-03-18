@@ -125,7 +125,7 @@
                 v-if="getOAuthOrgBadge(key)"
                 variant="secondary"
                 class="text-[10px] px-1 py-0 h-4 shrink-0"
-                :title="getOAuthOrgBadge(key)?.id"
+                :title="getOAuthOrgBadge(key)?.title"
               >{{ getOAuthOrgBadge(key)?.label }}</Badge>
               <Badge
                 v-if="isBannedKey(key)"
