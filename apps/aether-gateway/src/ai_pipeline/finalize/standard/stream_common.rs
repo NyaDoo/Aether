@@ -1,12 +1,12 @@
 use serde_json::{json, Value};
 
+use crate::gateway::ai_pipeline::adaptation::private_envelope::transform_provider_private_stream_line as transform_envelope_line;
+use crate::gateway::ai_pipeline::adaptation::surfaces::provider_adaptation_should_unwrap_stream_envelope;
+use crate::gateway::ai_pipeline::finalize::sse::{encode_done_sse, encode_json_sse};
 use crate::gateway::ai_pipeline::finalize::standard::{
     aggregate_standard_chat_stream_sync_response, aggregate_standard_cli_stream_sync_response,
     convert_standard_chat_response, convert_standard_cli_response,
 };
-use crate::gateway::ai_pipeline::finalize::sse::{encode_done_sse, encode_json_sse};
-use crate::gateway::ai_pipeline::private_response::transform_provider_private_stream_line as transform_envelope_line;
-use crate::gateway::ai_pipeline::private_surfaces::provider_adaptation_should_unwrap_stream_envelope;
 use crate::gateway::GatewayError;
 
 #[derive(Default)]

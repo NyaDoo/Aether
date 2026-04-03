@@ -3,26 +3,29 @@ use axum::http::Response;
 use std::collections::BTreeMap;
 
 use crate::gateway::ai_pipeline::planner::{
+    maybe_build_stream_decision_payload, EXECUTION_RUNTIME_STREAM_DECISION_ACTION,
+    OPENAI_VIDEO_CONTENT_PLAN_KIND,
+};
+use crate::gateway::ai_pipeline::planner::{
     maybe_build_stream_local_decision_payload,
     maybe_build_stream_local_gemini_files_decision_payload,
     maybe_build_stream_local_openai_cli_decision_payload,
     maybe_build_stream_local_same_format_provider_decision_payload,
+};
+use crate::gateway::api::response::build_client_response_from_parts;
+use crate::gateway::executor::maybe_execute_stream_via_local_standard_decision;
+use crate::gateway::executor::{
     maybe_execute_stream_via_local_decision, maybe_execute_stream_via_local_gemini_files_decision,
     maybe_execute_stream_via_local_openai_cli_decision,
-    maybe_execute_stream_via_local_same_format_provider_decision, parse_direct_request_body,
-};
-use crate::gateway::ai_pipeline::planner::{
-    maybe_build_stream_decision_payload, maybe_execute_stream_via_local_standard_decision,
-    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, OPENAI_VIDEO_CONTENT_PLAN_KIND,
+    maybe_execute_stream_via_local_same_format_provider_decision, parse_local_request_body,
 };
 use crate::gateway::scheduler::{
     is_matching_stream_request, resolve_execution_runtime_stream_plan_kind,
     supports_stream_scheduler_decision_kind,
 };
 use crate::gateway::{
-    build_client_response_from_parts, execute_execution_runtime_stream, AppState,
-    GatewayControlDecision, GatewayControlSyncDecisionResponse, GatewayError,
-    GatewayFallbackReason,
+    execute_execution_runtime_stream, AppState, GatewayControlDecision,
+    GatewayControlSyncDecisionResponse, GatewayError, GatewayFallbackReason,
 };
 
 pub(crate) async fn maybe_build_stream_decision_payload_via_local_path(
@@ -46,7 +49,7 @@ pub(crate) async fn maybe_execute_via_stream_decision_path(
         return Ok(None);
     };
 
-    let Some((body_json, body_base64)) = parse_direct_request_body(parts, body_bytes) else {
+    let Some((body_json, body_base64)) = parse_local_request_body(parts, body_bytes) else {
         return Ok(None);
     };
 
@@ -84,11 +87,10 @@ pub(crate) async fn maybe_execute_via_stream_decision_path(
             return Ok(Some(response));
         }
 
-        if let Some(response) =
-            maybe_execute_stream_via_local_standard_decision(
-                state, parts, trace_id, decision, &body_json, plan_kind,
-            )
-            .await?
+        if let Some(response) = maybe_execute_stream_via_local_standard_decision(
+            state, parts, trace_id, decision, &body_json, plan_kind,
+        )
+        .await?
         {
             return Ok(Some(response));
         }

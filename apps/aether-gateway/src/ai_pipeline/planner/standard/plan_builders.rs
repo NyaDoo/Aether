@@ -2,7 +2,7 @@ use aether_contracts::RequestBody;
 
 use super::augment_sync_report_context;
 use super::*;
-use crate::gateway::ai_pipeline::private_surfaces::provider_adaptation_requires_eventstream_accept;
+use crate::gateway::ai_pipeline::adaptation::surfaces::provider_adaptation_requires_eventstream_accept;
 use crate::gateway::provider_transport::ensure_upstream_auth_header;
 
 pub(crate) fn build_standard_sync_plan_from_decision(

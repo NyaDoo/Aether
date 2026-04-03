@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use base64::Engine as _;
 use serde_json::Value;
 
-use crate::gateway::ai_pipeline::private_surfaces::{
+use crate::gateway::ai_pipeline::adaptation::surfaces::{
     provider_adaptation_allows_sync_finalize_envelope, provider_adaptation_descriptor_for_envelope,
     provider_adaptation_should_unwrap_stream_envelope, ANTIGRAVITY_V1INTERNAL_ENVELOPE_NAME,
     GEMINI_CLI_V1INTERNAL_ENVELOPE_NAME,

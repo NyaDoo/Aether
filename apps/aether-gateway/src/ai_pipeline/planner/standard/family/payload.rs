@@ -10,7 +10,7 @@ use crate::gateway::provider_transport::{
     resolve_transport_execution_timeouts, resolve_transport_proxy_snapshot_with_tunnel_affinity,
     resolve_transport_tls_profile, LocalResolvedOAuthRequestAuth,
 };
-use crate::gateway::request_candidates::current_unix_secs;
+use crate::gateway::scheduler::current_unix_secs;
 use crate::gateway::{
     append_execution_contract_fields_to_value, AppState, ConversionMode, ExecutionStrategy,
     GatewayControlSyncDecisionResponse, EXECUTION_RUNTIME_STREAM_DECISION_ACTION,

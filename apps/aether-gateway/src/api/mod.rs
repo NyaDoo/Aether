@@ -2,6 +2,7 @@ pub(crate) mod ai;
 pub(crate) mod backend;
 mod core;
 mod ops;
+pub(crate) mod response;
 
 pub(crate) use ai::mount_ai_routes;
 pub(crate) use backend::{

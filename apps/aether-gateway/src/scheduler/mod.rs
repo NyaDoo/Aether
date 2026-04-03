@@ -1,6 +1,7 @@
 mod candidate;
 mod failover;
 mod health;
+mod request_candidates;
 mod route;
 
 pub(crate) use candidate::{
@@ -20,6 +21,10 @@ pub(crate) use health::{
     count_recent_rpm_requests_for_provider_key, count_recent_rpm_requests_for_provider_key_since,
     is_provider_key_circuit_open, provider_key_health_score, provider_key_rpm_allows_request_since,
     PROVIDER_KEY_RPM_WINDOW_SECS,
+};
+pub(crate) use request_candidates::{
+    current_unix_secs, ensure_execution_request_candidate_slot, execution_error_details,
+    record_local_request_candidate_status, record_report_request_candidate_status,
 };
 pub(crate) use route::{
     is_matching_stream_request, resolve_execution_runtime_stream_plan_kind,

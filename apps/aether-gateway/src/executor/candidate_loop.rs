@@ -4,7 +4,7 @@ use axum::http::Response;
 use crate::gateway::ai_pipeline::planner::plan_builders::{
     LocalStreamPlanAndReport, LocalSyncPlanAndReport,
 };
-use crate::gateway::request_candidates::record_local_request_candidate_status;
+use crate::gateway::scheduler::record_local_request_candidate_status;
 use crate::gateway::{
     execute_execution_runtime_stream, execute_execution_runtime_sync, AppState,
     GatewayControlDecision, GatewayError,

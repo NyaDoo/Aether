@@ -21,8 +21,7 @@ use crate::gateway::provider_transport::{
     AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
     LocalResolvedOAuthRequestAuth, KIRO_ENVELOPE_NAME,
 };
-use crate::gateway::request_candidates::current_unix_secs;
-use crate::gateway::scheduler::GatewayMinimalCandidateSelectionCandidate;
+use crate::gateway::scheduler::{current_unix_secs, GatewayMinimalCandidateSelectionCandidate};
 use crate::gateway::{
     append_execution_contract_fields_to_value, AppState, ConversionMode, ExecutionStrategy,
     GatewayControlSyncDecisionResponse, EXECUTION_RUNTIME_STREAM_DECISION_ACTION,

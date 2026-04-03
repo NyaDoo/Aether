@@ -24,7 +24,7 @@ pub(crate) async fn maybe_execute_via_execution_runtime_stream(
         if parts.method != http::Method::POST {
             return Ok(None);
         }
-        return crate::gateway::ai_pipeline::planner::maybe_execute_stream_local_path(
+        return crate::gateway::executor::maybe_execute_stream_local_path(
             state, parts, body_bytes, trace_id, decision,
         )
         .await;
@@ -39,7 +39,7 @@ pub(crate) async fn maybe_execute_via_execution_runtime_stream(
         {
             return Ok(None);
         }
-        crate::gateway::ai_pipeline::planner::maybe_execute_stream_local_path(
+        crate::gateway::executor::maybe_execute_stream_local_path(
             state, parts, body_bytes, trace_id, decision,
         )
         .await

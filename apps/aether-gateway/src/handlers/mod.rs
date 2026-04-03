@@ -55,6 +55,10 @@ use crate::gateway::api::ai::{
     admin_default_body_rules_for_signature, admin_endpoint_signature_parts,
     public_api_format_local_path,
 };
+use crate::gateway::api::response::{
+    build_client_response, build_local_auth_rejection_response, build_local_http_error_response,
+    build_local_overloaded_response, build_local_user_rpm_limited_response,
+};
 use crate::gateway::constants::*;
 use crate::gateway::headers::{
     extract_or_generate_trace_id, header_value_str, should_skip_request_header,
@@ -68,9 +72,7 @@ use crate::gateway::scheduler::{
     provider_key_health_score,
 };
 use crate::gateway::{
-    allows_control_execute_emergency, build_client_response, build_local_auth_rejection_response,
-    build_local_http_error_response, build_local_overloaded_response,
-    build_local_user_rpm_limited_response, execute_execution_runtime_stream,
+    allows_control_execute_emergency, execute_execution_runtime_stream,
     execute_execution_runtime_sync, maybe_build_stream_decision_payload,
     maybe_build_stream_plan_payload, maybe_build_sync_decision_payload,
     maybe_build_sync_finalize_outcome, maybe_build_sync_plan_payload, maybe_execute_via_control,
@@ -91,11 +93,17 @@ const ADMIN_EXTERNAL_MODELS_CACHE_TTL_SECS: u64 = 15 * 60;
 const ADMIN_PROVIDER_OAUTH_RUST_BACKEND_DETAIL: &str =
     "Admin provider OAuth requires Rust maintenance backend";
 
-#[path = "handlers/proxy.rs"]
-mod proxy;
+pub(crate) mod admin;
+pub(crate) mod internal;
+pub(crate) mod proxy;
+pub(crate) mod public;
+pub(crate) mod shared;
 
-use proxy::matches_model_mapping_for_models;
+pub(crate) use admin::*;
+pub(crate) use internal::*;
+pub(crate) use public::*;
 pub(crate) use proxy::proxy_request;
+pub(crate) use shared::*;
 
 const OFFICIAL_EXTERNAL_MODEL_PROVIDERS: &[&str] = &[
     "anthropic",
@@ -134,102 +142,4 @@ pub(crate) struct AdminProviderPoolRuntimeState {
     pub(crate) lru_score_by_key: BTreeMap<String, f64>,
 }
 
-#[path = "handlers/admin/adaptive.rs"]
-mod admin_adaptive_handler;
-#[path = "handlers/admin/api_keys.rs"]
-mod admin_api_keys_handler;
-#[path = "handlers/admin/billing.rs"]
-mod admin_billing_handler;
-#[path = "handlers/admin/endpoints_health_helpers.rs"]
-mod admin_endpoints_health_helpers;
-#[path = "handlers/admin/gemini_files.rs"]
-mod admin_gemini_files_handler;
-#[path = "handlers/admin/ldap.rs"]
-mod admin_ldap_handler;
-#[path = "handlers/admin/models_helpers.rs"]
-mod admin_models_helpers;
-#[path = "handlers/admin/monitoring.rs"]
-mod admin_monitoring_handler;
-#[path = "handlers/admin/oauth_helpers.rs"]
-mod admin_oauth_helpers;
-#[path = "handlers/admin/payments.rs"]
-mod admin_payments_handler;
-#[path = "handlers/admin/pool.rs"]
-mod admin_pool_handler;
-#[path = "handlers/admin/provider_oauth/quota.rs"]
-mod admin_provider_oauth_quota;
-#[path = "handlers/admin/provider_oauth/refresh.rs"]
-mod admin_provider_oauth_refresh;
-#[path = "handlers/admin/provider_oauth/state.rs"]
-mod admin_provider_oauth_state;
-#[path = "handlers/admin/provider_ops.rs"]
-mod admin_provider_ops;
-#[path = "handlers/admin/provider_query.rs"]
-mod admin_provider_query_handler;
-#[path = "handlers/admin/provider_strategy.rs"]
-mod admin_provider_strategy_handler;
-#[path = "handlers/admin/providers_helpers.rs"]
-mod admin_providers_helpers;
-#[path = "handlers/admin/proxy_nodes.rs"]
-mod admin_proxy_nodes_handler;
-#[path = "handlers/admin/security.rs"]
-mod admin_security_handler;
-#[path = "handlers/admin/stats.rs"]
-mod admin_stats_handler;
-#[path = "handlers/admin/usage.rs"]
-mod admin_usage_handler;
-#[path = "handlers/admin/users.rs"]
-mod admin_users_handler;
-#[path = "handlers/admin/video_tasks.rs"]
-mod admin_video_tasks_handler;
-#[path = "handlers/admin/wallets.rs"]
-mod admin_wallets_handler;
-#[path = "handlers/internal/gateway.rs"]
-mod internal_gateway;
-#[path = "handlers/internal/gateway_helpers.rs"]
-mod internal_gateway_helpers;
-#[path = "handlers/public/catalog_helpers.rs"]
-mod public_catalog_helpers;
-#[path = "handlers/public/system_modules_helpers.rs"]
-mod public_system_modules_helpers;
-#[path = "handlers/shared.rs"]
-mod shared;
-
-#[path = "handlers/admin/catalog_write_helpers.rs"]
-mod admin_catalog_write_helpers;
-pub(crate) use self::admin_catalog_write_helpers::*;
-#[path = "handlers/admin/misc_helpers.rs"]
-mod admin_misc_helpers;
-pub(crate) use self::admin_misc_helpers::*;
-
-pub(crate) use self::admin_adaptive_handler::*;
-pub(crate) use self::admin_api_keys_handler::*;
-pub(crate) use self::admin_billing_handler::*;
-pub(crate) use self::admin_endpoints_health_helpers::*;
-pub(crate) use self::admin_gemini_files_handler::*;
-pub(crate) use self::admin_ldap_handler::*;
-pub(crate) use self::admin_models_helpers::*;
-pub(crate) use self::admin_monitoring_handler::maybe_build_local_admin_monitoring_root_response as maybe_build_local_admin_monitoring_response;
-pub(crate) use self::admin_oauth_helpers::*;
-pub(crate) use self::admin_payments_handler::*;
-pub(crate) use self::admin_pool_handler::*;
-pub(crate) use self::admin_provider_oauth_quota::*;
-pub(crate) use self::admin_provider_oauth_refresh::*;
-pub(crate) use self::admin_provider_oauth_state::*;
-pub(crate) use self::admin_provider_ops::admin_provider_ops_local_action_response;
-pub(crate) use self::admin_provider_ops::maybe_build_local_admin_provider_ops_response;
-pub(crate) use self::admin_provider_query_handler::*;
-pub(crate) use self::admin_provider_strategy_handler::*;
-pub(crate) use self::admin_providers_helpers::*;
-pub(crate) use self::admin_proxy_nodes_handler::*;
-pub(crate) use self::admin_security_handler::*;
-pub(crate) use self::admin_stats_handler::*;
-pub(crate) use self::admin_usage_handler::*;
-pub(crate) use self::admin_users_handler::*;
-pub(crate) use self::admin_video_tasks_handler::*;
-pub(crate) use self::admin_wallets_handler::*;
-pub(crate) use self::internal_gateway::maybe_build_local_internal_proxy_response_impl;
-pub(crate) use self::internal_gateway_helpers::*;
-pub(crate) use self::public_catalog_helpers::*;
-pub(crate) use self::public_system_modules_helpers::*;
 pub(crate) use self::shared::*;

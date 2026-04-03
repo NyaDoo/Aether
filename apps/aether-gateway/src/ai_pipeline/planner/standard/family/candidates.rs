@@ -5,9 +5,8 @@ use serde_json::json;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::gateway::request_candidates::current_unix_secs;
 use crate::gateway::scheduler::{
-    list_selectable_candidates, GatewayMinimalCandidateSelectionCandidate,
+    current_unix_secs, list_selectable_candidates, GatewayMinimalCandidateSelectionCandidate,
 };
 use crate::gateway::{
     append_execution_contract_fields_to_value, AppState, ConversionMode, ExecutionStrategy,
@@ -118,9 +117,10 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
             }
         }
     }
-    let candidates =
-        crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates(state, candidates)
-            .await;
+    let candidates = crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates(
+        state, candidates,
+    )
+    .await;
 
     let created_at_unix_secs = current_unix_secs();
     let mut attempts = Vec::with_capacity(candidates.len());

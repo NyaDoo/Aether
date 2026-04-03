@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::gateway::gateway_data::GatewayDataState;
-use crate::gateway::handlers::admin_provider_ops_local_action_response;
+use crate::gateway::handlers::admin::admin_provider_ops_local_action_response;
 use crate::gateway::{AppState, GatewayError};
 
 #[path = "runtime/audit_cleanup.rs"]

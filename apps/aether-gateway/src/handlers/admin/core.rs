@@ -53,7 +53,7 @@ fn build_admin_model_catalog_maintenance_response() -> Response<Body> {
         .into_response()
 }
 
-pub(super) async fn maybe_build_local_admin_core_response(
+pub(crate) async fn maybe_build_local_admin_core_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
     request_body: Option<&axum::body::Bytes>,

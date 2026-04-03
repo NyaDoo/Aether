@@ -6,13 +6,13 @@ use super::{
     aggregate_openai_cli_stream_sync_response, convert_claude_chat_response_to_openai_chat,
     convert_gemini_chat_response_to_openai_chat,
 };
+use crate::gateway::ai_pipeline::conversion::sync_chat_response_conversion_kind;
 use crate::gateway::ai_pipeline::finalize::common::{
     build_generated_tool_call_id, build_local_success_outcome,
     build_local_success_outcome_with_conversion_report, canonicalize_tool_arguments,
     local_finalize_allows_envelope, unwrap_local_finalize_response_value,
     LocalCoreSyncFinalizeOutcome,
 };
-use crate::gateway::ai_pipeline::conversion::sync_chat_response_conversion_kind;
 
 #[derive(Debug, Default)]
 struct OpenAIChatChoiceState {

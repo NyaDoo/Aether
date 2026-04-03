@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::gateway::request_candidates::{
+use crate::gateway::scheduler::{
     current_unix_secs, execution_error_details, record_report_request_candidate_status,
 };
 use crate::gateway::{AppState, GatewayError};

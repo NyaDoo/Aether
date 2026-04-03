@@ -4,7 +4,7 @@ use crate::gateway::ai_pipeline::planner::{
 
 use super::super::family::{LocalStandardSourceFamily, LocalStandardSourceMode, LocalStandardSpec};
 
-pub(super) fn resolve_sync_spec(plan_kind: &str) -> Option<LocalStandardSpec> {
+pub(crate) fn resolve_sync_spec(plan_kind: &str) -> Option<LocalStandardSpec> {
     match plan_kind {
         GEMINI_CHAT_SYNC_PLAN_KIND => Some(LocalStandardSpec {
             api_format: "gemini:chat",
@@ -18,7 +18,7 @@ pub(super) fn resolve_sync_spec(plan_kind: &str) -> Option<LocalStandardSpec> {
     }
 }
 
-pub(super) fn resolve_stream_spec(plan_kind: &str) -> Option<LocalStandardSpec> {
+pub(crate) fn resolve_stream_spec(plan_kind: &str) -> Option<LocalStandardSpec> {
     match plan_kind {
         GEMINI_CHAT_STREAM_PLAN_KIND => Some(LocalStandardSpec {
             api_format: "gemini:chat",

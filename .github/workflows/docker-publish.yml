@@ -4,177 +4,13 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      build_base:
-        description: 'Rebuild base image'
-        required: false
-        default: false
-        type: boolean
 
 env:
   REGISTRY: ghcr.io
-  BASE_IMAGE_NAME: fawney19/aether-base
   APP_IMAGE_NAME: fawney19/aether
   GITHUB_REPO: fawney19/Aether
-  # Base image hash inputs:
-  # - Dockerfile.base
-  # - pyproject.toml (dependency fingerprint only; ignores tool/optional deps)
-  # - frontend/package-lock.json
 
 jobs:
-  check-base-changes:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    outputs:
-      base_changed: ${{ steps.check.outputs.base_changed }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check if base image needs rebuild
-        id: check
-        run: |
-          if [ "${{ github.event.inputs.build_base }}" == "true" ]; then
-            echo "base_changed=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Calculate current hash of base-related inputs (dependency-only fingerprint)
-          PY_FINGERPRINT=$(python3 - <<'PY'
-          import json
-          import pathlib
-          import tomllib
-          
-          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text("utf-8"))
-          project = data.get("project") or {}
-          build = data.get("build-system") or {}
-          
-          fingerprint = {
-              "requires-python": project.get("requires-python"),
-              "dependencies": sorted(project.get("dependencies") or []),
-              "build-backend": build.get("build-backend"),
-              "build-requires": sorted(build.get("requires") or []),
-          }
-          
-          print(json.dumps(fingerprint, sort_keys=True, separators=(",", ":")))
-          PY
-          )
-          
-          CURRENT_HASH=$(
-            (
-              cat Dockerfile.base
-              printf '%s\n' "$PY_FINGERPRINT"
-              cat frontend/package-lock.json
-            ) | sha256sum | cut -d' ' -f1
-          )
-          echo "Current base hash: $CURRENT_HASH"
-
-          # Try to get hash label from remote image config
-          # Pull the image config and extract labels
-          REMOTE_HASH=""
-          if docker pull ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:latest; then
-            REMOTE_HASH=$(docker inspect ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:latest --format '{{ index .Config.Labels "org.opencontainers.image.base.hash" }}' 2>/dev/null) || true
-          else
-            echo "WARN: failed to pull remote base image; forcing base rebuild."
-            echo "base_changed=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          if [ -z "$REMOTE_HASH" ] || [ "$REMOTE_HASH" == "<no value>" ]; then
-            # No remote image or no hash label, need to rebuild
-            echo "No remote base image or hash label found, need rebuild"
-            echo "base_changed=true" >> $GITHUB_OUTPUT
-          elif [ "$CURRENT_HASH" != "$REMOTE_HASH" ]; then
-            echo "Hash mismatch: remote=$REMOTE_HASH, current=$CURRENT_HASH"
-            echo "base_changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "Hash matches, no rebuild needed"
-            echo "base_changed=false" >> $GITHUB_OUTPUT
-          fi
-
-  build-base:
-    needs: check-base-changes
-    if: needs.check-base-changes.outputs.base_changed == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Calculate base files hash
-        id: hash
-        run: |
-          PY_FINGERPRINT=$(python3 - <<'PY'
-          import json
-          import pathlib
-          import tomllib
-          
-          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text("utf-8"))
-          project = data.get("project") or {}
-          build = data.get("build-system") or {}
-          
-          fingerprint = {
-              "requires-python": project.get("requires-python"),
-              "dependencies": sorted(project.get("dependencies") or []),
-              "build-backend": build.get("build-backend"),
-              "build-requires": sorted(build.get("requires") or []),
-          }
-          
-          print(json.dumps(fingerprint, sort_keys=True, separators=(",", ":")))
-          PY
-          )
-          
-          HASH=$(
-            (
-              cat Dockerfile.base
-              printf '%s\n' "$PY_FINGERPRINT"
-              cat frontend/package-lock.json
-            ) | sha256sum | cut -d' ' -f1
-          )
-          echo "hash=$HASH" >> $GITHUB_OUTPUT
-
-      - name: Extract metadata for base image
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,prefix=
-          labels: |
-            org.opencontainers.image.base.hash=${{ steps.hash.outputs.hash }}
-
-      - name: Build and push base image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.base
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=base
-          cache-to: type=gha,mode=max,scope=base
-          platforms: linux/amd64,linux/arm64
-
   download-hub:
     runs-on: ubuntu-latest
     permissions:
@@ -197,8 +33,7 @@ jobs:
           echo "Hub release tag: $TAG"
 
   build-app:
-    needs: [check-base-changes, build-base, download-hub]
-    if: always() && (needs.build-base.result == 'success' || needs.build-base.result == 'skipped') && needs.download-hub.result == 'success'
+    needs: [download-hub]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -241,29 +76,12 @@ jobs:
       - name: Extract version from tag
         id: version
         run: |
-          # 从 tag 提取版本号，如 v0.2.5 -> 0.2.5
           VERSION="${GITHUB_REF#refs/tags/v}"
           if [ "$VERSION" = "$GITHUB_REF" ]; then
-            # 不是 tag 触发，使用 git describe
             VERSION=$(git describe --tags --always | sed 's/^v//')
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
-
-      - name: Update Dockerfile.app to use registry base image
-        run: |
-          sed -i "s|FROM aether-base:latest AS builder|FROM ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:latest AS builder|g" Dockerfile.app
-
-      - name: Generate version file
-        run: |
-          # 生成 _version.py 文件
-          cat > src/_version.py << EOF
-          # Auto-generated by CI
-          __version__ = '${{ steps.version.outputs.version }}'
-          __version_tuple__ = tuple(int(x) for x in '${{ steps.version.outputs.version }}'.split('.') if x.isdigit())
-          version = __version__
-          version_tuple = __version_tuple__
-          EOF
 
       - name: Resolve hub release for build args
         run: |
@@ -276,7 +94,6 @@ jobs:
           context: .
           file: ./Dockerfile.app
           labels: ${{ steps.meta.outputs.labels }}
-          no-cache-filters: builder
           cache-from: type=gha,scope=app-amd64
           cache-to: type=gha,mode=min,scope=app-amd64
           build-args: |
@@ -292,7 +109,6 @@ jobs:
           context: .
           file: ./Dockerfile.app
           labels: ${{ steps.meta.outputs.labels }}
-          no-cache-filters: builder
           cache-from: type=gha,scope=app-arm64
           cache-to: type=gha,mode=min,scope=app-arm64
           build-args: |
@@ -303,16 +119,13 @@ jobs:
 
       - name: Create multi-arch manifest and push
         run: |
-          # Extract digests
           AMD64_DIGEST="${{ steps.build-amd64.outputs.digest }}"
           ARM64_DIGEST="${{ steps.build-arm64.outputs.digest }}"
           echo "amd64 digest: $AMD64_DIGEST"
           echo "arm64 digest: $ARM64_DIGEST"
 
-          # For each tag, create multi-arch manifest on each registry
           TAGS=$(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')
           for FULL_TAG in $TAGS; do
-            # Determine which registry this tag belongs to
             if [[ "$FULL_TAG" == ghcr.io/* ]]; then
               REPO="${{ env.REGISTRY }}/${{ env.APP_IMAGE_NAME }}"
             elif [[ "$FULL_TAG" == docker.io/* ]]; then

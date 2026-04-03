@@ -20,6 +20,30 @@ pub(crate) use std::time::Duration;
 pub(crate) use tokio::task::JoinHandle;
 
 pub(crate) use aether_crypto::encrypt_python_fernet_plaintext;
+pub(crate) use ai_pipeline::contracts::{
+    GatewayControlPlanRequest, GatewayControlPlanResponse, GatewayControlSyncDecisionResponse,
+    CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CHAT_SYNC_PLAN_KIND, CLAUDE_CLI_STREAM_PLAN_KIND,
+    CLAUDE_CLI_SYNC_PLAN_KIND, EXECUTION_RUNTIME_STREAM_ACTION,
+    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_ACTION,
+    EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_CHAT_STREAM_PLAN_KIND,
+    GEMINI_CHAT_SYNC_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND,
+    GEMINI_FILES_DELETE_PLAN_KIND, GEMINI_FILES_DOWNLOAD_PLAN_KIND, GEMINI_FILES_GET_PLAN_KIND,
+    GEMINI_FILES_LIST_PLAN_KIND, GEMINI_FILES_UPLOAD_PLAN_KIND, GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND,
+    GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND,
+    OPENAI_CLI_STREAM_PLAN_KIND, OPENAI_CLI_SYNC_PLAN_KIND, OPENAI_COMPACT_STREAM_PLAN_KIND,
+    OPENAI_COMPACT_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
+    OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
+    OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
+};
+pub(crate) use ai_pipeline::finalize::{
+    maybe_build_stream_response_rewriter, maybe_build_sync_finalize_outcome,
+    maybe_compile_sync_finalize_response,
+};
+pub(crate) use ai_pipeline::planner::{
+    generic_decision_missing_exact_provider_request, maybe_build_stream_decision_payload,
+    maybe_build_stream_plan_payload, maybe_build_sync_decision_payload,
+    maybe_build_sync_plan_payload, resolve_stream_plan_kind, resolve_sync_plan_kind,
+};
 pub(crate) use async_task::video as video_tasks;
 pub(crate) use async_task::VideoTaskService;
 pub use async_task::VideoTaskTruthSourceMode;
@@ -82,37 +106,11 @@ pub(crate) use maintenance::{
     spawn_gemini_file_mapping_cleanup_worker, spawn_provider_checkin_worker,
     spawn_request_candidate_cleanup_worker,
 };
+pub use middleware::strip_cf_headers_middleware;
 pub(crate) use model_fetch::spawn_model_fetch_worker;
 pub(crate) use model_fetch::{perform_model_fetch_once, ModelFetchRunSummary};
 pub use rate_limit::FrontdoorUserRpmConfig;
 pub(crate) use rate_limit::{FrontdoorUserRpmLimiter, FrontdoorUserRpmOutcome};
-pub(crate) use ai_pipeline::planner::{
-    generic_decision_missing_exact_provider_request, maybe_build_stream_decision_payload,
-    maybe_build_stream_plan_payload, maybe_build_sync_decision_payload,
-    maybe_build_sync_plan_payload, resolve_stream_plan_kind, resolve_sync_plan_kind,
-    GatewayControlPlanRequest, GatewayControlPlanResponse, GatewayControlSyncDecisionResponse,
-    CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CHAT_SYNC_PLAN_KIND, CLAUDE_CLI_STREAM_PLAN_KIND,
-    CLAUDE_CLI_SYNC_PLAN_KIND, EXECUTION_RUNTIME_STREAM_ACTION,
-    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_ACTION,
-    EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_CHAT_STREAM_PLAN_KIND,
-    GEMINI_CHAT_SYNC_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND,
-    GEMINI_FILES_DELETE_PLAN_KIND, GEMINI_FILES_DOWNLOAD_PLAN_KIND, GEMINI_FILES_GET_PLAN_KIND,
-    GEMINI_FILES_LIST_PLAN_KIND, GEMINI_FILES_UPLOAD_PLAN_KIND, GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND,
-    GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND,
-    OPENAI_CLI_STREAM_PLAN_KIND, OPENAI_CLI_SYNC_PLAN_KIND, OPENAI_COMPACT_STREAM_PLAN_KIND,
-    OPENAI_COMPACT_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
-};
-pub(crate) use response::{
-    attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
-    build_local_auth_rejection_response, build_local_http_error_response,
-    build_local_overloaded_response, build_local_user_rpm_limited_response,
-};
-pub(crate) use ai_pipeline::finalize::{
-    maybe_build_stream_response_rewriter, maybe_build_sync_finalize_outcome,
-    maybe_compile_sync_finalize_response,
-};
 pub use router::{build_router, build_router_with_state, serve_tcp};
 pub(crate) use router::{metrics, RequestAdmissionError};
 pub(crate) use state::{

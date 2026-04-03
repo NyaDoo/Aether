@@ -36,12 +36,8 @@ services:
     env_file:
       - .env
     environment:
-      # 需要组合的变量
       DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/aether
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-      # Supervisor 需要的变量
-      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
-      # 容器级别设置
       TZ: Asia/Shanghai
     depends_on:
       postgres:

@@ -15,7 +15,7 @@ mod dispatch_start;
 #[path = "dispatch/tasks.rs"]
 mod dispatch_tasks;
 
-pub(super) async fn maybe_build_local_admin_provider_oauth_response(
+pub(crate) async fn maybe_build_local_admin_provider_oauth_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
     request_body: Option<&axum::body::Bytes>,

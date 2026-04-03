@@ -13,11 +13,11 @@ use crate::gateway::ai_pipeline::planner::plan_builders::{
     LocalStreamPlanAndReport, LocalSyncPlanAndReport,
 };
 use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
-use crate::gateway::scheduler::{
-    list_selectable_candidates, GatewayMinimalCandidateSelectionCandidate,
-};
 use crate::gateway::ai_pipeline::planner::{
     OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND,
+};
+use crate::gateway::scheduler::{
+    list_selectable_candidates, GatewayMinimalCandidateSelectionCandidate,
 };
 
 pub(super) fn build_local_openai_chat_miss_diagnostic(

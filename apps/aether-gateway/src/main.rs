@@ -318,7 +318,7 @@ impl GatewayRateLimitArgs {
     about = "Phase 3a Rust ingress gateway for Aether"
 )]
 struct Args {
-    #[arg(long, env = "AETHER_GATEWAY_BIND", default_value = "0.0.0.0:8084")]
+    #[arg(long, env = "AETHER_GATEWAY_BIND", default_value = "0.0.0.0:80")]
     bind: String,
 
     #[arg(
@@ -327,6 +327,11 @@ struct Args {
         default_value = "http://127.0.0.1:18084"
     )]
     upstream: String,
+
+    /// Path to frontend static files directory (SPA). When set, the gateway
+    /// serves the frontend directly without nginx.
+    #[arg(long, env = "AETHER_GATEWAY_STATIC_DIR")]
+    static_dir: Option<String>,
 
     #[arg(
         long,
@@ -516,9 +521,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execution_runtime_configured = state.execution_runtime_configured(),
         "aether-gateway data layer configured"
     );
+    // Run pending database migrations before serving traffic
+    if let Some(pool) = state.postgres_pool() {
+        info!("running database migrations...");
+        aether_data::migrate::run_migrations(&pool).await?;
+        info!("database migrations complete");
+    }
+
     let background_tasks = state.spawn_background_tasks();
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-    let router = build_router_with_state(state);
+    let api_router = build_router_with_state(state);
+
+    // Compose the final router: API routes + optional static file serving + CF header stripping
+    let router = if let Some(ref static_dir) = args.static_dir {
+        use tower_http::compression::CompressionLayer;
+        use tower_http::services::{ServeDir, ServeFile};
+
+        let static_path = std::path::PathBuf::from(static_dir);
+        let index_html = static_path.join("index.html");
+        info!(static_dir = %static_dir, "serving frontend static files");
+
+        // ServeDir with SPA fallback: if no static file matches, serve index.html
+        let serve_dir = ServeDir::new(&static_path)
+            .not_found_service(ServeFile::new(&index_html));
+
+        api_router
+            .fallback_service(serve_dir)
+            .layer(CompressionLayer::new())
+            .layer(axum::middleware::from_fn(
+                aether_gateway::strip_cf_headers_middleware,
+            ))
+    } else {
+        api_router.layer(axum::middleware::from_fn(
+            aether_gateway::strip_cf_headers_middleware,
+        ))
+    };
+
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),

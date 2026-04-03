@@ -19,7 +19,7 @@ mod provider_models_list;
 #[path = "provider_models/update.rs"]
 mod provider_models_update;
 
-pub(super) async fn maybe_build_local_admin_provider_models_response(
+pub(crate) async fn maybe_build_local_admin_provider_models_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
     request_body: Option<&axum::body::Bytes>,

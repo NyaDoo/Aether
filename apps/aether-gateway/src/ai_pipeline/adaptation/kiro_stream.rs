@@ -64,13 +64,13 @@ enum FrameParseError {
     Invalid(String),
 }
 
-#[path = "stream/decoder.rs"]
+#[path = "kiro_stream/stream/decoder.rs"]
 mod decoder;
-#[path = "stream/state.rs"]
+#[path = "kiro_stream/stream/state.rs"]
 mod state;
-#[path = "stream/util.rs"]
+#[path = "kiro_stream/stream/util.rs"]
 mod util;
 
 #[cfg(test)]
-#[path = "stream/tests.rs"]
+#[path = "kiro_stream/stream/tests.rs"]
 mod tests;

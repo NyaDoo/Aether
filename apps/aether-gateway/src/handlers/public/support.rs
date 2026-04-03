@@ -19,7 +19,7 @@ mod support_user_me;
 #[path = "support/wallet.rs"]
 mod support_wallet;
 
-pub(super) use self::support_announcements::maybe_build_local_admin_announcements_response;
+pub(crate) use self::support_announcements::maybe_build_local_admin_announcements_response;
 pub(crate) use self::support_models::matches_model_mapping_for_models;
 
 use self::support_announcements::{
@@ -57,7 +57,7 @@ fn build_public_support_maintenance_response(detail: &str) -> Response<Body> {
         .into_response()
 }
 
-pub(super) async fn maybe_build_local_public_support_response(
+pub(crate) async fn maybe_build_local_public_support_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
     headers: &http::HeaderMap,

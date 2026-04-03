@@ -18,13 +18,15 @@ mod control;
 mod error;
 #[path = "execution_runtime/mod.rs"]
 mod execution_runtime;
+#[path = "executor/mod.rs"]
+mod executor;
 #[path = "fallback_metrics.rs"]
 mod fallback_metrics;
 #[path = "gateway_cache/mod.rs"]
 mod gateway_cache;
 #[path = "gateway_data/mod.rs"]
 mod gateway_data;
-#[path = "handlers.rs"]
+#[path = "handlers/mod.rs"]
 mod handlers;
 #[path = "headers.rs"]
 mod headers;
@@ -35,17 +37,13 @@ mod intent;
 #[path = "maintenance/mod.rs"]
 mod maintenance;
 #[path = "middleware/mod.rs"]
-mod middleware;
+pub(crate) mod middleware;
 #[path = "model_fetch/mod.rs"]
 mod model_fetch;
 #[path = "provider_transport/mod.rs"]
 mod provider_transport;
 #[path = "rate_limit.rs"]
 mod rate_limit;
-#[path = "request_candidates.rs"]
-mod request_candidates;
-#[path = "response.rs"]
-mod response;
 #[path = "gateway/router.rs"]
 mod router;
 #[path = "scheduler/mod.rs"]

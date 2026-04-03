@@ -3,25 +3,26 @@ use axum::http::Response;
 use std::collections::BTreeMap;
 
 use crate::gateway::ai_pipeline::planner::{
+    maybe_build_sync_decision_payload, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
+    GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
+    OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
+};
+use crate::gateway::api::response::build_client_response_from_parts;
+use crate::gateway::executor::maybe_execute_sync_via_local_standard_decision;
+use crate::gateway::executor::{
     maybe_execute_sync_via_local_decision, maybe_execute_sync_via_local_gemini_files_decision,
     maybe_execute_sync_via_local_openai_cli_decision,
     maybe_execute_sync_via_local_same_format_provider_decision,
-    maybe_execute_sync_via_local_video_decision, parse_direct_request_body,
-};
-use crate::gateway::ai_pipeline::planner::{
-    maybe_build_sync_decision_payload, maybe_execute_sync_via_local_standard_decision,
-    EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
+    maybe_execute_sync_via_local_video_decision, parse_local_request_body,
 };
 use crate::gateway::scheduler::{
     is_matching_stream_request, resolve_execution_runtime_stream_plan_kind,
     resolve_execution_runtime_sync_plan_kind, supports_sync_scheduler_decision_kind,
 };
 use crate::gateway::{
-    build_client_response_from_parts, execute_execution_runtime_sync,
-    resolve_execution_runtime_auth_context, AppState, GatewayControlDecision,
-    GatewayControlSyncDecisionResponse, GatewayError, GatewayFallbackReason,
+    execute_execution_runtime_sync, resolve_execution_runtime_auth_context, AppState,
+    GatewayControlDecision, GatewayControlSyncDecisionResponse, GatewayError,
+    GatewayFallbackReason,
 };
 use url::Url;
 
@@ -63,7 +64,7 @@ pub(crate) async fn maybe_execute_via_sync_decision_path(
         return Ok(None);
     };
 
-    let Some((body_json, body_base64)) = parse_direct_request_body(parts, body_bytes) else {
+    let Some((body_json, body_base64)) = parse_local_request_body(parts, body_bytes) else {
         return Ok(None);
     };
 
@@ -112,11 +113,10 @@ pub(crate) async fn maybe_execute_via_sync_decision_path(
             return Ok(Some(response));
         }
 
-        if let Some(response) =
-            maybe_execute_sync_via_local_standard_decision(
-                state, parts, trace_id, decision, &body_json, plan_kind,
-            )
-            .await?
+        if let Some(response) = maybe_execute_sync_via_local_standard_decision(
+            state, parts, trace_id, decision, &body_json, plan_kind,
+        )
+        .await?
         {
             return Ok(Some(response));
         }

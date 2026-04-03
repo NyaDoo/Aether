@@ -8,6 +8,14 @@ use uuid::Uuid;
 use crate::gateway::ai_pipeline::conversion::{
     request_conversion_direct_auth, request_conversion_kind, request_conversion_transport_supported,
 };
+use crate::gateway::ai_pipeline::planner::plan_builders::{
+    LocalStreamPlanAndReport, LocalSyncPlanAndReport,
+};
+use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
+use crate::gateway::ai_pipeline::planner::{
+    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
+    OPENAI_CHAT_STREAM_PLAN_KIND,
+};
 use crate::gateway::headers::collect_control_headers;
 use crate::gateway::provider_transport::{
     apply_local_header_rules, build_openai_passthrough_headers, ensure_upstream_auth_header,
@@ -15,23 +23,16 @@ use crate::gateway::provider_transport::{
     resolve_transport_proxy_snapshot_with_tunnel_affinity, resolve_transport_tls_profile,
     supports_local_openai_chat_transport, LocalResolvedOAuthRequestAuth,
 };
-use crate::gateway::request_candidates::record_local_request_candidate_status;
-use crate::gateway::ai_pipeline::planner::plan_builders::{
-    LocalStreamPlanAndReport, LocalSyncPlanAndReport,
+use crate::gateway::scheduler::{
+    record_local_request_candidate_status, GatewayMinimalCandidateSelectionCandidate,
 };
-use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
-use crate::gateway::scheduler::GatewayMinimalCandidateSelectionCandidate;
 use crate::gateway::{
     append_execution_contract_fields_to_value, AppState, ConversionMode, ExecutionStrategy,
     GatewayControlSyncDecisionResponse,
 };
-use crate::gateway::ai_pipeline::planner::{
-    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
-    OPENAI_CHAT_STREAM_PLAN_KIND,
-};
 
 use super::plans::current_unix_secs;
-use crate::gateway::ai_pipeline::planner::standard::openai::{
+use crate::gateway::ai_pipeline::planner::standard::{
     build_cross_format_openai_chat_request_body, build_cross_format_openai_chat_upstream_url,
     build_local_openai_chat_request_body, build_local_openai_chat_upstream_url,
 };

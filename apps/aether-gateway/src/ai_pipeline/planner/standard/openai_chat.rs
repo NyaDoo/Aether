@@ -1,29 +1,27 @@
-use axum::body::Body;
-use axum::http::Response;
-
 use serde_json::{Map, Value};
 use tracing::warn;
 
-use crate::gateway::{
-    execute_execution_runtime_stream, execute_execution_runtime_sync, AppState,
-    GatewayControlDecision, GatewayControlSyncDecisionResponse, GatewayError,
-    LocalExecutionRuntimeMissDiagnostic,
-};
 use crate::gateway::ai_pipeline::planner::{
     OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND,
 };
+use crate::gateway::{
+    AppState, GatewayControlDecision, GatewayControlSyncDecisionResponse, GatewayError,
+    LocalExecutionRuntimeMissDiagnostic,
+};
 
-use crate::gateway::ai_pipeline::planner::standard::openai::{
+use crate::gateway::ai_pipeline::planner::standard::{
     convert_openai_chat_request_to_claude_request, convert_openai_chat_request_to_gemini_request,
     convert_openai_chat_request_to_openai_cli_request, extract_openai_text_content,
     parse_openai_tool_result_content,
 };
 
+#[path = "openai/chat/decision.rs"]
 mod decision;
+#[path = "openai/chat/plans.rs"]
 mod plans;
 
 use self::decision::{
-    mark_unused_local_openai_chat_candidates, materialize_local_openai_chat_candidate_attempts,
+    materialize_local_openai_chat_candidate_attempts,
     maybe_build_local_openai_chat_decision_payload_for_candidate, LocalOpenAiChatDecisionInput,
 };
 use self::plans::{
@@ -33,93 +31,48 @@ use self::plans::{
     set_local_openai_chat_miss_diagnostic,
 };
 
-pub(crate) async fn maybe_execute_sync_via_local_decision(
+pub(crate) async fn build_local_openai_chat_sync_plan_and_reports_for_kind(
     state: &AppState,
     parts: &http::request::Parts,
     trace_id: &str,
     decision: &GatewayControlDecision,
     body_json: &serde_json::Value,
     plan_kind: &str,
-) -> Result<Option<Response<Body>>, GatewayError> {
-    let plan_and_reports = build_local_openai_chat_sync_plan_and_reports(
+) -> Result<
+    Vec<crate::gateway::ai_pipeline::planner::plan_builders::LocalSyncPlanAndReport>,
+    GatewayError,
+> {
+    build_local_openai_chat_sync_plan_and_reports(
         state, parts, trace_id, decision, body_json, plan_kind,
     )
-    .await?;
-    if plan_and_reports.is_empty() {
-        return Ok(None);
-    }
-
-    let plan_count = plan_and_reports.len();
-    let mut remaining = plan_and_reports.into_iter();
-    while let Some(plan_and_report) = remaining.next() {
-        if let Some(response) = execute_execution_runtime_sync(
-            state,
-            parts.uri.path(),
-            plan_and_report.plan,
-            trace_id,
-            decision,
-            plan_kind,
-            plan_and_report.report_kind,
-            plan_and_report.report_context,
-        )
-        .await?
-        {
-            mark_unused_local_openai_chat_candidates(state, remaining.collect()).await;
-            return Ok(Some(response));
-        }
-    }
-
-    state.set_local_execution_runtime_miss_diagnostic(
-        trace_id,
-        LocalExecutionRuntimeMissDiagnostic {
-            candidate_count: Some(plan_count),
-            ..build_local_openai_chat_miss_diagnostic(
-                decision,
-                plan_kind,
-                body_json.get("model").and_then(|value| value.as_str()),
-                "execution_runtime_candidates_exhausted",
-            )
-        },
-    );
-
-    Ok(None)
+    .await
 }
 
-pub(crate) async fn maybe_execute_stream_via_local_decision(
+pub(crate) async fn build_local_openai_chat_stream_plan_and_reports_for_kind(
     state: &AppState,
     parts: &http::request::Parts,
     trace_id: &str,
     decision: &GatewayControlDecision,
     body_json: &serde_json::Value,
     plan_kind: &str,
-) -> Result<Option<Response<Body>>, GatewayError> {
-    let plan_and_reports = build_local_openai_chat_stream_plan_and_reports(
+) -> Result<
+    Vec<crate::gateway::ai_pipeline::planner::plan_builders::LocalStreamPlanAndReport>,
+    GatewayError,
+> {
+    build_local_openai_chat_stream_plan_and_reports(
         state, parts, trace_id, decision, body_json, plan_kind,
     )
-    .await?;
-    if plan_and_reports.is_empty() {
-        return Ok(None);
-    }
+    .await
+}
 
-    let plan_count = plan_and_reports.len();
-    let mut remaining = plan_and_reports.into_iter();
-    while let Some(plan_and_report) = remaining.next() {
-        if let Some(response) = execute_execution_runtime_stream(
-            state,
-            plan_and_report.plan,
-            trace_id,
-            decision,
-            plan_kind,
-            plan_and_report.report_kind,
-            plan_and_report.report_context,
-        )
-        .await?
-        {
-            mark_unused_local_openai_chat_candidates(state, remaining.collect()).await;
-            return Ok(Some(response));
-        }
-    }
-
+pub(crate) fn set_local_openai_chat_execution_exhausted_diagnostic(
+    state: &AppState,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    body_json: &serde_json::Value,
+    plan_count: usize,
+) {
     state.set_local_execution_runtime_miss_diagnostic(
         trace_id,
         LocalExecutionRuntimeMissDiagnostic {
@@ -132,8 +85,6 @@ pub(crate) async fn maybe_execute_stream_via_local_decision(
             )
         },
     );
-
-    Ok(None)
 }
 
 pub(crate) async fn maybe_build_sync_local_decision_payload(

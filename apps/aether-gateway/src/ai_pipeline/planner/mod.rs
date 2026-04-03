@@ -2,10 +2,7 @@ use crate::gateway::{AppState, GatewayControlDecision, GatewayError};
 
 pub(crate) mod candidate_affinity;
 pub(crate) mod common;
-pub(crate) mod contracts;
 mod decision;
-pub(crate) mod family_core;
-pub(crate) mod local_path;
 pub(crate) mod passthrough;
 pub(crate) mod plan_builders;
 pub(crate) mod specialized;
@@ -26,7 +23,7 @@ pub(crate) use self::common::{
     OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
     OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
-pub(crate) use self::contracts::{
+pub(crate) use crate::gateway::ai_pipeline::contracts::{
     build_gateway_plan_request, generic_decision_missing_exact_provider_request,
     GatewayControlPlanRequest, GatewayControlPlanResponse, GatewayControlSyncDecisionResponse,
 };
@@ -43,18 +40,12 @@ pub(crate) use crate::gateway::scheduler::{
 pub(crate) use passthrough::{
     maybe_build_stream_local_same_format_provider_decision_payload,
     maybe_build_sync_local_same_format_provider_decision_payload,
-    maybe_execute_stream_via_local_same_format_provider_decision,
-    maybe_execute_sync_via_local_same_format_provider_decision,
 };
 pub(crate) use specialized::{
     maybe_build_stream_local_gemini_files_decision_payload,
     maybe_build_sync_local_gemini_files_decision_payload,
     maybe_build_sync_local_video_decision_payload,
-    maybe_execute_stream_via_local_gemini_files_decision,
-    maybe_execute_sync_via_local_gemini_files_decision,
-    maybe_execute_sync_via_local_video_decision,
 };
-pub(crate) use local_path::{maybe_execute_stream_local_path, maybe_execute_sync_local_path};
 pub(crate) use standard::{
     copy_request_number_field, copy_request_number_field_as,
     map_openai_reasoning_effort_to_claude_output, map_openai_reasoning_effort_to_gemini_budget,
@@ -62,11 +53,7 @@ pub(crate) use standard::{
     maybe_build_stream_local_openai_cli_decision_payload,
     maybe_build_stream_local_standard_decision_payload, maybe_build_sync_local_decision_payload,
     maybe_build_sync_local_openai_cli_decision_payload,
-    maybe_build_sync_local_standard_decision_payload, maybe_execute_stream_via_local_decision,
-    maybe_execute_stream_via_local_openai_cli_decision,
-    maybe_execute_stream_via_local_standard_decision, maybe_execute_sync_via_local_decision,
-    maybe_execute_sync_via_local_openai_cli_decision,
-    maybe_execute_sync_via_local_standard_decision, parse_openai_stop_sequences,
+    maybe_build_sync_local_standard_decision_payload, parse_openai_stop_sequences,
     resolve_openai_chat_max_tokens, value_as_u64,
 };
 

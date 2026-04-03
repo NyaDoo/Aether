@@ -1,27 +1,14 @@
 pub(crate) use super::*;
 
-#[path = "proxy/local.rs"]
 mod local;
-
-#[path = "admin/core.rs"]
-mod admin_core;
-#[path = "admin/endpoints.rs"]
-mod admin_endpoints;
-#[path = "admin/global_models.rs"]
-mod admin_global_models;
-#[path = "admin/provider_models.rs"]
-mod admin_provider_models;
-#[path = "admin/provider_oauth/dispatch.rs"]
-mod admin_provider_oauth_dispatch;
-#[path = "admin/providers.rs"]
-mod admin_providers;
-#[path = "public/support.rs"]
-mod public_support;
 
 use self::local::{
     maybe_build_local_admin_proxy_response, maybe_build_local_internal_proxy_response,
 };
-pub(crate) use self::public_support::matches_model_mapping_for_models;
+use super::internal::{
+    attach_legacy_internal_gateway_deprecation_headers, resolve_local_proxy_execution_path,
+};
+pub(crate) use super::public::matches_model_mapping_for_models;
 use crate::gateway::ai_pipeline::{finalize as ai_finalize, runtime as ai_runtime};
 
 const OPENAI_CHAT_PYTHON_FALLBACK_REMOVED_DETAIL: &str =
@@ -362,7 +349,7 @@ pub(crate) async fn proxy_request(
             request_permit.take(),
         ));
     }
-    if let Some(response) = public_support::maybe_build_local_public_support_response(
+    if let Some(response) = super::public::maybe_build_local_public_support_response(
         &state,
         &request_context,
         &parts.headers,
@@ -882,7 +869,7 @@ fn local_execution_runtime_miss_detail_after_python_fallback_removal(
     }
 }
 
-#[path = "proxy/finalize.rs"]
+#[path = "finalize.rs"]
 mod finalize;
 
 use self::finalize::{

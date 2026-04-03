@@ -7,6 +7,7 @@ mod headers;
 mod policy;
 mod refresh;
 mod request;
+#[path = "../../../adaptation/kiro_stream.rs"]
 mod stream;
 mod url;
 

@@ -1,6 +1,7 @@
 pub mod backends;
 mod config;
 mod error;
+pub mod migrate;
 pub mod postgres;
 pub mod redis;
 pub mod repository;

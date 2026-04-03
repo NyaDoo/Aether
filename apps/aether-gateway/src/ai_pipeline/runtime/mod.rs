@@ -36,6 +36,12 @@ pub(crate) use super::super::execution_runtime::{
     execute_execution_runtime_stream, execute_execution_runtime_sync,
     execute_execution_runtime_sync_plan,
 };
+pub(crate) use super::adaptation::private_envelope::{
+    maybe_build_provider_private_stream_normalizer,
+    maybe_normalize_provider_private_sync_report_payload,
+    normalize_provider_private_report_context, normalize_provider_private_response_value,
+    provider_private_response_allows_sync_finalize, transform_provider_private_stream_line,
+};
 pub(crate) use adapters::antigravity::{
     build_antigravity_safe_v1internal_request, build_antigravity_static_identity_headers,
     build_antigravity_v1internal_url, classify_local_antigravity_request_support,
@@ -66,12 +72,6 @@ pub(crate) use adapters::kiro::{
 pub(crate) use adapters::openai::{
     build_openai_chat_url, build_openai_cli_url, build_openai_passthrough_headers,
     resolve_local_openai_chat_auth, supports_local_openai_chat_transport,
-};
-pub(crate) use super::private_response::{
-    maybe_build_provider_private_stream_normalizer,
-    maybe_normalize_provider_private_sync_report_payload,
-    normalize_provider_private_report_context, normalize_provider_private_response_value,
-    provider_private_response_allows_sync_finalize, transform_provider_private_stream_line,
 };
 pub(crate) use adapters::vertex::{
     build_vertex_api_key_gemini_content_url, resolve_local_vertex_api_key_query_auth,

@@ -1,11 +1,11 @@
 use serde_json::Value;
 
+use crate::gateway::ai_pipeline::adaptation::private_envelope::transform_provider_private_stream_line as transform_envelope_line;
+use crate::gateway::ai_pipeline::finalize::sse::{encode_done_sse, encode_json_sse};
 use crate::gateway::ai_pipeline::finalize::standard::{
     BufferedCliConversionStreamState, BufferedStandardConversionStreamState,
     ClaudeToOpenAIChatStreamState, GeminiToOpenAIChatStreamState, OpenAICliToOpenAIChatStreamState,
 };
-use crate::gateway::ai_pipeline::finalize::sse::{encode_done_sse, encode_json_sse};
-use crate::gateway::ai_pipeline::private_response::transform_provider_private_stream_line as transform_envelope_line;
 use crate::gateway::ai_pipeline::runtime::KiroToClaudeCliStreamState;
 use crate::gateway::GatewayError;
 

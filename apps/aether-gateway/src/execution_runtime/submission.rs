@@ -1,12 +1,13 @@
+use crate::gateway::ai_pipeline::adaptation::private_envelope::normalize_provider_private_response_value as unwrap_local_finalize_response_value;
 use crate::gateway::ai_pipeline::conversion::{
     build_core_error_body_for_client_format, core_error_background_report_kind,
     core_error_default_client_api_format, is_core_error_finalize_kind, LocalCoreSyncErrorKind,
 };
-use crate::gateway::ai_pipeline::private_response::normalize_provider_private_response_value as unwrap_local_finalize_response_value;
+use crate::gateway::api::response::build_client_response_from_parts;
 use crate::gateway::usage::spawn_sync_report;
 use crate::gateway::{
-    build_client_response_from_parts, maybe_compile_sync_finalize_response, AppState,
-    GatewayControlDecision, GatewayError, GatewaySyncReportRequest,
+    maybe_compile_sync_finalize_response, AppState, GatewayControlDecision, GatewayError,
+    GatewaySyncReportRequest,
 };
 use axum::body::Body;
 use axum::http::Response;

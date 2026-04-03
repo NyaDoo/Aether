@@ -4,14 +4,13 @@ use axum::body::Body;
 use axum::http::Response;
 use serde_json::Value;
 
+use crate::gateway::ai_pipeline::contracts::core_success_background_report_kind;
 pub(crate) use crate::gateway::ai_pipeline::runtime::{
     normalize_provider_private_response_value as unwrap_local_finalize_response_value,
     provider_private_response_allows_sync_finalize as local_finalize_allows_envelope,
 };
-use crate::gateway::{
-    build_client_response_from_parts, GatewayControlDecision, GatewayError,
-    GatewaySyncReportRequest,
-};
+use crate::gateway::api::response::build_client_response_from_parts;
+use crate::gateway::{GatewayControlDecision, GatewayError, GatewaySyncReportRequest};
 
 pub(crate) struct LocalCoreSyncFinalizeOutcome {
     pub(crate) response: Response<Body>,
@@ -127,17 +126,7 @@ fn map_local_finalize_to_success_report(
 }
 
 fn map_local_finalize_kind_to_success_report_kind(report_kind: &str) -> Option<&'static str> {
-    match report_kind {
-        "openai_chat_sync_finalize" => Some("openai_chat_sync_success"),
-        "claude_chat_sync_finalize" => Some("claude_chat_sync_success"),
-        "gemini_chat_sync_finalize" => Some("gemini_chat_sync_success"),
-        "openai_cli_sync_finalize" | "openai_compact_sync_finalize" => {
-            Some("openai_cli_sync_success")
-        }
-        "claude_cli_sync_finalize" => Some("claude_cli_sync_success"),
-        "gemini_cli_sync_finalize" => Some("gemini_cli_sync_success"),
-        _ => None,
-    }
+    core_success_background_report_kind(report_kind)
 }
 
 pub(crate) fn canonicalize_tool_arguments(value: Option<Value>) -> String {

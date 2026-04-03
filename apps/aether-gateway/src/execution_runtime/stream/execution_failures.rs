@@ -5,18 +5,16 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 use tracing::warn;
 
+use crate::gateway::api::response::attach_control_metadata_headers;
 use crate::gateway::execution_runtime::submission::{
     resolve_core_error_background_report_kind, submit_local_core_error_or_sync_finalize,
 };
-use crate::gateway::request_candidates::{
+use crate::gateway::scheduler::{
     current_unix_secs as current_request_candidate_unix_secs,
     record_report_request_candidate_status,
 };
 use crate::gateway::usage::submit_sync_report;
-use crate::gateway::{
-    attach_control_metadata_headers, AppState, GatewayControlDecision, GatewayError,
-    GatewaySyncReportRequest,
-};
+use crate::gateway::{AppState, GatewayControlDecision, GatewayError, GatewaySyncReportRequest};
 
 #[derive(Debug, Clone)]
 pub(super) struct StreamFailureReport {

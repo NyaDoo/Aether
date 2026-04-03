@@ -17,7 +17,7 @@ use crate::gateway::ai_pipeline::planner::{
     GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND,
 };
 
-pub(super) fn resolve_sync_spec(plan_kind: &str) -> Option<LocalSameFormatProviderSpec> {
+pub(crate) fn resolve_sync_spec(plan_kind: &str) -> Option<LocalSameFormatProviderSpec> {
     match plan_kind {
         CLAUDE_CHAT_SYNC_PLAN_KIND => Some(LocalSameFormatProviderSpec {
             api_format: "claude:chat",
@@ -51,7 +51,7 @@ pub(super) fn resolve_sync_spec(plan_kind: &str) -> Option<LocalSameFormatProvid
     }
 }
 
-pub(super) fn resolve_stream_spec(plan_kind: &str) -> Option<LocalSameFormatProviderSpec> {
+pub(crate) fn resolve_stream_spec(plan_kind: &str) -> Option<LocalSameFormatProviderSpec> {
     match plan_kind {
         CLAUDE_CHAT_STREAM_PLAN_KIND => Some(LocalSameFormatProviderSpec {
             api_format: "claude:chat",
@@ -85,7 +85,7 @@ pub(super) fn resolve_stream_spec(plan_kind: &str) -> Option<LocalSameFormatProv
     }
 }
 
-pub(super) async fn build_local_sync_plan_and_reports(
+pub(crate) async fn build_local_sync_plan_and_reports(
     state: &AppState,
     parts: &http::request::Parts,
     trace_id: &str,
@@ -141,7 +141,7 @@ pub(super) async fn build_local_sync_plan_and_reports(
     Ok(plans)
 }
 
-pub(super) async fn build_local_stream_plan_and_reports(
+pub(crate) async fn build_local_stream_plan_and_reports(
     state: &AppState,
     parts: &http::request::Parts,
     trace_id: &str,

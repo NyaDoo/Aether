@@ -9,11 +9,11 @@ use crate::gateway::ai_pipeline::planner::plan_builders::{
     build_openai_cli_stream_plan_from_decision, build_openai_cli_sync_plan_from_decision,
     LocalStreamPlanAndReport, LocalSyncPlanAndReport,
 };
-use crate::gateway::{AppState, GatewayControlDecision, GatewayError};
 use crate::gateway::ai_pipeline::planner::{
     OPENAI_CLI_STREAM_PLAN_KIND, OPENAI_CLI_SYNC_PLAN_KIND, OPENAI_COMPACT_STREAM_PLAN_KIND,
     OPENAI_COMPACT_SYNC_PLAN_KIND,
 };
+use crate::gateway::{AppState, GatewayControlDecision, GatewayError};
 
 pub(super) fn resolve_sync_spec(plan_kind: &str) -> Option<LocalOpenAiCliSpec> {
     match plan_kind {

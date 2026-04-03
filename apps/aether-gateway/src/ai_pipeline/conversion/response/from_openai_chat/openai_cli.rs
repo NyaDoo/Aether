@@ -1,8 +1,6 @@
 use serde_json::{json, Value};
 
-use super::shared::{
-    build_openai_cli_response, canonicalize_tool_arguments,
-};
+use super::shared::{build_openai_cli_response, canonicalize_tool_arguments};
 
 pub(crate) fn convert_openai_chat_response_to_openai_cli(
     body_json: &Value,

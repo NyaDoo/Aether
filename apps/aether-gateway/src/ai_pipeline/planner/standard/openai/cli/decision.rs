@@ -5,12 +5,19 @@ use serde_json::{json, Value};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::gateway::ai_pipeline::planner::standard::openai::{
+use crate::gateway::ai_pipeline::conversion::{
+    request_conversion_direct_auth, request_conversion_kind, request_conversion_transport_supported,
+};
+use crate::gateway::ai_pipeline::planner::plan_builders::{
+    LocalStreamPlanAndReport, LocalSyncPlanAndReport,
+};
+use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
+use crate::gateway::ai_pipeline::planner::standard::{
     build_cross_format_openai_cli_request_body, build_cross_format_openai_cli_upstream_url,
     build_local_openai_cli_request_body, build_local_openai_cli_upstream_url,
 };
-use crate::gateway::ai_pipeline::conversion::{
-    request_conversion_direct_auth, request_conversion_kind, request_conversion_transport_supported,
+use crate::gateway::ai_pipeline::planner::{
+    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
 };
 use crate::gateway::headers::collect_control_headers;
 use crate::gateway::provider_transport::{
@@ -23,22 +30,13 @@ use crate::gateway::provider_transport::{
     AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport,
     LocalResolvedOAuthRequestAuth,
 };
-use crate::gateway::request_candidates::{
-    current_unix_secs, record_local_request_candidate_status,
-};
-use crate::gateway::ai_pipeline::planner::plan_builders::{
-    LocalStreamPlanAndReport, LocalSyncPlanAndReport,
-};
-use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
 use crate::gateway::scheduler::{
-    list_selectable_candidates, GatewayMinimalCandidateSelectionCandidate,
+    current_unix_secs, list_selectable_candidates, record_local_request_candidate_status,
+    GatewayMinimalCandidateSelectionCandidate,
 };
 use crate::gateway::{
     append_execution_contract_fields_to_value, AppState, ConversionMode, ExecutionStrategy,
     GatewayControlDecision, GatewayControlSyncDecisionResponse, GatewayError,
-};
-use crate::gateway::ai_pipeline::planner::{
-    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
 };
 
 const ANTIGRAVITY_ENVELOPE_NAME: &str = "antigravity:v1internal";

@@ -5,12 +5,12 @@ use super::{
     aggregate_claude_stream_sync_response, aggregate_gemini_stream_sync_response,
     convert_claude_cli_response_to_openai_cli, convert_gemini_cli_response_to_openai_cli,
 };
+use crate::gateway::ai_pipeline::conversion::sync_cli_response_conversion_kind;
 use crate::gateway::ai_pipeline::finalize::common::{
     build_local_success_outcome, build_local_success_outcome_with_conversion_report,
     canonicalize_tool_arguments, local_finalize_allows_envelope,
     unwrap_local_finalize_response_value, LocalCoreSyncFinalizeOutcome,
 };
-use crate::gateway::ai_pipeline::conversion::sync_cli_response_conversion_kind;
 
 pub(crate) fn maybe_build_local_openai_cli_stream_sync_response(
     trace_id: &str,

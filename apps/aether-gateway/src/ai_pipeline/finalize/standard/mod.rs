@@ -9,12 +9,20 @@ use crate::gateway::{GatewayControlDecision, GatewayError, GatewaySyncReportRequ
 
 #[path = "claude/chat.rs"]
 mod claude_chat;
+#[path = "claude/chat_stream.rs"]
+mod claude_chat_stream;
 #[path = "claude/cli.rs"]
 mod claude_cli;
+#[path = "claude/cli_stream.rs"]
+mod claude_cli_stream;
 #[path = "gemini/chat.rs"]
 mod gemini_chat;
+#[path = "gemini/chat_stream.rs"]
+mod gemini_chat_stream;
 #[path = "gemini/cli.rs"]
 mod gemini_cli;
+#[path = "gemini/cli_stream.rs"]
+mod gemini_cli_stream;
 #[path = "openai/chat.rs"]
 mod openai_chat;
 #[path = "openai/chat_stream.rs"]
@@ -24,8 +32,8 @@ mod openai_cli;
 #[path = "openai/cli_stream.rs"]
 mod openai_cli_stream;
 
-#[path = "stream.rs"]
-mod stream;
+#[path = "stream_common.rs"]
+mod stream_common;
 
 pub(crate) use crate::gateway::ai_pipeline::conversion::response::{
     build_openai_cli_response, convert_claude_chat_response_to_openai_chat,
@@ -34,18 +42,19 @@ pub(crate) use crate::gateway::ai_pipeline::conversion::response::{
     convert_openai_chat_response_to_gemini_chat, convert_openai_chat_response_to_openai_cli,
     convert_openai_cli_response_to_openai_chat,
 };
-pub(crate) use claude_chat::{
+pub(crate) use claude_chat::maybe_build_local_claude_sync_response;
+pub(crate) use claude_chat_stream::{
     aggregate_claude_stream_sync_response, maybe_build_local_claude_stream_sync_response,
-    maybe_build_local_claude_sync_response,
 };
-pub(crate) use claude_cli::maybe_build_local_claude_cli_stream_sync_response;
-pub(crate) use gemini_chat::{
+pub(crate) use claude_cli_stream::maybe_build_local_claude_cli_stream_sync_response;
+pub(crate) use gemini_chat::maybe_build_local_gemini_sync_response;
+pub(crate) use gemini_chat_stream::{
     aggregate_gemini_stream_sync_response, maybe_build_local_gemini_stream_sync_response,
-    maybe_build_local_gemini_sync_response,
 };
-pub(crate) use gemini_cli::maybe_build_local_gemini_cli_stream_sync_response;
+pub(crate) use gemini_cli_stream::maybe_build_local_gemini_cli_stream_sync_response;
 pub(crate) use openai_chat::{
-    aggregate_openai_chat_stream_sync_response, maybe_build_local_openai_chat_cross_format_stream_sync_response,
+    aggregate_openai_chat_stream_sync_response,
+    maybe_build_local_openai_chat_cross_format_stream_sync_response,
     maybe_build_local_openai_chat_cross_format_sync_response,
     maybe_build_local_openai_chat_stream_sync_response,
     maybe_build_local_openai_chat_sync_response,
@@ -54,12 +63,13 @@ pub(crate) use openai_chat_stream::{
     ClaudeToOpenAIChatStreamState, GeminiToOpenAIChatStreamState, OpenAICliToOpenAIChatStreamState,
 };
 pub(crate) use openai_cli::{
-    aggregate_openai_cli_stream_sync_response, maybe_build_local_openai_cli_cross_format_stream_sync_response,
+    aggregate_openai_cli_stream_sync_response,
+    maybe_build_local_openai_cli_cross_format_stream_sync_response,
     maybe_build_local_openai_cli_cross_format_sync_response,
     maybe_build_local_openai_cli_stream_sync_response,
 };
 pub(crate) use openai_cli_stream::BufferedCliConversionStreamState;
-pub(crate) use stream::BufferedStandardConversionStreamState;
+pub(crate) use stream_common::BufferedStandardConversionStreamState;
 
 pub(crate) fn aggregate_standard_chat_stream_sync_response(
     body: &[u8],

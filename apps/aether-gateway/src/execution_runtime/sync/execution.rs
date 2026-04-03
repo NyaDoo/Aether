@@ -6,24 +6,25 @@ use axum::http::Response;
 use base64::Engine as _;
 use tracing::warn;
 
+use crate::gateway::ai_pipeline::contracts::implicit_sync_finalize_report_kind;
+use crate::gateway::api::response::{
+    attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
+};
 use crate::gateway::constants::{CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER};
 #[cfg(test)]
 use crate::gateway::execution_runtime::remote_compat::post_sync_plan_to_remote_execution_runtime;
 use crate::gateway::execution_runtime::submission::submit_local_core_error_or_sync_finalize;
 use crate::gateway::execution_runtime::transport::DirectSyncExecutionRuntime;
-use crate::gateway::request_candidates::{
+use crate::gateway::scheduler::{
     current_unix_secs as current_request_candidate_unix_secs,
     ensure_execution_request_candidate_slot, execution_error_details,
-    record_local_request_candidate_status,
-};
-use crate::gateway::scheduler::{
-    resolve_core_sync_error_finalize_report_kind, should_fallback_to_control_sync,
-    should_finalize_sync_response, should_retry_next_local_candidate_sync,
+    record_local_request_candidate_status, resolve_core_sync_error_finalize_report_kind,
+    should_fallback_to_control_sync, should_finalize_sync_response,
+    should_retry_next_local_candidate_sync,
 };
 use crate::gateway::usage::{spawn_sync_report, submit_sync_report};
 use crate::gateway::video_tasks::VideoTaskSyncReportMode;
 use crate::gateway::{
-    attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
     maybe_build_sync_finalize_outcome, AppState, GatewayControlDecision, GatewayError,
     GatewaySyncReportRequest,
 };
@@ -498,19 +499,6 @@ pub(crate) async fn execute_execution_runtime_sync(
     )?))
 }
 
-fn resolve_implicit_sync_finalize_report_kind(plan_kind: &str) -> Option<&'static str> {
-    match plan_kind {
-        "openai_chat_sync" => Some("openai_chat_sync_finalize"),
-        "claude_chat_sync" => Some("claude_chat_sync_finalize"),
-        "gemini_chat_sync" => Some("gemini_chat_sync_finalize"),
-        "openai_cli_sync" => Some("openai_cli_sync_finalize"),
-        "openai_compact_sync" => Some("openai_compact_sync_finalize"),
-        "claude_cli_sync" => Some("claude_cli_sync_finalize"),
-        "gemini_cli_sync" => Some("gemini_cli_sync_finalize"),
-        _ => None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)] // mirrors sync execution context
 fn maybe_build_implicit_sync_finalize_outcome(
     trace_id: &str,
@@ -527,7 +515,7 @@ fn maybe_build_implicit_sync_finalize_outcome(
         return Ok(None);
     }
 
-    let Some(report_kind) = resolve_implicit_sync_finalize_report_kind(plan_kind) else {
+    let Some(report_kind) = implicit_sync_finalize_report_kind(plan_kind) else {
         return Ok(None);
     };
 

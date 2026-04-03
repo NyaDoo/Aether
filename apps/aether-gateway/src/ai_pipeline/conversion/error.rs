@@ -1,5 +1,12 @@
 use serde_json::{Map, Value};
 
+#[cfg(test)]
+use crate::gateway::ai_pipeline::contracts::core_success_background_report_kind as contract_core_success_background_report_kind;
+use crate::gateway::ai_pipeline::contracts::{
+    core_error_background_report_kind as contract_core_error_background_report_kind,
+    core_error_default_client_api_format as contract_core_error_default_client_api_format,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LocalCoreSyncErrorKind {
     InvalidRequest,
@@ -17,44 +24,16 @@ pub(crate) fn is_core_error_finalize_kind(report_kind: &str) -> bool {
 }
 
 pub(crate) fn core_error_default_client_api_format(report_kind: &str) -> Option<&'static str> {
-    match report_kind {
-        "openai_chat_sync_finalize" => Some("openai:chat"),
-        "claude_chat_sync_finalize" => Some("claude:chat"),
-        "gemini_chat_sync_finalize" => Some("gemini:chat"),
-        "openai_cli_sync_finalize" => Some("openai:cli"),
-        "openai_compact_sync_finalize" => Some("openai:compact"),
-        "claude_cli_sync_finalize" => Some("claude:cli"),
-        "gemini_cli_sync_finalize" => Some("gemini:cli"),
-        _ => None,
-    }
+    contract_core_error_default_client_api_format(report_kind)
 }
 
 pub(crate) fn core_error_background_report_kind(report_kind: &str) -> Option<&'static str> {
-    match report_kind {
-        "openai_chat_sync_finalize" => Some("openai_chat_sync_error"),
-        "claude_chat_sync_finalize" => Some("claude_chat_sync_error"),
-        "gemini_chat_sync_finalize" => Some("gemini_chat_sync_error"),
-        "openai_cli_sync_finalize" => Some("openai_cli_sync_error"),
-        "openai_compact_sync_finalize" => Some("openai_compact_sync_error"),
-        "claude_cli_sync_finalize" => Some("claude_cli_sync_error"),
-        "gemini_cli_sync_finalize" => Some("gemini_cli_sync_error"),
-        _ => None,
-    }
+    contract_core_error_background_report_kind(report_kind)
 }
 
 #[cfg(test)]
 pub(crate) fn core_success_background_report_kind(report_kind: &str) -> Option<&'static str> {
-    match report_kind {
-        "openai_chat_sync_finalize" => Some("openai_chat_sync_success"),
-        "claude_chat_sync_finalize" => Some("claude_chat_sync_success"),
-        "gemini_chat_sync_finalize" => Some("gemini_chat_sync_success"),
-        "openai_cli_sync_finalize" | "openai_compact_sync_finalize" => {
-            Some("openai_cli_sync_success")
-        }
-        "claude_cli_sync_finalize" => Some("claude_cli_sync_success"),
-        "gemini_cli_sync_finalize" => Some("gemini_cli_sync_success"),
-        _ => None,
-    }
+    contract_core_success_background_report_kind(report_kind)
 }
 
 pub(crate) fn build_core_error_body_for_client_format(

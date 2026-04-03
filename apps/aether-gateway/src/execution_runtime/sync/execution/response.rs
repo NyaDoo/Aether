@@ -5,12 +5,10 @@ use axum::body::Body;
 use axum::http::Response;
 use serde_json::json;
 
+use crate::gateway::api::response::build_client_response_from_parts;
 use crate::gateway::video_tasks::{LocalVideoTaskSnapshot, VideoTaskSyncReportMode};
 use crate::gateway::VideoTaskService;
-use crate::gateway::{
-    build_client_response_from_parts, GatewayControlDecision, GatewayError,
-    GatewaySyncReportRequest,
-};
+use crate::gateway::{GatewayControlDecision, GatewayError, GatewaySyncReportRequest};
 
 pub(crate) struct LocalVideoSyncSuccessOutcome {
     pub(crate) response: Response<Body>,

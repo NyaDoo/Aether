@@ -9,7 +9,7 @@ mod endpoints_routes;
 #[path = "endpoints/rpm.rs"]
 mod endpoints_rpm;
 
-pub(super) async fn maybe_build_local_admin_endpoints_response(
+pub(crate) async fn maybe_build_local_admin_endpoints_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
     request_body: Option<&axum::body::Bytes>,

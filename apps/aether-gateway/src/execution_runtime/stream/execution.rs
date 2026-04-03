@@ -26,6 +26,9 @@ use self::execution_failures::{
 use crate::gateway::ai_pipeline::runtime::{
     maybe_build_provider_private_stream_normalizer, normalize_provider_private_report_context,
 };
+use crate::gateway::api::response::{
+    attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
+};
 use crate::gateway::constants::{CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER};
 use crate::gateway::execution_runtime::build_direct_execution_frame_stream;
 #[cfg(test)]
@@ -36,18 +39,15 @@ use crate::gateway::execution_runtime::submission::{
 use crate::gateway::execution_runtime::transport::{
     DirectSyncExecutionRuntime, DirectUpstreamStreamExecution,
 };
-use crate::gateway::request_candidates::{
+use crate::gateway::scheduler::{
     current_unix_secs as current_request_candidate_unix_secs,
     ensure_execution_request_candidate_slot, record_local_request_candidate_status,
-};
-use crate::gateway::scheduler::{
     resolve_core_stream_direct_finalize_report_kind,
     resolve_core_stream_error_finalize_report_kind, should_fallback_to_control_stream,
     should_retry_next_local_candidate_stream,
 };
 use crate::gateway::usage::submit_stream_report;
 use crate::gateway::{
-    attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
     maybe_build_stream_response_rewriter, AppState, GatewayControlDecision, GatewayError,
     GatewayStreamReportRequest, GatewaySyncReportRequest, MAX_STREAM_PREFETCH_BYTES,
     MAX_STREAM_PREFETCH_FRAMES,

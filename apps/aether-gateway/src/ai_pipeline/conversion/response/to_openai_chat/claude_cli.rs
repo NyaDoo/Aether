@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
-use super::shared::{build_generated_tool_call_id, canonicalize_tool_arguments};
 use super::super::from_openai_chat::build_openai_cli_response;
+use super::shared::{build_generated_tool_call_id, canonicalize_tool_arguments};
 
 pub(crate) fn convert_claude_cli_response_to_openai_cli(
     body_json: &Value,

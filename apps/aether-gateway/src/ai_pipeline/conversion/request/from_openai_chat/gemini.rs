@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use super::shared::parse_openai_tool_arguments;
 use super::super::to_openai_chat::{extract_openai_text_content, parse_openai_tool_result_content};
+use super::shared::parse_openai_tool_arguments;
 use crate::gateway::ai_pipeline::planner::standard::{
     copy_request_number_field_as, map_openai_reasoning_effort_to_gemini_budget,
     parse_openai_stop_sequences, value_as_u64,
@@ -37,8 +37,10 @@ pub(crate) fn convert_openai_chat_request_to_gemini_request(
                     }
                 }
                 "user" => {
-                    let parts =
-                        convert_openai_content_to_gemini_parts(message_object.get("content"), true)?;
+                    let parts = convert_openai_content_to_gemini_parts(
+                        message_object.get("content"),
+                        true,
+                    )?;
                     if !parts.is_empty() {
                         contents.push(json!({
                             "role": "user",

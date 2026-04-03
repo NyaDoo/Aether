@@ -8,6 +8,13 @@ use serde_json::{json, Value};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::gateway::ai_pipeline::planner::plan_builders::{
+    LocalStreamPlanAndReport, LocalSyncPlanAndReport,
+};
+use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
+use crate::gateway::ai_pipeline::planner::{
+    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
+};
 use crate::gateway::headers::collect_control_headers;
 use crate::gateway::provider_transport::{
     apply_local_body_rules, apply_local_header_rules, build_antigravity_safe_v1internal_request,
@@ -29,27 +36,17 @@ use crate::gateway::provider_transport::{
     AntigravityRequestEnvelopeSupport, AntigravityRequestSideSupport, AntigravityRequestUrlAction,
     LocalResolvedOAuthRequestAuth, KIRO_ENVELOPE_NAME,
 };
-use crate::gateway::request_candidates::{
-    current_unix_secs, record_local_request_candidate_status,
-};
-use crate::gateway::ai_pipeline::planner::plan_builders::{
-    LocalStreamPlanAndReport, LocalSyncPlanAndReport,
-};
-use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
 use crate::gateway::scheduler::{
-    list_selectable_candidates, GatewayMinimalCandidateSelectionCandidate,
+    current_unix_secs, list_selectable_candidates, record_local_request_candidate_status,
+    GatewayMinimalCandidateSelectionCandidate,
 };
 use crate::gateway::{
-    append_execution_contract_fields_to_value, execute_execution_runtime_stream,
-    execute_execution_runtime_sync, AppState, ConversionMode, ExecutionStrategy,
+    append_execution_contract_fields_to_value, AppState, ConversionMode, ExecutionStrategy,
     GatewayControlDecision, GatewayControlSyncDecisionResponse, GatewayError,
 };
-use crate::gateway::ai_pipeline::planner::{
-    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
-};
 
-mod family;
-mod plans;
+pub(crate) mod family;
+pub(crate) mod plans;
 mod request;
 
 pub(super) use self::family::{
@@ -61,12 +58,6 @@ pub(super) use self::family::{
 pub(crate) use self::family::{
     maybe_build_stream_local_same_format_provider_decision_payload,
     maybe_build_sync_local_same_format_provider_decision_payload,
-    maybe_execute_stream_via_local_same_format_provider_decision,
-    maybe_execute_sync_via_local_same_format_provider_decision,
-};
-use self::plans::{
-    build_local_stream_plan_and_reports, build_local_sync_plan_and_reports, resolve_stream_spec,
-    resolve_sync_spec,
 };
 use self::request::{
     build_same_format_provider_request_body, build_same_format_upstream_url,

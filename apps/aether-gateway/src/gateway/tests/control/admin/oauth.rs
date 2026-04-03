@@ -1744,7 +1744,10 @@ async fn gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_p
         .as_bool()
         .expect("account_state_recheck_attempted should be bool");
     if account_state_recheck_attempted {
-        assert_eq!(payload["account_state_recheck_error"], "wham/usage API 返回状态码 401");
+        assert_eq!(
+            payload["account_state_recheck_error"],
+            "wham/usage API 返回状态码 401"
+        );
     } else {
         assert_eq!(
             payload["account_state_recheck_error"],

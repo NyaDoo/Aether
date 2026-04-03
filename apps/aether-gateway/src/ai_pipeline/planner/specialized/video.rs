@@ -1,12 +1,18 @@
 use std::collections::BTreeMap;
 
 use aether_data::repository::candidates::{RequestCandidateStatus, UpsertRequestCandidateRecord};
-use axum::body::Body;
-use axum::http::Response;
 use serde_json::{json, Value};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::gateway::ai_pipeline::planner::plan_builders::{
+    build_passthrough_sync_plan_from_decision, LocalSyncPlanAndReport,
+};
+use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
+use crate::gateway::ai_pipeline::planner::{
+    EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND,
+    OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
+};
 use crate::gateway::headers::collect_control_headers;
 use crate::gateway::provider_transport::{
     apply_local_body_rules, apply_local_header_rules, build_gemini_video_predict_long_running_url,
@@ -15,23 +21,12 @@ use crate::gateway::provider_transport::{
     resolve_transport_proxy_snapshot_with_tunnel_affinity, resolve_transport_tls_profile,
     supports_local_gemini_transport_with_network, supports_local_standard_transport_with_network,
 };
-use crate::gateway::request_candidates::{
-    current_unix_secs, record_local_request_candidate_status,
-};
-use crate::gateway::ai_pipeline::planner::plan_builders::{
-    build_passthrough_sync_plan_from_decision, LocalSyncPlanAndReport,
-};
-use crate::gateway::ai_pipeline::planner::prefer_local_tunnel_owner_candidates;
 use crate::gateway::scheduler::{
-    list_selectable_candidates, GatewayMinimalCandidateSelectionCandidate,
+    current_unix_secs, list_selectable_candidates, record_local_request_candidate_status,
+    GatewayMinimalCandidateSelectionCandidate,
 };
 use crate::gateway::{
-    execute_execution_runtime_sync, AppState, GatewayControlDecision,
-    GatewayControlSyncDecisionResponse, GatewayError,
-};
-use crate::gateway::ai_pipeline::planner::{
-    EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_CREATE_SYNC_PLAN_KIND,
+    AppState, GatewayControlDecision, GatewayControlSyncDecisionResponse, GatewayError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,45 +57,19 @@ struct LocalVideoCreateCandidateAttempt {
     candidate_id: String,
 }
 
-pub(crate) async fn maybe_execute_sync_via_local_video_decision(
+pub(crate) async fn build_local_video_sync_plan_and_reports_for_kind(
     state: &AppState,
     parts: &http::request::Parts,
     body_json: &serde_json::Value,
     trace_id: &str,
     decision: &GatewayControlDecision,
     plan_kind: &str,
-) -> Result<Option<Response<Body>>, GatewayError> {
+) -> Result<Vec<LocalSyncPlanAndReport>, GatewayError> {
     let Some(spec) = resolve_sync_spec(plan_kind) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
-    let plan_and_reports =
-        build_local_sync_plan_and_reports(state, parts, body_json, trace_id, decision, spec)
-            .await?;
-    if plan_and_reports.is_empty() {
-        return Ok(None);
-    }
-
-    let mut remaining = plan_and_reports.into_iter();
-    while let Some(plan_and_report) = remaining.next() {
-        if let Some(response) = execute_execution_runtime_sync(
-            state,
-            parts.uri.path(),
-            plan_and_report.plan,
-            trace_id,
-            decision,
-            plan_kind,
-            plan_and_report.report_kind,
-            plan_and_report.report_context,
-        )
-        .await?
-        {
-            mark_unused_local_video_candidates(state, remaining.collect()).await;
-            return Ok(Some(response));
-        }
-    }
-
-    Ok(None)
+    build_local_sync_plan_and_reports(state, parts, body_json, trace_id, decision, spec).await
 }
 
 pub(crate) async fn maybe_build_sync_local_video_decision_payload(
