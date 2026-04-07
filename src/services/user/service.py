@@ -17,10 +17,12 @@ from src.models.database import (
     GlobalModel,
     Model,
     Provider,
+    SubscriptionPlan,
     Usage,
     User,
     UserGroup,
     UserRole,
+    UserSubscription,
 )
 from src.services.auth.session_service import SessionService
 from src.services.cache.user_cache import UserCacheService
@@ -205,7 +207,15 @@ class UserService:
     ) -> list[User]:
         """列出用户"""
         query = db.query(User)
-        query = query.options(selectinload(User.group))
+        query = query.options(
+            selectinload(User.group),
+            selectinload(User.subscriptions)
+            .selectinload(UserSubscription.plan)
+            .selectinload(SubscriptionPlan.user_group),
+            selectinload(User.subscriptions)
+            .selectinload(UserSubscription.plan)
+            .selectinload(SubscriptionPlan.product),
+        )
 
         if role:
             query = query.filter(User.role == role)

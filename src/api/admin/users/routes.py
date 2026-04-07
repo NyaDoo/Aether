@@ -33,6 +33,7 @@ from src.services.auth.session_service import SessionService
 from src.services.cache.user_cache import UserCacheService
 from src.services.system.config import SystemConfigService
 from src.services.model.group_service import ModelGroupBindingPayload
+from src.services.subscription import SubscriptionService
 from src.services.user.apikey import ApiKeyService
 from src.services.user.bulk_cleanup import pre_clean_api_key
 from src.services.user.group_service import UserGroupService
@@ -56,11 +57,19 @@ def _serialize_user(
     wallet: Wallet | None | _WalletSentinelType = _WALLET_SENTINEL,
 ) -> dict[str, Any]:
     effective_access = resolve_user_access_config(user)
+    active_subscription = SubscriptionService._load_active_subscription_from_user(user)
+    effective_group = SubscriptionService.resolve_effective_user_group_from_user(user)
+    if isinstance(user, User):
+        if active_subscription is None:
+            active_subscription = SubscriptionService.get_active_subscription(db, user_id=str(user.id))
+        if effective_group is None:
+            effective_group = SubscriptionService.resolve_effective_user_group(db, user)
     resolved_wallet: Wallet | None
     if wallet is _WALLET_SENTINEL:
         resolved_wallet = WalletService.get_wallet(db, user_id=user.id)
     else:
         resolved_wallet = wallet
+    active_subscription_ends_at = SubscriptionService.get_subscription_display_end(db, active_subscription)
     return {
         "id": user.id,
         "email": user.email,
@@ -68,10 +77,42 @@ def _serialize_user(
         "role": user.role.value,
         "group_id": user.group_id,
         "group_name": user.group.name if user.group else None,
+        "effective_group_id": getattr(effective_group, "id", None),
+        "effective_group_name": getattr(effective_group, "name", None),
         "effective_allowed_providers": effective_access.allowed_providers,
         "effective_allowed_api_formats": effective_access.allowed_api_formats,
         "effective_allowed_models": effective_access.allowed_models,
         "effective_rate_limit": effective_access.rate_limit,
+        "active_subscription_id": getattr(active_subscription, "id", None),
+        "active_subscription_product_id": (
+            getattr(getattr(getattr(active_subscription, "plan", None), "product", None), "id", None)
+            if active_subscription is not None
+            else None
+        ),
+        "active_subscription_product_name": (
+            getattr(getattr(getattr(active_subscription, "plan", None), "product", None), "name", None)
+            if active_subscription is not None
+            else None
+        ),
+        "active_subscription_plan_id": getattr(active_subscription, "plan_id", None),
+        "active_subscription_plan_name": (
+            getattr(getattr(active_subscription, "plan", None), "name", None)
+            if active_subscription is not None
+            else None
+        ),
+        "active_subscription_status": getattr(active_subscription, "status", None),
+        "active_subscription_remaining_quota_usd": (
+            float(SubscriptionService.get_remaining_quota_value(active_subscription))
+            if active_subscription is not None
+            else None
+        ),
+        "active_subscription_overage_policy": (
+            getattr(getattr(active_subscription, "plan", None), "overage_policy", None)
+            if active_subscription is not None
+            else None
+        ),
+        "active_subscription_started_at": getattr(active_subscription, "started_at", None),
+        "active_subscription_ends_at": active_subscription_ends_at,
         "unlimited": WalletService.is_unlimited_wallet(resolved_wallet),
         "is_active": user.is_active,
         "created_at": user.created_at.isoformat(),

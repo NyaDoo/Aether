@@ -224,25 +224,28 @@
 
       <!-- 桌面端表格 -->
       <div class="hidden xl:block overflow-x-auto">
-        <Table>
+        <Table class="min-w-[1320px] w-full table-fixed">
           <TableHeader>
             <TableRow class="border-b border-border/60 hover:bg-transparent">
-              <TableHead class="w-[260px] h-12 font-semibold">
+              <TableHead class="h-12 w-[260px] font-semibold whitespace-nowrap">
                 用户信息
               </TableHead>
-              <TableHead class="w-[240px] h-12 font-semibold">
+              <TableHead class="h-12 w-[180px] font-semibold whitespace-nowrap">
                 钱包
               </TableHead>
-              <TableHead class="w-[170px] h-12 font-semibold">
+              <TableHead class="h-12 w-[240px] font-semibold whitespace-nowrap">
+                订阅
+              </TableHead>
+              <TableHead class="h-12 w-[170px] font-semibold whitespace-nowrap">
                 统计/限速
               </TableHead>
-              <TableHead class="w-[110px] h-12 font-semibold">
+              <TableHead class="h-12 w-[110px] font-semibold whitespace-nowrap">
                 创建时间
               </TableHead>
-              <TableHead class="w-[180px] h-12 font-semibold">
+              <TableHead class="h-12 w-[140px] font-semibold whitespace-nowrap">
                 状态
               </TableHead>
-              <TableHead class="w-[220px] h-12 font-semibold text-center">
+              <TableHead class="h-12 w-[220px] font-semibold text-center whitespace-nowrap">
                 操作
               </TableHead>
             </TableRow>
@@ -270,14 +273,14 @@
                       </div>
                       <Badge
                         :variant="user.role === 'admin' ? 'default' : 'secondary'"
-                        class="h-5 px-1.5 py-0 text-[10px] font-medium flex-shrink-0"
+                        class="h-5 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium flex-shrink-0"
                       >
                         {{ user.role === 'admin' ? '管理员' : '普通用户' }}
                       </Badge>
                       <Badge
                         v-if="user.group_name"
                         variant="outline"
-                        class="h-5 px-1.5 py-0 text-[10px] font-medium flex-shrink-0"
+                        class="h-5 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium flex-shrink-0"
                       >
                         {{ user.group_name }}
                       </Badge>
@@ -291,93 +294,147 @@
                   </div>
                 </div>
               </TableCell>
-              <TableCell class="py-4">
-                <div class="space-y-1.5">
-                  <div class="flex items-center gap-1 text-[11px] text-muted-foreground">
-                    <span>余额：</span>
+              <TableCell class="py-4 pr-2 align-top">
+                <div class="min-w-0 space-y-1.5">
+                  <div class="flex items-center gap-1.5 text-[11px] text-muted-foreground whitespace-nowrap">
+                    <span class="shrink-0">余额：</span>
                     <Badge
                       v-if="isUserUnlimited(user)"
                       variant="secondary"
-                      class="h-5 px-1.5 py-0 text-[10px] font-medium"
+                      class="h-5 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium"
                     >
                       无限额度
                     </Badge>
                     <span
                       v-else
-                      class="text-sm font-semibold tabular-nums"
+                      class="text-sm font-semibold tabular-nums whitespace-nowrap"
                       :class="isNegativeWalletValue(getUserWalletTotalBalance(user)) ? 'text-rose-600' : 'text-foreground'"
                     >
                       {{ formatCurrencyValue(getUserWalletTotalBalance(user), '-') }}
                     </span>
                   </div>
-                  <div class="flex items-center gap-2 text-[11px] text-muted-foreground flex-wrap">
-                    <span>
+                  <div class="flex items-center gap-2 text-[11px] text-muted-foreground whitespace-nowrap">
+                    <span class="whitespace-nowrap">
                       已消费：
-                      <span class="font-medium tabular-nums text-foreground">${{ getUserWalletConsumed(user).toFixed(2) }}</span>
+                      <span class="font-medium tabular-nums text-foreground whitespace-nowrap">${{ getUserWalletConsumed(user).toFixed(2) }}</span>
                     </span>
                   </div>
                 </div>
               </TableCell>
-              <TableCell class="py-4">
+              <TableCell class="py-4 align-top">
+                <div
+                  v-if="user.active_subscription_id"
+                  class="min-w-0 space-y-1.5 text-xs"
+                >
+                  <div class="flex min-w-0 items-center gap-2">
+                    <div class="min-w-0 truncate text-sm font-semibold text-foreground">
+                      {{ formatUserSubscriptionName(user) }}
+                    </div>
+                    <Badge
+                      variant="outline"
+                      class="h-5 shrink-0 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium"
+                    >
+                      {{ user.active_subscription_status === 'active' ? '生效中' : '已开通' }}
+                    </Badge>
+                  </div>
+                  <div class="text-muted-foreground whitespace-nowrap">
+                    剩余额度：
+                    <span class="font-medium text-foreground">
+                      {{ formatCurrencyValue(user.active_subscription_remaining_quota_usd ?? null, '-') }}
+                    </span>
+                  </div>
+                  <div class="text-muted-foreground whitespace-nowrap">
+                    超额策略：
+                    <span class="font-medium text-foreground">
+                      {{ formatOveragePolicy(user.active_subscription_overage_policy) }}
+                    </span>
+                  </div>
+                </div>
+                <div
+                  v-else
+                  class="space-y-1.5 text-xs"
+                >
+                  <div class="flex min-w-0 items-center gap-2">
+                    <div class="min-w-0 truncate text-sm font-semibold text-foreground">
+                      未开通
+                    </div>
+                    <Badge
+                      variant="secondary"
+                      class="h-5 shrink-0 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium"
+                    >
+                      未开通
+                    </Badge>
+                  </div>
+                  <div class="text-muted-foreground whitespace-nowrap">
+                    剩余额度：
+                    <span class="font-medium text-foreground">-</span>
+                  </div>
+                  <div class="text-muted-foreground whitespace-nowrap">
+                    超额策略：
+                    <span class="font-medium text-foreground">-</span>
+                  </div>
+                </div>
+              </TableCell>
+              <TableCell class="py-4 align-top">
                 <div class="space-y-1 text-xs">
                   <template v-if="userStats[user.id]">
-                    <div class="flex items-center text-muted-foreground">
-                      <span class="w-14">请求:</span>
-                      <span class="font-medium text-foreground">{{ formatNumber(userStats[user.id]?.request_count) }}</span>
+                    <div class="flex items-center text-muted-foreground whitespace-nowrap">
+                      <span class="w-14 shrink-0">请求:</span>
+                      <span class="font-medium text-foreground whitespace-nowrap">{{ formatNumber(userStats[user.id]?.request_count) }}</span>
                     </div>
-                    <div class="flex items-center text-muted-foreground">
-                      <span class="w-14">Tokens:</span>
-                      <span class="font-medium text-foreground">{{ formatTokens(userStats[user.id]?.total_tokens ?? 0) }}</span>
+                    <div class="flex items-center text-muted-foreground whitespace-nowrap">
+                      <span class="w-14 shrink-0">Tokens:</span>
+                      <span class="font-medium text-foreground whitespace-nowrap">{{ formatTokens(userStats[user.id]?.total_tokens ?? 0) }}</span>
                     </div>
                   </template>
                   <div
                     v-else
-                    class="flex items-center text-muted-foreground"
+                    class="flex items-center text-muted-foreground whitespace-nowrap"
                   >
-                    <span class="w-14">统计:</span>
+                    <span class="w-14 shrink-0">统计:</span>
                     <span v-if="loadingStats">加载中...</span>
                     <span v-else>无数据</span>
                   </div>
-                  <div class="flex items-center text-muted-foreground">
-                    <span class="w-14">限速:</span>
+                  <div class="flex items-center text-muted-foreground whitespace-nowrap">
+                    <span class="w-14 shrink-0">限速:</span>
                     <Badge
                       v-if="isRateLimitInherited(user.effective_rate_limit) || isRateLimitUnlimited(user.effective_rate_limit)"
                       variant="secondary"
-                      class="h-5 px-1.5 py-0 text-[10px] font-medium"
+                      class="h-5 shrink-0 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium"
                     >
                       {{ formatRateLimitInheritable(user.effective_rate_limit) }}
                     </Badge>
                     <span
                       v-else
-                      class="font-medium text-foreground"
+                      class="font-medium text-foreground whitespace-nowrap"
                     >
                       {{ formatRateLimitInheritable(user.effective_rate_limit) }}
                     </span>
                   </div>
                 </div>
               </TableCell>
-              <TableCell class="py-4 text-xs text-muted-foreground">
+              <TableCell class="py-4 align-top text-xs text-muted-foreground whitespace-nowrap">
                 {{ formatDate(user.created_at) }}
               </TableCell>
-              <TableCell class="py-4">
+              <TableCell class="py-4 align-top">
                 <div class="flex flex-col items-start gap-1.5">
                   <Badge
                     :variant="user.is_active ? 'success' : 'destructive'"
-                    class="h-5 px-1.5 py-0 text-[10px] font-medium"
+                    class="h-5 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium"
                   >
                     {{ user.is_active ? '活跃' : '禁用' }}
                   </Badge>
                   <Badge
                     v-if="getUserWallet(user.id)"
                     :variant="walletStatusBadge(getUserWalletStatus(user.id))"
-                    class="h-5 px-1.5 py-0 text-[10px] font-medium"
+                    class="h-5 whitespace-nowrap px-1.5 py-0 text-[10px] font-medium"
                   >
                     {{ walletStatusLabel(getUserWalletStatus(user.id)) }}
                   </Badge>
                 </div>
               </TableCell>
-              <TableCell class="py-4">
-                <div class="flex justify-center gap-1">
+              <TableCell class="py-4 align-top">
+                <div class="flex justify-center gap-1 whitespace-nowrap">
                   <Button
                     variant="ghost"
                     size="icon"
@@ -386,6 +443,15 @@
                     @click="editUser(user)"
                   >
                     <SquarePen class="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    class="h-8 w-8"
+                    title="订阅"
+                    @click="openSubscriptionDialog(user)"
+                  >
+                    <CreditCard class="h-4 w-4" />
                   </Button>
                   <Button
                     variant="ghost"
@@ -569,6 +635,38 @@
                 </div>
               </div>
 
+              <div class="rounded-xl border border-border/60 bg-background/70 p-3.5">
+                <div class="flex items-start justify-between gap-3">
+                  <div class="space-y-1 min-w-0">
+                    <p class="text-[11px] text-muted-foreground">
+                      订阅
+                    </p>
+                    <p class="truncate text-sm font-semibold text-foreground">
+                      {{ formatUserSubscriptionName(user) || '未开通' }}
+                    </p>
+                    <p
+                      v-if="user.active_subscription_id"
+                      class="text-[11px] text-muted-foreground"
+                    >
+                      {{ formatCurrencyValue(user.active_subscription_remaining_quota_usd ?? null, '-') }} 剩余 · {{ formatOveragePolicy(user.active_subscription_overage_policy) }}
+                    </p>
+                    <p
+                      v-else
+                      class="text-[11px] text-muted-foreground"
+                    >
+                      可直接开通订阅
+                    </p>
+                  </div>
+                  <Badge
+                    v-if="user.active_subscription_id"
+                    variant="outline"
+                    class="h-5 px-1.5 py-0 text-[10px] font-medium"
+                  >
+                    {{ user.active_subscription_status === 'active' ? '生效中' : '已开通' }}
+                  </Badge>
+                </div>
+              </div>
+
               <div class="grid grid-cols-2 gap-2.5 text-xs">
                 <div class="rounded-lg border border-border/50 bg-background/70 p-2.5">
                   <div class="mb-1 text-muted-foreground">
@@ -604,6 +702,15 @@
                 >
                   <SquarePen class="mr-1.5 h-3.5 w-3.5" />
                   编辑
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  class="h-8 text-xs"
+                  @click="openSubscriptionDialog(user)"
+                >
+                  <CreditCard class="mr-1.5 h-3.5 w-3.5" />
+                  订阅
                 </Button>
                 <Button
                   variant="outline"
@@ -681,6 +788,13 @@
       :user="editingUser"
       @close="closeUserFormDialog"
       @submit="handleUserFormSubmit"
+    />
+
+    <UserSubscriptionDrawer
+      :open="showSubscriptionDrawer"
+      :user="subscriptionDrawerUser"
+      @close="closeSubscriptionDrawer"
+      @changed="handleSubscriptionDrawerChanged"
     />
 
     <!-- API Keys 管理对话框 -->
@@ -1131,11 +1245,13 @@ import {
   CheckCircle,
   Lock,
   LockOpen,
-  MonitorSmartphone
+  MonitorSmartphone,
+  CreditCard
 } from 'lucide-vue-next'
 
 // 功能组件
 import UserFormDialog, { type UserFormData } from '@/features/users/components/UserFormDialog.vue'
+import UserSubscriptionDrawer from '@/features/users/components/UserSubscriptionDrawer.vue'
 import WalletOpsDrawer from '@/features/wallet/components/WalletOpsDrawer.vue'
 import { parseApiError } from '@/utils/errorParser'
 import { formatTokens, formatRateLimitInheritable, formatRateLimitSimple, isRateLimitInherited, isRateLimitUnlimited } from '@/utils/format'
@@ -1153,6 +1269,8 @@ const showUserFormDialog = ref(false)
 const editingUser = ref<UserFormData | null>(null)
 const userFormDialogRef = ref<InstanceType<typeof UserFormDialog>>()
 const userGroups = ref<UserGroup[]>([])
+const showSubscriptionDrawer = ref(false)
+const subscriptionDrawerUser = ref<User | null>(null)
 
 // API Keys 对话框状态
 const showApiKeysDialog = ref(false)
@@ -1263,7 +1381,22 @@ async function loadUserGroups() {
 }
 
 function formatDate(dateString: string) {
-  return new Date(dateString).toLocaleDateString('zh-CN')
+  if (!dateString) return '-'
+  const date = new Date(dateString)
+  if (Number.isNaN(date.getTime())) return '-'
+  return date.toLocaleDateString('zh-CN')
+}
+
+function formatOveragePolicy(policy?: string | null): string {
+  return policy === 'use_wallet_balance' ? '扣钱包' : '拦截'
+}
+
+function formatUserSubscriptionName(user: User): string {
+  if (!user.active_subscription_id) return ''
+  if (user.active_subscription_product_name && user.active_subscription_plan_name) {
+    return `${user.active_subscription_product_name} · ${user.active_subscription_plan_name}`
+  }
+  return user.active_subscription_plan_name || user.active_subscription_product_name || ''
 }
 
 async function loadUserStats() {
@@ -1409,6 +1542,20 @@ function editUser(user: User) {
 function closeUserFormDialog() {
   showUserFormDialog.value = false
   editingUser.value = null
+}
+
+async function openSubscriptionDialog(user: User) {
+  subscriptionDrawerUser.value = user
+  showSubscriptionDrawer.value = true
+}
+
+function closeSubscriptionDrawer() {
+  showSubscriptionDrawer.value = false
+  subscriptionDrawerUser.value = null
+}
+
+async function handleSubscriptionDrawerChanged() {
+  await refreshUsers()
 }
 
 async function handleUserFormSubmit(data: UserFormData & { password?: string; unlimited?: boolean }) {

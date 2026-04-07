@@ -104,6 +104,18 @@ class UserGroup(Base):
         passive_deletes=True,
         order_by="UserGroupModelGroup.priority.asc()",
     )
+    subscription_plans = relationship(
+        "SubscriptionPlan",
+        back_populates="user_group",
+        passive_deletes=True,
+        order_by="SubscriptionPlan.plan_level.asc(), SubscriptionPlan.created_at.asc()",
+    )
+    subscription_products = relationship(
+        "SubscriptionProduct",
+        back_populates="user_group",
+        passive_deletes=True,
+        order_by="SubscriptionProduct.plan_level.asc(), SubscriptionProduct.created_at.asc()",
+    )
 
 
 class User(Base):
@@ -190,6 +202,12 @@ class User(Base):
     usage_records = relationship("Usage", back_populates="user", passive_deletes=True)
     wallet = relationship("Wallet", back_populates="user", uselist=False, passive_deletes=True)
     payment_orders = relationship("PaymentOrder", back_populates="user", passive_deletes=True)
+    subscriptions = relationship(
+        "UserSubscription",
+        back_populates="user",
+        passive_deletes=True,
+        order_by="UserSubscription.created_at.desc()",
+    )
     refund_requests = relationship(
         "RefundRequest",
         back_populates="user",
@@ -260,6 +278,159 @@ class UserGroupModelGroup(Base):
         UniqueConstraint("user_group_id", "model_group_id", name="uq_user_group_model_group"),
         Index("idx_user_group_model_group_priority", "user_group_id", "priority"),
     )
+
+
+class SubscriptionPlan(Base):
+    """订阅计划。"""
+
+    __tablename__ = "subscription_plans"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    product_id = Column(
+        String(36),
+        ForeignKey("subscription_products.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    code = Column(String(100), unique=True, nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500), nullable=True)
+    user_group_id = Column(
+        String(36),
+        ForeignKey("user_groups.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_level = Column(Integer, nullable=False, default=0)
+    monthly_price_usd = Column(Numeric(20, 8), nullable=False, default=0)
+    monthly_quota_usd = Column(Numeric(20, 8), nullable=False, default=0)
+    variant_rank = Column(Integer, nullable=False, default=100)
+    is_default_variant = Column(Boolean, nullable=False, default=False)
+    overage_policy = Column(String(30), nullable=False, default="block")
+    term_discounts_json = Column(JSON, nullable=False, default=list)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    product = relationship("SubscriptionProduct", back_populates="variants")
+    user_group = relationship("UserGroup", back_populates="subscription_plans")
+    subscriptions = relationship(
+        "UserSubscription",
+        back_populates="plan",
+        passive_deletes=True,
+        order_by="UserSubscription.created_at.desc()",
+    )
+
+
+class SubscriptionProduct(Base):
+    """订阅产品，共享权限档位与超额策略。"""
+
+    __tablename__ = "subscription_products"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    code = Column(String(100), unique=True, nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500), nullable=True)
+    user_group_id = Column(
+        String(36),
+        ForeignKey("user_groups.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_level = Column(Integer, nullable=False, default=0)
+    overage_policy = Column(String(30), nullable=False, default="block")
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    user_group = relationship("UserGroup", back_populates="subscription_products")
+    variants = relationship(
+        "SubscriptionPlan",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="SubscriptionPlan.variant_rank.asc(), SubscriptionPlan.created_at.asc()",
+    )
+
+
+class UserSubscription(Base):
+    """用户订阅。"""
+
+    __tablename__ = "user_subscriptions"
+    __table_args__ = (
+        Index("idx_user_subscriptions_user_status", "user_id", "status"),
+        Index("idx_user_subscriptions_plan_status", "plan_id", "status"),
+        Index("idx_user_subscriptions_ends_at", "ends_at"),
+        Index("idx_user_subscriptions_current_cycle", "current_cycle_end"),
+        Index(
+            "uq_user_subscriptions_single_pending",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status = 'pending_payment'"),
+            sqlite_where=text("status = 'pending_payment'"),
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    plan_id = Column(
+        String(36),
+        ForeignKey("subscription_plans.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    status = Column(String(20), nullable=False, default="pending_payment")
+    end_reason = Column(String(40), nullable=True)
+    purchased_months = Column(Integer, nullable=False)
+    discount_factor = Column(Numeric(10, 4), nullable=False, default=1.0)
+    monthly_price_usd_snapshot = Column(Numeric(20, 8), nullable=False, default=0)
+    total_price_usd = Column(Numeric(20, 8), nullable=False, default=0)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    ends_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    current_cycle_start = Column(DateTime(timezone=True), nullable=False)
+    current_cycle_end = Column(DateTime(timezone=True), nullable=False, index=True)
+    cycle_quota_usd = Column(Numeric(20, 8), nullable=False, default=0)
+    cycle_used_usd = Column(Numeric(20, 8), nullable=False, default=0)
+    cancel_at_period_end = Column(Boolean, nullable=False, default=False)
+    canceled_at = Column(DateTime(timezone=True), nullable=True)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    upgraded_from_subscription_id = Column(
+        String(36),
+        ForeignKey("user_subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    user = relationship("User", back_populates="subscriptions")
+    plan = relationship("SubscriptionPlan", back_populates="subscriptions")
+    upgraded_from = relationship("UserSubscription", remote_side=[id], uselist=False)
+    usage_records = relationship("Usage", back_populates="subscription", passive_deletes=True)
+    payment_orders = relationship("PaymentOrder", back_populates="subscription", passive_deletes=True)
 
 
 class UserSession(Base):
@@ -562,6 +733,12 @@ class Usage(Base):
         nullable=True,
         index=True,
     )
+    subscription_id = Column(
+        String(36),
+        ForeignKey("user_subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # Token统计
     input_tokens = Column(Integer, default=0)
@@ -640,6 +817,9 @@ class Usage(Base):
     wallet_recharge_balance_after = Column(Numeric(20, 8), nullable=True)  # 结算后充值余额
     wallet_gift_balance_before = Column(Numeric(20, 8), nullable=True)  # 结算前赠款余额
     wallet_gift_balance_after = Column(Numeric(20, 8), nullable=True)  # 结算后赠款余额
+    subscription_quota_before_usd = Column(Numeric(20, 8), nullable=True)  # 结算前订阅剩余额度
+    subscription_quota_after_usd = Column(Numeric(20, 8), nullable=True)  # 结算后订阅剩余额度
+    billing_source = Column(String(30), nullable=True)  # subscription / wallet / mixed / unlimited_wallet
 
     # 完整请求和响应记录
     request_headers = Column(JSON, nullable=True)  # 客户端请求头
@@ -677,6 +857,7 @@ class Usage(Base):
     provider_api_key = relationship("ProviderAPIKey")
     model_group = relationship("ModelGroup")
     model_group_route = relationship("ModelGroupRoute")
+    subscription = relationship("UserSubscription", back_populates="usage_records")
 
     def get_request_body(self) -> Any:
         """获取客户端原始请求体（自动解压）"""
@@ -890,6 +1071,12 @@ class PaymentOrder(Base):
     order_no = Column(String(64), nullable=False)
     wallet_id = Column(String(36), ForeignKey("wallets.id", ondelete="RESTRICT"), nullable=False)
     user_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    subscription_id = Column(
+        String(36),
+        ForeignKey("user_subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     amount_usd = Column(Numeric(20, 8), nullable=False)
     pay_amount = Column(Numeric(20, 2), nullable=True)
@@ -899,6 +1086,7 @@ class PaymentOrder(Base):
     refundable_amount_usd = Column(Numeric(20, 8), nullable=False, default=0)
 
     payment_method = Column(String(30), nullable=False)
+    order_type = Column(String(30), nullable=False, default="topup")
     gateway_order_id = Column(String(128), nullable=True)
     gateway_response = Column(JSONB, nullable=True)
 
@@ -912,6 +1100,7 @@ class PaymentOrder(Base):
 
     wallet = relationship("Wallet", back_populates="payment_orders")
     user = relationship("User", back_populates="payment_orders")
+    subscription = relationship("UserSubscription", back_populates="payment_orders")
     callbacks = relationship("PaymentCallback", back_populates="payment_order")
     refund_requests = relationship("RefundRequest", back_populates="payment_order")
 
@@ -1675,6 +1864,12 @@ class ModelGroupModel(Base):
     )
     created_at = Column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
 
     model_group = relationship("ModelGroup", back_populates="model_links")

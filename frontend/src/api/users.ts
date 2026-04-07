@@ -9,10 +9,22 @@ export interface User {
   unlimited: boolean
   group_id?: string | null
   group_name?: string | null
+  effective_group_id?: string | null
+  effective_group_name?: string | null
   effective_allowed_providers?: string[] | null
   effective_allowed_api_formats?: string[] | null
   effective_allowed_models?: string[] | null
   effective_rate_limit?: number | null
+  active_subscription_id?: string | null
+  active_subscription_product_id?: string | null
+  active_subscription_product_name?: string | null
+  active_subscription_plan_id?: string | null
+  active_subscription_plan_name?: string | null
+  active_subscription_status?: string | null
+  active_subscription_remaining_quota_usd?: number | null
+  active_subscription_overage_policy?: string | null
+  active_subscription_started_at?: string | null
+  active_subscription_ends_at?: string | null
   created_at: string
   updated_at?: string
   last_login_at?: string | null

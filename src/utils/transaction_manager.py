@@ -211,11 +211,23 @@ def retry_on_database_error(max_retries: int = 3, delay: float = 0.1) -> Any:
             import random
             import time
 
+            db_session = _find_db_session(args, kwargs)
+
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
 
                 except (DatabaseError, IntegrityError) as e:
+                    if db_session is not None:
+                        try:
+                            db_session.rollback()
+                        except Exception as rollback_error:
+                            logger.warning(
+                                "数据库操作失败后回滚 Session 失败: {} - {}",
+                                type(rollback_error).__name__,
+                                str(rollback_error),
+                            )
+
                     if attempt < max_retries - 1:
                         # 随机化延迟，避免多个请求同时重试
                         actual_delay = delay * (2**attempt) + random.uniform(0, 0.1)

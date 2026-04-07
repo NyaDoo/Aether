@@ -561,7 +561,14 @@ class ModelGroupService:
         user: User | None,
         global_model_id: str,
     ) -> list[UserGroupModelGroup]:
-        if user is None or not getattr(user, "group_id", None):
+        if user is None:
+            return []
+
+        from src.services.subscription import SubscriptionService
+
+        effective_group = SubscriptionService.resolve_effective_user_group(db, user)
+        effective_group_id = str(getattr(effective_group, "id", "") or "").strip()
+        if not effective_group_id:
             return []
 
         return (
@@ -579,7 +586,7 @@ class ModelGroupService:
                 ),
             )
             .filter(
-                UserGroupModelGroup.user_group_id == user.group_id,
+                UserGroupModelGroup.user_group_id == effective_group_id,
                 UserGroupModelGroup.is_active.is_(True),
                 ModelGroup.is_active.is_(True),
             )

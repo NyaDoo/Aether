@@ -133,6 +133,11 @@ const routes: RouteRecordRaw[] = [
         component: () => importWithRetry(() => import('@/views/user/WalletCenter.vue'))
       },
       {
+        path: 'subscriptions',
+        name: 'SubscriptionsCenter',
+        component: () => importWithRetry(() => import('@/views/user/SubscriptionsCenter.vue'))
+      },
+      {
         path: 'models',
         name: 'ModelCatalog',
         component: () => importWithRetry(() => import('@/views/user/ModelCatalog.vue'))
@@ -173,6 +178,11 @@ const routes: RouteRecordRaw[] = [
         path: 'wallets',
         name: 'WalletsManagement',
         component: () => importWithRetry(() => import('@/views/admin/WalletsManagement.vue'))
+      },
+      {
+        path: 'subscriptions',
+        name: 'Subscriptions',
+        component: () => importWithRetry(() => import('@/views/admin/Subscriptions.vue'))
       },
       {
         path: 'management-tokens',

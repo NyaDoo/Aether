@@ -23,7 +23,9 @@ def get_user_group(user: User | None) -> UserGroup | None:
     """返回用户所属分组。"""
     if user is None:
         return None
-    group = getattr(user, "group", None)
+    from src.services.subscription import SubscriptionService
+
+    group = SubscriptionService.resolve_effective_user_group_from_user(user)
     return group if group is not None else None
 
 

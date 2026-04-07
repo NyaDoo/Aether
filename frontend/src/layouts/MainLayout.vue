@@ -377,6 +377,7 @@ import {
   Zap,
   FileUp,
   Server,
+  CreditCard,
   type LucideIcon,
 } from 'lucide-vue-next'
 
@@ -529,6 +530,7 @@ const navigation = computed(() => {
     {
       title: '账户',
       items: [
+         { name: '订阅中心', href: '/dashboard/subscriptions', icon: CreditCard },
          { name: '钱包中心', href: '/dashboard/wallet', icon: Wallet },
          { name: '使用记录', href: '/dashboard/usage', icon: Activity },
          { name: '异步任务', href: '/dashboard/async-tasks', icon: Zap },
@@ -589,6 +591,7 @@ const navigation = computed(() => {
         { name: '号池管理', href: '/admin/pool', icon: Database },
         { name: '独立密钥', href: '/admin/keys', icon: Key },
         { name: '钱包管理', href: '/admin/wallets', icon: Wallet },
+        { name: '订阅管理', href: '/admin/subscriptions', icon: CreditCard },
         { name: '异步任务', href: '/admin/async-tasks', icon: Zap },
         { name: '使用记录', href: '/admin/usage', icon: BarChart3 },
       ]
