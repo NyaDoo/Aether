@@ -1,6 +1,8 @@
 use crate::async_task;
 use crate::control::GatewayPublicRequestContext;
-use crate::handlers::admin::shared::{attach_admin_audit_response, query_param_value};
+use crate::handlers::admin::shared::{
+    attach_admin_audit_response, build_proxy_error_response, query_param_value,
+};
 use crate::{AppState, GatewayError};
 use aether_data_contracts::repository::video_tasks::{VideoTaskQueryFilter, VideoTaskStatus};
 use axum::{
@@ -11,7 +13,6 @@ use axum::{
 };
 use serde_json::json;
 
-use super::super::super::auth::build_proxy_error_response;
 use super::builders::{
     admin_video_task_detail_id_from_path, admin_video_task_nested_id_from_path,
     admin_video_task_status_name, admin_video_task_timestamp, build_admin_video_task_list_item,

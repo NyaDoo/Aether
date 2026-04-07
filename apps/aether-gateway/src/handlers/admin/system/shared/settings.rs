@@ -1,4 +1,4 @@
-use crate::handlers::public::{system_config_bool, system_config_string};
+use crate::handlers::shared::{system_config_bool, system_config_string};
 use crate::{AppState, GatewayError};
 use axum::body::Bytes;
 use axum::http;

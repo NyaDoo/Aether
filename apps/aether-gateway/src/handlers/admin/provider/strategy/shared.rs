@@ -1,4 +1,4 @@
-use super::super::build_proxy_error_response;
+use crate::handlers::admin::shared::build_proxy_error_response;
 use axum::{
     body::Body,
     http,

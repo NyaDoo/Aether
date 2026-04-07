@@ -14,14 +14,9 @@ pub(crate) use self::catalog_helpers::{
     ApiFormatHealthMonitorOptions,
 };
 pub(crate) use self::system_modules_helpers::{
-    apply_admin_email_template_update, build_admin_email_template_payload,
-    build_admin_email_templates_payload, build_admin_keys_grouped_by_format_payload,
-    build_public_auth_modules_status_payload, capability_detail_by_name,
-    enabled_key_capability_short_names, escape_admin_email_template_html,
-    ldap_module_config_is_valid, module_available_from_env, preview_admin_email_template,
-    read_admin_email_template_payload, render_admin_email_template_html,
-    reset_admin_email_template, serialize_public_capability, supported_capability_names,
-    system_config_bool, system_config_string, PUBLIC_CAPABILITY_DEFINITIONS,
+    build_admin_keys_grouped_by_format_payload, build_public_auth_modules_status_payload,
+    capability_detail_by_name, enabled_key_capability_short_names, ldap_module_config_is_valid,
+    serialize_public_capability, supported_capability_names, PUBLIC_CAPABILITY_DEFINITIONS,
 };
 
 pub(crate) use self::support::{

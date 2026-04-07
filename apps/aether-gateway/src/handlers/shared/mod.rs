@@ -1,9 +1,11 @@
 mod admin_proxy;
 mod catalog;
+mod email_templates;
 mod external_models;
 mod normalize;
 mod payloads;
 mod request_utils;
+mod system_config_values;
 mod usage_stats;
 
 pub(crate) use self::admin_proxy::{
@@ -16,6 +18,11 @@ pub(crate) use self::catalog::{
     encrypt_catalog_secret_with_fallbacks, masked_catalog_api_key, parse_catalog_auth_config_json,
     provider_catalog_key_supports_format, provider_key_health_summary,
     provider_key_status_snapshot_payload,
+};
+pub(crate) use self::email_templates::{
+    admin_email_template_definition, admin_email_template_html_key,
+    admin_email_template_subject_key, escape_admin_email_template_html,
+    read_admin_email_template_payload, render_admin_email_template_html,
 };
 pub(crate) use self::external_models::OFFICIAL_EXTERNAL_MODEL_PROVIDERS;
 pub(crate) use self::normalize::{
@@ -33,6 +40,9 @@ pub(crate) use self::request_utils::{
     request_enables_control_execute, rust_auth_terminates_provider_credentials,
     sanitize_upstream_path_and_query, should_strip_forwarded_provider_credential_header,
     should_strip_forwarded_trusted_admin_header, strip_query_param, unix_secs_to_rfc3339,
+};
+pub(crate) use self::system_config_values::{
+    module_available_from_env, system_config_bool, system_config_string,
 };
 pub(crate) use self::usage_stats::{
     admin_stats_bad_request_response, list_usage_for_optional_range, parse_bounded_u32, round_to,

@@ -7,8 +7,6 @@ pub(crate) mod pool_admin;
 pub(crate) mod shared;
 pub(crate) mod write;
 
-use super::auth::build_proxy_error_response;
-
 mod crud;
 mod delete_task;
 mod models;

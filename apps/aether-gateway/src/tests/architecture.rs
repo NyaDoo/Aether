@@ -1096,8 +1096,27 @@ fn admin_shared_does_not_own_system_core_routes_or_payloads() {
         );
     }
     assert!(
+        !auth_oauth_config.contains("pub(crate) fn build_proxy_error_response"),
+        "auth/oauth_config.rs should not own build_proxy_error_response"
+    );
+    assert!(
         !workspace_file_exists("apps/aether-gateway/src/handlers/admin/system/shared/payloads.rs"),
         "system/shared/payloads.rs should be removed after oauth payload ownership moves to auth"
+    );
+
+    let admin_shared_mod =
+        read_workspace_file("apps/aether-gateway/src/handlers/admin/shared/mod.rs");
+    assert!(
+        admin_shared_mod.contains("mod proxy_errors;")
+            && admin_shared_mod
+                .contains("pub(crate) use self::proxy_errors::build_proxy_error_response;"),
+        "handlers/admin/shared/mod.rs should expose shared admin proxy error builder"
+    );
+    let admin_shared_proxy_errors =
+        read_workspace_file("apps/aether-gateway/src/handlers/admin/shared/proxy_errors.rs");
+    assert!(
+        admin_shared_proxy_errors.contains("pub(crate) fn build_proxy_error_response"),
+        "handlers/admin/shared/proxy_errors.rs should own build_proxy_error_response"
     );
 }
 
@@ -1279,6 +1298,29 @@ fn admin_system_and_endpoint_roots_stay_thin() {
         );
     }
 
+    let system_routes =
+        read_workspace_file("apps/aether-gateway/src/handlers/admin/system/core/system_routes.rs");
+    assert!(
+        !system_routes.contains("use crate::handlers::public::{"),
+        "handlers/admin/system/core/system_routes.rs should not borrow system-owned route helpers from handlers/public"
+    );
+    assert!(
+        !system_routes.contains("crate::handlers::admin::auth::build_proxy_error_response")
+            && !system_routes.contains("use crate::handlers::admin::auth::build_proxy_error_response;"),
+        "handlers/admin/system/core/system_routes.rs should not borrow proxy error builder from auth"
+    );
+    for pattern in [
+        "build_admin_email_template_payload",
+        "build_admin_email_templates_payload",
+        "preview_admin_email_template",
+        "reset_admin_email_template",
+    ] {
+        assert!(
+            system_routes.contains(pattern),
+            "handlers/admin/system/core/system_routes.rs should keep delegating through admin system shared helper {pattern}"
+        );
+    }
+
     let endpoint_keys =
         read_workspace_file("apps/aether-gateway/src/handlers/admin/endpoint/keys.rs");
     assert!(
@@ -1349,6 +1391,7 @@ fn admin_provider_root_stays_thin() {
         "pub(crate) use self::endpoints_admin::{",
         "pub(crate) use self::pool_admin::{",
         "pub(crate) use self::write::{",
+        "build_proxy_error_response",
         "build_internal_control_error_response",
         "admin_provider_ops_local_action_response",
         "admin_provider_pool_config",
@@ -1465,6 +1508,206 @@ fn admin_system_owns_admin_module_helpers() {
         assert!(
             system_shared_modules.contains(pattern),
             "handlers/admin/system/shared/modules.rs should own {pattern}"
+        );
+    }
+}
+
+#[test]
+fn admin_system_owns_system_route_helpers() {
+    let public_system_helpers =
+        read_workspace_file("apps/aether-gateway/src/handlers/public/system_modules_helpers.rs");
+    for pattern in [
+        "current_aether_version",
+        "build_admin_system_check_update_payload",
+        "build_admin_system_stats_payload",
+        "build_admin_system_settings_payload",
+        "apply_admin_system_settings_update",
+        "build_admin_api_formats_payload",
+        "build_admin_system_config_export_payload",
+        "build_admin_system_users_export_payload",
+        "build_admin_system_configs_payload",
+        "build_admin_system_config_detail_payload",
+        "apply_admin_system_config_update",
+        "delete_admin_system_config",
+        "serialize_admin_system_users_export_wallet",
+        "module_available_from_env",
+        "system_config_bool",
+        "system_config_string",
+        "read_admin_email_template_payload",
+        "escape_admin_email_template_html",
+        "render_admin_email_template_html",
+    ] {
+        assert!(
+            !public_system_helpers.contains(pattern),
+            "handlers/public/system_modules_helpers.rs should not re-export admin system helper {pattern}"
+        );
+    }
+
+    let public_mod = read_workspace_file("apps/aether-gateway/src/handlers/public/mod.rs");
+    for pattern in [
+        "current_aether_version",
+        "build_admin_system_check_update_payload",
+        "build_admin_system_stats_payload",
+        "build_admin_system_settings_payload",
+        "apply_admin_system_settings_update",
+        "build_admin_api_formats_payload",
+        "build_admin_system_config_export_payload",
+        "build_admin_system_users_export_payload",
+        "build_admin_system_configs_payload",
+        "build_admin_system_config_detail_payload",
+        "apply_admin_system_config_update",
+        "delete_admin_system_config",
+        "serialize_admin_system_users_export_wallet",
+        "module_available_from_env",
+        "system_config_bool",
+        "system_config_string",
+        "read_admin_email_template_payload",
+        "escape_admin_email_template_html",
+        "render_admin_email_template_html",
+    ] {
+        assert!(
+            !public_mod.contains(pattern),
+            "handlers/public/mod.rs should not re-export admin system helper {pattern}"
+        );
+    }
+
+    let public_system_file = read_workspace_file(
+        "apps/aether-gateway/src/handlers/public/system_modules_helpers/system.rs",
+    );
+    for pattern in [
+        "pub(crate) fn current_aether_version",
+        "pub(crate) fn build_admin_system_check_update_payload",
+        "pub(crate) async fn build_admin_system_stats_payload",
+        "pub(crate) async fn build_admin_system_settings_payload",
+        "pub(crate) async fn build_admin_system_config_export_payload",
+        "pub(crate) async fn build_admin_system_users_export_payload",
+        "pub(crate) fn build_admin_system_configs_payload",
+        "pub(crate) async fn build_admin_system_config_detail_payload",
+        "pub(crate) async fn apply_admin_system_config_update",
+        "pub(crate) async fn delete_admin_system_config",
+        "pub(crate) fn serialize_admin_system_users_export_wallet",
+        "pub(crate) fn module_available_from_env",
+        "pub(crate) fn system_config_bool",
+        "pub(crate) fn system_config_string",
+        "pub(crate) async fn read_admin_email_template_payload",
+        "pub(crate) fn escape_admin_email_template_html",
+        "pub(crate) fn render_admin_email_template_html",
+    ] {
+        assert!(
+            !public_system_file.contains(pattern),
+            "handlers/public/system_modules_helpers/system.rs should not own shared/admin system helper {pattern}"
+        );
+    }
+
+    let shared_mod = read_workspace_file("apps/aether-gateway/src/handlers/shared/mod.rs");
+    for pattern in [
+        "mod email_templates;",
+        "mod system_config_values;",
+        "pub(crate) use self::email_templates::{",
+        "pub(crate) use self::system_config_values::{",
+    ] {
+        assert!(
+            shared_mod.contains(pattern),
+            "handlers/shared/mod.rs should wire shared system helper owner {pattern}"
+        );
+    }
+
+    let shared_system_config_values =
+        read_workspace_file("apps/aether-gateway/src/handlers/shared/system_config_values.rs");
+    for pattern in [
+        "pub(crate) fn module_available_from_env",
+        "pub(crate) fn system_config_bool",
+        "pub(crate) fn system_config_string",
+    ] {
+        assert!(
+            shared_system_config_values.contains(pattern),
+            "handlers/shared/system_config_values.rs should own {pattern}"
+        );
+    }
+
+    let shared_email_templates =
+        read_workspace_file("apps/aether-gateway/src/handlers/shared/email_templates.rs");
+    for pattern in [
+        "pub(crate) fn admin_email_template_definition",
+        "pub(crate) fn admin_email_template_subject_key",
+        "pub(crate) fn admin_email_template_html_key",
+        "pub(crate) async fn read_admin_email_template_payload",
+        "pub(crate) fn escape_admin_email_template_html",
+        "pub(crate) fn render_admin_email_template_html",
+    ] {
+        assert!(
+            shared_email_templates.contains(pattern),
+            "handlers/shared/email_templates.rs should own {pattern}"
+        );
+    }
+
+    let system_shared_mod =
+        read_workspace_file("apps/aether-gateway/src/handlers/admin/system/shared/mod.rs");
+    for pattern in [
+        "mod configs;",
+        "mod email_templates;",
+        "mod settings;",
+        "pub(crate) use self::email_templates::{",
+        "pub(crate) use self::configs::*;",
+        "pub(crate) use self::settings::*;",
+    ] {
+        assert!(
+            system_shared_mod.contains(pattern),
+            "handlers/admin/system/shared/mod.rs should wire system helper owner {pattern}"
+        );
+    }
+
+    assert!(
+        !workspace_file_exists("apps/aether-gateway/src/handlers/admin/system/shared/system.rs"),
+        "handlers/admin/system/shared/system.rs should be replaced by email_templates.rs"
+    );
+
+    let system_shared_settings =
+        read_workspace_file("apps/aether-gateway/src/handlers/admin/system/shared/settings.rs");
+    for pattern in [
+        "pub(crate) fn current_aether_version",
+        "pub(crate) fn build_admin_system_check_update_payload",
+        "pub(crate) async fn build_admin_system_stats_payload",
+        "pub(crate) async fn build_admin_system_settings_payload",
+        "pub(crate) async fn apply_admin_system_settings_update",
+        "pub(crate) fn build_admin_api_formats_payload",
+    ] {
+        assert!(
+            system_shared_settings.contains(pattern),
+            "handlers/admin/system/shared/settings.rs should own {pattern}"
+        );
+    }
+
+    let system_shared_configs =
+        read_workspace_file("apps/aether-gateway/src/handlers/admin/system/shared/configs.rs");
+    for pattern in [
+        "pub(crate) async fn build_admin_system_config_export_payload",
+        "pub(crate) fn serialize_admin_system_users_export_wallet",
+        "pub(crate) async fn build_admin_system_users_export_payload",
+        "pub(crate) fn build_admin_system_configs_payload",
+        "pub(crate) async fn build_admin_system_config_detail_payload",
+        "pub(crate) async fn apply_admin_system_config_update",
+        "pub(crate) async fn delete_admin_system_config",
+    ] {
+        assert!(
+            system_shared_configs.contains(pattern),
+            "handlers/admin/system/shared/configs.rs should own {pattern}"
+        );
+    }
+
+    let system_shared_email_templates = read_workspace_file(
+        "apps/aether-gateway/src/handlers/admin/system/shared/email_templates.rs",
+    );
+    for pattern in [
+        "pub(crate) async fn build_admin_email_templates_payload",
+        "pub(crate) async fn build_admin_email_template_payload",
+        "pub(crate) async fn apply_admin_email_template_update",
+        "pub(crate) async fn preview_admin_email_template",
+        "pub(crate) async fn reset_admin_email_template",
+    ] {
+        assert!(
+            system_shared_email_templates.contains(pattern),
+            "handlers/admin/system/shared/email_templates.rs should own {pattern}"
         );
     }
 }

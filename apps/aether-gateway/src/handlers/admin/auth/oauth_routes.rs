@@ -1,10 +1,10 @@
 use super::oauth_config::{
     admin_oauth_provider_type_from_path, admin_oauth_test_provider_type_from_path,
     build_admin_oauth_provider_payload, build_admin_oauth_supported_types_payload,
-    build_admin_oauth_upsert_record, build_proxy_error_response, AdminOAuthProviderUpsertRequest,
+    build_admin_oauth_upsert_record, AdminOAuthProviderUpsertRequest,
 };
 use crate::control::GatewayPublicRequestContext;
-use crate::handlers::admin::shared::attach_admin_audit_response;
+use crate::handlers::admin::shared::{attach_admin_audit_response, build_proxy_error_response};
 use crate::{AppState, GatewayError};
 use axum::{
     body::{Body, Bytes},

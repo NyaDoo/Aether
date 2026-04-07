@@ -1,4 +1,4 @@
-use crate::handlers::public::{module_available_from_env, system_config_bool};
+use crate::handlers::shared::{module_available_from_env, system_config_bool};
 use crate::{AppState, GatewayError};
 use serde_json::json;
 

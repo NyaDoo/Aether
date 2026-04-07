@@ -1,4 +1,3 @@
-use super::super::super::auth::build_proxy_error_response;
 use super::shared::{
     admin_adaptive_adjustment_items, admin_adaptive_dispatcher_not_found_response,
     admin_adaptive_effective_limit, admin_adaptive_find_key, admin_adaptive_key_id_from_path,
@@ -6,7 +5,9 @@ use super::shared::{
     admin_adaptive_load_candidate_keys,
 };
 use crate::control::GatewayPublicRequestContext;
-use crate::handlers::admin::shared::{query_param_value, unix_secs_to_rfc3339};
+use crate::handlers::admin::shared::{
+    build_proxy_error_response, query_param_value, unix_secs_to_rfc3339,
+};
 use crate::{AppState, GatewayError};
 use axum::{
     body::{Body, Bytes},

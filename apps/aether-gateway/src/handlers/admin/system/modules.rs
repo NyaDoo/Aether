@@ -5,7 +5,7 @@ use crate::handlers::admin::system::shared::{
     build_admin_module_validation_result, build_admin_modules_status_payload,
     AdminSetModuleEnabledRequest,
 };
-use crate::handlers::public::module_available_from_env;
+use crate::handlers::shared::module_available_from_env;
 use crate::{AppState, GatewayError};
 use axum::{
     body::{Body, Bytes},
