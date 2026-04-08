@@ -5,7 +5,8 @@ use super::response::{
     ADMIN_PROVIDER_QUERY_NO_LOCAL_MODELS_DETAIL, ADMIN_PROVIDER_QUERY_PROVIDER_ID_REQUIRED_DETAIL,
     ADMIN_PROVIDER_QUERY_PROVIDER_NOT_FOUND_DETAIL,
 };
-use crate::{AppState, GatewayError};
+use crate::handlers::admin::request::AdminAppState;
+use crate::GatewayError;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
@@ -13,9 +14,9 @@ use axum::{body::Body, http::Response, response::IntoResponse, Json};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) const ADMIN_PROVIDER_QUERY_LOCAL_TEST_MODEL_MESSAGE: &str =
+pub(crate) const ADMIN_PROVIDER_QUERY_LOCAL_TEST_MODEL_MESSAGE: &str =
     "Rust local provider-query model test is not configured";
-pub(super) const ADMIN_PROVIDER_QUERY_LOCAL_TEST_MODEL_FAILOVER_MESSAGE: &str =
+pub(crate) const ADMIN_PROVIDER_QUERY_LOCAL_TEST_MODEL_FAILOVER_MESSAGE: &str =
     "Rust local provider-query failover simulation is not configured";
 
 fn provider_query_string_list(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -67,8 +68,8 @@ fn provider_query_resolved_api_formats(
     formats
 }
 
-pub(super) async fn build_admin_provider_query_models_response(
-    state: &AppState,
+pub(crate) async fn build_admin_provider_query_models_response(
+    state: &AdminAppState<'_>,
     payload: &serde_json::Value,
 ) -> Result<Response<Body>, GatewayError> {
     let Some(provider_id) = provider_query_extract_provider_id(payload) else {
@@ -78,6 +79,7 @@ pub(super) async fn build_admin_provider_query_models_response(
     };
 
     let Some(provider) = state
+        .app()
         .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id))
         .await?
         .into_iter()
@@ -90,9 +92,11 @@ pub(super) async fn build_admin_provider_query_models_response(
 
     let provider_ids = vec![provider.id.clone()];
     let endpoints = state
+        .app()
         .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
         .await?;
     let keys = state
+        .app()
         .list_provider_catalog_keys_by_provider_ids(&provider_ids)
         .await?;
     let selected_key = if let Some(api_key_id) = provider_query_extract_api_key_id(payload) {
@@ -114,6 +118,7 @@ pub(super) async fn build_admin_provider_query_models_response(
 
     let resolved_api_formats = provider_query_resolved_api_formats(&endpoints, selected_key);
     let provider_models = state
+        .app()
         .list_admin_provider_available_source_models(&provider.id)
         .await?;
 
@@ -188,7 +193,7 @@ pub(super) async fn build_admin_provider_query_models_response(
     .into_response())
 }
 
-pub(super) fn build_admin_provider_query_test_model_response(
+pub(crate) fn build_admin_provider_query_test_model_response(
     provider_id: String,
     model: String,
 ) -> Response<Body> {
@@ -207,7 +212,7 @@ pub(super) fn build_admin_provider_query_test_model_response(
     .into_response()
 }
 
-pub(super) fn build_admin_provider_query_test_model_failover_response(
+pub(crate) fn build_admin_provider_query_test_model_failover_response(
     provider_id: String,
     failover_models: Vec<String>,
 ) -> Response<Body> {
