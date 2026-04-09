@@ -412,7 +412,10 @@ async fn gateway_handles_admin_provider_query_models_respecting_key_api_formats(
     assert_eq!(payload["success"], json!(true));
     assert_eq!(payload["data"]["error"], serde_json::Value::Null);
     assert_eq!(payload["data"]["from_cache"], json!(false));
-    assert_eq!(payload["data"]["models"][0]["api_formats"], json!(["openai:cli"]));
+    assert_eq!(
+        payload["data"]["models"][0]["api_formats"],
+        json!(["openai:cli"])
+    );
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
         1

@@ -1,22 +1,16 @@
 use super::super::super::shared::json_string_list;
 use super::super::payloads::timestamp_or_now;
-use super::helpers::{
-    admin_global_model_provider_counts, admin_global_model_provider_models_by_global_model_id,
-    admin_global_models_now_unix_secs, build_admin_global_model_price_range,
-};
+use super::helpers::{admin_global_models_now_unix_secs, build_admin_global_model_price_range};
 use crate::handlers::admin::request::AdminAppState;
 use aether_data_contracts::repository::global_models::{
-    AdminGlobalModelListQuery, StoredAdminGlobalModel, StoredAdminProviderModel,
+    AdminGlobalModelListQuery, StoredAdminGlobalModel,
 };
 use serde_json::json;
 
 pub(crate) fn build_admin_global_model_response(
     global_model: &StoredAdminGlobalModel,
-    provider_models: &[StoredAdminProviderModel],
     now_unix_secs: u64,
 ) -> serde_json::Value {
-    let (_, provider_count, active_provider_count) =
-        admin_global_model_provider_counts(provider_models);
     json!({
         "id": &global_model.id,
         "name": &global_model.name,
@@ -26,8 +20,9 @@ pub(crate) fn build_admin_global_model_response(
         "default_tiered_pricing": global_model.default_tiered_pricing.clone(),
         "supported_capabilities": json_string_list(global_model.supported_capabilities.as_ref()),
         "config": global_model.config.clone(),
-        "provider_count": provider_count,
-        "active_provider_count": active_provider_count,
+        "provider_count": global_model.provider_count,
+        "active_provider_count": global_model.active_provider_count,
+        "usage_count": global_model.usage_count,
         "created_at": timestamp_or_now(global_model.created_at_unix_secs, now_unix_secs),
         "updated_at": timestamp_or_now(global_model.updated_at_unix_secs, now_unix_secs),
     })
@@ -59,22 +54,9 @@ pub(crate) async fn build_admin_global_models_payload(
             .cmp(&right.name)
             .then_with(|| left.id.cmp(&right.id))
     });
-    let global_model_ids = models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<Vec<_>>();
-    let mut provider_models_by_global_model =
-        admin_global_model_provider_models_by_global_model_id(state, &global_model_ids).await;
     let mut payload_models = Vec::with_capacity(models.len());
     for model in models {
-        let provider_models = provider_models_by_global_model
-            .remove(&model.id)
-            .unwrap_or_default();
-        payload_models.push(build_admin_global_model_response(
-            &model,
-            &provider_models,
-            now_unix_secs,
-        ));
+        payload_models.push(build_admin_global_model_response(&model, now_unix_secs));
     }
     Some(json!({
         "models": payload_models,
@@ -99,15 +81,57 @@ pub(crate) async fn build_admin_global_model_payload(
         .ok()
         .unwrap_or_default();
     let now_unix_secs = admin_global_models_now_unix_secs();
-    let (total_models, total_providers, _) = admin_global_model_provider_counts(&provider_models);
-    let mut payload = build_admin_global_model_response(&model, &provider_models, now_unix_secs);
+    let total_models = provider_models.len();
+    let mut payload = build_admin_global_model_response(&model, now_unix_secs);
     if let Some(object) = payload.as_object_mut() {
         object.insert("total_models".to_string(), json!(total_models));
-        object.insert("total_providers".to_string(), json!(total_providers));
+        object.insert("total_providers".to_string(), json!(model.provider_count));
         object.insert(
             "price_range".to_string(),
             build_admin_global_model_price_range(&model, &provider_models),
         );
     }
     Some(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_admin_global_model_response;
+    use aether_data_contracts::repository::global_models::StoredAdminGlobalModel;
+    use serde_json::json;
+
+    #[test]
+    fn admin_global_model_response_uses_stored_stats_and_usage_count() {
+        let global_model = StoredAdminGlobalModel::new(
+            "global-minimax".to_string(),
+            "MiniMax-M2.7".to_string(),
+            "MiniMax-M2.7".to_string(),
+            true,
+            None,
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 0.3,
+                    "output_price_per_1m": 1.2,
+                }]
+            })),
+            Some(json!(["cache_1h"])),
+            Some(json!({
+                "family": "minimax",
+                "streaming": true,
+            })),
+            3,
+            3,
+            1,
+            Some(1_711_000_000),
+            Some(1_711_000_100),
+        )
+        .expect("global model should build");
+
+        let payload = build_admin_global_model_response(&global_model, 1_711_000_100);
+
+        assert_eq!(payload["provider_count"], 3);
+        assert_eq!(payload["active_provider_count"], 3);
+        assert_eq!(payload["usage_count"], 1);
+    }
 }

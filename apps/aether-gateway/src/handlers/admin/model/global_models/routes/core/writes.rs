@@ -104,27 +104,20 @@ async fn build_create_global_model_response(
     };
 
     Ok(match state.create_admin_global_model(&record).await? {
-        Some(created) => {
-            let provider_models = state
-                .list_admin_provider_models_by_global_model_id(&created.id)
-                .await
-                .unwrap_or_default();
-            attach_admin_audit_response(
-                (
-                    http::StatusCode::CREATED,
-                    Json(build_admin_global_model_response(
-                        &created,
-                        &provider_models,
-                        current_unix_secs(),
-                    )),
-                )
-                    .into_response(),
-                "admin_global_model_created",
-                "create_global_model",
-                "global_model",
-                &created.id,
+        Some(created) => attach_admin_audit_response(
+            (
+                http::StatusCode::CREATED,
+                Json(build_admin_global_model_response(
+                    &created,
+                    current_unix_secs(),
+                )),
             )
-        }
+                .into_response(),
+            "admin_global_model_created",
+            "create_global_model",
+            "global_model",
+            &created.id,
+        ),
         None => (
             http::StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "detail": ADMIN_GLOBAL_MODELS_DATA_UNAVAILABLE_DETAIL })),
@@ -169,24 +162,17 @@ async fn build_update_global_model_response(
         };
 
     Ok(match state.update_admin_global_model(&record).await? {
-        Some(updated) => {
-            let provider_models = state
-                .list_admin_provider_models_by_global_model_id(&updated.id)
-                .await
-                .unwrap_or_default();
-            attach_admin_audit_response(
-                Json(build_admin_global_model_response(
-                    &updated,
-                    &provider_models,
-                    current_unix_secs(),
-                ))
-                .into_response(),
-                "admin_global_model_updated",
-                "update_global_model",
-                "global_model",
-                &updated.id,
-            )
-        }
+        Some(updated) => attach_admin_audit_response(
+            Json(build_admin_global_model_response(
+                &updated,
+                current_unix_secs(),
+            ))
+            .into_response(),
+            "admin_global_model_updated",
+            "update_global_model",
+            "global_model",
+            &updated.id,
+        ),
         None => global_model_not_found_response(&existing.id),
     })
 }

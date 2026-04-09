@@ -40,11 +40,28 @@ async fn gateway_handles_admin_global_models_locally_with_trusted_admin_principa
         }),
     );
 
+    let mut gpt41 = sample_admin_global_model("global-gpt-4.1", "gpt-4.1", "GPT 4.1");
+    gpt41.usage_count = 7;
+    let mut gpt41_anthropic = sample_admin_provider_model(
+        "model-anthropic-gpt41",
+        "provider-anthropic",
+        "global-gpt-4.1",
+        "gpt-4.1-anthropic",
+    );
+    gpt41_anthropic.is_available = false;
+    let mut gpt41_google = sample_admin_provider_model(
+        "model-google-gpt41",
+        "provider-google",
+        "global-gpt-4.1",
+        "gpt-4.1-google",
+    );
+    gpt41_google.is_available = false;
+
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::new())
             .with_admin_global_models(vec![
                 sample_admin_global_model("global-gpt-5", "gpt-5", "GPT 5"),
-                sample_admin_global_model("global-gpt-4.1", "gpt-4.1", "GPT 4.1"),
+                gpt41,
             ])
             .with_admin_provider_models(vec![
                 sample_admin_provider_model(
@@ -59,6 +76,8 @@ async fn gateway_handles_admin_global_models_locally_with_trusted_admin_principa
                     "global-gpt-4.1",
                     "gpt-4.1-upstream",
                 ),
+                gpt41_anthropic,
+                gpt41_google,
             ]),
     );
 
@@ -92,9 +111,9 @@ async fn gateway_handles_admin_global_models_locally_with_trusted_admin_principa
         payload["models"].as_array().expect("models array")[0]["name"],
         "gpt-4.1"
     );
-    assert_eq!(payload["models"][0]["provider_count"], 1);
-    assert_eq!(payload["models"][0]["active_provider_count"], 1);
-    assert_eq!(payload["models"][0]["usage_count"], 0);
+    assert_eq!(payload["models"][0]["provider_count"], 3);
+    assert_eq!(payload["models"][0]["active_provider_count"], 3);
+    assert_eq!(payload["models"][0]["usage_count"], 7);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -273,19 +292,36 @@ async fn gateway_handles_admin_global_model_detail_locally_with_trusted_admin_pr
         }),
     );
 
+    let mut global_model = sample_admin_global_model("global-gpt-5", "gpt-5", "GPT 5");
+    global_model.usage_count = 7;
+    let mut anthropic_model = sample_admin_provider_model(
+        "model-anthropic-gpt5",
+        "provider-anthropic",
+        "global-gpt-5",
+        "gpt-5-anthropic",
+    );
+    anthropic_model.is_available = false;
+    let mut google_model = sample_admin_provider_model(
+        "model-google-gpt5",
+        "provider-google",
+        "global-gpt-5",
+        "gpt-5-google",
+    );
+    google_model.is_available = false;
+
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::new())
-            .with_admin_global_models(vec![sample_admin_global_model(
-                "global-gpt-5",
-                "gpt-5",
-                "GPT 5",
-            )])
-            .with_admin_provider_models(vec![sample_admin_provider_model(
-                "model-openai-gpt5",
-                "provider-openai",
-                "global-gpt-5",
-                "gpt-5-upstream",
-            )]),
+            .with_admin_global_models(vec![global_model])
+            .with_admin_provider_models(vec![
+                sample_admin_provider_model(
+                    "model-openai-gpt5",
+                    "provider-openai",
+                    "global-gpt-5",
+                    "gpt-5-upstream",
+                ),
+                anthropic_model,
+                google_model,
+            ]),
     );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
@@ -314,11 +350,11 @@ async fn gateway_handles_admin_global_model_detail_locally_with_trusted_admin_pr
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["id"], "global-gpt-5");
-    assert_eq!(payload["provider_count"], 1);
-    assert_eq!(payload["active_provider_count"], 1);
-    assert_eq!(payload["usage_count"], 0);
-    assert_eq!(payload["total_models"], 1);
-    assert_eq!(payload["total_providers"], 1);
+    assert_eq!(payload["provider_count"], 3);
+    assert_eq!(payload["active_provider_count"], 3);
+    assert_eq!(payload["usage_count"], 7);
+    assert_eq!(payload["total_models"], 3);
+    assert_eq!(payload["total_providers"], 3);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
