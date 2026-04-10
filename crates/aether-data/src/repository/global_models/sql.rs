@@ -124,7 +124,7 @@ LEFT JOIN (
     COUNT(DISTINCT m.provider_id)::bigint AS provider_count,
     COUNT(
       DISTINCT CASE
-        WHEN m.is_active = TRUE AND p.is_active = TRUE THEN m.provider_id
+        WHEN m.is_active = TRUE AND COALESCE(m.is_available, TRUE) = TRUE AND p.is_active = TRUE THEN m.provider_id
         ELSE NULL
       END
     )::bigint AS active_provider_count
@@ -411,7 +411,7 @@ LEFT JOIN (
     COUNT(DISTINCT m.provider_id)::bigint AS provider_count,
     COUNT(
       DISTINCT CASE
-        WHEN m.is_active = TRUE AND p.is_active = TRUE THEN m.provider_id
+        WHEN m.is_active = TRUE AND COALESCE(m.is_available, TRUE) = TRUE AND p.is_active = TRUE THEN m.provider_id
         ELSE NULL
       END
     )::bigint AS active_provider_count
@@ -458,7 +458,7 @@ LEFT JOIN (
     COUNT(DISTINCT m.provider_id)::bigint AS provider_count,
     COUNT(
       DISTINCT CASE
-        WHEN m.is_active = TRUE AND p.is_active = TRUE THEN m.provider_id
+        WHEN m.is_active = TRUE AND COALESCE(m.is_available, TRUE) = TRUE AND p.is_active = TRUE THEN m.provider_id
         ELSE NULL
       END
     )::bigint AS active_provider_count

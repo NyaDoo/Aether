@@ -6,9 +6,7 @@ use crate::handlers::admin::request::AdminAppState;
 use aether_data_contracts::repository::global_models::{
     StoredAdminGlobalModel, StoredAdminProviderModel,
 };
-use futures_util::stream::{self, StreamExt};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) async fn resolve_admin_global_model_by_id_or_err(
@@ -28,24 +26,6 @@ pub(super) fn admin_global_models_now_unix_secs() -> u64 {
         .ok()
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
-}
-
-pub(super) fn admin_global_model_provider_counts(
-    provider_models: &[StoredAdminProviderModel],
-) -> (usize, usize, usize) {
-    let total_models = provider_models.len();
-    let total_providers = provider_models
-        .iter()
-        .map(|model| model.provider_id.clone())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let active_provider_count = provider_models
-        .iter()
-        .filter(|model| model.is_active && model.is_available)
-        .map(|model| model.provider_id.clone())
-        .collect::<BTreeSet<_>>()
-        .len();
-    (total_models, total_providers, active_provider_count)
 }
 
 pub(super) fn build_admin_global_model_price_range(
@@ -84,28 +64,4 @@ pub(super) fn build_admin_global_model_price_range(
         "min_output": output_values.iter().copied().reduce(f64::min),
         "max_output": output_values.iter().copied().reduce(f64::max),
     })
-}
-
-#[allow(clippy::redundant_iter_cloned, clippy::redundant_locals)]
-pub(super) async fn admin_global_model_provider_models_by_global_model_id(
-    state: &AdminAppState<'_>,
-    global_model_ids: &[String],
-) -> BTreeMap<String, Vec<StoredAdminProviderModel>> {
-    let state = *state;
-    stream::iter(global_model_ids.iter().cloned().map(|global_model_id| {
-        let state = state;
-        async move {
-            let provider_models = state
-                .list_admin_provider_models_by_global_model_id(&global_model_id)
-                .await
-                .ok()
-                .unwrap_or_default();
-            (global_model_id, provider_models)
-        }
-    }))
-    .buffer_unordered(32)
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .collect()
 }

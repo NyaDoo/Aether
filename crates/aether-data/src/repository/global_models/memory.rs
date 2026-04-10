@@ -106,7 +106,9 @@ impl InMemoryGlobalModelReadRepository {
             .len() as u64;
         let active_provider_count = items
             .iter()
-            .filter(|item| item.global_model_id == global_model_id && item.is_active)
+            .filter(|item| {
+                item.global_model_id == global_model_id && item.is_active && item.is_available
+            })
             .map(|item| item.provider_id.clone())
             .collect::<BTreeSet<_>>()
             .len() as u64;
