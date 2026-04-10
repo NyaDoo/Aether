@@ -163,14 +163,14 @@ struct GatewayDataArgs {
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_MAX_CONNECTIONS",
-        default_value_t = 20
+        default_value_t = 30
     )]
     postgres_max_connections: u32,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_ACQUIRE_TIMEOUT_MS",
-        default_value_t = 5_000
+        default_value_t = 3_000
     )]
     postgres_acquire_timeout_ms: u64,
 
