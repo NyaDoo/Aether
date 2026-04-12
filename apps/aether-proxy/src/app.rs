@@ -233,6 +233,7 @@ pub async fn run(mut config: Config, servers: Vec<ServerEntry>) -> anyhow::Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_registration_recovery_tasks(
     state: Arc<AppState>,
     server_contexts: Arc<Mutex<Vec<Arc<ServerContext>>>>,
@@ -272,6 +273,7 @@ async fn spawn_registration_recovery_tasks(
 
 /// Background task that retries registration for a single server until either
 /// registration succeeds or shutdown is requested.
+#[allow(clippy::too_many_arguments)]
 async fn retry_failed_registration(
     state: Arc<AppState>,
     server_contexts: Arc<Mutex<Vec<Arc<ServerContext>>>>,

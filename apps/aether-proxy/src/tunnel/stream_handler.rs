@@ -362,6 +362,7 @@ fn resolve_redirect<B>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_upstream_request(
     state: &AppState,
     server: &ServerContext,
@@ -455,6 +456,7 @@ async fn execute_upstream_request(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_upstream_response(
     server: &ServerContext,
     stream_id: u32,
@@ -577,6 +579,7 @@ async fn relay_upstream_response(
     Some(total_elapsed)
 }
 
+#[cfg(test)]
 fn upstream_client_for_request<'a>(
     state: &'a AppState,
     meta: &RequestMeta,

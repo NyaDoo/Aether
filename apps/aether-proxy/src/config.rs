@@ -39,6 +39,7 @@ const DELEGATE_TO_UPSTREAM: &[(&str, &str)] = &[
 /// 307/308 redirects. Kept aligned with the current admin-side request size
 /// default, but exposed as an independent proxy transport budget.
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+#[allow(dead_code)]
 pub const DEFAULT_REDIRECT_REPLAY_BUDGET_BYTES: usize = 5_242_880;
 pub const DEFAULT_REDIRECT_REPLAY_BUDGET_HUMAN: &str = "5M";
 pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 7;
