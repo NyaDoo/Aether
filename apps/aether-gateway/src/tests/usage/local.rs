@@ -170,7 +170,10 @@ async fn gateway_handles_local_openai_chat_sync_report_with_local_reporting_when
             .find_by_request_id("trace-openai-chat-local-report-sync-123")
             .await
             .expect("usage lookup should succeed");
-        if stored_usage.is_some() {
+        if stored_usage
+            .as_ref()
+            .is_some_and(|usage| usage.status == "completed")
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -495,7 +498,10 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
             .find_by_request_id("trace-openai-chat-local-report-sync-failure-123")
             .await
             .expect("usage lookup should succeed");
-        if stored_usage.is_some() {
+        if stored_usage
+            .as_ref()
+            .is_some_and(|usage| usage.status == "failed")
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -710,7 +716,10 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
             .find_by_request_id("trace-claude-runtime-miss-usage-123")
             .await
             .expect("usage lookup should succeed");
-        if stored_usage.is_some() {
+        if stored_usage
+            .as_ref()
+            .is_some_and(|usage| usage.status == "failed")
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -914,7 +923,10 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
             .find_by_request_id("trace-openai-chat-local-report-stream-123")
             .await
             .expect("usage lookup should succeed");
-        if stored_usage.is_some() {
+        if stored_usage
+            .as_ref()
+            .is_some_and(|usage| usage.status == "completed")
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1171,7 +1183,10 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
             .find_by_request_id("trace-claude-cli-usage-local-miss-123")
             .await
             .expect("usage lookup should succeed");
-        if stored_usage.is_some() {
+        if stored_usage
+            .as_ref()
+            .is_some_and(|usage| usage.status == "failed")
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1460,7 +1475,10 @@ async fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_
             .find_by_request_id("trace-claude-cli-usage-local-miss-large-123")
             .await
             .expect("usage lookup should succeed");
-        if stored_usage.is_some() {
+        if stored_usage
+            .as_ref()
+            .is_some_and(|usage| usage.status == "failed")
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
