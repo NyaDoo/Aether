@@ -24,6 +24,31 @@ fn deep_nested_metadata(levels: usize) -> serde_json::Value {
     current
 }
 
+async fn wait_for_usage_status<T>(
+    repository: &T,
+    request_id: &str,
+    expected_status: &str,
+) -> aether_data_contracts::repository::usage::StoredRequestUsageAudit
+where
+    T: UsageReadRepository + ?Sized,
+{
+    let mut stored = None;
+    for _ in 0..50 {
+        stored = repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage lookup should succeed");
+        if stored
+            .as_ref()
+            .is_some_and(|usage| usage.status == expected_status)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    stored.unwrap_or_else(|| panic!("usage should reach status {expected_status}"))
+}
+
 #[tokio::test]
 async fn gateway_handles_local_openai_chat_sync_report_with_local_reporting_when_usage_runtime_enabled(
 ) {
@@ -164,21 +189,12 @@ async fn gateway_handles_local_openai_chat_sync_report_with_local_reporting_when
     let body_json: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(body_json["model"], "gpt-5-upstream");
 
-    let mut stored_usage = None;
-    for _ in 0..50 {
-        stored_usage = usage_repository
-            .find_by_request_id("trace-openai-chat-local-report-sync-123")
-            .await
-            .expect("usage lookup should succeed");
-        if stored_usage
-            .as_ref()
-            .is_some_and(|usage| usage.status == "completed")
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let stored_usage = stored_usage.expect("usage should be recorded");
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-openai-chat-local-report-sync-123",
+        "completed",
+    )
+    .await;
     assert_eq!(stored_usage.status, "completed");
     assert_eq!(stored_usage.total_tokens, 5);
     assert_eq!(stored_usage.response_time_ms, Some(25));
@@ -492,6 +508,7 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
     let body_json: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(body_json["error"]["type"], "http_error");
 
+<<<<<<< HEAD
     let mut stored_usage = None;
     for _ in 0..50 {
         stored_usage = usage_repository
@@ -507,6 +524,14 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let stored_usage = stored_usage.expect("failed usage should be recorded");
+=======
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-openai-chat-local-report-sync-failure-123",
+        "failed",
+    )
+    .await;
+>>>>>>> test(gateway): 稳定本地 usage 终态断言
     assert_eq!(stored_usage.status, "failed");
     assert_eq!(stored_usage.billing_status, "void");
     assert_eq!(stored_usage.status_code, Some(503));
@@ -710,6 +735,7 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
         "没有可用的提供商支持模型 claude-sonnet-4-5 的同步请求"
     );
 
+<<<<<<< HEAD
     let mut stored_usage = None;
     for _ in 0..50 {
         stored_usage = usage_repository
@@ -725,6 +751,14 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let stored_usage = stored_usage.expect("failed usage should be recorded");
+=======
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-claude-runtime-miss-usage-123",
+        "failed",
+    )
+    .await;
+>>>>>>> test(gateway): 稳定本地 usage 终态断言
     assert_eq!(stored_usage.status, "failed");
     assert_eq!(stored_usage.billing_status, "void");
     assert_eq!(stored_usage.status_code, Some(503));
@@ -917,6 +951,7 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
         "data: {\"id\":\"chatcmpl-local-report-stream-123\",\"usage\":{\"input_tokens\":2,\"output_tokens\":4,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"
     );
 
+<<<<<<< HEAD
     let mut stored_usage = None;
     for _ in 0..50 {
         stored_usage = usage_repository
@@ -932,6 +967,14 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let stored_usage = stored_usage.expect("usage should be recorded");
+=======
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-openai-chat-local-report-stream-123",
+        "completed",
+    )
+    .await;
+>>>>>>> test(gateway): 稳定本地 usage 终态断言
     assert_eq!(stored_usage.status, "completed");
     assert_eq!(stored_usage.total_tokens, 6);
     assert_eq!(stored_usage.first_byte_time_ms, Some(11));
@@ -1177,6 +1220,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         "没有可用的提供商支持模型 gpt-5.4 的同步请求"
     );
 
+<<<<<<< HEAD
     let mut stored_usage = None;
     for _ in 0..50 {
         stored_usage = usage_repository
@@ -1192,6 +1236,14 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let stored_usage = stored_usage.expect("failed usage should be recorded");
+=======
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-claude-cli-usage-local-miss-123",
+        "failed",
+    )
+    .await;
+>>>>>>> test(gateway): 稳定本地 usage 终态断言
     assert_eq!(stored_usage.status, "failed");
     assert_eq!(stored_usage.billing_status, "void");
     assert_eq!(stored_usage.status_code, Some(503));
@@ -1469,6 +1521,7 @@ async fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_
         Some("all_candidates_skipped")
     );
 
+<<<<<<< HEAD
     let mut stored_usage = None;
     for _ in 0..50 {
         stored_usage = usage_repository
@@ -1484,6 +1537,14 @@ async fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     let stored_usage = stored_usage.expect("failed usage should be recorded");
+=======
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-claude-cli-usage-local-miss-large-123",
+        "failed",
+    )
+    .await;
+>>>>>>> test(gateway): 稳定本地 usage 终态断言
     assert_eq!(stored_usage.status, "failed");
     assert!(stored_usage.request_body.is_none());
     assert_eq!(
