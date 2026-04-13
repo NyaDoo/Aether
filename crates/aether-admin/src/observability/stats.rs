@@ -1436,6 +1436,60 @@ pub fn build_api_key_leaderboard_items(
     grouped.into_values().collect()
 }
 
+pub fn compare_leaderboard_items(
+    metric: AdminStatsLeaderboardMetric,
+    order: AdminStatsSortOrder,
+    left: &AdminStatsLeaderboardItem,
+    right: &AdminStatsLeaderboardItem,
+) -> std::cmp::Ordering {
+    let metric_order = match metric {
+        AdminStatsLeaderboardMetric::Requests => left.requests.cmp(&right.requests),
+        AdminStatsLeaderboardMetric::Tokens => left.tokens.cmp(&right.tokens),
+        AdminStatsLeaderboardMetric::Cost => left
+            .cost
+            .partial_cmp(&right.cost)
+            .unwrap_or(std::cmp::Ordering::Equal),
+    };
+    let metric_order = match order {
+        AdminStatsSortOrder::Asc => metric_order,
+        AdminStatsSortOrder::Desc => metric_order.reverse(),
+    };
+    if metric_order == std::cmp::Ordering::Equal {
+        left.id.cmp(&right.id)
+    } else {
+        metric_order
+    }
+}
+
+fn leaderboard_metric_equal(
+    metric: AdminStatsLeaderboardMetric,
+    left: &AdminStatsLeaderboardItem,
+    right: &AdminStatsLeaderboardItem,
+) -> bool {
+    match metric {
+        AdminStatsLeaderboardMetric::Requests => left.requests == right.requests,
+        AdminStatsLeaderboardMetric::Tokens => left.tokens == right.tokens,
+        AdminStatsLeaderboardMetric::Cost => (left.cost - right.cost).abs() < 1e-9,
+    }
+}
+
+pub fn compute_dense_rank(
+    metric: AdminStatsLeaderboardMetric,
+    items: &[AdminStatsLeaderboardItem],
+    index: usize,
+) -> usize {
+    if index == 0 {
+        return 1;
+    }
+    let mut rank = 1usize;
+    for current in 1..=index {
+        if !leaderboard_metric_equal(metric, &items[current - 1], &items[current]) {
+            rank = rank.saturating_add(1);
+        }
+    }
+    rank
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1594,58 +1648,4 @@ mod tests {
         assert_eq!(leaderboard.len(), 1);
         assert_eq!(leaderboard[0].name, "alice");
     }
-}
-
-pub fn compare_leaderboard_items(
-    metric: AdminStatsLeaderboardMetric,
-    order: AdminStatsSortOrder,
-    left: &AdminStatsLeaderboardItem,
-    right: &AdminStatsLeaderboardItem,
-) -> std::cmp::Ordering {
-    let metric_order = match metric {
-        AdminStatsLeaderboardMetric::Requests => left.requests.cmp(&right.requests),
-        AdminStatsLeaderboardMetric::Tokens => left.tokens.cmp(&right.tokens),
-        AdminStatsLeaderboardMetric::Cost => left
-            .cost
-            .partial_cmp(&right.cost)
-            .unwrap_or(std::cmp::Ordering::Equal),
-    };
-    let metric_order = match order {
-        AdminStatsSortOrder::Asc => metric_order,
-        AdminStatsSortOrder::Desc => metric_order.reverse(),
-    };
-    if metric_order == std::cmp::Ordering::Equal {
-        left.id.cmp(&right.id)
-    } else {
-        metric_order
-    }
-}
-
-fn leaderboard_metric_equal(
-    metric: AdminStatsLeaderboardMetric,
-    left: &AdminStatsLeaderboardItem,
-    right: &AdminStatsLeaderboardItem,
-) -> bool {
-    match metric {
-        AdminStatsLeaderboardMetric::Requests => left.requests == right.requests,
-        AdminStatsLeaderboardMetric::Tokens => left.tokens == right.tokens,
-        AdminStatsLeaderboardMetric::Cost => (left.cost - right.cost).abs() < 1e-9,
-    }
-}
-
-pub fn compute_dense_rank(
-    metric: AdminStatsLeaderboardMetric,
-    items: &[AdminStatsLeaderboardItem],
-    index: usize,
-) -> usize {
-    if index == 0 {
-        return 1;
-    }
-    let mut rank = 1usize;
-    for current in 1..=index {
-        if !leaderboard_metric_equal(metric, &items[current - 1], &items[current]) {
-            rank = rank.saturating_add(1);
-        }
-    }
-    rank
 }
