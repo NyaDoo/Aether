@@ -21,7 +21,9 @@ use super::{
     VideoTaskModelCount, VideoTaskQueryFilter, VideoTaskStatusCount, WalletLookupKey,
     WalletMutationOutcome,
 };
-use aether_data_contracts::repository::usage::UsageAuditListQuery;
+use aether_data_contracts::repository::usage::{
+    StoredUsageDailySummary, UsageAuditListQuery, UsageDailyHeatmapQuery,
+};
 use aether_video_tasks_core::read_data_backed_video_task_response;
 
 impl GatewayDataState {
@@ -660,6 +662,16 @@ impl GatewayDataState {
     ) -> Result<Vec<StoredRequestUsageAudit>, DataLayerError> {
         match &self.usage_reader {
             Some(repository) => repository.list_usage_audits(query).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn summarize_usage_daily_heatmap(
+        &self,
+        query: &UsageDailyHeatmapQuery,
+    ) -> Result<Vec<StoredUsageDailySummary>, DataLayerError> {
+        match &self.usage_reader {
+            Some(repository) => repository.summarize_usage_daily_heatmap(query).await,
             None => Ok(Vec::new()),
         }
     }

@@ -1,4 +1,4 @@
-# Aether 部署配置 - 使用预构建镜像
+ # Aether 部署配置 - 使用预构建镜像
 # 使用方法: docker compose up -d
 
 services:
@@ -12,6 +12,7 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    command: postgres -c idle_in_transaction_session_timeout=30000 -c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 5s
@@ -57,6 +58,12 @@ services:
       - "${APP_PORT:-8084}:${APP_PORT:-8084}"
     volumes:
       - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "aether-gateway", "health", "--url", "http://127.0.0.1:${APP_PORT:-8084}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
 
 volumes:

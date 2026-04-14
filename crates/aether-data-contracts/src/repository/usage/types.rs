@@ -482,6 +482,25 @@ pub struct UsageAuditListQuery {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct UsageDailyHeatmapQuery {
+    pub created_from_unix_secs: u64,
+    pub user_id: Option<String>,
+    /// When true, exclude rows with status in ('pending', 'streaming') (admin heatmap).
+    /// When false, only include rows with billing_status = 'settled' and total_cost_usd > 0 (user heatmap).
+    pub admin_mode: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredUsageDailySummary {
+    /// Date as "YYYY-MM-DD"
+    pub date: String,
+    pub requests: u64,
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    pub actual_total_cost_usd: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageBodyField {
@@ -586,6 +605,11 @@ pub trait UsageReadRepository: Send + Sync {
         provider_id: &str,
         since_unix_secs: u64,
     ) -> Result<StoredProviderUsageSummary, crate::DataLayerError>;
+
+    async fn summarize_usage_daily_heatmap(
+        &self,
+        query: &UsageDailyHeatmapQuery,
+    ) -> Result<Vec<StoredUsageDailySummary>, crate::DataLayerError>;
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

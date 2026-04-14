@@ -1,5 +1,6 @@
 use crate::{AppState, GatewayError};
 use aether_data_contracts::repository::{candidates, usage};
+use usage::{StoredUsageDailySummary, UsageDailyHeatmapQuery};
 
 impl AppState {
     pub(crate) async fn read_request_candidates_by_request_id(
@@ -40,6 +41,16 @@ impl AppState {
     ) -> Result<Vec<usage::StoredRequestUsageAudit>, GatewayError> {
         self.data
             .list_usage_audits(query)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn summarize_usage_daily_heatmap(
+        &self,
+        query: &UsageDailyHeatmapQuery,
+    ) -> Result<Vec<StoredUsageDailySummary>, GatewayError> {
+        self.data
+            .summarize_usage_daily_heatmap(query)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }

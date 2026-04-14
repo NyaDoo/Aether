@@ -10,8 +10,8 @@ use serde_json::Value;
 use super::{
     strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
     StoredProviderApiKeyUsageSummary, StoredProviderUsageSummary, StoredProviderUsageWindow,
-    StoredRequestUsageAudit, UpsertUsageRecord, UsageAuditListQuery, UsageReadRepository,
-    UsageWriteRepository,
+    StoredRequestUsageAudit, StoredUsageDailySummary, UpsertUsageRecord, UsageAuditListQuery,
+    UsageDailyHeatmapQuery, UsageReadRepository, UsageWriteRepository,
 };
 use crate::DataLayerError;
 
@@ -334,6 +334,70 @@ impl UsageReadRepository for InMemoryUsageReadRepository {
         }
 
         Ok(summary)
+    }
+
+    async fn summarize_usage_daily_heatmap(
+        &self,
+        query: &UsageDailyHeatmapQuery,
+    ) -> Result<Vec<StoredUsageDailySummary>, DataLayerError> {
+        let items = self.by_request_id.read().expect("usage repository lock");
+        let mut daily = BTreeMap::<String, (u64, u64, f64, f64)>::new();
+        for item in items.values() {
+            if item.created_at_unix_ms < query.created_from_unix_secs {
+                continue;
+            }
+            if let Some(user_id) = &query.user_id {
+                if item.user_id.as_deref() != Some(user_id) {
+                    continue;
+                }
+            }
+            if query.admin_mode {
+                if item.status == "pending" || item.status == "streaming" {
+                    continue;
+                }
+            } else if item.billing_status != "settled" || item.total_cost_usd <= 0.0 {
+                continue;
+            }
+            let ts = i64::try_from(item.created_at_unix_ms).unwrap_or_default();
+            let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0) else {
+                continue;
+            };
+            let date_key = dt.date_naive().to_string();
+            let entry = daily.entry(date_key).or_insert((0, 0, 0.0, 0.0));
+            entry.0 += 1;
+            let cache_creation = if item.cache_creation_input_tokens == 0
+                && (item.cache_creation_ephemeral_5m_input_tokens
+                    + item.cache_creation_ephemeral_1h_input_tokens)
+                    > 0
+            {
+                item.cache_creation_ephemeral_5m_input_tokens
+                    + item.cache_creation_ephemeral_1h_input_tokens
+            } else {
+                item.cache_creation_input_tokens
+            };
+            entry.1 += item.input_tokens
+                + item.output_tokens
+                + cache_creation
+                + item.cache_read_input_tokens;
+            entry.2 += item.total_cost_usd;
+            entry.3 += item.actual_total_cost_usd;
+        }
+        let mut result: Vec<_> = daily
+            .into_iter()
+            .map(
+                |(date, (requests, total_tokens, total_cost_usd, actual_total_cost_usd))| {
+                    StoredUsageDailySummary {
+                        date,
+                        requests,
+                        total_tokens,
+                        total_cost_usd,
+                        actual_total_cost_usd,
+                    }
+                },
+            )
+            .collect();
+        result.sort_by(|a, b| a.date.cmp(&b.date));
+        Ok(result)
     }
 }
 

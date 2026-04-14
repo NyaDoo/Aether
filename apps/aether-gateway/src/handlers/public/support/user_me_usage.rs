@@ -1026,14 +1026,14 @@ pub(super) async fn handle_users_me_usage_heatmap_get(
     )
     .unwrap_or_default();
 
-    let items = match state
-        .list_usage_audits(&UsageAuditListQuery {
-            created_from_unix_secs: Some(created_from_unix_secs),
-            created_until_unix_secs: None,
-            user_id: Some(auth.user.id.clone()),
-            provider_name: None,
-            model: None,
-        })
+    let summaries = match state
+        .summarize_usage_daily_heatmap(
+            &aether_data_contracts::repository::usage::UsageDailyHeatmapQuery {
+                created_from_unix_secs,
+                user_id: Some(auth.user.id.clone()),
+                admin_mode: false,
+            },
+        )
         .await
     {
         Ok(value) => value,
@@ -1047,40 +1047,28 @@ pub(super) async fn handle_users_me_usage_heatmap_get(
     };
 
     let include_actual_cost = auth.user.role.eq_ignore_ascii_case("admin");
-    let mut daily = BTreeMap::<chrono::NaiveDate, (u64, u64, f64, f64)>::new();
-    for item in items {
-        if item.billing_status != "settled" || item.total_cost_usd <= 0.0 {
-            continue;
-        }
-        let effective = users_me_usage_effective_unix_secs(&item);
-        let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp(
-            i64::try_from(effective).unwrap_or_default(),
-            0,
-        ) else {
-            continue;
-        };
-        let entry = daily
-            .entry(timestamp.date_naive())
-            .or_insert((0, 0, 0.0, 0.0));
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = entry
-            .1
-            .saturating_add(item.total_tokens)
-            .saturating_add(item.cache_creation_input_tokens)
-            .saturating_add(item.cache_read_input_tokens);
-        entry.2 += item.total_cost_usd;
-        entry.3 += item.actual_total_cost_usd;
-    }
+    let grouped: std::collections::HashMap<String, _> =
+        summaries.into_iter().map(|s| (s.date.clone(), s)).collect();
 
     let mut max_requests = 0_u64;
     let mut cursor = start_date;
     let mut days = Vec::new();
     while cursor <= today {
+        let date_str = cursor.to_string();
         let (requests, total_tokens, total_cost, actual_total_cost) =
-            daily.get(&cursor).copied().unwrap_or((0, 0, 0.0, 0.0));
+            if let Some(s) = grouped.get(&date_str) {
+                (
+                    s.requests,
+                    s.total_tokens,
+                    s.total_cost_usd,
+                    s.actual_total_cost_usd,
+                )
+            } else {
+                (0, 0, 0.0, 0.0)
+            };
         max_requests = max_requests.max(requests);
         let mut day = json!({
-            "date": cursor.to_string(),
+            "date": date_str,
             "requests": requests,
             "total_tokens": total_tokens,
             "total_cost": round_to(total_cost, 6),

@@ -14,7 +14,8 @@ use uuid::Uuid;
 use super::{
     incoming_usage_can_recover_terminal_failure, strip_deprecated_usage_display_fields,
     StoredProviderApiKeyUsageSummary, StoredProviderUsageSummary, StoredRequestUsageAudit,
-    UpsertUsageRecord, UsageAuditListQuery, UsageReadRepository, UsageWriteRepository,
+    StoredUsageDailySummary, UpsertUsageRecord, UsageAuditListQuery, UsageDailyHeatmapQuery,
+    UsageReadRepository, UsageWriteRepository,
 };
 use crate::postgres::PostgresTransactionRunner;
 use crate::{error::SqlxResultExt, DataLayerError};
@@ -1209,6 +1210,67 @@ impl SqlxUsageReadRepository {
         Ok(items)
     }
 
+    pub async fn summarize_usage_daily_heatmap(
+        &self,
+        query: &UsageDailyHeatmapQuery,
+    ) -> Result<Vec<StoredUsageDailySummary>, DataLayerError> {
+        let mut sql = String::from(
+            r#"SELECT
+  DATE("usage".created_at) AS day,
+  COUNT(*)::BIGINT AS requests,
+  COALESCE(SUM("usage".input_tokens + "usage".output_tokens
+    + CASE
+        WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
+             AND (COALESCE("usage".cache_creation_input_tokens_5m, 0) + COALESCE("usage".cache_creation_input_tokens_1h, 0)) > 0
+        THEN COALESCE("usage".cache_creation_input_tokens_5m, 0) + COALESCE("usage".cache_creation_input_tokens_1h, 0)
+        ELSE COALESCE("usage".cache_creation_input_tokens, 0)
+      END
+    + COALESCE("usage".cache_read_input_tokens, 0)), 0)::BIGINT AS total_tokens,
+  COALESCE(SUM(CAST("usage".total_cost_usd AS DOUBLE PRECISION)), 0) AS total_cost_usd,
+  COALESCE(SUM(CAST("usage".actual_total_cost_usd AS DOUBLE PRECISION)), 0) AS actual_total_cost_usd
+FROM "usage"
+WHERE "usage".created_at >= TO_TIMESTAMP($1::double precision)"#,
+        );
+        if query.admin_mode {
+            sql.push_str(" AND \"usage\".status NOT IN ('pending', 'streaming')");
+        } else {
+            sql.push_str(
+                " AND \"usage\".billing_status = 'settled' AND CAST(\"usage\".total_cost_usd AS DOUBLE PRECISION) > 0",
+            );
+        }
+        let mut bind_index = 2;
+        if query.user_id.is_some() {
+            sql.push_str(&format!(" AND \"usage\".user_id = ${bind_index}"));
+            bind_index += 1;
+        }
+        let _ = bind_index;
+        sql.push_str(" GROUP BY day ORDER BY day ASC");
+
+        let mut q = sqlx::query(&sql).bind(query.created_from_unix_secs as f64);
+        if let Some(user_id) = &query.user_id {
+            q = q.bind(user_id.clone());
+        }
+
+        let mut rows = q.fetch(&self.pool);
+        let mut items = Vec::new();
+        while let Some(row) = rows.try_next().await.map_postgres_err()? {
+            let day: chrono::NaiveDate = row.try_get("day").map_postgres_err()?;
+            let requests: i64 = row.try_get("requests").map_postgres_err()?;
+            let total_tokens: i64 = row.try_get("total_tokens").map_postgres_err()?;
+            let total_cost_usd: f64 = row.try_get("total_cost_usd").map_postgres_err()?;
+            let actual_total_cost_usd: f64 =
+                row.try_get("actual_total_cost_usd").map_postgres_err()?;
+            items.push(StoredUsageDailySummary {
+                date: day.to_string(),
+                requests: requests as u64,
+                total_tokens: total_tokens as u64,
+                total_cost_usd,
+                actual_total_cost_usd,
+            });
+        }
+        Ok(items)
+    }
+
     pub async fn list_recent_usage_audits(
         &self,
         user_id: Option<&str>,
@@ -1702,6 +1764,13 @@ impl UsageReadRepository for SqlxUsageReadRepository {
         since_unix_secs: u64,
     ) -> Result<StoredProviderUsageSummary, DataLayerError> {
         Self::summarize_provider_usage_since(self, provider_id, since_unix_secs).await
+    }
+
+    async fn summarize_usage_daily_heatmap(
+        &self,
+        query: &UsageDailyHeatmapQuery,
+    ) -> Result<Vec<StoredUsageDailySummary>, DataLayerError> {
+        Self::summarize_usage_daily_heatmap(self, query).await
     }
 }
 

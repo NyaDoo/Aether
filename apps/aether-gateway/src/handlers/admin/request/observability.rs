@@ -40,6 +40,14 @@ impl<'a> AdminAppState<'a> {
         self.app.list_usage_audits(query).await
     }
 
+    pub(crate) async fn summarize_usage_daily_heatmap(
+        &self,
+        query: &aether_data_contracts::repository::usage::UsageDailyHeatmapQuery,
+    ) -> Result<Vec<aether_data_contracts::repository::usage::StoredUsageDailySummary>, GatewayError>
+    {
+        self.app.summarize_usage_daily_heatmap(query).await
+    }
+
     pub(crate) async fn find_request_usage_by_id(
         &self,
         usage_id: &str,
