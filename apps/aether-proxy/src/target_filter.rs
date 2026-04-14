@@ -210,13 +210,15 @@ impl DnsCache {
     }
 }
 
-/// Resolve a hostname to public (non-private) socket addresses.
+/// Resolve a hostname to validated socket addresses.
 ///
-/// Results are cached in `dns_cache`. Private/reserved IPs are filtered out.
-/// Returns an error if no public addresses remain after filtering.
+/// Results are cached in `dns_cache`. Private/reserved IPs are filtered out
+/// unless `allow_private` is enabled. Returns an error if filtering removes
+/// every resolved address.
 pub async fn resolve_public_addrs(
     host: &str,
     port: u16,
+    allow_private: bool,
     dns_cache: &DnsCache,
 ) -> Result<Vec<SocketAddr>, FilterError> {
     // Cache hit
@@ -235,11 +237,15 @@ pub async fn resolve_public_addrs(
         return Err(FilterError::DnsResolutionFailed(host.to_string()));
     }
 
-    // Filter out private/reserved addresses
-    let public: Vec<SocketAddr> = resolved
-        .into_iter()
-        .filter(|addr| !is_private_ip(&addr.ip()))
-        .collect();
+    // Filter out private/reserved addresses unless explicitly allowed.
+    let public: Vec<SocketAddr> = if allow_private {
+        resolved
+    } else {
+        resolved
+            .into_iter()
+            .filter(|addr| !is_private_ip(&addr.ip()))
+            .collect()
+    };
 
     if public.is_empty() {
         return Err(FilterError::NoPublicAddrs(host.to_string()));
@@ -260,6 +266,7 @@ pub async fn validate_target(
     host: &str,
     port: u16,
     allowed_ports: &HashSet<u16>,
+    allow_private: bool,
     dns_cache: &DnsCache,
 ) -> Result<Vec<SocketAddr>, FilterError> {
     // Port whitelist check
@@ -269,14 +276,14 @@ pub async fn validate_target(
 
     // Try parsing as IP directly (no DNS needed)
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(&ip) {
+        if !allow_private && is_private_ip(&ip) {
             return Err(FilterError::PrivateIp(ip));
         }
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     // Resolve and validate DNS (populates cache for SafeDnsResolver)
-    resolve_public_addrs(host, port, dns_cache).await
+    resolve_public_addrs(host, port, allow_private, dns_cache).await
 }
 
 #[cfg(test)]
@@ -333,25 +340,52 @@ mod tests {
     #[tokio::test]
     async fn test_port_not_allowed() {
         let cache = cache();
-        let result = validate_target("8.8.8.8", 22, &ports(), &cache).await;
+        let result = validate_target("8.8.8.8", 22, &ports(), false, &cache).await;
         assert!(matches!(result, Err(FilterError::PortNotAllowed(22))));
     }
 
     #[tokio::test]
     async fn test_private_ip_blocked() {
         let cache = cache();
-        let result = validate_target("127.0.0.1", 80, &ports(), &cache).await;
+        let result = validate_target("127.0.0.1", 80, &ports(), false, &cache).await;
         assert!(matches!(result, Err(FilterError::PrivateIp(_))));
     }
 
     #[tokio::test]
     async fn test_public_ip_allowed() {
         let cache = cache();
-        let result = validate_target("8.8.8.8", 443, &ports(), &cache).await;
+        let result = validate_target("8.8.8.8", 443, &ports(), false, &cache).await;
         assert!(result.is_ok());
         let addrs = result.unwrap();
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[tokio::test]
+    async fn test_private_ip_allowed_when_enabled() {
+        let cache = cache();
+        let result = validate_target("127.0.0.1", 80, &ports(), true, &cache).await;
+        assert!(result.is_ok());
+        let addrs = result.unwrap();
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_localhost_hostname_blocked_by_default() {
+        let cache = cache();
+        let result = validate_target("localhost", 80, &ports(), false, &cache).await;
+        assert!(matches!(result, Err(FilterError::NoPublicAddrs(_))));
+    }
+
+    #[tokio::test]
+    async fn test_localhost_hostname_allowed_when_enabled() {
+        let cache = cache();
+        let result = validate_target("localhost", 80, &ports(), true, &cache).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap().is_empty());
     }
 
     #[tokio::test]

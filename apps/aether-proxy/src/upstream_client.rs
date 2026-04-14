@@ -61,11 +61,15 @@ pub struct RequestTiming {
 #[derive(Clone)]
 pub struct ValidatedResolver {
     dns_cache: Arc<DnsCache>,
+    allow_private: bool,
 }
 
 impl ValidatedResolver {
-    pub fn new(dns_cache: Arc<DnsCache>) -> Self {
-        Self { dns_cache }
+    pub fn new(dns_cache: Arc<DnsCache>, allow_private: bool) -> Self {
+        Self {
+            dns_cache,
+            allow_private,
+        }
     }
 }
 
@@ -92,6 +96,7 @@ impl Service<Name> for ValidatedResolver {
 
     fn call(&mut self, name: Name) -> Self::Future {
         let dns_cache = Arc::clone(&self.dns_cache);
+        let allow_private = self.allow_private;
         let host = name.as_str().to_string();
         Box::pin(async move {
             if let Some(addrs) = dns_cache.get_by_host(&host).await {
@@ -100,9 +105,10 @@ impl Service<Name> for ValidatedResolver {
                 });
             }
 
-            let resolved = target_filter::resolve_public_addrs(&host, 0, dns_cache.as_ref())
-                .await
-                .map_err(|err| io::Error::other(err.to_string()))?;
+            let resolved =
+                target_filter::resolve_public_addrs(&host, 0, allow_private, dns_cache.as_ref())
+                    .await
+                    .map_err(|err| io::Error::other(err.to_string()))?;
             Ok(ValidatedAddrs {
                 inner: resolved.into_iter(),
             })
@@ -184,7 +190,10 @@ fn build_upstream_client_with_protocol(
     dns_cache: Arc<DnsCache>,
     http1_only: bool,
 ) -> UpstreamClient {
-    let mut http = HttpConnector::new_with_resolver(ValidatedResolver::new(dns_cache));
+    let mut http = HttpConnector::new_with_resolver(ValidatedResolver::new(
+        dns_cache,
+        config.allow_private_targets,
+    ));
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(
         config.upstream_connect_timeout_secs,

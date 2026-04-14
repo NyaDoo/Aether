@@ -76,6 +76,7 @@ sudo aether-proxy uninstall
 | `--node-region` | `AETHER_PROXY_NODE_REGION` | 自动检测 | 地区标识 |
 | `--heartbeat-interval` | `AETHER_PROXY_HEARTBEAT_INTERVAL` | `5` | 心跳间隔（秒） |
 | `--allowed-ports` | `AETHER_PROXY_ALLOWED_PORTS` | `80,443,8080,8443` | 允许代理的目标端口 |
+| `--allow-private-targets` | `AETHER_PROXY_ALLOW_PRIVATE_TARGETS` | `true` | 允许 private/reserved 目标地址，通过后仍受 `allowed_ports` 限制；设为 `false` 可恢复严格拦截 |
 
 #### Tunnel 连接
 
@@ -121,6 +122,7 @@ sudo aether-proxy uninstall
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
+| `--allow-private-targets` | `AETHER_PROXY_ALLOW_PRIVATE_TARGETS` | `true` | 默认允许 private/reserved 目标地址；设为 `false` 可恢复拦截，且仅影响重启后的进程 |
 | `--dns-cache-ttl-secs` | `AETHER_PROXY_DNS_CACHE_TTL_SECS` | `60` | DNS 缓存 TTL（秒） |
 | `--dns-cache-capacity` | `AETHER_PROXY_DNS_CACHE_CAPACITY` | `1024` | DNS 缓存容量（条目数） |
 

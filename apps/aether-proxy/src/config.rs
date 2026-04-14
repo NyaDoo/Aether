@@ -284,6 +284,14 @@ pub struct Config {
     )]
     pub allowed_ports: Vec<u16>,
 
+    /// Allow private/reserved upstream IP targets. Enabled by default.
+    #[arg(
+        long,
+        env = "AETHER_PROXY_ALLOW_PRIVATE_TARGETS",
+        default_value_t = true
+    )]
+    pub allow_private_targets: bool,
+
     /// Aether API request timeout in seconds
     #[arg(
         long,
@@ -808,6 +816,8 @@ pub struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_ports: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_private_targets: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aether_request_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aether_connect_timeout_secs: Option<u64>,
@@ -950,6 +960,10 @@ impl ConfigFile {
         set!("AETHER_PROXY_NODE_NAME", node_name);
         set!("AETHER_PROXY_NODE_REGION", self.node_region);
         set!("AETHER_PROXY_HEARTBEAT_INTERVAL", self.heartbeat_interval);
+        set!(
+            "AETHER_PROXY_ALLOW_PRIVATE_TARGETS",
+            self.allow_private_targets
+        );
         set!(
             "AETHER_PROXY_AETHER_REQUEST_TIMEOUT",
             self.aether_request_timeout_secs
@@ -1183,6 +1197,12 @@ mod tests {
     }
 
     #[test]
+    fn config_file_deserializes_allow_private_targets() {
+        let cfg: ConfigFile = toml::from_str("allow_private_targets = true").expect("bool toml");
+        assert_eq!(cfg.allow_private_targets, Some(true));
+    }
+
+    #[test]
     fn config_file_rejects_removed_tunnel_seconds_keys() {
         let error = reject_removed_config_keys("tunnel_ping_interval_secs = 5")
             .expect_err("removed tunnel seconds keys should be rejected");
@@ -1222,6 +1242,20 @@ mod tests {
 
         assert!(node_name.is_required_set());
         assert!(node_name.get_default_values().is_empty());
+    }
+
+    #[test]
+    fn cli_defaults_private_targets_to_enabled() {
+        let config = Config::parse_from([
+            "aether-proxy",
+            "--aether-url",
+            "https://example.com",
+            "--management-token",
+            "ae_test",
+            "--node-name",
+            "proxy-test",
+        ]);
+        assert!(config.allow_private_targets);
     }
 
     #[test]

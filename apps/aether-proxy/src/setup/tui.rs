@@ -167,6 +167,15 @@ impl App {
                     help: "Write pretty .log files with daily rotation and 7-day retention",
                 },
                 Field {
+                    label: "Allow Private Targets",
+                    key: "allow_private_targets",
+                    value: "true".into(),
+                    kind: FieldKind::Bool,
+                    required: false,
+                    help:
+                        "Allow proxying private/reserved upstream IPs by default; takes effect after restart",
+                },
+                Field {
                     label: "Heartbeat Interval",
                     key: "heartbeat_interval",
                     value: DEFAULT_HEARTBEAT_INTERVAL_SECS.to_string(),
@@ -254,6 +263,7 @@ impl App {
                     )
                     .to_string()
                 }),
+                "allow_private_targets" => cfg.allow_private_targets.map(|v| v.to_string()),
                 "heartbeat_interval" => cfg.heartbeat_interval.map(|v| v.to_string()),
                 "redirect_replay_budget_bytes" => cfg.redirect_replay_budget_bytes.clone(),
                 _ => None,
@@ -362,6 +372,7 @@ impl App {
         let save_logs_to_file = self.toggle_enabled("save_logs_to_file");
         let mut cfg = ConfigFile {
             log_level: get_global("log_level"),
+            allow_private_targets: Some(self.toggle_enabled("allow_private_targets")),
             heartbeat_interval: self.parse_optional_heartbeat_interval()?,
             redirect_replay_budget_bytes: self.parse_optional_redirect_replay_budget()?,
             log_destination: Some(if save_logs_to_file {
@@ -1089,10 +1100,12 @@ mod tests {
     #[test]
     fn to_config_persists_optional_heartbeat_interval() {
         let mut app = sample_app();
+        set_global_field(&mut app, "allow_private_targets", "true");
         set_global_field(&mut app, "heartbeat_interval", "45");
         set_global_field(&mut app, "redirect_replay_budget_bytes", "6m");
 
         let cfg = app.to_config().expect("config should serialize");
+        assert_eq!(cfg.allow_private_targets, Some(true));
         assert_eq!(cfg.heartbeat_interval, Some(45));
         assert_eq!(cfg.redirect_replay_budget_bytes.as_deref(), Some("6M"));
     }
@@ -1131,7 +1144,12 @@ mod tests {
         let config_path = unique_temp_config_path("ctrl-s");
         let mut app = sample_app();
         app.config_path = config_path.clone();
-        app.selected = app.server_field_count() + 3;
+        let heartbeat_idx = app
+            .global_fields
+            .iter()
+            .position(|field| field.key == "heartbeat_interval")
+            .expect("heartbeat field");
+        app.selected = app.server_field_count() + heartbeat_idx;
         app.mode = Mode::Editing;
         app.edit_buffer = "45".to_string();
         app.edit_cursor = 2;

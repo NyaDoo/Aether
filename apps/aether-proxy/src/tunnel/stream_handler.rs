@@ -381,8 +381,14 @@ async fn execute_upstream_request(
     let dns_start = Instant::now();
     {
         let allowed_ports = Arc::clone(&server.dynamic.load().allowed_ports);
-        if let Err(error) =
-            target_filter::validate_target(host, port, &allowed_ports, &state.dns_cache).await
+        if let Err(error) = target_filter::validate_target(
+            host,
+            port,
+            &allowed_ports,
+            state.config.allow_private_targets,
+            &state.dns_cache,
+        )
+        .await
         {
             server.metrics.dns_failures.fetch_add(1, Ordering::Release);
             return Err(format!("target blocked: {error}"));
@@ -1560,6 +1566,7 @@ mod tests {
             node_region: None,
             heartbeat_interval: 30,
             allowed_ports: vec![80, 443],
+            allow_private_targets: false,
             aether_request_timeout_secs: 10,
             aether_connect_timeout_secs: 10,
             aether_pool_max_idle_per_host: 8,

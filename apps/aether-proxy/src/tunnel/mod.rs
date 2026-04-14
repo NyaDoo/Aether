@@ -479,6 +479,7 @@ mod tests {
             node_region: None,
             heartbeat_interval: 1,
             allowed_ports: vec![80, 443],
+            allow_private_targets: false,
             aether_request_timeout_secs: 10,
             aether_connect_timeout_secs: 2,
             aether_pool_max_idle_per_host: 8,
