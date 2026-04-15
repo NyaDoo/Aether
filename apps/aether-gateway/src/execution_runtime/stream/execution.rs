@@ -112,21 +112,28 @@ pub(crate) async fn execute_execution_runtime_stream(
         .usage_runtime
         .record_pending(state.data.as_ref(), &lifecycle_seed);
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
-    record_local_request_candidate_status(
-        state,
-        &plan,
-        report_context.as_ref(),
-        SchedulerRequestCandidateStatusUpdate {
-            status: RequestCandidateStatus::Pending,
-            status_code: None,
-            error_type: None,
-            error_message: None,
-            latency_ms: None,
-            started_at_unix_ms: Some(candidate_started_unix_secs),
-            finished_at_unix_ms: None,
-        },
-    )
-    .await;
+    {
+        let state_bg = state.clone();
+        let plan_bg = plan.clone();
+        let report_context_bg = report_context.clone();
+        tokio::spawn(async move {
+            record_local_request_candidate_status(
+                &state_bg,
+                &plan_bg,
+                report_context_bg.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Pending,
+                    status_code: None,
+                    error_type: None,
+                    error_message: None,
+                    latency_ms: None,
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: None,
+                },
+            )
+            .await;
+        });
+    }
     let plan_request_id_for_log = short_request_id(plan.request_id.as_str());
     let provider_name = plan.provider_name.as_deref().unwrap_or("-");
     let endpoint_id = plan.endpoint_id.as_str();
@@ -973,23 +980,31 @@ async fn execute_stream_from_frame_stream(
         status_code,
         prefetched_telemetry.as_ref(),
     );
-    record_local_request_candidate_status(
-        state,
-        &plan,
-        report_context.as_ref(),
-        SchedulerRequestCandidateStatusUpdate {
-            status: RequestCandidateStatus::Streaming,
-            status_code: Some(status_code),
-            error_type: None,
-            error_message: None,
-            latency_ms: prefetched_telemetry
-                .as_ref()
-                .and_then(|telemetry| telemetry.elapsed_ms),
-            started_at_unix_ms: Some(candidate_started_unix_secs),
-            finished_at_unix_ms: None,
-        },
-    )
-    .await;
+    {
+        let state_bg = state.clone();
+        let plan_bg = plan.clone();
+        let report_context_bg = report_context.clone();
+        let latency_ms = prefetched_telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms);
+        tokio::spawn(async move {
+            record_local_request_candidate_status(
+                &state_bg,
+                &plan_bg,
+                report_context_bg.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Streaming,
+                    status_code: Some(status_code),
+                    error_type: None,
+                    error_message: None,
+                    latency_ms,
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: None,
+                },
+            )
+            .await;
+        });
+    }
 
     let (tx, mut rx) = mpsc::channel::<Result<Bytes, IoError>>(16);
     let state_for_report = state.clone();
@@ -999,9 +1014,9 @@ async fn execute_stream_from_frame_stream(
     let report_kind_owned = report_kind.clone();
     let report_context_owned = report_context.clone();
     let lifecycle_seed_for_report = lifecycle_seed.clone();
-    let provider_prefetched_body_for_report = provider_prefetched_body.clone();
-    let prefetched_body_for_report = prefetched_body.clone();
-    let prefetched_chunks_for_body = prefetched_chunks.clone();
+    let provider_prefetched_body_for_report = provider_prefetched_body;
+    let prefetched_body_for_report = prefetched_body;
+    let prefetched_chunks_for_body = prefetched_chunks;
     let initial_telemetry = prefetched_telemetry.clone();
     let initial_reached_eof = reached_eof;
     let direct_stream_finalize_kind_owned = direct_stream_finalize_kind.clone();
@@ -1012,8 +1027,8 @@ async fn execute_stream_from_frame_stream(
     tokio::spawn(async move {
         const MAX_STREAM_BODY_BUFFER_BYTES: usize = 256 * 1024; // 256KB
 
-        let mut provider_buffered_body = provider_prefetched_body_for_report;
-        let mut buffered_body = prefetched_body_for_report;
+        let mut provider_buffered_body: VecDeque<u8> = provider_prefetched_body_for_report.into();
+        let mut buffered_body: VecDeque<u8> = prefetched_body_for_report.into();
         let mut provider_body_truncated = false;
         let mut client_body_truncated = false;
         let mut telemetry: Option<ExecutionTelemetry> = initial_telemetry.clone();
@@ -1077,7 +1092,7 @@ async fn execute_stream_from_frame_stream(
                             continue;
                         }
 
-                        provider_buffered_body.extend_from_slice(&chunk);
+                        provider_buffered_body.extend(chunk.iter().copied());
                         if provider_buffered_body.len() > MAX_STREAM_BODY_BUFFER_BYTES {
                             let tail_start =
                                 provider_buffered_body.len() - MAX_STREAM_BODY_BUFFER_BYTES;
@@ -1140,7 +1155,7 @@ async fn execute_stream_from_frame_stream(
                             continue;
                         }
 
-                        buffered_body.extend_from_slice(&rewritten_chunk);
+                        buffered_body.extend(&rewritten_chunk);
                         if buffered_body.len() > MAX_STREAM_BODY_BUFFER_BYTES {
                             let tail_start = buffered_body.len() - MAX_STREAM_BODY_BUFFER_BYTES;
                             buffered_body.drain(..tail_start);
@@ -1239,7 +1254,7 @@ async fn execute_stream_from_frame_stream(
                             normalized_chunk
                         };
                         if !rewritten_chunk.is_empty() {
-                            buffered_body.extend_from_slice(&rewritten_chunk);
+                            buffered_body.extend(&rewritten_chunk);
                             if tx.send(Ok(Bytes::from(rewritten_chunk))).await.is_err() {
                                 warn!(
                                     event_name = "stream_execution_downstream_flush_disconnected",
@@ -1278,7 +1293,7 @@ async fn execute_stream_from_frame_stream(
                 if let Some(rewriter) = local_stream_rewriter.as_mut() {
                     match rewriter.finish() {
                         Ok(flushed_chunk) if !flushed_chunk.is_empty() => {
-                            buffered_body.extend_from_slice(&flushed_chunk);
+                            buffered_body.extend(&flushed_chunk);
                             if tx.send(Ok(Bytes::from(flushed_chunk))).await.is_err() {
                                 warn!(
                                     event_name = "stream_execution_downstream_rewrite_flush_disconnected",
@@ -1340,10 +1355,15 @@ async fn execute_stream_from_frame_stream(
                     provider_body_base64: (!provider_body_truncated
                         && !provider_buffered_body.is_empty())
                     .then(|| {
-                        base64::engine::general_purpose::STANDARD.encode(&provider_buffered_body)
+                        base64::engine::general_purpose::STANDARD
+                            .encode(provider_buffered_body.make_contiguous())
                     }),
-                    client_body_base64: (!client_body_truncated && !buffered_body.is_empty())
-                        .then(|| base64::engine::general_purpose::STANDARD.encode(&buffered_body)),
+                    client_body_base64: (!client_body_truncated && !buffered_body.is_empty()).then(
+                        || {
+                            base64::engine::general_purpose::STANDARD
+                                .encode(buffered_body.make_contiguous())
+                        },
+                    ),
                     telemetry: telemetry.clone(),
                 },
                 true,
@@ -1378,7 +1398,7 @@ async fn execute_stream_from_frame_stream(
                 if provider_body_truncated {
                     &[]
                 } else {
-                    &provider_buffered_body
+                    provider_buffered_body.make_contiguous()
                 },
                 candidate_started_unix_secs_for_report,
                 failure,
@@ -1394,9 +1414,13 @@ async fn execute_stream_from_frame_stream(
             status_code,
             headers: headers_for_report.clone(),
             provider_body_base64: (!provider_body_truncated && !provider_buffered_body.is_empty())
-                .then(|| base64::engine::general_purpose::STANDARD.encode(&provider_buffered_body)),
-            client_body_base64: (!client_body_truncated && !buffered_body.is_empty())
-                .then(|| base64::engine::general_purpose::STANDARD.encode(&buffered_body)),
+                .then(|| {
+                    base64::engine::general_purpose::STANDARD
+                        .encode(provider_buffered_body.make_contiguous())
+                }),
+            client_body_base64: (!client_body_truncated && !buffered_body.is_empty()).then(|| {
+                base64::engine::general_purpose::STANDARD.encode(buffered_body.make_contiguous())
+            }),
             telemetry: telemetry.clone(),
         };
         record_stream_terminal_usage(

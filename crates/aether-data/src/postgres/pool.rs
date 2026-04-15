@@ -21,7 +21,7 @@ impl Default for PostgresPoolConfig {
         Self {
             database_url: String::new(),
             min_connections: 1,
-            max_connections: 30,
+            max_connections: 50,
             acquire_timeout_ms: 3_000,
             idle_timeout_ms: 60_000,
             max_lifetime_ms: 30 * 60_000,
