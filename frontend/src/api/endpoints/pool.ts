@@ -143,7 +143,7 @@ export interface PoolKeyDetail {
   model_include_patterns?: string[] | null
   model_exclude_patterns?: string[] | null
   proxy?: ProxyConfig | null
-  account_quota: string | null
+  account_quota: string | null  // compatibility only; UI should prefer status_snapshot.quota
   cooldown_reason: string | null
   cooldown_ttl_seconds: number | null
   cost_window_usage: number

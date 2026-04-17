@@ -2,6 +2,7 @@ use crate::handlers::admin::provider::shared::payloads::{
     OAUTH_ACCOUNT_BLOCK_PREFIX, OAUTH_REFRESH_FAILED_PREFIX,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
+use crate::handlers::shared::sync_provider_key_quota_status_snapshot;
 use crate::GatewayError;
 use aether_admin::provider::quota as admin_provider_quota_pure;
 use aether_contracts::{ExecutionPlan, ExecutionResult, ExecutionTimeouts, ProxySnapshot};
@@ -89,6 +90,20 @@ pub(super) fn coerce_json_string(value: Option<&serde_json::Value>) -> Option<St
     admin_provider_quota_pure::coerce_json_string(value)
 }
 
+pub(super) fn build_quota_snapshot_payload(
+    provider_type: &str,
+    current_status_snapshot: Option<&serde_json::Value>,
+    metadata_update: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let updated_snapshot = sync_provider_key_quota_status_snapshot(
+        current_status_snapshot,
+        provider_type,
+        metadata_update,
+        "refresh_api",
+    )?;
+    updated_snapshot.get("quota").cloned()
+}
+
 pub(crate) async fn persist_provider_quota_refresh_state(
     state: &AdminAppState<'_>,
     key_id: &str,
@@ -106,17 +121,31 @@ pub(crate) async fn persist_provider_quota_refresh_state(
         return Ok(false);
     };
 
+    let mut quota_snapshot_provider_type = None::<&str>;
     if let Some(metadata_update) = metadata_update {
         latest_key.upstream_metadata = Some(merge_upstream_metadata(
             latest_key.upstream_metadata.as_ref(),
             metadata_update,
         ));
+        quota_snapshot_provider_type = metadata_update.as_object().and_then(|object| {
+            ["codex", "kiro", "antigravity", "gemini_cli"]
+                .into_iter()
+                .find(|provider_type| object.contains_key(*provider_type))
+        });
     }
     if let Some(encrypted_auth_config) = encrypted_auth_config {
         latest_key.encrypted_auth_config = Some(encrypted_auth_config);
     }
     latest_key.oauth_invalid_at_unix_secs = oauth_invalid_at_unix_secs;
     latest_key.oauth_invalid_reason = oauth_invalid_reason;
+    if let Some(provider_type) = quota_snapshot_provider_type {
+        latest_key.status_snapshot = sync_provider_key_quota_status_snapshot(
+            latest_key.status_snapshot.as_ref(),
+            provider_type,
+            latest_key.upstream_metadata.as_ref(),
+            "refresh_api",
+        );
+    }
     latest_key.updated_at_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()

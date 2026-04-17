@@ -1038,6 +1038,224 @@ async fn gateway_includes_pool_quota_and_compat_fields_in_list_keys_response() {
 }
 
 #[tokio::test]
+async fn gateway_prefers_status_snapshot_antigravity_quota_over_stale_metadata() {
+    let mut provider = sample_provider("provider-antigravity", "antigravity", 10)
+        .with_transport_fields(
+            true,
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "pool_advanced": {
+                    "enabled": true,
+                    "skip_exhausted_accounts": true
+                }
+            })),
+        );
+    provider.provider_type = "antigravity".to_string();
+
+    let mut key = sample_key(
+        "key-antigravity-snapshot-fresh",
+        "provider-antigravity",
+        "gemini:chat",
+        "oauth-placeholder",
+    );
+    key.name = "antigravity snapshot fresh".to_string();
+    key.auth_type = "oauth".to_string();
+    key.upstream_metadata = Some(json!({
+        "antigravity": {
+            "quota_by_model": {
+                "gemini-2.5-pro": { "used_percent": 100.0 },
+                "gemini-2.5-flash": { "used_percent": 100.0 }
+            }
+        }
+    }));
+    key.status_snapshot = Some(json!({
+        "quota": {
+            "version": 2,
+            "provider_type": "antigravity",
+            "code": "ok",
+            "label": serde_json::Value::Null,
+            "reason": serde_json::Value::Null,
+            "freshness": "fresh",
+            "source": "refresh_api",
+            "observed_at": 1_775_553_285u64,
+            "exhausted": false,
+            "usage_ratio": 0.0,
+            "updated_at": 1_775_553_285u64,
+            "reset_seconds": serde_json::Value::Null,
+            "plan_type": serde_json::Value::Null,
+            "windows": [
+                {
+                    "code": "model:gemini-2.5-pro",
+                    "label": "Gemini 2.5 Pro",
+                    "scope": "model",
+                    "unit": "percent",
+                    "model": "gemini-2.5-pro",
+                    "used_ratio": 0.0,
+                    "remaining_ratio": 1.0,
+                    "reset_at": serde_json::Value::Null,
+                    "reset_seconds": serde_json::Value::Null,
+                    "is_exhausted": false
+                },
+                {
+                    "code": "model:gemini-2.5-flash",
+                    "label": "Gemini 2.5 Flash",
+                    "scope": "model",
+                    "unit": "percent",
+                    "model": "gemini-2.5-flash",
+                    "used_ratio": 0.0,
+                    "remaining_ratio": 1.0,
+                    "reset_at": serde_json::Value::Null,
+                    "reset_seconds": serde_json::Value::Null,
+                    "is_exhausted": false
+                }
+            ]
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-antigravity/keys?page=1&page_size=50&status=all",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+
+    assert_eq!(keys[0]["scheduling_status"], json!("available"));
+    assert_eq!(keys[0]["scheduling_reason"], json!("available"));
+    assert_eq!(keys[0]["quota_updated_at"], json!(1_775_553_285u64));
+    assert_eq!(keys[0]["account_quota"], json!("最低剩余 100.0% (2 模型)"));
+}
+
+#[tokio::test]
+async fn gateway_renders_gemini_cli_account_quota_from_status_snapshot() {
+    let mut provider = sample_provider("provider-gemini-cli", "gemini_cli", 10)
+        .with_transport_fields(
+            true,
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "pool_advanced": {
+                    "enabled": true,
+                    "skip_exhausted_accounts": true
+                }
+            })),
+        );
+    provider.provider_type = "gemini_cli".to_string();
+
+    let mut key = sample_key(
+        "key-gemini-cli-snapshot",
+        "provider-gemini-cli",
+        "gemini:chat",
+        "oauth-placeholder",
+    );
+    key.name = "gemini cli snapshot".to_string();
+    key.auth_type = "oauth".to_string();
+    key.upstream_metadata = Some(json!({
+        "gemini_cli": {
+            "quota_by_model": {
+                "gemini-2.5-pro": {
+                    "is_exhausted": false
+                }
+            }
+        }
+    }));
+    key.status_snapshot = Some(json!({
+        "quota": {
+            "version": 2,
+            "provider_type": "gemini_cli",
+            "code": "cooldown",
+            "label": "冷却中",
+            "reason": serde_json::Value::Null,
+            "freshness": "fresh",
+            "source": "background_refresh",
+            "observed_at": 1_775_553_285u64,
+            "exhausted": false,
+            "usage_ratio": 1.0,
+            "updated_at": 1_775_553_285u64,
+            "reset_seconds": serde_json::Value::Null,
+            "plan_type": serde_json::Value::Null,
+            "windows": [
+                {
+                    "code": "model:gemini-2.5-pro",
+                    "label": "Gemini 2.5 Pro",
+                    "scope": "model",
+                    "unit": "percent",
+                    "model": "gemini-2.5-pro",
+                    "used_ratio": 1.0,
+                    "remaining_ratio": 0.0,
+                    "reset_at": serde_json::Value::Null,
+                    "reset_seconds": serde_json::Value::Null,
+                    "is_exhausted": true
+                }
+            ]
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-gemini-cli/keys?page=1&page_size=50&status=all",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+
+    assert_eq!(keys[0]["scheduling_status"], json!("available"));
+    assert_eq!(keys[0]["quota_updated_at"], json!(1_775_553_285u64));
+    assert_eq!(keys[0]["account_quota"], json!("Gemini 2.5 Pro 冷却中"));
+}
+
+#[tokio::test]
 async fn gateway_formats_codex_quota_countdown_from_reset_after_seconds() {
     let mut provider = sample_provider("provider-codex", "codex", 10).with_transport_fields(
         true,
@@ -1193,6 +1411,124 @@ async fn gateway_marks_exhausted_codex_pool_key_as_blocked_when_flag_enabled() {
 }
 
 #[tokio::test]
+async fn gateway_prefers_status_snapshot_codex_quota_over_stale_metadata() {
+    let mut provider = sample_provider("provider-codex", "codex", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(json!({
+            "pool_advanced": {
+                "enabled": true,
+                "skip_exhausted_accounts": true
+            }
+        })),
+    );
+    provider.provider_type = "codex".to_string();
+
+    let mut key = sample_key(
+        "key-codex-snapshot-fresh",
+        "provider-codex",
+        "openai:cli",
+        "oauth-placeholder",
+    );
+    key.name = "codex snapshot fresh".to_string();
+    key.auth_type = "oauth".to_string();
+    key.upstream_metadata = Some(json!({
+        "codex": {
+            "plan_type": "plus",
+            "secondary_used_percent": 100.0
+        }
+    }));
+    key.status_snapshot = Some(json!({
+        "quota": {
+            "version": 2,
+            "provider_type": "codex",
+            "code": "ok",
+            "label": serde_json::Value::Null,
+            "reason": serde_json::Value::Null,
+            "freshness": "fresh",
+            "source": "response_headers",
+            "observed_at": 1_775_553_285u64,
+            "exhausted": false,
+            "usage_ratio": 0.0,
+            "updated_at": 1_775_553_285u64,
+            "reset_seconds": serde_json::Value::Null,
+            "plan_type": "plus",
+            "credits": {
+                "has_credits": true,
+                "balance": 12.5,
+                "unlimited": false
+            },
+            "windows": [
+                {
+                    "code": "weekly",
+                    "label": "周",
+                    "scope": "account",
+                    "unit": "percent",
+                    "used_ratio": 0.0,
+                    "remaining_ratio": 1.0,
+                    "reset_at": serde_json::Value::Null,
+                    "reset_seconds": serde_json::Value::Null,
+                    "window_minutes": 10_080
+                },
+                {
+                    "code": "5h",
+                    "label": "5H",
+                    "scope": "account",
+                    "unit": "percent",
+                    "used_ratio": 0.0,
+                    "remaining_ratio": 1.0,
+                    "reset_at": serde_json::Value::Null,
+                    "reset_seconds": serde_json::Value::Null,
+                    "window_minutes": 300
+                }
+            ]
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-codex/keys?page=1&page_size=50&status=all",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+
+    assert_eq!(keys[0]["scheduling_status"], json!("available"));
+    assert_eq!(keys[0]["scheduling_reason"], json!("available"));
+    assert_eq!(keys[0]["quota_updated_at"], json!(1_775_553_285u64));
+    assert_eq!(
+        keys[0]["account_quota"],
+        json!("周剩余 100.0% | 5H剩余 100.0%")
+    );
+}
+
+#[tokio::test]
 async fn gateway_marks_exhausted_kiro_pool_key_as_blocked_when_flag_enabled() {
     let mut provider = sample_provider("provider-kiro", "kiro", 10).with_transport_fields(
         true,
@@ -1263,6 +1599,108 @@ async fn gateway_marks_exhausted_kiro_pool_key_as_blocked_when_flag_enabled() {
     );
     assert_eq!(keys[0]["scheduling_label"], json!("额度耗尽"));
     assert_eq!(keys[0]["account_quota"], json!("剩余 0/100"));
+}
+
+#[tokio::test]
+async fn gateway_prefers_status_snapshot_kiro_quota_over_stale_metadata() {
+    let mut provider = sample_provider("provider-kiro", "kiro", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(json!({
+            "pool_advanced": {
+                "enabled": true,
+                "skip_exhausted_accounts": true
+            }
+        })),
+    );
+    provider.provider_type = "kiro".to_string();
+
+    let mut key = sample_key(
+        "key-kiro-snapshot-fresh",
+        "provider-kiro",
+        "claude:cli",
+        "oauth-placeholder",
+    );
+    key.name = "kiro snapshot fresh".to_string();
+    key.auth_type = "oauth".to_string();
+    key.upstream_metadata = Some(json!({
+        "kiro": {
+            "remaining": 0.0,
+            "usage_limit": 100.0,
+            "current_usage": 100.0
+        }
+    }));
+    key.status_snapshot = Some(json!({
+        "quota": {
+            "version": 2,
+            "provider_type": "kiro",
+            "code": "ok",
+            "label": serde_json::Value::Null,
+            "reason": serde_json::Value::Null,
+            "freshness": "fresh",
+            "source": "refresh_api",
+            "observed_at": 1_775_553_285u64,
+            "exhausted": false,
+            "usage_ratio": 0.25,
+            "updated_at": 1_775_553_285u64,
+            "reset_seconds": 86_400u64,
+            "plan_type": "KIRO PRO+",
+            "windows": [
+                {
+                    "code": "usage",
+                    "label": "额度",
+                    "scope": "account",
+                    "unit": "count",
+                    "used_ratio": 0.25,
+                    "remaining_ratio": 0.75,
+                    "used_value": 5.0,
+                    "remaining_value": 15.0,
+                    "limit_value": 20.0,
+                    "reset_at": 1_775_639_685u64,
+                    "reset_seconds": 86_400u64
+                }
+            ]
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-kiro/keys?page=1&page_size=50&status=all",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    let keys = payload["keys"].as_array().expect("keys should be array");
+
+    assert_eq!(keys[0]["scheduling_status"], json!("available"));
+    assert_eq!(keys[0]["scheduling_reason"], json!("available"));
+    assert_eq!(keys[0]["quota_updated_at"], json!(1_775_553_285u64));
+    assert_eq!(keys[0]["account_quota"], json!("剩余 75.0% (5/20)"));
 }
 
 #[tokio::test]

@@ -165,6 +165,21 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
     assert_eq!(payload["failed"], 0);
     assert_eq!(payload["total"], 1);
     assert_eq!(payload["results"][0]["status"], "success");
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["provider_type"],
+        "codex"
+    );
+    assert_eq!(payload["results"][0]["quota_snapshot"]["plan_type"], "plus");
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["credits"]["balance"],
+        json!(42.0)
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["windows"]
+            .as_array()
+            .map(Vec::len),
+        Some(2usize)
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -517,6 +532,18 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_kiro_with_trusted_ad
     assert_eq!(payload["failed"], 0);
     assert_eq!(payload["total"], 1);
     assert_eq!(payload["results"][0]["status"], "success");
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["provider_type"],
+        "kiro"
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["plan_type"],
+        "KIRO PRO+"
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["windows"][0]["remaining_value"],
+        json!(15.0)
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -565,6 +592,40 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_kiro_with_trusted_ad
             .and_then(|value| value.get("kiro"))
             .and_then(|value| value.get("email")),
         Some(&json!("dev@example.com"))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("provider_type")),
+        Some(&json!("kiro"))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("usage_ratio")),
+        Some(&json!(0.25))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("plan_type")),
+        Some(&json!("KIRO PRO+"))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("windows"))
+            .and_then(|value| value.get(0))
+            .and_then(|value| value.get("remaining_value")),
+        Some(&json!(15.0))
     );
 
     gateway_handle.abort();
@@ -830,6 +891,20 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
     assert_eq!(payload["failed"], 0);
     assert_eq!(payload["total"], 1);
     assert_eq!(payload["results"][0]["status"], "success");
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["provider_type"],
+        "antigravity"
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["usage_ratio"],
+        json!(0.75)
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["windows"]
+            .as_array()
+            .map(Vec::len),
+        Some(1usize)
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -879,6 +954,32 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .and_then(|value| value.get("claude-sonnet-4"))
             .and_then(|value| value.get("used_percent")),
         Some(&json!(75.0))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("provider_type")),
+        Some(&json!("antigravity"))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("usage_ratio")),
+        Some(&json!(0.75))
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .and_then(|value| value.get("windows"))
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(1usize)
     );
 
     gateway_handle.abort();

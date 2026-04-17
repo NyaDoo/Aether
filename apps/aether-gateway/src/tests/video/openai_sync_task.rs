@@ -288,15 +288,15 @@ async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_loca
 
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
-        .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
-        .with_data_state_for_tests(
-            crate::data::GatewayDataState::with_video_task_provider_transport_and_request_candidate_repository_for_tests(
-                repository,
-                provider_catalog_repository,
-                Arc::clone(&request_candidate_repository),
-                DEVELOPMENT_ENCRYPTION_KEY,
+            .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_video_task_provider_transport_and_request_candidate_repository_for_tests(
+                    repository,
+                    provider_catalog_repository,
+                    Arc::clone(&request_candidate_repository),
+                    DEVELOPMENT_ENCRYPTION_KEY,
+                ),
             ),
-        ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -308,8 +308,15 @@ async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_loca
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let response_json: serde_json::Value = response.json().await.expect("body should parse");
+    let response_status = response.status();
+    let response_text = response.text().await.expect("body should read");
+    assert_eq!(
+        response_status,
+        StatusCode::OK,
+        "unexpected response body: {response_text}"
+    );
+    let response_json: serde_json::Value =
+        serde_json::from_str(&response_text).expect("body should parse");
     assert_eq!(
         response_json,
         json!({

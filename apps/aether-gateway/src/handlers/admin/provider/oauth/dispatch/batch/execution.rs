@@ -11,7 +11,8 @@ use crate::handlers::admin::provider::oauth::provisioning::{
     update_existing_provider_oauth_catalog_key,
 };
 use crate::handlers::admin::provider::oauth::runtime::{
-    provider_oauth_runtime_endpoint_for_provider, refresh_provider_oauth_account_state_after_update,
+    provider_oauth_runtime_endpoint_for_provider,
+    spawn_provider_oauth_account_state_refresh_after_update,
 };
 use crate::handlers::admin::provider::oauth::state::{
     admin_provider_oauth_template, exchange_admin_provider_oauth_refresh_token,
@@ -264,9 +265,12 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
             }
         };
 
-        let _ =
-            refresh_provider_oauth_account_state_after_update(state, &provider, &persisted_key.id)
-                .await;
+        spawn_provider_oauth_account_state_refresh_after_update(
+            state.cloned_app(),
+            provider.clone(),
+            persisted_key.id.clone(),
+            request_proxy.clone(),
+        );
 
         success += 1;
         results.push(json!({

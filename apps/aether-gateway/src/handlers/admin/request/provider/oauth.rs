@@ -514,11 +514,13 @@ impl<'a> AdminAppState<'a> {
         &self,
         provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
         key_id: &str,
+        proxy_override: Option<&ProxySnapshot>,
     ) -> Result<(bool, Option<String>), GatewayError> {
         crate::handlers::admin::provider::oauth::runtime::refresh_provider_oauth_account_state_after_update(
             self,
             provider,
             key_id,
+            proxy_override,
         )
         .await
     }

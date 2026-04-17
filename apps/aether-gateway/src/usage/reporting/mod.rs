@@ -873,6 +873,17 @@ mod tests {
             .expect("codex metadata should exist");
         assert_eq!(codex.get("primary_used_percent"), Some(&json!(31.0)));
         assert_eq!(codex.get("secondary_used_percent"), Some(&json!(100.0)));
+        let quota = reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|snapshot| snapshot.get("quota"))
+            .and_then(serde_json::Value::as_object)
+            .expect("quota snapshot should exist");
+        assert_eq!(quota.get("provider_type"), Some(&json!("codex")));
+        assert_eq!(quota.get("source"), Some(&json!("response_headers")));
+        assert_eq!(quota.get("code"), Some(&json!("exhausted")));
+        assert_eq!(quota.get("updated_at"), quota.get("observed_at"));
     }
 
     #[tokio::test]
@@ -925,6 +936,17 @@ mod tests {
             .expect("codex metadata should exist");
         assert_eq!(codex.get("primary_used_percent"), Some(&json!(31.0)));
         assert_eq!(codex.get("secondary_used_percent"), Some(&json!(100.0)));
+        let quota = reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|snapshot| snapshot.get("quota"))
+            .and_then(serde_json::Value::as_object)
+            .expect("quota snapshot should exist");
+        assert_eq!(quota.get("provider_type"), Some(&json!("codex")));
+        assert_eq!(quota.get("source"), Some(&json!("response_headers")));
+        assert_eq!(quota.get("code"), Some(&json!("exhausted")));
+        assert_eq!(quota.get("updated_at"), quota.get("observed_at"));
     }
 
     #[tokio::test]

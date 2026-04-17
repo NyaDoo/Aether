@@ -6,7 +6,7 @@ use super::parse::normalize_codex_plan_type;
 use crate::handlers::admin::provider::shared::payloads::CODEX_WHAM_USAGE_URL;
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
-use aether_contracts::{ExecutionPlan, RequestBody};
+use aether_contracts::{ExecutionPlan, ProxySnapshot, RequestBody};
 use std::collections::BTreeMap;
 
 pub(super) fn build_codex_refresh_headers(
@@ -60,10 +60,16 @@ pub(super) async fn execute_codex_quota_plan(
     state: &AdminAppState<'_>,
     transport: &AdminGatewayProviderTransportSnapshot,
     headers: BTreeMap<String, String>,
+    proxy_override: Option<&ProxySnapshot>,
 ) -> Result<ProviderQuotaExecutionOutcome, GatewayError> {
-    let proxy = state
-        .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
-        .await;
+    let proxy = match proxy_override {
+        Some(proxy) => Some(proxy.clone()),
+        None => {
+            state
+                .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
+                .await
+        }
+    };
     let timeouts = state
         .resolve_transport_execution_timeouts(transport)
         .or(Some(default_provider_quota_execution_timeouts(

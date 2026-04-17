@@ -5,7 +5,8 @@ use crate::handlers::admin::provider::oauth::provisioning::{
     update_existing_provider_oauth_catalog_key,
 };
 use crate::handlers::admin::provider::oauth::runtime::{
-    provider_oauth_runtime_endpoint_for_provider, refresh_provider_oauth_account_state_after_update,
+    provider_oauth_runtime_endpoint_for_provider,
+    spawn_provider_oauth_account_state_refresh_after_update,
 };
 use crate::handlers::admin::provider::oauth::state::decode_jwt_claims;
 use crate::handlers::admin::provider::shared::support::ADMIN_PROVIDER_OAUTH_DATA_UNAVAILABLE_DETAIL;
@@ -548,9 +549,12 @@ pub(super) async fn execute_admin_provider_oauth_kiro_batch_import(
             .get("auth_method")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let _ =
-            refresh_provider_oauth_account_state_after_update(state, &provider, &persisted_key.id)
-                .await;
+        spawn_provider_oauth_account_state_refresh_after_update(
+            state.cloned_app(),
+            provider.clone(),
+            persisted_key.id.clone(),
+            request_proxy.clone(),
+        );
 
         success += 1;
         results.push(json!({

@@ -18,15 +18,45 @@ export interface AccountStatusSnapshot {
   recoverable?: boolean
 }
 
+export interface QuotaWindowSnapshot {
+  code: string
+  label?: string | null
+  scope?: 'account' | 'workspace' | 'model' | string
+  unit?: 'percent' | 'count' | 'usd' | 'tokens' | string
+  model?: string | null
+  used_ratio?: number | null
+  remaining_ratio?: number | null
+  used_value?: number | null
+  remaining_value?: number | null
+  limit_value?: number | null
+  reset_at?: number | null
+  reset_seconds?: number | null
+  window_minutes?: number | null
+  is_exhausted?: boolean | null
+}
+
+export interface QuotaCreditsSnapshot {
+  has_credits?: boolean | null
+  balance?: number | null
+  unlimited?: boolean | null
+}
+
 export interface QuotaStatusSnapshot {
-  code: 'unknown' | 'ok' | 'exhausted'
+  version?: number | null
+  provider_type?: string | null
+  code: 'unknown' | 'ok' | 'exhausted' | 'cooldown' | 'forbidden' | 'banned' | string
   label?: string | null
   reason?: string | null
+  freshness?: 'fresh' | 'stale' | 'unknown' | 'error' | string | null
+  source?: string | null
+  observed_at?: number | null
   exhausted: boolean
   usage_ratio?: number | null
   updated_at?: number | null
   reset_seconds?: number | null
   plan_type?: string | null
+  credits?: QuotaCreditsSnapshot | null
+  windows?: QuotaWindowSnapshot[] | null
 }
 
 export interface ProviderKeyStatusSnapshot {

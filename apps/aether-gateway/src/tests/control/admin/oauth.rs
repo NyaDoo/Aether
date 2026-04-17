@@ -2564,6 +2564,13 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_p
     assert_eq!(payload["results"][0]["key_id"], "key-kiro-batch-runtime");
     assert_eq!(payload["results"][0]["replaced"], true);
 
+    for _ in 0..40 {
+        let plan_count = execution_plans.lock().expect("mutex should lock").len();
+        if plan_count == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     {
         let plans = execution_plans.lock().expect("mutex should lock");
         assert_eq!(plans.len(), 2);

@@ -417,7 +417,16 @@ mod tests {
                 return Ok(None);
             }
 
-            Ok(Some(Self::start(initdb_bin, postgres_bin).await?))
+            match Self::start(initdb_bin, postgres_bin).await {
+                Ok(server) => Ok(Some(server)),
+                Err(err) if postgres_shared_memory_unavailable(err.to_string().as_str()) => {
+                    eprintln!(
+                        "skipping postgres integration test because local postgres could not allocate shared memory: {err}"
+                    );
+                    Ok(None)
+                }
+                Err(err) => Err(err),
+            }
         }
 
         async fn start(
@@ -468,6 +477,14 @@ mod tests {
                 .arg("synchronous_commit=off")
                 .arg("-c")
                 .arg("full_page_writes=off")
+                .arg("-c")
+                .arg("shared_buffers=8MB")
+                .arg("-c")
+                .arg("max_connections=8")
+                .arg("-c")
+                .arg("dynamic_shared_memory_type=none")
+                .arg("-c")
+                .arg("autovacuum=off")
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
                 .spawn()?;
@@ -517,6 +534,14 @@ mod tests {
         let port = listener.local_addr()?.port();
         drop(listener);
         Ok(port)
+    }
+
+    fn postgres_shared_memory_unavailable(message: &str) -> bool {
+        let message = message.to_ascii_lowercase();
+        message.contains("shared memory")
+            && (message.contains("could not create shared memory segment")
+                || message.contains("shmget")
+                || message.contains("no space left on device"))
     }
 
     async fn wait_for_postgres(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {

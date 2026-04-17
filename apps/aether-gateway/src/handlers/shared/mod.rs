@@ -22,7 +22,7 @@ pub(crate) use self::catalog::{
     default_provider_key_status_snapshot, effective_catalog_encryption_key,
     encrypt_catalog_secret_with_fallbacks, masked_catalog_api_key, parse_catalog_auth_config_json,
     provider_catalog_key_supports_format, provider_key_health_summary,
-    provider_key_status_snapshot_payload,
+    provider_key_status_snapshot_payload, sync_provider_key_quota_status_snapshot,
 };
 pub(crate) use self::email_templates::{
     admin_email_template_definition, admin_email_template_html_key,

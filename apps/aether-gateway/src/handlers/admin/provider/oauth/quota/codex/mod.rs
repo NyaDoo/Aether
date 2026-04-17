@@ -13,13 +13,15 @@ use self::parse::{
 };
 use self::plan::{build_codex_refresh_headers, execute_codex_quota_plan};
 use super::shared::{
-    extract_execution_error_message, persist_provider_quota_refresh_state,
-    provider_auto_remove_banned_keys, quota_refresh_success_invalid_state,
-    should_auto_remove_structured_reason, ProviderQuotaExecutionOutcome,
+    build_quota_snapshot_payload, extract_execution_error_message,
+    persist_provider_quota_refresh_state, provider_auto_remove_banned_keys,
+    quota_refresh_success_invalid_state, should_auto_remove_structured_reason,
+    ProviderQuotaExecutionOutcome,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::provider_key_auth::provider_key_is_oauth_managed;
 use crate::GatewayError;
+use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -31,6 +33,7 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
     provider: &StoredProviderCatalogProvider,
     endpoint: &StoredProviderCatalogEndpoint,
     keys: Vec<StoredProviderCatalogKey>,
+    proxy_override: Option<ProxySnapshot>,
 ) -> Result<Option<serde_json::Value>, GatewayError> {
     let auto_remove_abnormal_keys = provider_auto_remove_banned_keys(provider.config.as_ref());
     let mut results = Vec::new();
@@ -77,20 +80,23 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
             }
         };
 
-        let result = match execute_codex_quota_plan(state, &transport, headers).await? {
-            ProviderQuotaExecutionOutcome::Response(result) => result,
-            ProviderQuotaExecutionOutcome::Failure(detail) => {
-                failed_count += 1;
-                results.push(json!({
-                    "key_id": key.id,
-                    "key_name": key.name,
-                    "status": "error",
-                    "message": format!("wham/usage 请求执行失败: {detail}"),
-                    "status_code": 502,
-                }));
-                continue;
-            }
-        };
+        let result =
+            match execute_codex_quota_plan(state, &transport, headers, proxy_override.as_ref())
+                .await?
+            {
+                ProviderQuotaExecutionOutcome::Response(result) => result,
+                ProviderQuotaExecutionOutcome::Failure(detail) => {
+                    failed_count += 1;
+                    results.push(json!({
+                        "key_id": key.id,
+                        "key_name": key.name,
+                        "status": "error",
+                        "message": format!("wham/usage 请求执行失败: {detail}"),
+                        "status_code": 502,
+                    }));
+                    continue;
+                }
+            };
         let now_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -277,6 +283,13 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
             .cloned()
         {
             payload.insert("metadata".to_string(), metadata_update);
+        }
+        if let Some(quota_snapshot) = build_quota_snapshot_payload(
+            "codex",
+            key.status_snapshot.as_ref(),
+            metadata_update.as_ref(),
+        ) {
+            payload.insert("quota_snapshot".to_string(), quota_snapshot);
         }
         if auto_removed {
             payload.insert("auto_removed".to_string(), json!(true));

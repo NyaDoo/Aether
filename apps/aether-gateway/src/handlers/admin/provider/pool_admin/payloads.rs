@@ -5,6 +5,7 @@ use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{provider_key_status_snapshot_payload, unix_secs_to_rfc3339};
 use crate::provider_key_auth::provider_key_auth_semantics;
 use aether_admin::provider::pool as admin_provider_pool_pure;
+use aether_admin::provider::quota as admin_provider_quota_pure;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use serde_json::json;
 
@@ -238,88 +239,135 @@ fn admin_pool_format_reset_after(seconds: f64) -> Option<String> {
     Some("即将重置".to_string())
 }
 
-fn admin_pool_build_codex_account_quota(
-    data: &serde_json::Map<String, serde_json::Value>,
+fn admin_pool_quota_snapshot_matches_provider(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
+    provider_type: &str,
+) -> bool {
+    let normalized_provider_type = provider_type.trim().to_ascii_lowercase();
+    match quota_snapshot
+        .get("provider_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(provider_type) => provider_type.eq_ignore_ascii_case(&normalized_provider_type),
+        None => {
+            quota_snapshot
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|code| !code.trim().eq_ignore_ascii_case("unknown"))
+                || quota_snapshot
+                    .get("updated_at")
+                    .is_some_and(|value| !value.is_null())
+                || quota_snapshot
+                    .get("observed_at")
+                    .is_some_and(|value| !value.is_null())
+                || quota_snapshot
+                    .get("usage_ratio")
+                    .is_some_and(|value| !value.is_null())
+                || quota_snapshot
+                    .get("reset_seconds")
+                    .is_some_and(|value| !value.is_null())
+                || quota_snapshot
+                    .get("windows")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|windows| !windows.is_empty())
+                || quota_snapshot
+                    .get("credits")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|credits| !credits.is_empty())
+        }
+    }
+}
+
+fn admin_pool_quota_window<'a>(
+    quota_snapshot: &'a serde_json::Map<String, serde_json::Value>,
+    code: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    quota_snapshot
+        .get("windows")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .find(|window| {
+            window
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(code))
+        })
+}
+
+fn admin_pool_quota_window_used_percent(
+    window: &serde_json::Map<String, serde_json::Value>,
+) -> Option<f64> {
+    admin_pool_json_to_f64(window.get("used_ratio"))
+        .map(|value| (value * 100.0).clamp(0.0, 100.0))
+        .or_else(|| {
+            admin_pool_json_to_f64(window.get("remaining_ratio"))
+                .map(|value| ((1.0 - value) * 100.0).clamp(0.0, 100.0))
+        })
+}
+
+fn admin_pool_quota_window_reset_seconds(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
+    window: &serde_json::Map<String, serde_json::Value>,
+    now_unix_secs: u64,
+) -> Option<f64> {
+    if let Some(reset_at) = admin_pool_json_to_u64(window.get("reset_at")) {
+        return Some(reset_at.saturating_sub(now_unix_secs) as f64);
+    }
+
+    let remaining = admin_pool_json_to_f64(window.get("reset_seconds"))?;
+    let observed_at_unix_secs = admin_pool_json_to_u64(quota_snapshot.get("observed_at"))
+        .or_else(|| admin_pool_json_to_u64(quota_snapshot.get("updated_at")));
+    let elapsed = observed_at_unix_secs
+        .map(|observed_at| now_unix_secs.saturating_sub(observed_at) as f64)
+        .unwrap_or(0.0);
+    Some((remaining - elapsed).max(0.0))
+}
+
+fn admin_pool_codex_quota_part_from_window(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
+    window_code: &str,
+    label: &str,
+    now_unix_secs: u64,
 ) -> Option<String> {
-    fn codex_reset_seconds(
-        data: &serde_json::Map<String, serde_json::Value>,
-        reset_seconds_key: &str,
-        reset_after_seconds_key: &str,
-        reset_at_key: &str,
-        now_unix_secs: u64,
-        updated_at_unix_secs: Option<u64>,
-    ) -> Option<f64> {
-        if let Some(reset_at) = admin_pool_json_to_u64(data.get(reset_at_key)) {
-            return Some(reset_at.saturating_sub(now_unix_secs) as f64);
-        }
+    let window = admin_pool_quota_window(quota_snapshot, window_code)?;
+    let used_percent = admin_pool_quota_window_used_percent(window)?;
+    let reset_seconds =
+        admin_pool_quota_window_reset_seconds(quota_snapshot, window, now_unix_secs);
+    let effective_used_percent = if reset_seconds.is_some_and(|value| value <= 0.0) {
+        0.0
+    } else {
+        used_percent
+    };
 
-        let remaining = admin_pool_json_to_f64(data.get(reset_seconds_key))
-            .or_else(|| admin_pool_json_to_f64(data.get(reset_after_seconds_key)))?;
-        let elapsed = updated_at_unix_secs
-            .map(|updated_at| now_unix_secs.saturating_sub(updated_at) as f64)
-            .unwrap_or(0.0);
-        Some((remaining - elapsed).max(0.0))
+    let mut part = format!(
+        "{label}剩余 {}",
+        admin_pool_format_percent(100.0 - effective_used_percent)
+    );
+    if admin_pool_has_quota_consumption(Some(effective_used_percent)) {
+        if let Some(reset_text) = reset_seconds.and_then(admin_pool_format_reset_after) {
+            part.push_str(&format!(" ({reset_text})"));
+        }
     }
+    Some(part)
+}
 
-    fn codex_effective_used_percent(used_percent: f64, reset_seconds: Option<f64>) -> f64 {
-        let normalized = used_percent.clamp(0.0, 100.0);
-        if normalized <= 1e-6 {
-            return 0.0;
-        }
-        if reset_seconds.is_some_and(|value| value <= 0.0) {
-            return 0.0;
-        }
-        normalized
-    }
-
-    let mut parts = Vec::new();
+fn admin_pool_build_codex_account_quota_from_snapshot(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
     let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
-    let updated_at_unix_secs = admin_pool_json_to_u64(data.get("updated_at"));
+    let mut parts = Vec::new();
 
-    let primary_used_raw = admin_pool_json_to_f64(data.get("primary_used_percent"));
-    if let Some(primary_used_raw) = primary_used_raw {
-        let primary_reset_seconds = codex_reset_seconds(
-            data,
-            "primary_reset_seconds",
-            "primary_reset_after_seconds",
-            "primary_reset_at",
-            now_unix_secs,
-            updated_at_unix_secs,
-        );
-        let primary_used = codex_effective_used_percent(primary_used_raw, primary_reset_seconds);
-        let mut part = format!("周剩余 {}", admin_pool_format_percent(100.0 - primary_used));
-        if admin_pool_has_quota_consumption(Some(primary_used)) {
-            if let Some(reset_text) = primary_reset_seconds.and_then(admin_pool_format_reset_after)
-            {
-                part.push_str(&format!(" ({reset_text})"));
-            }
-        }
+    if let Some(part) =
+        admin_pool_codex_quota_part_from_window(quota_snapshot, "weekly", "周", now_unix_secs)
+    {
         parts.push(part);
     }
-
-    let secondary_used_raw = admin_pool_json_to_f64(data.get("secondary_used_percent"));
-    if let Some(secondary_used_raw) = secondary_used_raw {
-        let secondary_reset_seconds = codex_reset_seconds(
-            data,
-            "secondary_reset_seconds",
-            "secondary_reset_after_seconds",
-            "secondary_reset_at",
-            now_unix_secs,
-            updated_at_unix_secs,
-        );
-        let secondary_used =
-            codex_effective_used_percent(secondary_used_raw, secondary_reset_seconds);
-        let mut part = format!(
-            "5H剩余 {}",
-            admin_pool_format_percent(100.0 - secondary_used)
-        );
-        if admin_pool_has_quota_consumption(Some(secondary_used)) {
-            if let Some(reset_text) =
-                secondary_reset_seconds.and_then(admin_pool_format_reset_after)
-            {
-                part.push_str(&format!(" ({reset_text})"));
-            }
-        }
+    if let Some(part) =
+        admin_pool_codex_quota_part_from_window(quota_snapshot, "5h", "5H", now_unix_secs)
+    {
         parts.push(part);
     }
 
@@ -327,11 +375,16 @@ fn admin_pool_build_codex_account_quota(
         return Some(parts.join(" | "));
     }
 
-    let has_credits = data
-        .get("has_credits")
-        .and_then(serde_json::Value::as_bool)
+    let credits = quota_snapshot
+        .get("credits")
+        .and_then(serde_json::Value::as_object);
+    let has_credits = credits
+        .and_then(|credits| credits.get("has_credits"))
+        .and_then(admin_provider_quota_pure::coerce_json_bool)
         .unwrap_or(false);
-    let credits_balance = admin_pool_json_to_f64(data.get("credits_balance"));
+    let credits_balance = credits
+        .and_then(|credits| credits.get("balance"))
+        .and_then(admin_provider_quota_pure::coerce_json_f64);
     if has_credits && credits_balance.is_some() {
         return credits_balance.map(|value| format!("积分 {value:.2}"));
     }
@@ -342,73 +395,115 @@ fn admin_pool_build_codex_account_quota(
     None
 }
 
-fn admin_pool_build_kiro_account_quota(
-    data: &serde_json::Map<String, serde_json::Value>,
+fn admin_pool_quota_windows<'a>(
+    quota_snapshot: &'a serde_json::Map<String, serde_json::Value>,
+) -> Vec<&'a serde_json::Map<String, serde_json::Value>> {
+    quota_snapshot
+        .get("windows")
+        .and_then(serde_json::Value::as_array)
+        .map(|windows| {
+            windows
+                .iter()
+                .filter_map(serde_json::Value::as_object)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn admin_pool_build_kiro_account_quota_from_snapshot(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    if data
-        .get("is_banned")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Some("账号已封禁".to_string());
+    let code = quota_snapshot
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if code.eq_ignore_ascii_case("banned") {
+        return quota_snapshot
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("账号已封禁".to_string()));
     }
 
-    let usage_percentage = admin_pool_json_to_f64(data.get("usage_percentage"));
-    if let Some(usage_percentage) = usage_percentage {
-        let remaining = 100.0 - usage_percentage;
-        let current_usage = admin_pool_json_to_f64(data.get("current_usage"));
-        let usage_limit = admin_pool_json_to_f64(data.get("usage_limit"));
-        if let (Some(current_usage), Some(usage_limit)) = (current_usage, usage_limit) {
-            if usage_limit > 0.0 {
+    let window = admin_pool_quota_windows(quota_snapshot)
+        .into_iter()
+        .next()?;
+    let used_ratio = admin_pool_json_to_f64(window.get("used_ratio"));
+    let remaining_ratio = admin_pool_json_to_f64(window.get("remaining_ratio"))
+        .or_else(|| used_ratio.map(|value| (1.0 - value).max(0.0)));
+    let used_value = admin_pool_json_to_f64(window.get("used_value"));
+    let remaining_value = admin_pool_json_to_f64(window.get("remaining_value"));
+    let limit_value = admin_pool_json_to_f64(window.get("limit_value"));
+
+    if let (Some(remaining_value), Some(limit_value)) = (remaining_value, limit_value) {
+        if limit_value > 0.0 && remaining_value <= 0.0 {
+            return Some(format!(
+                "剩余 {}/{}",
+                admin_pool_format_quota_value(remaining_value),
+                admin_pool_format_quota_value(limit_value),
+            ));
+        }
+    }
+
+    if let Some(remaining_ratio) = remaining_ratio {
+        let remaining_percent = (remaining_ratio * 100.0).clamp(0.0, 100.0);
+        if let (Some(used_value), Some(limit_value)) = (used_value, limit_value) {
+            if limit_value > 0.0 {
                 return Some(format!(
                     "剩余 {} ({}/{})",
-                    admin_pool_format_percent(remaining),
-                    admin_pool_format_quota_value(current_usage),
-                    admin_pool_format_quota_value(usage_limit),
+                    admin_pool_format_percent(remaining_percent),
+                    admin_pool_format_quota_value(used_value),
+                    admin_pool_format_quota_value(limit_value),
                 ));
             }
         }
-        return Some(format!("剩余 {}", admin_pool_format_percent(remaining)));
+        return Some(format!(
+            "剩余 {}",
+            admin_pool_format_percent(remaining_percent)
+        ));
     }
 
-    let remaining = admin_pool_json_to_f64(data.get("remaining"));
-    let usage_limit = admin_pool_json_to_f64(data.get("usage_limit"));
-    match (remaining, usage_limit) {
-        (Some(remaining), Some(usage_limit)) if usage_limit > 0.0 => Some(format!(
+    match (remaining_value, limit_value) {
+        (Some(remaining_value), Some(limit_value)) if limit_value > 0.0 => Some(format!(
             "剩余 {}/{}",
-            admin_pool_format_quota_value(remaining),
-            admin_pool_format_quota_value(usage_limit),
+            admin_pool_format_quota_value(remaining_value),
+            admin_pool_format_quota_value(limit_value),
         )),
         _ => None,
     }
 }
 
-fn admin_pool_quota_by_model(
-    data: &serde_json::Map<String, serde_json::Value>,
-) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    data.get("quota_by_model")?.as_object()
-}
-
-fn admin_pool_build_antigravity_account_quota(
-    data: &serde_json::Map<String, serde_json::Value>,
+fn admin_pool_build_antigravity_account_quota_from_snapshot(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    if data
-        .get("is_forbidden")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+    if quota_snapshot
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|code| code.eq_ignore_ascii_case("forbidden"))
     {
-        return Some("访问受限".to_string());
+        return quota_snapshot
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("访问受限".to_string()));
     }
 
-    let remaining_list = admin_pool_quota_by_model(data)?
-        .values()
-        .filter_map(serde_json::Value::as_object)
-        .filter_map(|item| {
-            let used_percent = admin_pool_json_to_f64(item.get("used_percent")).or_else(|| {
-                admin_pool_json_to_f64(item.get("remaining_fraction"))
-                    .map(|value| (1.0 - value) * 100.0)
-            })?;
-            Some((100.0 - used_percent).clamp(0.0, 100.0))
+    let remaining_list = admin_pool_quota_windows(quota_snapshot)
+        .into_iter()
+        .filter(|window| {
+            window
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|scope| scope.eq_ignore_ascii_case("model"))
+        })
+        .filter_map(|window| {
+            admin_pool_json_to_f64(window.get("remaining_ratio"))
+                .map(|value| (value * 100.0).clamp(0.0, 100.0))
+                .or_else(|| {
+                    admin_pool_json_to_f64(window.get("used_ratio"))
+                        .map(|value| ((1.0 - value) * 100.0).clamp(0.0, 100.0))
+                })
         })
         .collect::<Vec<_>>();
 
@@ -427,41 +522,41 @@ fn admin_pool_build_antigravity_account_quota(
     ))
 }
 
-fn admin_pool_gemini_reset_at(item: &serde_json::Map<String, serde_json::Value>) -> Option<i64> {
-    let reset_at = admin_pool_json_to_u64(item.get("reset_at"))?;
-    Some(reset_at as i64)
-}
-
-fn admin_pool_gemini_model_exhausted(item: &serde_json::Map<String, serde_json::Value>) -> bool {
-    if item
-        .get("is_exhausted")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    if admin_pool_json_to_f64(item.get("remaining_fraction")).is_some_and(|value| value <= 0.0) {
-        return true;
-    }
-    admin_pool_json_to_f64(item.get("used_percent")).is_some_and(|value| value >= 100.0 - 1e-6)
-}
-
-fn admin_pool_build_gemini_cli_account_quota(
-    data: &serde_json::Map<String, serde_json::Value>,
+fn admin_pool_build_gemini_cli_account_quota_from_snapshot(
+    quota_snapshot: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
     let now = chrono::Utc::now().timestamp();
-    let mut active = admin_pool_quota_by_model(data)?
-        .iter()
-        .filter_map(|(model_name, item)| {
-            let item = item.as_object()?;
-            if !admin_pool_gemini_model_exhausted(item) {
-                return None;
-            }
-            let reset_at = admin_pool_gemini_reset_at(item);
+    let mut active = admin_pool_quota_windows(quota_snapshot)
+        .into_iter()
+        .filter(|window| {
+            window
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|scope| scope.eq_ignore_ascii_case("model"))
+        })
+        .filter(|window| {
+            window
+                .get("is_exhausted")
+                .and_then(admin_provider_quota_pure::coerce_json_bool)
+                .or_else(|| {
+                    admin_pool_json_to_f64(window.get("used_ratio"))
+                        .map(|value| value >= 1.0 - 1e-6)
+                })
+                .unwrap_or(false)
+        })
+        .filter_map(|window| {
+            let reset_at = admin_pool_json_to_u64(window.get("reset_at")).map(|value| value as i64);
             if reset_at.is_some_and(|value| value <= now) {
                 return None;
             }
-            Some((model_name.as_str(), reset_at))
+            let label = window
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| window.get("model").and_then(serde_json::Value::as_str))
+                .unwrap_or("模型");
+            Some((label.to_string(), reset_at))
         })
         .collect::<Vec<_>>();
 
@@ -470,10 +565,10 @@ fn admin_pool_build_gemini_cli_account_quota(
     }
 
     active.sort_by_key(|(_, reset_at)| reset_at.unwrap_or(i64::MAX));
-    let (first_model, first_reset_at) = active[0];
+    let (first_model, first_reset_at) = &active[0];
     if active.len() == 1 {
         if let Some(reset_at) = first_reset_at {
-            if let Some(reset_text) = admin_pool_format_reset_after((reset_at - now) as f64) {
+            if let Some(reset_text) = admin_pool_format_reset_after((*reset_at - now) as f64) {
                 return Some(format!("{first_model} 冷却中 ({reset_text})"));
             }
         }
@@ -481,7 +576,7 @@ fn admin_pool_build_gemini_cli_account_quota(
     }
 
     if let Some(reset_at) = first_reset_at {
-        if let Some(reset_text) = admin_pool_format_reset_after((reset_at - now) as f64) {
+        if let Some(reset_text) = admin_pool_format_reset_after((*reset_at - now) as f64) {
             return Some(format!(
                 "{} 个模型冷却中（最早 {reset_text}）",
                 active.len()
@@ -493,21 +588,46 @@ fn admin_pool_build_gemini_cli_account_quota(
 
 fn admin_pool_build_account_quota(
     provider_type: &str,
-    upstream_metadata: Option<&serde_json::Value>,
+    quota_snapshot: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<String> {
     let normalized_provider_type = provider_type.trim().to_ascii_lowercase();
-    let upstream_metadata = upstream_metadata?.as_object()?;
-    let data = upstream_metadata
-        .get(&normalized_provider_type)?
-        .as_object()?;
+    let quota_snapshot = quota_snapshot.filter(|quota_snapshot| {
+        admin_pool_quota_snapshot_matches_provider(quota_snapshot, &normalized_provider_type)
+    })?;
 
     match normalized_provider_type.as_str() {
-        "codex" => admin_pool_build_codex_account_quota(data),
-        "kiro" => admin_pool_build_kiro_account_quota(data),
-        "antigravity" => admin_pool_build_antigravity_account_quota(data),
-        "gemini_cli" => admin_pool_build_gemini_cli_account_quota(data),
-        _ => None,
+        "codex" => {
+            if let Some(account_quota) =
+                admin_pool_build_codex_account_quota_from_snapshot(quota_snapshot)
+            {
+                return Some(account_quota);
+            }
+        }
+        "kiro" => {
+            if let Some(account_quota) =
+                admin_pool_build_kiro_account_quota_from_snapshot(quota_snapshot)
+            {
+                return Some(account_quota);
+            }
+        }
+        "antigravity" => {
+            if let Some(account_quota) =
+                admin_pool_build_antigravity_account_quota_from_snapshot(quota_snapshot)
+            {
+                return Some(account_quota);
+            }
+        }
+        "gemini_cli" => {
+            if let Some(account_quota) =
+                admin_pool_build_gemini_cli_account_quota_from_snapshot(quota_snapshot)
+            {
+                return Some(account_quota);
+            }
+        }
+        _ => {}
     }
+
+    None
 }
 
 fn admin_pool_health_score(key: &StoredProviderCatalogKey) -> f64 {
@@ -668,7 +788,7 @@ pub(super) fn build_admin_pool_key_payload(
         admin_pool_derive_oauth_expires_at(provider_type, key, auth_config.as_ref());
     let oauth_plan_type =
         admin_pool_derive_oauth_plan_type(key, provider_type, auth_config.as_ref());
-    let status_snapshot = provider_key_status_snapshot_payload(key);
+    let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
     let account_snapshot = status_snapshot
         .get("account")
         .and_then(serde_json::Value::as_object);
@@ -680,6 +800,7 @@ pub(super) fn build_admin_pool_key_payload(
         .and_then(serde_json::Value::as_object);
     let quota_updated_at =
         admin_pool_json_to_u64(quota_snapshot.and_then(|item| item.get("updated_at")));
+    let account_quota = admin_pool_build_account_quota(provider_type, quota_snapshot);
     let oauth_invalid_at = if auth_semantics.can_show_oauth_metadata() {
         admin_pool_json_to_u64(oauth_snapshot.and_then(|item| item.get("invalid_at")))
             .or(key.oauth_invalid_at_unix_secs)
@@ -851,13 +972,7 @@ pub(super) fn build_admin_pool_key_payload(
     );
     payload.insert("proxy".to_string(), json!(key.proxy.clone()));
     payload.insert("fingerprint".to_string(), json!(key.fingerprint.clone()));
-    payload.insert(
-        "account_quota".to_string(),
-        json!(admin_pool_build_account_quota(
-            provider_type,
-            key.upstream_metadata.as_ref(),
-        )),
-    );
+    payload.insert("account_quota".to_string(), json!(account_quota));
     payload.insert("cooldown_reason".to_string(), json!(cooldown_reason));
     payload.insert(
         "cooldown_ttl_seconds".to_string(),

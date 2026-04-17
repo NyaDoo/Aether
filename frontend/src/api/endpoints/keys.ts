@@ -1,5 +1,6 @@
 import client from '../client'
 import type { EndpointAPIKey, AllowedModels } from './types'
+import type { QuotaStatusSnapshot } from './types'
 
 // Re-export types for convenience
 export type { EndpointAPIKey, AllowedModels }
@@ -212,9 +213,18 @@ export interface RefreshQuotaResult {
   results: Array<{
     key_id: string
     key_name: string
-    status: 'success' | 'no_metadata' | 'error'
-    // Codex: 额度字段为扁平结构；Antigravity: 返回 { antigravity: { quota_by_model: ... } }
+    status:
+      | 'success'
+      | 'no_metadata'
+      | 'quota_exhausted'
+      | 'workspace_deactivated'
+      | 'auth_invalid'
+      | 'forbidden'
+      | 'banned'
+      | 'error'
+    // provider 级 bucket 数据；前端应按当前 provider_type 包装回 upstream_metadata.<provider_type>
     metadata?: Record<string, unknown>
+    quota_snapshot?: QuotaStatusSnapshot
     message?: string
     status_code?: number
   }>

@@ -15,8 +15,15 @@ fn local_candidate_index(report_context: Option<&serde_json::Value>) -> Option<u
         .and_then(serde_json::Value::as_u64)
 }
 
-fn is_retryable_local_upstream_status(status_code: u16) -> bool {
-    status_code == 429 || status_code >= 500
+fn should_failover_local_upstream_status(status_code: u16) -> bool {
+    status_code >= 400
+}
+
+fn sync_plan_kind_disables_local_candidate_failover(plan_kind: &str) -> bool {
+    matches!(
+        plan_kind,
+        "openai_video_delete_sync" | "openai_video_cancel_sync" | "gemini_video_cancel_sync"
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,11 +61,14 @@ impl LocalFailoverDecision {
 pub(crate) async fn should_retry_next_local_candidate_sync(
     state: &AppState,
     plan: &ExecutionPlan,
-    _plan_kind: &str,
+    plan_kind: &str,
     report_context: Option<&serde_json::Value>,
     result: &ExecutionResult,
     response_text: Option<&str>,
 ) -> bool {
+    if sync_plan_kind_disables_local_candidate_failover(plan_kind) {
+        return false;
+    }
     matches!(
         resolve_local_failover_decision(
             state,
@@ -75,11 +85,14 @@ pub(crate) async fn should_retry_next_local_candidate_sync(
 pub(crate) async fn should_stop_local_candidate_failover_sync(
     state: &AppState,
     plan: &ExecutionPlan,
-    _plan_kind: &str,
+    plan_kind: &str,
     report_context: Option<&serde_json::Value>,
     result: &ExecutionResult,
     response_text: Option<&str>,
 ) -> bool {
+    if sync_plan_kind_disables_local_candidate_failover(plan_kind) {
+        return false;
+    }
     matches!(
         resolve_local_failover_decision(
             state,
@@ -294,7 +307,7 @@ async fn resolve_local_failover_decision(
         return LocalFailoverDecision::RetryNextCandidate;
     }
 
-    if is_retryable_local_upstream_status(status_code) {
+    if should_failover_local_upstream_status(status_code) {
         return LocalFailoverDecision::RetryNextCandidate;
     }
 
@@ -851,6 +864,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_retry_next_candidate_treats_client_error_as_failover_by_default() {
+        let result = ExecutionResult {
+            request_id: "req-1".to_string(),
+            candidate_id: None,
+            status_code: 401,
+            headers: Default::default(),
+            body: None,
+            telemetry: None,
+            error: None,
+        };
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let state = build_state_with_provider_config(None);
+        let plan = sample_plan();
+
+        assert!(
+            should_retry_next_local_candidate_sync(
+                &state,
+                &plan,
+                "openai_chat_sync",
+                Some(&local_report_context),
+                &result,
+                Some("{\"error\":{\"message\":\"invalid auth token\"}}"),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_retry_next_candidate_skips_video_follow_up_plan_kinds() {
+        let result = ExecutionResult {
+            request_id: "req-1".to_string(),
+            candidate_id: None,
+            status_code: 404,
+            headers: Default::default(),
+            body: None,
+            telemetry: None,
+            error: None,
+        };
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let state = build_state_with_provider_config(None);
+        let plan = sample_plan();
+
+        for plan_kind in [
+            "openai_video_delete_sync",
+            "openai_video_cancel_sync",
+            "gemini_video_cancel_sync",
+        ] {
+            assert!(
+                !should_retry_next_local_candidate_sync(
+                    &state,
+                    &plan,
+                    plan_kind,
+                    Some(&local_report_context),
+                    &result,
+                    None,
+                )
+                .await,
+                "{plan_kind} should not retry local failover candidates"
+            );
+            assert!(
+                !should_stop_local_candidate_failover_sync(
+                    &state,
+                    &plan,
+                    plan_kind,
+                    Some(&local_report_context),
+                    &result,
+                    None,
+                )
+                .await,
+                "{plan_kind} should not use local failover stop decisions"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stream_retry_next_candidate_requires_local_candidate_context() {
         let local_report_context = serde_json::json!({
             "candidate_index": 0,
@@ -922,6 +1016,28 @@ mod tests {
                 Some(&local_report_context),
                 429,
                 None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_retry_next_candidate_treats_client_error_as_failover_by_default() {
+        let local_report_context = serde_json::json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let state = build_state_with_provider_config(None);
+        let plan = sample_plan();
+
+        assert!(
+            should_retry_next_local_candidate_stream(
+                &state,
+                &plan,
+                "openai_chat_stream",
+                Some(&local_report_context),
+                403,
+                Some("{\"error\":{\"message\":\"invalid auth token\"}}"),
             )
             .await
         );

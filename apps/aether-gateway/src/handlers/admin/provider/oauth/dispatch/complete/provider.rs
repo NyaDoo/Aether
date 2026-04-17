@@ -5,7 +5,8 @@ use super::super::super::provisioning::{
     provider_oauth_active_api_formats, update_existing_provider_oauth_catalog_key,
 };
 use super::super::super::runtime::{
-    provider_oauth_runtime_endpoint_for_provider, refresh_provider_oauth_account_state_after_update,
+    provider_oauth_runtime_endpoint_for_provider,
+    spawn_provider_oauth_account_state_refresh_after_update,
 };
 use super::super::super::state::{
     admin_provider_oauth_template, build_admin_provider_oauth_backend_unavailable_response,
@@ -137,7 +138,7 @@ pub(super) async fn handle_admin_provider_oauth_complete_provider(
             &callback.code,
             &callback.state_nonce,
             state_data.pkce_verifier.as_deref(),
-            request_proxy,
+            request_proxy.clone(),
         )
         .await
     {
@@ -231,9 +232,12 @@ pub(super) async fn handle_admin_provider_oauth_complete_provider(
         }
     };
 
-    let _ = state
-        .refresh_provider_oauth_account_state_after_update(&provider, &persisted_key.id)
-        .await;
+    spawn_provider_oauth_account_state_refresh_after_update(
+        state.cloned_app(),
+        provider.clone(),
+        persisted_key.id.clone(),
+        request_proxy.clone(),
+    );
 
     Ok(Json(json!({
         "key_id": persisted_key.id,

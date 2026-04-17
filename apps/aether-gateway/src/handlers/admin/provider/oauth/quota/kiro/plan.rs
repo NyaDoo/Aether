@@ -7,7 +7,7 @@ use crate::handlers::admin::request::{
     AdminAppState, AdminGatewayProviderTransportSnapshot, AdminKiroRequestAuth,
 };
 use crate::GatewayError;
-use aether_contracts::{ExecutionPlan, RequestBody};
+use aether_contracts::{ExecutionPlan, ProxySnapshot, RequestBody};
 use std::collections::BTreeMap;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -66,10 +66,16 @@ pub(super) async fn execute_kiro_quota_plan(
     state: &AdminAppState<'_>,
     transport: &AdminGatewayProviderTransportSnapshot,
     auth: &AdminKiroRequestAuth,
+    proxy_override: Option<&ProxySnapshot>,
 ) -> Result<ProviderQuotaExecutionOutcome, GatewayError> {
-    let proxy = state
-        .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
-        .await;
+    let proxy = match proxy_override {
+        Some(proxy) => Some(proxy.clone()),
+        None => {
+            state
+                .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
+                .await
+        }
+    };
     let timeouts = state
         .resolve_transport_execution_timeouts(transport)
         .or(Some(default_provider_quota_execution_timeouts(

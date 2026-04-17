@@ -145,14 +145,11 @@ pub fn parse_antigravity_usage_response(
         let remaining_fraction = quota_info
             .and_then(|object| object.get("remainingFraction"))
             .and_then(coerce_json_f64);
-        let used_percent = remaining_fraction
-            .map(|value| ((1.0 - value).max(0.0) * 100.0).min(100.0))
-            .unwrap_or(100.0);
-        payload.insert(
-            "remaining_fraction".to_string(),
-            json!(remaining_fraction.unwrap_or(0.0)),
-        );
-        payload.insert("used_percent".to_string(), json!(used_percent));
+        if let Some(remaining_fraction) = remaining_fraction {
+            let used_percent = ((1.0 - remaining_fraction).max(0.0) * 100.0).min(100.0);
+            payload.insert("remaining_fraction".to_string(), json!(remaining_fraction));
+            payload.insert("used_percent".to_string(), json!(used_percent));
+        }
         if let Some(reset_time) = quota_info
             .and_then(|object| object.get("resetTime"))
             .cloned()

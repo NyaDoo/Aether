@@ -195,10 +195,15 @@ pub(super) async fn maybe_handle(
     }
 
     let Some(payload) = (match normalized_provider_type.as_str() {
-        "codex" => refresh_codex_provider_quota_locally(state, &provider, &endpoint, keys).await?,
-        "kiro" => refresh_kiro_provider_quota_locally(state, &provider, &endpoint, keys).await?,
+        "codex" => {
+            refresh_codex_provider_quota_locally(state, &provider, &endpoint, keys, None).await?
+        }
+        "kiro" => {
+            refresh_kiro_provider_quota_locally(state, &provider, &endpoint, keys, None).await?
+        }
         "antigravity" => {
-            refresh_antigravity_provider_quota_locally(state, &provider, &endpoint, keys).await?
+            refresh_antigravity_provider_quota_locally(state, &provider, &endpoint, keys, None)
+                .await?
         }
         _ => None,
     }) else {

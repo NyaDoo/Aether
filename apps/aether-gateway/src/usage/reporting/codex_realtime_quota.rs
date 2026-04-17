@@ -3,6 +3,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::clock::current_unix_secs;
+use crate::handlers::shared::sync_provider_key_quota_status_snapshot;
 use crate::{AppState, GatewayError};
 use aether_admin::provider::quota as admin_provider_quota_pure;
 use serde_json::Value;
@@ -185,14 +186,21 @@ pub(super) async fn sync_codex_quota_from_response_headers(
 
     let updated_upstream_metadata =
         merge_metadata_object(key.upstream_metadata.as_ref(), "codex", parsed);
+    let updated_status_snapshot = sync_provider_key_quota_status_snapshot(
+        key.status_snapshot.as_ref(),
+        provider.provider_type.as_str(),
+        updated_upstream_metadata.as_ref(),
+        "response_headers",
+    );
+    let mut updated_key = key;
+    updated_key.upstream_metadata = updated_upstream_metadata;
+    updated_key.status_snapshot = updated_status_snapshot;
+    updated_key.updated_at_unix_secs = Some(now_unix_secs);
 
     let updated = state
-        .update_provider_catalog_key_upstream_metadata(
-            &key_id,
-            updated_upstream_metadata.as_ref(),
-            Some(now_unix_secs),
-        )
-        .await?;
+        .update_provider_catalog_key(&updated_key)
+        .await?
+        .is_some();
     if updated {
         set_cached_fingerprint(&key_id, incoming_fingerprint, now);
     }
@@ -270,6 +278,15 @@ mod tests {
         key
     }
 
+    fn quota_snapshot<'a>(key: &'a StoredProviderCatalogKey) -> &'a serde_json::Map<String, Value> {
+        key.status_snapshot
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|snapshot| snapshot.get("quota"))
+            .and_then(Value::as_object)
+            .expect("quota snapshot should exist")
+    }
+
     fn paid_headers(
         primary_used_percent: &str,
         secondary_used_percent: &str,
@@ -323,25 +340,43 @@ mod tests {
     async fn sync_codex_quota_replaces_existing_codex_fields_and_preserves_other_sections() {
         clear_codex_quota_fingerprint_cache();
 
+        let mut key = sample_key(
+            "key-codex-1",
+            "provider-codex",
+            Some(json!({
+                "codex": {
+                    "legacy_marker": "drop-me",
+                    "secondary_used_percent": 2.0,
+                    "credits_balance": 42.0,
+                    "account_disabled": true,
+                    "reason": "deactivated_workspace"
+                },
+                "other": {
+                    "value": true
+                }
+            })),
+        );
+        key.status_snapshot = Some(json!({
+            "oauth": {
+                "code": "valid",
+                "label": "有效",
+                "requires_reauth": false,
+                "expiring_soon": false
+            },
+            "account": {
+                "code": "ok",
+                "blocked": false,
+                "recoverable": false
+            },
+            "quota": {
+                "code": "unknown",
+                "exhausted": false
+            }
+        }));
         let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
             vec![sample_provider("provider-codex", "codex")],
             Vec::new(),
-            vec![sample_key(
-                "key-codex-1",
-                "provider-codex",
-                Some(json!({
-                    "codex": {
-                        "legacy_marker": "drop-me",
-                        "secondary_used_percent": 2.0,
-                        "credits_balance": 42.0,
-                        "account_disabled": true,
-                        "reason": "deactivated_workspace"
-                    },
-                    "other": {
-                        "value": true
-                    }
-                })),
-            )],
+            vec![key],
         ));
         let state = build_state(Arc::clone(&repository));
 
@@ -386,6 +421,38 @@ mod tests {
                 .and_then(|metadata| metadata.get("other")),
             Some(&json!({"value": true}))
         );
+        let quota = quota_snapshot(&reloaded[0]);
+        assert_eq!(quota.get("version"), Some(&json!(2)));
+        assert_eq!(quota.get("provider_type"), Some(&json!("codex")));
+        assert_eq!(quota.get("source"), Some(&json!("response_headers")));
+        assert_eq!(quota.get("code"), Some(&json!("exhausted")));
+        assert_eq!(quota.get("exhausted"), Some(&json!(true)));
+        assert_eq!(quota.get("plan_type"), Some(&json!("team")));
+        assert_eq!(quota.get("usage_ratio"), Some(&json!(1.0)));
+        assert_eq!(quota.get("updated_at"), quota.get("observed_at"));
+        let windows = quota
+            .get("windows")
+            .and_then(Value::as_array)
+            .expect("windows should be array");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].get("code"), Some(&json!("weekly")));
+        assert_eq!(windows[1].get("code"), Some(&json!("5h")));
+        let oauth = reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|snapshot| snapshot.get("oauth"))
+            .and_then(Value::as_object)
+            .expect("oauth snapshot should exist");
+        assert_eq!(oauth.get("code"), Some(&json!("valid")));
+        let account = reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|snapshot| snapshot.get("account"))
+            .and_then(Value::as_object)
+            .expect("account snapshot should exist");
+        assert_eq!(account.get("code"), Some(&json!("ok")));
     }
 
     #[tokio::test]

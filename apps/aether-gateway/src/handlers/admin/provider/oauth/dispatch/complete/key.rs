@@ -148,7 +148,7 @@ pub(super) async fn handle_admin_provider_oauth_complete_key(
             &callback.code,
             &callback.state_nonce,
             state_data.pkce_verifier.as_deref(),
-            request_proxy,
+            request_proxy.clone(),
         )
         .await
     {
@@ -243,6 +243,7 @@ pub(super) async fn handle_admin_provider_oauth_complete_key(
                 &provider,
                 &endpoint,
                 vec![refreshed_key],
+                request_proxy.clone(),
             )
             .await?
             {

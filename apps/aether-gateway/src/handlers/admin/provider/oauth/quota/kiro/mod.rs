@@ -4,11 +4,13 @@ mod plan;
 use self::parse::parse_kiro_usage_response;
 use self::plan::execute_kiro_quota_plan;
 use super::shared::{
-    extract_execution_error_message, persist_provider_quota_refresh_state,
-    quota_refresh_success_invalid_state, ProviderQuotaExecutionOutcome,
+    build_quota_snapshot_payload, extract_execution_error_message,
+    persist_provider_quota_refresh_state, quota_refresh_success_invalid_state,
+    ProviderQuotaExecutionOutcome,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::GatewayError;
+use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -20,6 +22,7 @@ pub(crate) async fn refresh_kiro_provider_quota_locally(
     provider: &StoredProviderCatalogProvider,
     endpoint: &StoredProviderCatalogEndpoint,
     keys: Vec<StoredProviderCatalogKey>,
+    proxy_override: Option<ProxySnapshot>,
 ) -> Result<Option<serde_json::Value>, GatewayError> {
     let mut results = Vec::new();
     let mut success_count = 0usize;
@@ -57,20 +60,22 @@ pub(crate) async fn refresh_kiro_provider_quota_locally(
             continue;
         };
 
-        let result = match execute_kiro_quota_plan(state, &transport, &auth).await? {
-            ProviderQuotaExecutionOutcome::Response(result) => result,
-            ProviderQuotaExecutionOutcome::Failure(detail) => {
-                failed_count += 1;
-                results.push(json!({
-                    "key_id": key.id,
-                    "key_name": key.name,
-                    "status": "error",
-                    "message": format!("getUsageLimits 请求执行失败: {detail}"),
-                    "status_code": 502,
-                }));
-                continue;
-            }
-        };
+        let result =
+            match execute_kiro_quota_plan(state, &transport, &auth, proxy_override.as_ref()).await?
+            {
+                ProviderQuotaExecutionOutcome::Response(result) => result,
+                ProviderQuotaExecutionOutcome::Failure(detail) => {
+                    failed_count += 1;
+                    results.push(json!({
+                        "key_id": key.id,
+                        "key_name": key.name,
+                        "status": "error",
+                        "message": format!("getUsageLimits 请求执行失败: {detail}"),
+                        "status_code": 502,
+                    }));
+                    continue;
+                }
+            };
 
         let now_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -93,7 +98,25 @@ pub(crate) async fn refresh_kiro_provider_quota_locally(
                 metadata_update = parse_kiro_usage_response(body_json, now_unix_secs)
                     .map(|metadata| json!({ "kiro": metadata }));
                 if metadata_update.is_some() {
-                    let auth_config_json = auth.auth_config.to_json_value().to_string();
+                    let mut auth_config_object = transport
+                        .key
+                        .decrypted_auth_config
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default();
+                    if let Some(refreshed_auth_config) =
+                        auth.auth_config.to_json_value().as_object()
+                    {
+                        for (key, value) in refreshed_auth_config {
+                            auth_config_object.insert(key.clone(), value.clone());
+                        }
+                    }
+                    auth_config_object
+                        .entry("provider_type".to_string())
+                        .or_insert_with(|| json!("kiro"));
+                    let auth_config_json =
+                        serde_json::Value::Object(auth_config_object).to_string();
                     if let Some(auth_config_json) =
                         state.encrypt_catalog_secret_with_fallbacks(auth_config_json.as_str())
                     {
@@ -184,6 +207,13 @@ pub(crate) async fn refresh_kiro_provider_quota_locally(
             .cloned()
         {
             payload.insert("metadata".to_string(), metadata);
+        }
+        if let Some(quota_snapshot) = build_quota_snapshot_payload(
+            "kiro",
+            key.status_snapshot.as_ref(),
+            metadata_update.as_ref(),
+        ) {
+            payload.insert("quota_snapshot".to_string(), quota_snapshot);
         }
         results.push(serde_json::Value::Object(payload));
     }

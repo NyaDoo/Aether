@@ -315,12 +315,12 @@
                             </Badge>
                             <!-- Kiro 订阅类型标签 -->
                             <Badge
-                              v-if="provider.provider_type === 'kiro' && key.upstream_metadata?.kiro?.subscription_title"
+                              v-if="provider.provider_type === 'kiro' && getKiroSubscriptionTitle(key)"
                               variant="outline"
                               class="text-[10px] px-1.5 py-0 shrink-0"
-                              :class="getOAuthPlanTypeClass(formatKiroSubscription(key.upstream_metadata?.kiro?.subscription_title))"
+                              :class="getOAuthPlanTypeClass(formatKiroSubscription(getKiroSubscriptionTitle(key)))"
                             >
-                              {{ formatKiroSubscription(key.upstream_metadata?.kiro?.subscription_title) }}
+                              {{ formatKiroSubscription(getKiroSubscriptionTitle(key)) }}
                             </Badge>
                           </div>
                           <div class="flex items-center gap-1">
@@ -403,7 +403,7 @@
                             </template>
                             <!-- Antigravity 账号未激活提示 -->
                             <span
-                              v-if="provider.provider_type === 'antigravity' && key.is_active && isOAuthManagedCredential(key) && (!key.upstream_metadata || !hasAntigravityQuotaData(key.upstream_metadata))"
+                              v-if="provider.provider_type === 'antigravity' && key.is_active && isOAuthManagedCredential(key) && !hasAntigravityQuotaDisplayData(key)"
                               class="text-[10px] text-orange-500 dark:text-orange-400"
                               title="该账号尚未完成 Gemini Code Assist 激活，无法获取配额和使用模型"
                             >
@@ -550,7 +550,7 @@
                     </div>
                     <!-- Codex 上游额度信息（仅当有元数据时显示） -->
                     <div
-                      v-if="key.upstream_metadata && hasCodexQuotaData(key.upstream_metadata)"
+                      v-if="hasCodexQuotaDisplayData(key)"
                       class="mt-2 p-2 bg-muted/30 rounded-md"
                     >
                       <div class="flex items-center justify-between mb-1">
@@ -561,12 +561,24 @@
                             class="w-3 h-3 text-muted-foreground/70 animate-spin"
                           />
                           <span
-                            v-if="key.upstream_metadata.codex?.updated_at"
+                            v-if="getCodexQuotaDisplay(key)?.updated_at"
                             class="text-[9px] text-muted-foreground/70"
                           >
-                            {{ formatCodexUpdatedAt(key.upstream_metadata.codex.updated_at) }}
+                            {{ formatCodexUpdatedAt(getCodexQuotaDisplay(key)?.updated_at || 0) }}
                           </span>
                         </div>
+                      </div>
+                      <div
+                        v-if="getCodexCreditsSummary(getCodexQuotaDisplay(key))"
+                        class="flex items-center justify-between text-[10px] mb-2"
+                      >
+                        <span class="text-muted-foreground">积分</span>
+                        <span
+                          class="font-medium"
+                          :class="getCodexQuotaDisplay(key)?.has_credits === false ? 'text-red-600 dark:text-red-400' : 'text-foreground/80'"
+                        >
+                          {{ getCodexCreditsSummary(getCodexQuotaDisplay(key)) }}
+                        </span>
                       </div>
                       <!-- 限额并排显示：Team/Plus/Enterprise 账号 2列, Free 账号 1列 -->
                       <div
@@ -574,69 +586,69 @@
                         :class="isCodexTeamPlan(key) ? 'grid-cols-2' : 'grid-cols-1'"
                       >
                         <!-- 周限额 -->
-                        <div v-if="key.upstream_metadata.codex?.primary_used_percent !== undefined">
+                        <div v-if="getCodexQuotaDisplay(key)?.primary_used_percent !== undefined">
                           <div class="flex items-center justify-between text-[10px] mb-0.5">
                             <span class="text-muted-foreground">周限额</span>
-                            <span :class="getQuotaRemainingClass(key.upstream_metadata.codex.primary_used_percent)">
-                              {{ (100 - key.upstream_metadata.codex.primary_used_percent).toFixed(1) }}%
+                            <span :class="getQuotaRemainingClass(getCodexQuotaDisplay(key)?.primary_used_percent || 0)">
+                              {{ (100 - (getCodexQuotaDisplay(key)?.primary_used_percent || 0)).toFixed(1) }}%
                             </span>
                           </div>
                           <div class="relative w-full h-1.5 bg-border rounded-full overflow-hidden">
                             <div
                               class="absolute left-0 top-0 h-full transition-all duration-300"
-                              :class="getQuotaRemainingBarColor(key.upstream_metadata.codex.primary_used_percent)"
-                              :style="{ width: `${Math.max(100 - key.upstream_metadata.codex.primary_used_percent, 0)}%` }"
+                              :class="getQuotaRemainingBarColor(getCodexQuotaDisplay(key)?.primary_used_percent || 0)"
+                              :style="{ width: `${Math.max(100 - (getCodexQuotaDisplay(key)?.primary_used_percent || 0), 0)}%` }"
                             />
                           </div>
                           <div
-                            v-if="(key.upstream_metadata.codex.primary_reset_at || key.upstream_metadata.codex.primary_reset_seconds) && shouldStartCodexResetCountdown(key.upstream_metadata.codex.primary_used_percent)"
+                            v-if="(getCodexQuotaDisplay(key)?.primary_reset_at || getCodexQuotaDisplay(key)?.primary_reset_seconds) && shouldStartCodexResetCountdown(getCodexQuotaDisplay(key)?.primary_used_percent || 0)"
                             class="text-[9px] mt-0.5 tabular-nums"
                             :class="getResetCountdownClass(
-                              key.upstream_metadata.codex.primary_reset_at,
-                              key.upstream_metadata.codex.primary_reset_seconds,
-                              key.upstream_metadata.codex.updated_at,
-                              key.upstream_metadata.codex.primary_used_percent
+                              getCodexQuotaDisplay(key)?.primary_reset_at,
+                              getCodexQuotaDisplay(key)?.primary_reset_seconds,
+                              getCodexQuotaDisplay(key)?.updated_at,
+                              getCodexQuotaDisplay(key)?.primary_used_percent
                             )"
                           >
                             {{ getResetCountdownText(
-                              key.upstream_metadata.codex.primary_reset_at,
-                              key.upstream_metadata.codex.primary_reset_seconds,
-                              key.upstream_metadata.codex.updated_at,
-                              key.upstream_metadata.codex.primary_used_percent
+                              getCodexQuotaDisplay(key)?.primary_reset_at,
+                              getCodexQuotaDisplay(key)?.primary_reset_seconds,
+                              getCodexQuotaDisplay(key)?.updated_at,
+                              getCodexQuotaDisplay(key)?.primary_used_percent
                             ) }}
                           </div>
                         </div>
                         <!-- 5H限额（仅 Team/Plus/Enterprise 显示） -->
-                        <div v-if="isCodexTeamPlan(key) && key.upstream_metadata.codex?.secondary_used_percent !== undefined">
+                        <div v-if="isCodexTeamPlan(key) && getCodexQuotaDisplay(key)?.secondary_used_percent !== undefined">
                           <div class="flex items-center justify-between text-[10px] mb-0.5">
                             <span class="text-muted-foreground">5H限额</span>
-                            <span :class="getQuotaRemainingClass(key.upstream_metadata.codex.secondary_used_percent)">
-                              {{ (100 - key.upstream_metadata.codex.secondary_used_percent).toFixed(1) }}%
+                            <span :class="getQuotaRemainingClass(getCodexQuotaDisplay(key)?.secondary_used_percent || 0)">
+                              {{ (100 - (getCodexQuotaDisplay(key)?.secondary_used_percent || 0)).toFixed(1) }}%
                             </span>
                           </div>
                           <div class="relative w-full h-1.5 bg-border rounded-full overflow-hidden">
                             <div
                               class="absolute left-0 top-0 h-full transition-all duration-300"
-                              :class="getQuotaRemainingBarColor(key.upstream_metadata.codex.secondary_used_percent)"
-                              :style="{ width: `${Math.max(100 - key.upstream_metadata.codex.secondary_used_percent, 0)}%` }"
+                              :class="getQuotaRemainingBarColor(getCodexQuotaDisplay(key)?.secondary_used_percent || 0)"
+                              :style="{ width: `${Math.max(100 - (getCodexQuotaDisplay(key)?.secondary_used_percent || 0), 0)}%` }"
                             />
                           </div>
                           <div
-                            v-if="shouldStartCodexResetCountdown(key.upstream_metadata.codex.secondary_used_percent)"
+                            v-if="shouldStartCodexResetCountdown(getCodexQuotaDisplay(key)?.secondary_used_percent || 0)"
                             class="text-[9px] mt-0.5 tabular-nums"
                             :class="getResetCountdownClass(
-                              key.upstream_metadata.codex.secondary_reset_at,
-                              key.upstream_metadata.codex.secondary_reset_seconds,
-                              key.upstream_metadata.codex.updated_at,
-                              key.upstream_metadata.codex.secondary_used_percent
+                              getCodexQuotaDisplay(key)?.secondary_reset_at,
+                              getCodexQuotaDisplay(key)?.secondary_reset_seconds,
+                              getCodexQuotaDisplay(key)?.updated_at,
+                              getCodexQuotaDisplay(key)?.secondary_used_percent
                             )"
                           >
-                            <template v-if="key.upstream_metadata.codex.secondary_reset_at || key.upstream_metadata.codex.secondary_reset_seconds">
+                            <template v-if="getCodexQuotaDisplay(key)?.secondary_reset_at || getCodexQuotaDisplay(key)?.secondary_reset_seconds">
                               {{ getResetCountdownText(
-                                key.upstream_metadata.codex.secondary_reset_at,
-                                key.upstream_metadata.codex.secondary_reset_seconds,
-                                key.upstream_metadata.codex.updated_at,
-                                key.upstream_metadata.codex.secondary_used_percent
+                                getCodexQuotaDisplay(key)?.secondary_reset_at,
+                                getCodexQuotaDisplay(key)?.secondary_reset_seconds,
+                                getCodexQuotaDisplay(key)?.updated_at,
+                                getCodexQuotaDisplay(key)?.secondary_used_percent
                               ) }}
                             </template>
                             <template v-else>
@@ -648,13 +660,13 @@
                     </div>
                     <!-- Antigravity 上游额度摘要（按家族分组展示关键配额） -->
                     <div
-                      v-if="provider.provider_type === 'antigravity' && key.upstream_metadata && (hasAntigravityQuotaData(key.upstream_metadata) || isAntigravityForbidden(key.upstream_metadata))"
+                      v-if="provider.provider_type === 'antigravity' && (hasAntigravityQuotaDisplayData(key) || isAntigravityForbiddenKey(key))"
                       class="mt-2 p-2 rounded-md"
-                      :class="isAntigravityForbidden(key.upstream_metadata) ? 'bg-destructive/10 border border-destructive/30' : 'bg-muted/30'"
+                      :class="isAntigravityForbiddenKey(key) ? 'bg-destructive/10 border border-destructive/30' : 'bg-muted/30'"
                     >
                       <!-- 封禁状态显示 -->
                       <div
-                        v-if="isAntigravityForbidden(key.upstream_metadata)"
+                        v-if="isAntigravityForbiddenKey(key)"
                         class="flex items-center gap-2 text-destructive"
                       >
                         <ShieldX class="w-4 h-4 shrink-0" />
@@ -663,18 +675,18 @@
                             账户访问被禁止
                           </div>
                           <div
-                            v-if="key.upstream_metadata.antigravity?.forbidden_reason"
+                            v-if="getAntigravityForbiddenReason(key)"
                             class="text-[10px] text-destructive/80 truncate"
-                            :title="key.upstream_metadata.antigravity?.forbidden_reason"
+                            :title="getAntigravityForbiddenReason(key)"
                           >
-                            {{ key.upstream_metadata.antigravity?.forbidden_reason }}
+                            {{ getAntigravityForbiddenReason(key) }}
                           </div>
                         </div>
                         <span
-                          v-if="key.upstream_metadata.antigravity?.forbidden_at"
+                          v-if="getAntigravityForbiddenAt(key)"
                           class="text-[9px] text-destructive/60 shrink-0"
                         >
-                          {{ formatBanTimestamp(key.upstream_metadata.antigravity?.forbidden_at) }}
+                          {{ formatBanTimestamp(getAntigravityForbiddenAt(key)) }}
                         </span>
                       </div>
                       <!-- 正常配额显示 -->
@@ -687,16 +699,16 @@
                               class="w-3 h-3 text-muted-foreground/70 animate-spin"
                             />
                             <span
-                              v-if="key.upstream_metadata.antigravity?.updated_at"
+                              v-if="getAntigravityQuotaUpdatedAt(key)"
                               class="text-[9px] text-muted-foreground/70"
                             >
-                              {{ formatAntigravityUpdatedAt(key.upstream_metadata.antigravity.updated_at) }}
+                              {{ formatAntigravityUpdatedAt(getAntigravityQuotaUpdatedAt(key) || 0) }}
                             </span>
                           </div>
                         </div>
                         <div class="grid grid-cols-2 gap-3">
                           <div
-                            v-for="group in getAntigravityQuotaSummary(key.upstream_metadata)"
+                            v-for="group in getAntigravityQuotaSummaryForKey(key)"
                             :key="group.key"
                           >
                             <div class="flex items-center justify-between text-[10px] mb-0.5">
@@ -734,13 +746,13 @@
                     </div>
                     <!-- Kiro 上游额度信息（仅当有元数据时显示） -->
                     <div
-                      v-if="provider.provider_type === 'kiro' && key.upstream_metadata && (hasKiroQuotaData(key.upstream_metadata) || isKiroBanned(key.upstream_metadata))"
+                      v-if="provider.provider_type === 'kiro' && (hasKiroQuotaDisplayData(key) || isKiroBannedKey(key))"
                       class="mt-2 p-2 rounded-md"
-                      :class="isKiroBanned(key.upstream_metadata) ? 'bg-destructive/10 border border-destructive/30' : 'bg-muted/30'"
+                      :class="isKiroBannedKey(key) ? 'bg-destructive/10 border border-destructive/30' : 'bg-muted/30'"
                     >
                       <!-- 封禁状态显示 -->
                       <div
-                        v-if="isKiroBanned(key.upstream_metadata)"
+                        v-if="isKiroBannedKey(key)"
                         class="flex items-center gap-2 text-destructive"
                       >
                         <ShieldX class="w-4 h-4 shrink-0" />
@@ -749,18 +761,18 @@
                             账户已封禁
                           </div>
                           <div
-                            v-if="key.upstream_metadata.kiro?.ban_reason"
+                            v-if="getKiroQuotaDisplay(key)?.ban_reason"
                             class="text-[10px] text-destructive/80 truncate"
-                            :title="key.upstream_metadata.kiro?.ban_reason"
+                            :title="getKiroQuotaDisplay(key)?.ban_reason"
                           >
-                            {{ key.upstream_metadata.kiro?.ban_reason }}
+                            {{ getKiroQuotaDisplay(key)?.ban_reason }}
                           </div>
                         </div>
                         <span
-                          v-if="key.upstream_metadata.kiro?.banned_at"
+                          v-if="getKiroQuotaDisplay(key)?.banned_at"
                           class="text-[9px] text-destructive/60 shrink-0"
                         >
-                          {{ formatBanTimestamp(key.upstream_metadata.kiro?.banned_at) }}
+                          {{ formatBanTimestamp(getKiroQuotaDisplay(key)?.banned_at) }}
                         </span>
                       </div>
                       <!-- 正常配额显示 -->
@@ -773,10 +785,10 @@
                               class="w-3 h-3 text-muted-foreground/70 animate-spin"
                             />
                             <span
-                              v-if="key.upstream_metadata.kiro?.updated_at"
+                              v-if="getKiroQuotaDisplay(key)?.updated_at"
                               class="text-[9px] text-muted-foreground/70"
                             >
-                              {{ formatKiroUpdatedAt(key.upstream_metadata.kiro?.updated_at) }}
+                              {{ formatKiroUpdatedAt(getKiroQuotaDisplay(key)?.updated_at || 0) }}
                             </span>
                           </div>
                         </div>
@@ -786,24 +798,24 @@
                           <div>
                             <div class="flex items-center justify-between text-[10px] mb-0.5">
                               <span class="text-muted-foreground">使用额度</span>
-                              <span :class="getQuotaRemainingClass(key.upstream_metadata.kiro?.usage_percentage || 0)">
-                                {{ (100 - (key.upstream_metadata.kiro?.usage_percentage || 0)).toFixed(1) }}%
+                              <span :class="getQuotaRemainingClass(getKiroQuotaDisplay(key)?.usage_percentage || 0)">
+                                {{ (100 - (getKiroQuotaDisplay(key)?.usage_percentage || 0)).toFixed(1) }}%
                               </span>
                             </div>
                             <div class="relative w-full h-1.5 bg-border rounded-full overflow-hidden">
                               <div
                                 class="absolute left-0 top-0 h-full transition-all duration-300"
-                                :class="getQuotaRemainingBarColor(key.upstream_metadata.kiro?.usage_percentage || 0)"
-                                :style="{ width: `${Math.max(100 - (key.upstream_metadata.kiro?.usage_percentage || 0), 0)}%` }"
+                                :class="getQuotaRemainingBarColor(getKiroQuotaDisplay(key)?.usage_percentage || 0)"
+                                :style="{ width: `${Math.max(100 - (getKiroQuotaDisplay(key)?.usage_percentage || 0), 0)}%` }"
                               />
                             </div>
                             <div class="flex items-center justify-between text-[9px] text-muted-foreground/70 mt-0.5">
                               <span>
-                                {{ formatKiroUsage(key.upstream_metadata.kiro?.current_usage) }} /
-                                {{ formatKiroUsage(key.upstream_metadata.kiro?.usage_limit) }}
+                                {{ formatKiroUsage(getKiroQuotaDisplay(key)?.current_usage) }} /
+                                {{ formatKiroUsage(getKiroQuotaDisplay(key)?.usage_limit) }}
                               </span>
-                              <span v-if="key.upstream_metadata.kiro?.next_reset_at">
-                                {{ formatKiroResetTime(key.upstream_metadata.kiro?.next_reset_at) }}重置
+                              <span v-if="getKiroQuotaDisplay(key)?.next_reset_at">
+                                {{ formatKiroResetTime(getKiroQuotaDisplay(key)?.next_reset_at) }}重置
                               </span>
                             </div>
                           </div>
@@ -1062,6 +1074,7 @@
     v-if="antigravityQuotaDialogKey"
     :open="antigravityQuotaDialogOpen"
     :metadata="antigravityQuotaDialogKey.upstream_metadata"
+    :quota-snapshot="antigravityQuotaDialogKey.status_snapshot?.quota ?? null"
     :key-name="antigravityQuotaDialogKey.name || '未命名密钥'"
     :provider-id="providerId"
     :key-id="antigravityQuotaDialogKey.id"
@@ -1152,7 +1165,15 @@ import {
   API_FORMAT_SHORT,
   sortApiFormats,
 } from '@/api/endpoints'
-import type { UpstreamMetadata, AntigravityModelQuota } from '@/api/endpoints/types'
+import type {
+  UpstreamMetadata,
+  AntigravityModelQuota,
+  AntigravityUpstreamMetadata,
+  CodexUpstreamMetadata,
+  KiroUpstreamMetadata,
+  QuotaStatusSnapshot,
+  QuotaWindowSnapshot,
+} from '@/api/endpoints/types'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
@@ -1786,23 +1807,221 @@ const AUTO_QUOTA_REFRESH_STALE_SECONDS = 5 * 60
 // 与后端 OAuth 懒刷新阈值对齐：到期前 2 分钟内视为需要刷新
 const AUTO_TOKEN_REFRESH_SKEW_SECONDS = 2 * 60
 
-// 检查 Codex 是否有配额数据
-function hasCodexQuotaData(meta: UpstreamMetadata | null | undefined): boolean {
-  if (!meta?.codex) return false
-  // Codex 配额数据存储在 codex 子对象中
-  return meta.codex.primary_used_percent !== undefined || meta.codex.secondary_used_percent !== undefined
+function quotaSnapshotHasDisplayData(quota: QuotaStatusSnapshot | null | undefined): boolean {
+  if (!quota) return false
+  return Boolean(
+    (typeof quota.code === 'string' && quota.code.trim().toLowerCase() !== 'unknown')
+    || quota.updated_at != null
+    || quota.observed_at != null
+    || quota.usage_ratio != null
+    || (Array.isArray(quota.windows) && quota.windows.length > 0)
+    || quota.credits,
+  )
 }
 
-// 检查 Kiro 是否有配额数据
-function hasKiroQuotaData(meta: UpstreamMetadata | null | undefined): boolean {
-  if (!meta?.kiro) return false
-  return meta.kiro.usage_percentage !== undefined || meta.kiro.usage_limit !== undefined
+function getQuotaSnapshotForProvider(
+  key: EndpointAPIKey,
+  providerType: 'codex' | 'kiro' | 'antigravity' | 'gemini_cli',
+): QuotaStatusSnapshot | null {
+  const quota = key.status_snapshot?.quota
+  if (!quota) return null
+
+  const snapshotProviderType = quota.provider_type?.trim().toLowerCase()
+  if (snapshotProviderType) {
+    return snapshotProviderType === providerType ? quota : null
+  }
+
+  return quotaSnapshotHasDisplayData(quota) ? quota : null
 }
 
-// 检查 Kiro 账户是否被封禁
-function isKiroBanned(meta: UpstreamMetadata | null | undefined): boolean {
-  if (!meta?.kiro) return false
-  return meta.kiro.is_banned === true
+function getQuotaSnapshotUpdatedAt(quota: QuotaStatusSnapshot | null | undefined): number | undefined {
+  const updatedAt = quota?.updated_at ?? quota?.observed_at
+  return typeof updatedAt === 'number' ? updatedAt : undefined
+}
+
+function getQuotaWindow(
+  quota: QuotaStatusSnapshot | null | undefined,
+  code: string,
+): QuotaWindowSnapshot | null {
+  const windows = quota?.windows
+  if (!Array.isArray(windows)) return null
+  return windows.find(window => String(window?.code || '').trim().toLowerCase() === code.trim().toLowerCase()) ?? null
+}
+
+function getQuotaWindowUsedPercent(window: QuotaWindowSnapshot | null | undefined): number | undefined {
+  if (!window) return undefined
+  if (typeof window.used_ratio === 'number') {
+    return Math.max(Math.min(window.used_ratio * 100, 100), 0)
+  }
+  if (typeof window.remaining_ratio === 'number') {
+    return Math.max(Math.min((1 - window.remaining_ratio) * 100, 100), 0)
+  }
+  return undefined
+}
+
+function getQuotaWindowRemainingPercent(window: QuotaWindowSnapshot | null | undefined): number | undefined {
+  if (!window) return undefined
+  if (typeof window.remaining_ratio === 'number') {
+    return Math.max(Math.min(window.remaining_ratio * 100, 100), 0)
+  }
+  if (typeof window.used_ratio === 'number') {
+    return Math.max(Math.min((1 - window.used_ratio) * 100, 100), 0)
+  }
+  return undefined
+}
+
+function getQuotaWindowResetAt(window: QuotaWindowSnapshot | null | undefined): number | undefined {
+  return typeof window?.reset_at === 'number' ? window.reset_at : undefined
+}
+
+function getQuotaWindowResetSeconds(window: QuotaWindowSnapshot | null | undefined): number | undefined {
+  return typeof window?.reset_seconds === 'number' ? window.reset_seconds : undefined
+}
+
+function getQuotaWindowByScope(
+  quota: QuotaStatusSnapshot | null | undefined,
+  scope: string,
+): QuotaWindowSnapshot[] {
+  const windows = quota?.windows
+  if (!Array.isArray(windows)) return []
+  return windows.filter(window => String(window?.scope || '').trim().toLowerCase() === scope.trim().toLowerCase())
+}
+
+function getQuotaWindowLiveResetSeconds(
+  quota: QuotaStatusSnapshot | null | undefined,
+  window: QuotaWindowSnapshot | null | undefined,
+): number | null {
+  if (!window) return null
+
+  const now = Math.floor(Date.now() / 1000)
+  if (typeof window.reset_at === 'number') {
+    return Math.max(window.reset_at - now, 0)
+  }
+
+  if (typeof window.reset_seconds === 'number') {
+    const updatedAt = getQuotaSnapshotUpdatedAt(quota)
+    const elapsed = typeof updatedAt === 'number' ? Math.max(now - updatedAt, 0) : 0
+    return Math.max(window.reset_seconds - elapsed, 0)
+  }
+
+  return null
+}
+
+function getCodexQuotaDisplay(key: EndpointAPIKey): CodexUpstreamMetadata | null {
+  const quota = getQuotaSnapshotForProvider(key, 'codex')
+  if (!quota) return null
+
+  const display: CodexUpstreamMetadata = {}
+  const updatedAt = getQuotaSnapshotUpdatedAt(quota)
+  if (updatedAt !== undefined) display.updated_at = updatedAt
+  if (quota.plan_type) display.plan_type = quota.plan_type
+
+  const primaryWindow = getQuotaWindow(quota, 'weekly')
+  const primaryUsedPercent = getQuotaWindowUsedPercent(primaryWindow)
+  if (primaryUsedPercent !== undefined) display.primary_used_percent = primaryUsedPercent
+  const primaryResetAt = getQuotaWindowResetAt(primaryWindow)
+  if (primaryResetAt !== undefined) display.primary_reset_at = primaryResetAt
+  const primaryResetSeconds = getQuotaWindowResetSeconds(primaryWindow)
+  if (primaryResetSeconds !== undefined) display.primary_reset_seconds = primaryResetSeconds
+  if (typeof primaryWindow?.window_minutes === 'number') {
+    display.primary_window_minutes = primaryWindow.window_minutes
+  }
+
+  const secondaryWindow = getQuotaWindow(quota, '5h')
+  const secondaryUsedPercent = getQuotaWindowUsedPercent(secondaryWindow)
+  if (secondaryUsedPercent !== undefined) display.secondary_used_percent = secondaryUsedPercent
+  const secondaryResetAt = getQuotaWindowResetAt(secondaryWindow)
+  if (secondaryResetAt !== undefined) display.secondary_reset_at = secondaryResetAt
+  const secondaryResetSeconds = getQuotaWindowResetSeconds(secondaryWindow)
+  if (secondaryResetSeconds !== undefined) display.secondary_reset_seconds = secondaryResetSeconds
+  if (typeof secondaryWindow?.window_minutes === 'number') {
+    display.secondary_window_minutes = secondaryWindow.window_minutes
+  }
+
+  if (typeof quota.credits?.has_credits === 'boolean') {
+    display.has_credits = quota.credits.has_credits
+  }
+  if (typeof quota.credits?.balance === 'number') {
+    display.credits_balance = quota.credits.balance
+  }
+
+  return Object.keys(display).length > 0 ? display : null
+}
+
+function hasCodexQuotaDisplayData(key: EndpointAPIKey): boolean {
+  const codex = getCodexQuotaDisplay(key)
+  return !!codex && (
+    codex.primary_used_percent !== undefined
+    || codex.secondary_used_percent !== undefined
+    || codex.has_credits !== undefined
+    || codex.credits_balance !== undefined
+  )
+}
+
+function getCodexCreditsSummary(codex: CodexUpstreamMetadata | null | undefined): string | null {
+  if (!codex) return null
+  if (codex.has_credits === true && typeof codex.credits_balance === 'number') {
+    return `积分 ${codex.credits_balance.toFixed(2)}`
+  }
+  if (codex.has_credits === true) {
+    return '有积分'
+  }
+  if (codex.has_credits === false) {
+    return '无可用积分'
+  }
+  if (typeof codex.credits_balance === 'number') {
+    return `积分 ${codex.credits_balance.toFixed(2)}`
+  }
+  return null
+}
+
+function getKiroQuotaDisplay(key: EndpointAPIKey): KiroUpstreamMetadata | null {
+  const quota = getQuotaSnapshotForProvider(key, 'kiro')
+  if (!quota) return null
+
+  const display: KiroUpstreamMetadata = {}
+  const updatedAt = getQuotaSnapshotUpdatedAt(quota)
+  if (updatedAt !== undefined) display.updated_at = updatedAt
+  if (quota.plan_type) display.subscription_title = quota.plan_type
+
+  if (String(quota.code || '').trim().toLowerCase() === 'banned') {
+    display.is_banned = true
+    if (quota.reason) display.ban_reason = quota.reason
+    if (updatedAt !== undefined) display.banned_at = updatedAt
+  }
+
+  const usageWindow =
+    getQuotaWindow(quota, 'usage')
+    ?? getQuotaWindowByScope(quota, 'account')[0]
+    ?? null
+  if (usageWindow) {
+    const usedPercent = getQuotaWindowUsedPercent(usageWindow)
+    if (usedPercent !== undefined) display.usage_percentage = usedPercent
+    if (typeof usageWindow.used_value === 'number') display.current_usage = usageWindow.used_value
+    if (typeof usageWindow.limit_value === 'number') display.usage_limit = usageWindow.limit_value
+    if (typeof usageWindow.remaining_value === 'number') display.remaining = usageWindow.remaining_value
+
+    const nextResetAt =
+      getQuotaWindowResetAt(usageWindow)
+      ?? (() => {
+        const resetSeconds = getQuotaWindowResetSeconds(usageWindow)
+        if (updatedAt === undefined || resetSeconds === undefined) return undefined
+        return updatedAt + resetSeconds
+      })()
+    if (nextResetAt !== undefined) display.next_reset_at = nextResetAt
+  }
+
+  return Object.keys(display).length > 0 ? display : null
+}
+
+function hasKiroQuotaDisplayData(key: EndpointAPIKey): boolean {
+  const kiro = getKiroQuotaDisplay(key)
+  return !!kiro && (kiro.usage_percentage !== undefined || kiro.usage_limit !== undefined)
+}
+
+function isKiroBannedKey(key: EndpointAPIKey): boolean {
+  const quota = getQuotaSnapshotForProvider(key, 'kiro')
+  return String(quota?.code || '').trim().toLowerCase() === 'banned'
 }
 
 // 格式化封禁/禁止时间（后端返回秒级时间戳，Kiro/Antigravity 通用）
@@ -1817,10 +2036,22 @@ function formatBanTimestamp(timestamp: number | undefined): string {
   })
 }
 
-// 检查 Antigravity 账户是否被禁止访问
-function isAntigravityForbidden(meta: UpstreamMetadata | null | undefined): boolean {
-  if (!meta?.antigravity) return false
-  return meta.antigravity.is_forbidden === true
+function isAntigravityForbiddenKey(key: EndpointAPIKey): boolean {
+  const quota = getQuotaSnapshotForProvider(key, 'antigravity')
+  return String(quota?.code || '').trim().toLowerCase() === 'forbidden'
+}
+
+function getAntigravityForbiddenReason(key: EndpointAPIKey): string | undefined {
+  const quota = getQuotaSnapshotForProvider(key, 'antigravity')
+  return quota?.reason || undefined
+}
+
+function getAntigravityForbiddenAt(key: EndpointAPIKey): number | undefined {
+  return getQuotaSnapshotUpdatedAt(getQuotaSnapshotForProvider(key, 'antigravity'))
+}
+
+function getAntigravityQuotaUpdatedAt(key: EndpointAPIKey): number | undefined {
+  return getQuotaSnapshotUpdatedAt(getQuotaSnapshotForProvider(key, 'antigravity'))
 }
 
 // 格式化 Kiro 更新时间
@@ -1877,6 +2108,10 @@ function formatKiroSubscription(title: string | undefined): string {
   return title
 }
 
+function getKiroSubscriptionTitle(key: EndpointAPIKey): string | undefined {
+  return getKiroQuotaDisplay(key)?.subscription_title
+}
+
 function shouldAutoRefreshCodexQuota(): boolean {
   if (provider.value?.provider_type !== 'codex') return false
   const now = Math.floor(Date.now() / 1000)
@@ -1886,13 +2121,12 @@ function shouldAutoRefreshCodexQuota(): boolean {
 
     if (isTokenExpiringSoon(key, now)) return true
 
-    const meta: UpstreamMetadata | null | undefined = key.upstream_metadata
     // 只要有一个活跃 key 没有配额数据，就刷新一次
-    if (!hasCodexQuotaData(meta)) {
+    if (!hasCodexQuotaDisplayData(key)) {
       return true
     }
     // 配额数据超过 5 分钟未更新，也触发刷新
-    const updatedAt = meta?.codex?.updated_at
+    const updatedAt = getCodexQuotaDisplay(key)?.updated_at
     if (typeof updatedAt !== 'number' || (now - updatedAt) > AUTO_QUOTA_REFRESH_STALE_SECONDS) {
       return true
     }
@@ -1920,14 +2154,11 @@ function shouldAutoRefreshAntigravityQuota(): boolean {
 
     if (isTokenExpiringSoon(key, now)) return true
 
-    const meta = key.upstream_metadata
-    const updatedAt = meta?.antigravity?.updated_at
-    const quotaByModel = meta?.antigravity?.quota_by_model
-
     // 只要有一个活跃 key 没有配额/为空/过期，就刷新一次（接口会批量刷新所有活跃 key）
-    if (!quotaByModel || typeof quotaByModel !== 'object' || Object.keys(quotaByModel).length === 0) {
+    if (!hasAntigravityQuotaDisplayData(key)) {
       return true
     }
+    const updatedAt = getAntigravityQuotaUpdatedAt(key)
     if (typeof updatedAt !== 'number' || (now - updatedAt) > AUTO_QUOTA_REFRESH_STALE_SECONDS) {
       return true
     }
@@ -1945,13 +2176,12 @@ function shouldAutoRefreshKiroQuota(): boolean {
 
     if (isTokenExpiringSoon(key, now)) return true
 
-    const meta = key.upstream_metadata
     // 只要有一个活跃 key 没有配额数据，就刷新一次
-    if (!hasKiroQuotaData(meta)) {
+    if (!hasKiroQuotaDisplayData(key)) {
       return true
     }
     // 配额数据超过 5 分钟未更新，也触发刷新
-    const updatedAt = meta?.kiro?.updated_at
+    const updatedAt = getKiroQuotaDisplay(key)?.updated_at
     if (typeof updatedAt !== 'number' || (now - updatedAt) > AUTO_QUOTA_REFRESH_STALE_SECONDS) {
       return true
     }
@@ -1960,15 +2190,81 @@ function shouldAutoRefreshKiroQuota(): boolean {
   return false
 }
 
+function defaultQuotaSnapshot(): QuotaStatusSnapshot {
+  return {
+    code: 'unknown',
+    exhausted: false,
+    usage_ratio: null,
+    updated_at: null,
+    reset_seconds: null,
+    plan_type: null,
+  }
+}
+
+function wrapQuotaMetadataForProvider(
+  providerType: string,
+  metadata: Record<string, unknown> | undefined,
+): UpstreamMetadata | null {
+  if (!metadata) return null
+  if (providerType in metadata) {
+    return metadata as UpstreamMetadata
+  }
+  return { [providerType]: metadata } as UpstreamMetadata
+}
+
 // 将配额刷新结果就地应用到现有 key 上，避免重新拉列表导致分页重置
-function applyQuotaResults(results: { key_id: string; status: string; metadata?: Record<string, unknown> }[]) {
+function applyQuotaResults(
+  results: { key_id: string; status: string; metadata?: Record<string, unknown>; quota_snapshot?: QuotaStatusSnapshot }[],
+): number {
+  const providerType = provider.value?.provider_type
+  if (!providerType) return 0
+
+  let applied = 0
   for (const r of results) {
-    if (r.status !== 'success' || !r.metadata) continue
     const target = providerKeys.value.find(k => k.id === r.key_id)
-    if (target) {
-      target.upstream_metadata = { ...target.upstream_metadata, ...r.metadata } as typeof target.upstream_metadata
+    if (!target) continue
+
+    let changed = false
+    const wrappedMetadata = wrapQuotaMetadataForProvider(providerType, r.metadata)
+    if (wrappedMetadata) {
+      target.upstream_metadata = { ...target.upstream_metadata, ...wrappedMetadata } as typeof target.upstream_metadata
+      changed = true
+    }
+
+    if (r.quota_snapshot) {
+      target.status_snapshot = {
+        oauth: target.status_snapshot?.oauth ?? {
+          code: 'none',
+          label: null,
+          reason: null,
+          expires_at: null,
+          invalid_at: null,
+          source: null,
+          requires_reauth: false,
+          expiring_soon: false,
+        },
+        account: target.status_snapshot?.account ?? {
+          code: 'ok',
+          label: null,
+          reason: null,
+          blocked: false,
+          source: null,
+          recoverable: false,
+        },
+        quota: {
+          ...defaultQuotaSnapshot(),
+          ...(target.status_snapshot?.quota ?? {}),
+          ...r.quota_snapshot,
+        },
+      }
+      changed = true
+    }
+
+    if (changed) {
+      applied += 1
     }
   }
+  return applied
 }
 
 // 通用的自动刷新配额函数（支持 Codex、Antigravity 和 Kiro）
@@ -1992,20 +2288,18 @@ async function autoRefreshQuotaInBackground() {
 
   let hadCachedQuota = false
   if (providerType === 'codex') {
-    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasCodexQuotaData(key.upstream_metadata))
+    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasCodexQuotaDisplayData(key))
   } else if (providerType === 'antigravity') {
-    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && key.upstream_metadata && hasAntigravityQuotaData(key.upstream_metadata))
+    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasAntigravityQuotaDisplayData(key))
   } else if (providerType === 'kiro') {
-    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasKiroQuotaData(key.upstream_metadata))
+    hadCachedQuota = allKeys.value.some(({ key }) => key.is_active && hasKiroQuotaDisplayData(key))
   }
 
   refreshingQuota.value = true
   try {
     const result = await refreshProviderQuota(props.providerId)
-    if (result.success > 0) {
-      // 就地更新 key 的 upstream_metadata，避免重新拉列表导致分页重置
-      applyQuotaResults(result.results)
-    } else if (!hadCachedQuota && providerType === 'antigravity') {
+    const applied = applyQuotaResults(result.results)
+    if (result.success <= 0 && applied === 0 && !hadCachedQuota && providerType === 'antigravity') {
       showError('没有获取到配额信息（请检查账号是否已授权、project_id 是否存在）', '提示')
     }
   } catch (err: unknown) {
@@ -2022,18 +2316,16 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
   antigravityQuotaDialogOpen.value = true
 
   // 没有配额数据时主动获取
-  if (!key.upstream_metadata || !hasAntigravityQuotaData(key.upstream_metadata)) {
+  if (!hasAntigravityQuotaDisplayData(key)) {
     if (refreshingQuota.value) return
     refreshingQuota.value = true
     try {
       const result = await refreshProviderQuota(props.providerId)
-      if (result.success > 0) {
-        applyQuotaResults(result.results)
-        // 更新弹窗引用的 key 数据
-        const updated = allKeys.value.find(({ key: k }) => k.id === key.id)
-        if (updated) {
-          antigravityQuotaDialogKey.value = updated.key
-        }
+      applyQuotaResults(result.results)
+      // 更新弹窗引用的 key 数据
+      const updated = allKeys.value.find(({ key: k }) => k.id === key.id)
+      if (updated) {
+        antigravityQuotaDialogKey.value = updated.key
       }
     } catch {
       // 静默失败，弹窗会显示"暂无配额数据"
@@ -2478,7 +2770,7 @@ function getQuotaRemainingBarColor(usedPercent: number): string {
 
 // 判断是否为 Codex Team/Plus/Enterprise 账号（有 5H 限额，显示 3 列）
 function isCodexTeamPlan(key: EndpointAPIKey): boolean {
-  const planType = key.oauth_plan_type?.toLowerCase() || key.upstream_metadata?.codex?.plan_type?.toLowerCase()
+  const planType = key.oauth_plan_type?.toLowerCase() || getCodexQuotaDisplay(key)?.plan_type?.toLowerCase()
   // Free 账号返回 false（2 列），其他所有账号返回 true（3 列）
   return planType !== undefined && planType !== 'free'
 }
@@ -2494,6 +2786,14 @@ interface AntigravityQuotaItem {
 function hasAntigravityQuotaData(metadata: UpstreamMetadata | null | undefined): boolean {
   const quotaByModel = metadata?.antigravity?.quota_by_model
   return !!quotaByModel && typeof quotaByModel === 'object' && Object.keys(quotaByModel).length > 0
+}
+
+function hasAntigravityQuotaDisplayData(key: EndpointAPIKey): boolean {
+  const quota = getQuotaSnapshotForProvider(key, 'antigravity')
+  if (Array.isArray(quota?.windows) && quota.windows.length > 0) {
+    return true
+  }
+  return hasAntigravityQuotaData(key.upstream_metadata)
 }
 
 function formatUpdatedAt(updatedAt: number): string {
@@ -2560,6 +2860,45 @@ function getAntigravityQuotaItems(metadata: UpstreamMetadata | null | undefined)
   }
 
   // 按“最紧张”（已用最多）优先排序，便于快速定位额度风险；完整列表通过滚动展示
+  items.sort((a, b) => (b.usedPercent - a.usedPercent) || a.model.localeCompare(b.model))
+  return items
+}
+
+function getAntigravityQuotaItemsFromSnapshot(key: EndpointAPIKey): AntigravityQuotaItem[] {
+  const quota = getQuotaSnapshotForProvider(key, 'antigravity')
+  const windows = getQuotaWindowByScope(quota, 'model')
+  if (!quota || windows.length === 0) return []
+
+  const items = windows
+    .map((window) => {
+      const model = String(window.model || window.label || window.code || '').trim()
+      if (!model) return null
+
+      const usedPercent = getQuotaWindowUsedPercent(window)
+      const remainingPercent = getQuotaWindowRemainingPercent(window)
+      if (usedPercent === undefined && remainingPercent === undefined) {
+        return null
+      }
+
+      const normalizedUsedPercent =
+        usedPercent !== undefined
+          ? usedPercent
+          : Math.max(100 - (remainingPercent ?? 0), 0)
+      const normalizedRemainingPercent =
+        remainingPercent !== undefined
+          ? remainingPercent
+          : Math.max(100 - normalizedUsedPercent, 0)
+
+      return {
+        model,
+        label: String(window.label || window.model || model),
+        usedPercent: normalizedUsedPercent,
+        remainingPercent: normalizedRemainingPercent,
+        resetSeconds: getQuotaWindowLiveResetSeconds(quota, window),
+      } satisfies AntigravityQuotaItem
+    })
+    .filter((item): item is AntigravityQuotaItem => item !== null)
+
   items.sort((a, b) => (b.usedPercent - a.usedPercent) || a.model.localeCompare(b.model))
   return items
 }
@@ -2631,6 +2970,53 @@ function getAntigravityQuotaSummary(metadata: UpstreamMetadata | null | undefine
     })
   }
   return result
+}
+
+function getAntigravityQuotaSummaryForKey(key: EndpointAPIKey): AntigravityQuotaSummaryItem[] {
+  const snapshotItems = getAntigravityQuotaItemsFromSnapshot(key)
+  if (snapshotItems.length > 0) {
+    const groupMap = new Map<string, { label: string, maxUsed: number, resetSeconds: number | null }>()
+
+    for (const item of snapshotItems) {
+      const model = item.model.toLowerCase()
+      const group = ANTIGRAVITY_QUOTA_GROUPS.find(g => g.match(model))
+      if (!group) continue
+
+      const existing = groupMap.get(group.key)
+      if (!existing) {
+        groupMap.set(group.key, {
+          label: group.label,
+          maxUsed: item.usedPercent,
+          resetSeconds: item.resetSeconds,
+        })
+      } else {
+        if (item.usedPercent > existing.maxUsed) {
+          existing.maxUsed = item.usedPercent
+        }
+        if (existing.resetSeconds === null) {
+          existing.resetSeconds = item.resetSeconds
+        } else if (item.resetSeconds !== null && item.resetSeconds < existing.resetSeconds) {
+          existing.resetSeconds = item.resetSeconds
+        }
+      }
+    }
+
+    const result: AntigravityQuotaSummaryItem[] = []
+    for (const group of ANTIGRAVITY_QUOTA_GROUPS) {
+      const data = groupMap.get(group.key)
+      if (!data) continue
+      result.push({
+        key: group.key,
+        label: data.label,
+        usedPercent: data.maxUsed,
+        remainingPercent: Math.max(100 - data.maxUsed, 0),
+        resetSeconds: data.resetSeconds,
+      })
+    }
+    return result
+  }
+
+  return getAntigravityQuotaSummary(key.upstream_metadata)
 }
 
 function getResetCountdownText(

@@ -94,7 +94,7 @@ pub(super) async fn execute_admin_provider_oauth_refresh(
         refreshed_key.encrypted_auth_config.as_deref(),
     );
     let (account_state_recheck_attempted, account_state_recheck_error) = state
-        .refresh_provider_oauth_account_state_after_update(&provider, &key_id)
+        .refresh_provider_oauth_account_state_after_update(&provider, &key_id, None)
         .await?;
 
     Ok(RefreshDispatch::Continue(RefreshSuccessContext {

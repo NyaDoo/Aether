@@ -148,7 +148,7 @@
                 </div>
                 <div class="flex items-center gap-1.5 mt-0.5 text-[11px] text-muted-foreground flex-wrap">
                   <span :class="key.is_active ? '' : 'text-destructive'">{{ key.is_active ? '启用' : '禁用' }}</span>
-                  <span v-if="key.account_quota">{{ shortenQuota(key.account_quota) }}</span>
+                  <span v-if="getQuotaText(key)">{{ shortenQuota(getQuotaText(key) || '') }}</span>
                   <span v-if="key.proxy?.node_id">独立代理</span>
                   <span
                     v-if="key.last_used_at"
@@ -300,6 +300,7 @@ import {
   getOAuthStatusDisplay,
   getOAuthStatusTitle,
 } from '@/utils/providerKeyStatus'
+import { getQuotaDisplayText } from '@/utils/providerKeyQuota'
 
 type QuickSelectorValue =
   | 'banned'
@@ -486,6 +487,10 @@ function formatRelativeTime(value: string): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟前`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`
   return `${Math.floor(diff / 86_400_000)}天前`
+}
+
+function getQuotaText(key: PoolKeyDetail): string | null {
+  return getQuotaDisplayText(key, props.providerType)
 }
 
 function shortenQuota(raw: string): string {

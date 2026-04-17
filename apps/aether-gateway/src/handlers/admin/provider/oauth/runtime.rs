@@ -3,7 +3,8 @@ use super::quota::codex::refresh_codex_provider_quota_locally;
 use super::quota::kiro::refresh_kiro_provider_quota_locally;
 use crate::handlers::admin::request::AdminAppState;
 use crate::provider_key_auth::provider_key_is_oauth_managed;
-use crate::GatewayError;
+use crate::{AppState, GatewayError};
+use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
 };
@@ -65,6 +66,7 @@ pub(crate) async fn refresh_provider_oauth_account_state_after_update(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
     key_id: &str,
+    proxy_override: Option<&ProxySnapshot>,
 ) -> Result<(bool, Option<String>), GatewayError> {
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
     if !matches!(provider_type.as_str(), "codex" | "kiro" | "antigravity") {
@@ -90,16 +92,37 @@ pub(crate) async fn refresh_provider_oauth_account_state_after_update(
         return Ok((false, None));
     }
 
+    let proxy_override = proxy_override.cloned();
     let payload = match provider_type.as_str() {
         "codex" => {
-            refresh_codex_provider_quota_locally(state, provider, &endpoint, vec![key]).await?
+            refresh_codex_provider_quota_locally(
+                state,
+                provider,
+                &endpoint,
+                vec![key],
+                proxy_override.clone(),
+            )
+            .await?
         }
         "kiro" => {
-            refresh_kiro_provider_quota_locally(state, provider, &endpoint, vec![key]).await?
+            refresh_kiro_provider_quota_locally(
+                state,
+                provider,
+                &endpoint,
+                vec![key],
+                proxy_override.clone(),
+            )
+            .await?
         }
         "antigravity" => {
-            refresh_antigravity_provider_quota_locally(state, provider, &endpoint, vec![key])
-                .await?
+            refresh_antigravity_provider_quota_locally(
+                state,
+                provider,
+                &endpoint,
+                vec![key],
+                proxy_override,
+            )
+            .await?
         }
         _ => None,
     };
@@ -122,4 +145,21 @@ pub(crate) async fn refresh_provider_oauth_account_state_after_update(
         None
     };
     Ok((true, error))
+}
+
+pub(crate) fn spawn_provider_oauth_account_state_refresh_after_update(
+    app: AppState,
+    provider: StoredProviderCatalogProvider,
+    key_id: String,
+    proxy_override: Option<ProxySnapshot>,
+) {
+    tokio::spawn(async move {
+        let _ = refresh_provider_oauth_account_state_after_update(
+            &AdminAppState::new(&app),
+            &provider,
+            &key_id,
+            proxy_override.as_ref(),
+        )
+        .await;
+    });
 }

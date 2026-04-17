@@ -1,14 +1,14 @@
 use super::shared::{
-    coerce_json_f64, coerce_json_string, default_provider_quota_execution_timeouts,
-    execute_provider_quota_plan, extract_execution_error_message,
-    persist_provider_quota_refresh_state, quota_refresh_success_invalid_state,
-    ProviderQuotaExecutionOutcome,
+    build_quota_snapshot_payload, coerce_json_f64, coerce_json_string,
+    default_provider_quota_execution_timeouts, execute_provider_quota_plan,
+    extract_execution_error_message, persist_provider_quota_refresh_state,
+    quota_refresh_success_invalid_state, ProviderQuotaExecutionOutcome,
 };
 use crate::handlers::admin::provider::shared::payloads::ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH;
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_admin::provider::quota::parse_antigravity_usage_response;
-use aether_contracts::{ExecutionPlan, RequestBody};
+use aether_contracts::{ExecutionPlan, ProxySnapshot, RequestBody};
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -22,6 +22,7 @@ async fn execute_antigravity_quota_plan(
     authorization: (String, String),
     project_id: &str,
     mut identity_headers: BTreeMap<String, String>,
+    proxy_override: Option<&ProxySnapshot>,
 ) -> Result<ProviderQuotaExecutionOutcome, GatewayError> {
     let mut headers = std::mem::take(&mut identity_headers);
     headers.insert("authorization".to_string(), authorization.1);
@@ -32,9 +33,14 @@ async fn execute_antigravity_quota_plan(
         .or_insert_with(|| "antigravity".to_string());
 
     let body = json!({ "project": project_id });
-    let proxy = state
-        .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
-        .await;
+    let proxy = match proxy_override {
+        Some(proxy) => Some(proxy.clone()),
+        None => {
+            state
+                .resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
+                .await
+        }
+    };
     let timeouts = state
         .resolve_transport_execution_timeouts(transport)
         .or(Some(default_provider_quota_execution_timeouts(
@@ -78,6 +84,7 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
     provider: &StoredProviderCatalogProvider,
     endpoint: &StoredProviderCatalogEndpoint,
     keys: Vec<StoredProviderCatalogKey>,
+    proxy_override: Option<ProxySnapshot>,
 ) -> Result<Option<serde_json::Value>, GatewayError> {
     let mut results = Vec::new();
     let mut success_count = 0usize;
@@ -134,6 +141,7 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
             authorization,
             &project_id,
             identity_headers,
+            proxy_override.as_ref(),
         )
         .await?
         {
@@ -249,6 +257,13 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
             .cloned()
         {
             payload.insert("metadata".to_string(), metadata);
+        }
+        if let Some(quota_snapshot) = build_quota_snapshot_payload(
+            "antigravity",
+            key.status_snapshot.as_ref(),
+            metadata_update.as_ref(),
+        ) {
+            payload.insert("quota_snapshot".to_string(), quota_snapshot);
         }
         results.push(serde_json::Value::Object(payload));
     }

@@ -8,7 +8,8 @@ use crate::handlers::admin::provider::oauth::provisioning::{
     update_existing_provider_oauth_catalog_key,
 };
 use crate::handlers::admin::provider::oauth::runtime::{
-    provider_oauth_runtime_endpoint_for_provider, refresh_provider_oauth_account_state_after_update,
+    provider_oauth_runtime_endpoint_for_provider,
+    spawn_provider_oauth_account_state_refresh_after_update,
 };
 use crate::handlers::admin::provider::oauth::state::{
     build_admin_provider_oauth_backend_unavailable_response, build_kiro_device_key_name,
@@ -149,7 +150,7 @@ pub(super) async fn handle_admin_provider_oauth_device_poll(
             &session.client_id,
             &session.client_secret,
             &session.device_code,
-            request_proxy,
+            request_proxy.clone(),
         )
         .await
     {
@@ -315,9 +316,12 @@ pub(super) async fn handle_admin_provider_oauth_device_poll(
         }
     };
 
-    let _ = state
-        .refresh_provider_oauth_account_state_after_update(&provider, &persisted_key.id)
-        .await;
+    spawn_provider_oauth_account_state_refresh_after_update(
+        state.cloned_app(),
+        provider.clone(),
+        persisted_key.id.clone(),
+        request_proxy.clone(),
+    );
 
     session.status = "authorized".to_string();
     session.key_id = Some(persisted_key.id.clone());
