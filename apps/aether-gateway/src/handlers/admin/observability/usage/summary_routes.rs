@@ -5,10 +5,11 @@ use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
 use crate::GatewayError;
 use aether_admin::observability::usage::{
-    admin_usage_bad_request_response, admin_usage_data_unavailable_response, admin_usage_parse_ids,
-    admin_usage_parse_limit, admin_usage_parse_offset, build_admin_usage_active_requests_response,
-    build_admin_usage_records_response, build_admin_usage_summary_stats_response_from_summary,
-    ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
+    admin_usage_bad_request_response, admin_usage_data_unavailable_response,
+    admin_usage_has_fallback, admin_usage_matches_search, admin_usage_matches_username,
+    admin_usage_parse_ids, admin_usage_parse_limit, admin_usage_parse_offset,
+    build_admin_usage_active_requests_response, build_admin_usage_records_response,
+    build_admin_usage_summary_stats_response_from_summary, ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
 };
 use aether_data_contracts::repository::usage::{
     StoredRequestUsageAudit, UsageAuditKeywordSearchQuery, UsageAuditListQuery,
@@ -54,6 +55,7 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
         "pending" | "streaming" | "completed" | "cancelled" => {
             query.statuses = Some(vec![status.to_string()]);
         }
+        "has_fallback" => {}
         _ => {}
     }
 }
@@ -331,6 +333,9 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                 Ok(value) => value,
                 Err(detail) => return Ok(Some(admin_usage_bad_request_response(detail))),
             };
+            let has_fallback_only = query_param_value(query, "status")
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("has_fallback"));
             let search = query_param_value(query, "search");
             let username_filter = query_param_value(query, "username");
             let limit = match admin_usage_parse_limit(query) {
@@ -367,7 +372,44 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             let active_username_filter = username_filter
                 .as_deref()
                 .filter(|value| !value.trim().is_empty());
-            let (usage, total) = if active_search.is_some() || active_username_filter.is_some() {
+            let (usage, total) = if has_fallback_only {
+                let mut usage = state.list_usage_audits(&base_query).await?;
+                let user_ids: Vec<String> = usage
+                    .iter()
+                    .filter_map(|item| item.user_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let users_by_id: BTreeMap<
+                    String,
+                    aether_data::repository::users::StoredUserSummary,
+                > = state.resolve_auth_user_summaries_by_ids(&user_ids).await?;
+                let api_key_names = admin_usage_api_key_names(state, &usage).await?;
+
+                usage.retain(|item| {
+                    admin_usage_matches_search(
+                        item,
+                        active_search,
+                        &users_by_id,
+                        &api_key_names,
+                        state.has_auth_user_data_reader(),
+                        state.has_auth_api_key_data_reader(),
+                    ) && admin_usage_matches_username(
+                        item,
+                        active_username_filter,
+                        &users_by_id,
+                        state.has_auth_user_data_reader(),
+                    ) && admin_usage_has_fallback(item)
+                });
+                sort_usage_newest_first(&mut usage);
+                let total = usage.len();
+                let records = usage
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                (records, total)
+            } else if active_search.is_some() || active_username_filter.is_some() {
                 let keywords = active_search
                     .map(parse_admin_usage_search_keywords)
                     .unwrap_or_default();

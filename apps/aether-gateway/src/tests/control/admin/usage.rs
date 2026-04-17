@@ -745,21 +745,25 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
         start_usage_upstream("/api/admin/usage/active").await;
 
     let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
-        sample_usage_row(
-            "usage-pending",
-            "req-pending",
-            Some("user-1"),
-            Some("key-1"),
-            Some("primary"),
-            "OpenAI",
-            "gpt-5",
-            "pending",
-            10,
-            0,
-            0.0,
-            0.0,
-            DAY_2_UNIX_SECS,
-        ),
+        {
+            let mut row = sample_usage_row(
+                "usage-pending",
+                "req-pending",
+                Some("user-1"),
+                Some("key-1"),
+                Some("primary"),
+                "OpenAI",
+                "gpt-5",
+                "pending",
+                10,
+                0,
+                0.0,
+                0.0,
+                DAY_2_UNIX_SECS,
+            );
+            row.candidate_index = Some(1);
+            row
+        },
         sample_usage_row(
             "usage-done",
             "req-done",
@@ -819,6 +823,7 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
     assert_eq!(payload["requests"][0]["effective_input_tokens"], 5);
     assert_eq!(payload["requests"][0]["provider"], "OpenAI");
     assert_eq!(payload["requests"][0]["api_key_name"], "fresh-primary");
+    assert_eq!(payload["requests"][0]["has_fallback"], true);
     assert_eq!(
         payload["requests"][0]["provider_key_name"],
         "upstream-primary"
@@ -1101,6 +1106,77 @@ async fn gateway_handles_admin_usage_records_with_provider_key_name_fallback_fro
         payload["records"][0]["provider_key_name"],
         "upstream-fallback"
     );
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_filters_admin_usage_records_by_has_fallback_status() {
+    let (_upstream_url, upstream_hits, upstream_handle) =
+        start_usage_upstream("/api/admin/usage/records").await;
+
+    let mut fallback_usage = sample_usage_row(
+        "usage-has-fallback",
+        "req-has-fallback",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        12,
+        8,
+        0.02,
+        0.02,
+        DAY_1_UNIX_SECS,
+    );
+    fallback_usage.candidate_index = Some(1);
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+        fallback_usage,
+        sample_usage_row(
+            "usage-no-fallback",
+            "req-no-fallback",
+            Some("user-1"),
+            Some("key-1"),
+            Some("primary"),
+            "OpenAI",
+            "gpt-5",
+            "completed",
+            12,
+            8,
+            0.02,
+            0.02,
+            DAY_1_UNIX_SECS,
+        ),
+    ]));
+    let user_repository = Arc::new(InMemoryUserReadRepository::seed(vec![sample_user_summary(
+        "user-1", "alice",
+    )]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_usage_reader_for_tests(usage_repository)
+                    .with_user_reader(user_repository),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/records?start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0&status=has_fallback&limit=10&offset=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["total"], 1);
+    assert_eq!(payload["records"][0]["id"], "usage-has-fallback");
+    assert_eq!(payload["records"][0]["has_fallback"], true);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
