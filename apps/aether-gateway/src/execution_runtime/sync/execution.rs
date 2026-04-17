@@ -30,9 +30,10 @@ use crate::execution_runtime::remote_compat::post_sync_plan_to_remote_execution_
 use crate::execution_runtime::submission::submit_local_core_error_or_sync_finalize;
 use crate::execution_runtime::transport::DirectSyncExecutionRuntime;
 use crate::execution_runtime::{
-    local_failover_response_text, resolve_core_sync_error_finalize_report_kind,
-    should_fallback_to_control_sync, should_finalize_sync_response,
-    should_retry_next_local_candidate_sync, should_stop_local_candidate_failover_sync,
+    local_failover_response_text, record_pool_error_feedback, record_sync_pool_success_feedback,
+    resolve_core_sync_error_finalize_report_kind, should_fallback_to_control_sync,
+    should_finalize_sync_response, should_retry_next_local_candidate_sync,
+    should_stop_local_candidate_failover_sync,
 };
 use crate::log_ids::short_request_id;
 use crate::request_candidate_runtime::{
@@ -255,6 +256,17 @@ pub(crate) async fn execute_execution_runtime_sync(
         local_failover_response_text.as_deref(),
     )
     .await;
+    if result.status_code >= 400 {
+        record_pool_error_feedback(
+            state,
+            &plan,
+            report_context.as_ref(),
+            result.status_code,
+            &headers,
+            local_failover_response_text.as_deref(),
+        )
+        .await;
+    }
     if should_retry_next_local_candidate_sync(
         state,
         &plan,
@@ -393,6 +405,15 @@ pub(crate) async fn execute_execution_runtime_sync(
         body_base64: body_base64.clone(),
         telemetry: result.telemetry.clone(),
     };
+    if result.status_code < 400 {
+        record_sync_pool_success_feedback(
+            state,
+            &plan,
+            report_context.as_ref(),
+            &base_usage_payload,
+        )
+        .await;
+    }
 
     if let Some(finalize_report_kind) = finalize_report_kind {
         if let Some(implicit_finalize) = implicit_finalize {

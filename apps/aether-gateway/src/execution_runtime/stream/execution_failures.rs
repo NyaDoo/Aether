@@ -16,6 +16,7 @@ use crate::control::GatewayControlDecision;
 use crate::execution_runtime::submission::{
     resolve_core_error_background_report_kind, submit_local_core_error_or_sync_finalize,
 };
+use crate::execution_runtime::{record_pool_error_feedback, record_pool_stream_timeout_feedback};
 use crate::log_ids::short_request_id;
 use crate::request_candidate_runtime::record_report_request_candidate_status;
 use crate::usage::submit_sync_report;
@@ -122,6 +123,22 @@ async fn record_stream_sync_failure(
     failure: &StreamFailureReport,
     started_at_unix_ms: Option<u64>,
 ) {
+    if matches!(
+        failure.error_type.as_str(),
+        "first_byte_timeout" | "read_timeout"
+    ) {
+        record_pool_stream_timeout_feedback(state, plan, report_context).await;
+    }
+    let error_body = serde_json::to_string(&failure.body_json).ok();
+    record_pool_error_feedback(
+        state,
+        plan,
+        report_context,
+        failure.status_code,
+        &payload.headers,
+        error_body.as_deref(),
+    )
+    .await;
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     state

@@ -17,6 +17,7 @@ mod materialization_policy;
 mod passthrough;
 mod payload_metadata;
 mod plan_builders;
+mod pool_scheduler;
 mod report_context;
 mod route;
 mod runtime_miss;
@@ -25,6 +26,7 @@ mod specialized;
 mod standard;
 mod state;
 
+pub(crate) use self::candidate_eligibility::extract_pool_sticky_session_token;
 pub(crate) use self::passthrough::{
     build_local_same_format_stream_plan_and_reports, build_local_same_format_sync_plan_and_reports,
 };

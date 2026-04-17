@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use crate::ai_pipeline::{GatewayProviderTransportSnapshot, PlannerAppState};
 
 use super::candidate_affinity::rank_eligible_local_execution_candidates;
+use super::pool_scheduler::apply_local_execution_pool_scheduler;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EligibleLocalExecutionCandidate {
@@ -28,6 +29,7 @@ pub(crate) async fn filter_and_rank_local_execution_candidates(
     client_api_format: &str,
     requested_model: &str,
     required_capabilities: Option<&serde_json::Value>,
+    sticky_session_token: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -37,6 +39,7 @@ pub(crate) async fn filter_and_rank_local_execution_candidates(
         candidates,
         client_api_format,
         required_capabilities,
+        sticky_session_token,
         |candidate, transport| {
             current_local_execution_candidate_skip_reason_with_transport(
                 candidate,
@@ -55,6 +58,7 @@ pub(crate) async fn filter_and_rank_local_execution_candidates_without_transport
     client_api_format: &str,
     requested_model: Option<&str>,
     required_capabilities: Option<&serde_json::Value>,
+    sticky_session_token: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
     Vec<SkippedLocalExecutionCandidate>,
@@ -64,6 +68,7 @@ pub(crate) async fn filter_and_rank_local_execution_candidates_without_transport
         candidates,
         client_api_format,
         required_capabilities,
+        sticky_session_token,
         |candidate, transport| {
             current_local_execution_candidate_common_skip_reason_with_transport(
                 candidate,
@@ -80,6 +85,7 @@ async fn filter_and_rank_local_execution_candidates_with_gate<F>(
     candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
     client_api_format: &str,
     required_capabilities: Option<&serde_json::Value>,
+    sticky_session_token: Option<&str>,
     runtime_skip_reason: F,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
@@ -149,8 +155,47 @@ where
         required_capabilities,
     )
     .await;
+    let (ranked, pool_skipped) =
+        apply_local_execution_pool_scheduler(state, ranked, sticky_session_token).await;
+    skipped.extend(pool_skipped);
 
     (ranked, skipped)
+}
+
+pub(crate) fn extract_pool_sticky_session_token(body_json: &serde_json::Value) -> Option<String> {
+    fn non_empty_string(value: Option<&serde_json::Value>) -> Option<String> {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    let object = body_json.as_object()?;
+
+    non_empty_string(object.get("prompt_cache_key"))
+        .or_else(|| non_empty_string(object.get("conversation_id")))
+        .or_else(|| non_empty_string(object.get("conversationId")))
+        .or_else(|| non_empty_string(object.get("session_id")))
+        .or_else(|| non_empty_string(object.get("sessionId")))
+        .or_else(|| {
+            object
+                .get("metadata")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|metadata| {
+                    non_empty_string(metadata.get("session_id"))
+                        .or_else(|| non_empty_string(metadata.get("conversation_id")))
+                })
+        })
+        .or_else(|| {
+            object
+                .get("conversationState")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|state| {
+                    non_empty_string(state.get("conversationId"))
+                        .or_else(|| non_empty_string(state.get("sessionId")))
+                })
+        })
 }
 
 fn current_local_execution_candidate_common_skip_reason_with_transport(

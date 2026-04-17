@@ -80,6 +80,7 @@ pub(crate) async fn build_local_openai_chat_stream_plan_and_reports(
         state,
         trace_id,
         &input,
+        body_json,
         candidates,
         skipped_candidates,
     )

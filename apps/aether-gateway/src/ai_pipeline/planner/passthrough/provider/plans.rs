@@ -57,9 +57,10 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
-    let (attempts, candidate_count) =
-        materialize_local_same_format_provider_candidate_attempts(state, trace_id, &input, spec)
-            .await?;
+    let (attempts, candidate_count) = materialize_local_same_format_provider_candidate_attempts(
+        state, trace_id, &input, body_json, spec,
+    )
+    .await?;
     apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(
         state,
         trace_id,
@@ -141,9 +142,10 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
-    let (attempts, candidate_count) =
-        materialize_local_same_format_provider_candidate_attempts(state, trace_id, &input, spec)
-            .await?;
+    let (attempts, candidate_count) = materialize_local_same_format_provider_candidate_attempts(
+        state, trace_id, &input, body_json, spec,
+    )
+    .await?;
     apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(
         state,
         trace_id,

@@ -4,7 +4,8 @@ use tracing::warn;
 
 use crate::ai_pipeline::conversion::{request_candidate_api_formats, request_conversion_kind};
 use crate::ai_pipeline::planner::candidate_eligibility::{
-    filter_and_rank_local_execution_candidates, SkippedLocalExecutionCandidate,
+    extract_pool_sticky_session_token, filter_and_rank_local_execution_candidates,
+    SkippedLocalExecutionCandidate,
 };
 use crate::ai_pipeline::planner::candidate_materialization::{
     persist_available_local_execution_candidates_with_context,
@@ -87,10 +88,12 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
     state: &AppState,
     trace_id: &str,
     input: &LocalStandardDecisionInput,
+    body_json: &serde_json::Value,
     spec: LocalStandardSpec,
 ) -> Result<(Vec<LocalStandardCandidateAttempt>, usize), GatewayError> {
     let spec_metadata = local_standard_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
+    let sticky_session_token = extract_pool_sticky_session_token(body_json);
     let persistence_policy = build_local_candidate_persistence_policy(
         &input.auth_context,
         input.required_capabilities.as_ref(),
@@ -176,6 +179,7 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
         spec_metadata.api_format,
         &input.requested_model,
         input.required_capabilities.as_ref(),
+        sticky_session_token.as_deref(),
     )
     .await;
     let skipped_candidates = preselection_skipped

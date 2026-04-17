@@ -1,6 +1,7 @@
 use super::keys::{
-    parse_pool_cost_member, pool_cooldown_index_key, pool_cooldown_keys, pool_cost_keys,
-    pool_lru_key, pool_sticky_pattern,
+    parse_pool_cost_member, parse_pool_latency_member, pool_cooldown_index_key, pool_cooldown_key,
+    pool_cooldown_keys, pool_cost_keys, pool_latency_keys, pool_lru_key, pool_sticky_key,
+    pool_sticky_pattern,
 };
 use crate::handlers::admin::provider::shared::support::{
     AdminProviderPoolConfig, AdminProviderPoolRuntimeState, ADMIN_PROVIDER_POOL_SCAN_BATCH,
@@ -10,6 +11,13 @@ use aether_data::redis::RedisKvRunner;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 async fn scan_redis_keys(
     connection: &mut redis::aio::MultiplexedConnection,
@@ -77,7 +85,8 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     runner: &RedisKvRunner,
     provider_id: &str,
     key_ids: &[String],
-    pool_config: AdminProviderPoolConfig,
+    pool_config: &AdminProviderPoolConfig,
+    sticky_session_token: Option<&str>,
 ) -> AdminProviderPoolRuntimeState {
     let mut runtime = AdminProviderPoolRuntimeState::default();
     let Ok(mut connection) = runner.client().get_multiplexed_async_connection().await else {
@@ -87,6 +96,57 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     let keyspace = runner.keyspace().clone();
     let cooldown_keys = pool_cooldown_keys(&keyspace, provider_id, key_ids);
     let cost_keys = pool_cost_keys(&keyspace, provider_id, key_ids);
+    let latency_keys = pool_latency_keys(&keyspace, provider_id, key_ids);
+
+    if let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| pool_config.sticky_session_ttl_seconds > 0)
+    {
+        let sticky_key = pool_sticky_key(&keyspace, provider_id, sticky_session_token);
+        let sticky_bound_key_id = redis::cmd("GET")
+            .arg(&sticky_key)
+            .query_async::<Option<String>>(&mut connection)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    "gateway admin provider pool: failed to read sticky binding for provider {provider_id}: {:?}",
+                    err
+                );
+                None
+            });
+        if let Some(bound_key_id) = sticky_bound_key_id {
+            let cooldown_key = pool_cooldown_key(&keyspace, provider_id, &bound_key_id);
+            runtime.sticky_bound_key_id = match redis::cmd("EXISTS")
+                .arg(&cooldown_key)
+                .query_async::<u64>(&mut connection)
+                .await
+            {
+                Ok(0) => {
+                    let _: Result<bool, _> = redis::cmd("EXPIRE")
+                        .arg(&sticky_key)
+                        .arg(pool_config.sticky_session_ttl_seconds)
+                        .query_async(&mut connection)
+                        .await;
+                    Some(bound_key_id)
+                }
+                Ok(_) => {
+                    let _: Result<i64, _> = redis::cmd("DEL")
+                        .arg(&sticky_key)
+                        .query_async(&mut connection)
+                        .await;
+                    None
+                }
+                Err(err) => {
+                    warn!(
+                        "gateway admin provider pool: failed to validate sticky cooldown for provider {provider_id}: {:?}",
+                        err
+                    );
+                    Some(bound_key_id)
+                }
+            };
+        }
+    }
 
     let sticky_keys = match scan_redis_keys(
         &mut connection,
@@ -174,11 +234,7 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     }
 
     if !cost_keys.is_empty() {
-        let window_start = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_sub(pool_config.cost_window_seconds);
+        let window_start = current_unix_secs().saturating_sub(pool_config.cost_window_seconds);
         let mut cost_pipeline = redis::pipe();
         for cost_key in &cost_keys {
             cost_pipeline
@@ -208,7 +264,52 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
         }
     }
 
-    if pool_config.lru_enabled && !key_ids.is_empty() {
+    if !latency_keys.is_empty() {
+        let window_start = current_unix_secs().saturating_sub(pool_config.latency_window_seconds);
+        let mut latency_pipeline = redis::pipe();
+        for latency_key in &latency_keys {
+            latency_pipeline
+                .cmd("ZRANGEBYSCORE")
+                .arg(latency_key)
+                .arg(window_start)
+                .arg("+inf");
+        }
+        let members_by_key = latency_pipeline
+            .query_async::<Vec<Vec<String>>>(&mut connection)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    "gateway admin provider pool: failed to batch read latency windows for provider {provider_id}: {:?}",
+                    err
+                );
+                vec![Vec::new(); latency_keys.len()]
+            });
+        for (key_id, members) in key_ids.iter().zip(members_by_key) {
+            let samples = members
+                .iter()
+                .map(|member| parse_pool_latency_member(member))
+                .filter(|value| *value > 0)
+                .collect::<Vec<_>>();
+            if samples.is_empty() {
+                continue;
+            }
+            let total = samples.iter().sum::<u64>() as f64;
+            let average = total / samples.len() as f64;
+            if average.is_finite() && average >= 0.0 {
+                runtime
+                    .latency_avg_ms_by_key
+                    .insert(key_id.clone(), average);
+            }
+        }
+    }
+
+    if (pool_config.lru_enabled
+        || pool_config
+            .scheduling_presets
+            .iter()
+            .any(|item| item.enabled))
+        && !key_ids.is_empty()
+    {
         let mut command = redis::cmd("ZMSCORE");
         command.arg(pool_lru_key(&keyspace, provider_id));
         for key_id in key_ids {

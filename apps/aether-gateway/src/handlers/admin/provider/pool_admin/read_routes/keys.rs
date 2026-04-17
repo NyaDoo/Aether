@@ -125,10 +125,16 @@ pub(super) async fn build_admin_pool_list_keys_response(
     };
 
     let key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
-    let runtime = match (state.redis_kv_runner(), pool_config) {
+    let runtime = match (state.redis_kv_runner(), pool_config.as_ref()) {
         (Some(runner), Some(pool_config)) if !key_ids.is_empty() => {
-            read_admin_provider_pool_runtime_state(&runner, &provider.id, &key_ids, pool_config)
-                .await
+            read_admin_provider_pool_runtime_state(
+                &runner,
+                &provider.id,
+                &key_ids,
+                pool_config,
+                None,
+            )
+            .await
         }
         _ => AdminProviderPoolRuntimeState::default(),
     };
@@ -145,7 +151,7 @@ pub(super) async fn build_admin_pool_list_keys_response(
                 &provider.provider_type,
                 &key,
                 &runtime,
-                pool_config,
+                pool_config.clone(),
             );
             if let Some(summary) = usage_summary_by_key_id.get(&key.id) {
                 if let Some(object) = payload.as_object_mut() {

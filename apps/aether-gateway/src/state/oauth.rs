@@ -672,6 +672,10 @@ impl AppState {
         Ok(None)
     }
 
+    pub(crate) async fn invalidate_local_oauth_refresh_entry(&self, key_id: &str) -> bool {
+        self.oauth_refresh.invalidate_cached_entry(key_id).await
+    }
+
     async fn persist_local_oauth_refresh_entry(
         &self,
         transport: &provider_transport::GatewayProviderTransportSnapshot,

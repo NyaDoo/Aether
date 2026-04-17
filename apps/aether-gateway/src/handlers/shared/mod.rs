@@ -5,6 +5,7 @@ mod email_templates;
 mod external_models;
 mod normalize;
 mod payloads;
+pub(crate) mod provider_pool;
 mod request_utils;
 mod system_config_values;
 mod usage_stats;

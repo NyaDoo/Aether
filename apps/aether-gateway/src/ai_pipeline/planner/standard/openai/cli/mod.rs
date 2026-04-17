@@ -66,7 +66,8 @@ pub(crate) async fn maybe_build_sync_local_openai_cli_decision_payload(
     };
 
     let attempts =
-        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
 
     for attempt in attempts {
         if let Some(payload) = maybe_build_local_openai_cli_decision_payload_for_candidate(
@@ -100,7 +101,8 @@ pub(crate) async fn maybe_build_stream_local_openai_cli_decision_payload(
     };
 
     let attempts =
-        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
 
     for attempt in attempts {
         if let Some(payload) = maybe_build_local_openai_cli_decision_payload_for_candidate(

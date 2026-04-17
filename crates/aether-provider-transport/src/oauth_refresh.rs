@@ -231,6 +231,10 @@ impl LocalOAuthRefreshCoordinator {
         self.cache.lock().await.insert(key_id.to_string(), entry);
     }
 
+    pub async fn invalidate_cached_entry(&self, key_id: &str) -> bool {
+        self.cache.lock().await.remove(key_id).is_some()
+    }
+
     pub async fn resolve_with_result(
         &self,
         executor: &dyn LocalOAuthHttpExecutor,

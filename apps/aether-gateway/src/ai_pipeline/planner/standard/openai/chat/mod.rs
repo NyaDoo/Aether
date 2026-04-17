@@ -118,6 +118,7 @@ pub(crate) async fn maybe_build_sync_local_decision_payload(
         state,
         trace_id,
         &input,
+        body_json,
         candidates,
         skipped_candidates,
     )
@@ -183,6 +184,7 @@ pub(crate) async fn maybe_build_stream_local_decision_payload(
         state,
         trace_id,
         &input,
+        body_json,
         candidates,
         skipped_candidates,
     )

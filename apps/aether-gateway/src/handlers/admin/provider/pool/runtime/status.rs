@@ -36,8 +36,14 @@ pub(crate) async fn build_admin_provider_pool_status_payload(
     let key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
     let runtime = match state.redis_kv_runner() {
         Some(runner) => {
-            read_admin_provider_pool_runtime_state(&runner, &provider.id, &key_ids, pool_config)
-                .await
+            read_admin_provider_pool_runtime_state(
+                &runner,
+                &provider.id,
+                &key_ids,
+                &pool_config,
+                None,
+            )
+            .await
         }
         None => AdminProviderPoolRuntimeState::default(),
     };
@@ -56,6 +62,7 @@ pub(crate) async fn build_admin_provider_pool_status_payload(
                 "cost_window_usage": runtime.cost_window_usage_by_key.get(&key.id).copied().unwrap_or(0),
                 "cost_limit": pool_config.cost_limit_per_key_tokens,
                 "sticky_sessions": runtime.sticky_sessions_by_key.get(&key.id).copied().unwrap_or(0),
+                "latency_avg_ms": runtime.latency_avg_ms_by_key.get(&key.id).copied(),
                 "lru_score": runtime.lru_score_by_key.get(&key.id).copied(),
             })
         })

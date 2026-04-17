@@ -33,10 +33,11 @@ pub(crate) use self::planner::{
     build_openai_cli_sync_plan_from_decision, build_passthrough_sync_plan_from_decision,
     build_standard_family_stream_plan_and_reports, build_standard_family_sync_plan_and_reports,
     build_standard_stream_plan_from_decision, build_standard_sync_plan_from_decision,
-    maybe_build_stream_decision_payload, maybe_build_stream_plan_payload,
-    maybe_build_sync_decision_payload, maybe_build_sync_plan_payload,
-    set_local_openai_chat_execution_exhausted_diagnostic, GatewayAuthApiKeySnapshot,
-    GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth, PlannerAppState,
+    extract_pool_sticky_session_token, maybe_build_stream_decision_payload,
+    maybe_build_stream_plan_payload, maybe_build_sync_decision_payload,
+    maybe_build_sync_plan_payload, set_local_openai_chat_execution_exhausted_diagnostic,
+    GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
+    PlannerAppState,
 };
 pub(crate) use self::pure::*;
 pub(crate) use crate::control::GatewayControlDecision;

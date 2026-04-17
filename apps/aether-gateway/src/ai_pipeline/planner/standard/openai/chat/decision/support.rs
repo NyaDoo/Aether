@@ -2,7 +2,8 @@ use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
 
 use crate::ai_pipeline::contracts::ExecutionRuntimeAuthContext;
 use crate::ai_pipeline::planner::candidate_eligibility::{
-    filter_and_rank_local_execution_candidates, SkippedLocalExecutionCandidate,
+    extract_pool_sticky_session_token, filter_and_rank_local_execution_candidates,
+    SkippedLocalExecutionCandidate,
 };
 use crate::ai_pipeline::planner::candidate_materialization::{
     mark_skipped_local_execution_candidate,
@@ -55,10 +56,12 @@ pub(crate) async fn materialize_local_openai_chat_candidate_attempts(
     state: &AppState,
     trace_id: &str,
     input: &LocalOpenAiChatDecisionInput,
+    body_json: &serde_json::Value,
     candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
 ) -> Vec<LocalOpenAiChatCandidateAttempt> {
     let planner_state = PlannerAppState::new(state);
+    let sticky_session_token = extract_pool_sticky_session_token(body_json);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -71,6 +74,7 @@ pub(crate) async fn materialize_local_openai_chat_candidate_attempts(
         "openai:chat",
         &input.requested_model,
         input.required_capabilities.as_ref(),
+        sticky_session_token.as_deref(),
     )
     .await;
     let skipped_candidates = preselection_skipped

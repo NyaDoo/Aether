@@ -772,7 +772,9 @@ pub(super) fn build_admin_pool_key_payload(
     let health_score = admin_pool_health_score(key);
     let circuit_breaker_open = admin_pool_circuit_breaker_open(key);
     let auth_semantics = provider_key_auth_semantics(key, provider_type);
-    let account_quota_exhausted = pool_config.is_some_and(|config| config.skip_exhausted_accounts)
+    let account_quota_exhausted = pool_config
+        .as_ref()
+        .is_some_and(|config| config.skip_exhausted_accounts)
         && admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(key, provider_type);
     let (scheduling_status, scheduling_reason, scheduling_label, scheduling_reasons) =
         admin_pool_scheduling_payload(
@@ -988,7 +990,9 @@ pub(super) fn build_admin_pool_key_payload(
     );
     payload.insert(
         "cost_limit".to_string(),
-        json!(pool_config.map(|config| config.cost_limit_per_key_tokens)),
+        json!(pool_config
+            .as_ref()
+            .map(|config| config.cost_limit_per_key_tokens)),
     );
     payload.insert(
         "request_count".to_string(),

@@ -60,6 +60,7 @@ pub(crate) async fn maybe_build_sync_local_video_decision_payload(
         state,
         trace_id,
         &input,
+        body_json,
         spec_metadata.api_format,
         spec_metadata.decision_kind,
     )
@@ -102,6 +103,7 @@ async fn build_local_sync_plan_and_reports(
         state,
         trace_id,
         &input,
+        body_json,
         spec_metadata.api_format,
         spec_metadata.decision_kind,
     )

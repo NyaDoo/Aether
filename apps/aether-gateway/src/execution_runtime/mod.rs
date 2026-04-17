@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 mod constants;
 mod fallback;
 pub(crate) mod ndjson;
+mod pool_feedback;
 #[cfg(test)]
 pub(crate) mod remote_compat;
 mod server;
@@ -27,6 +28,10 @@ pub(crate) use self::fallback::{
     should_retry_next_local_candidate_stream, should_retry_next_local_candidate_sync,
     should_stop_local_candidate_failover_stream, should_stop_local_candidate_failover_sync,
     LocalFailoverDecision,
+};
+pub(crate) use pool_feedback::{
+    record_pool_error_feedback, record_pool_stream_timeout_feedback,
+    record_stream_pool_success_feedback, record_sync_pool_success_feedback,
 };
 pub use server::{
     build_execution_runtime_router, build_execution_runtime_router_with_request_concurrency_limit,

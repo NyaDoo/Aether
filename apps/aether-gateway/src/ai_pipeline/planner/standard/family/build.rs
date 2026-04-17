@@ -51,7 +51,8 @@ pub(crate) async fn maybe_build_sync_via_standard_family_payload(
         "candidate_evaluation_incomplete",
     );
     let (attempts, candidate_count) =
-        materialize_local_standard_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_standard_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
 
     for attempt in attempts {
@@ -99,7 +100,8 @@ pub(crate) async fn maybe_build_stream_via_standard_family_payload(
         "candidate_evaluation_incomplete",
     );
     let (attempts, candidate_count) =
-        materialize_local_standard_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_standard_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
 
     for attempt in attempts {
@@ -153,7 +155,8 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         "candidate_evaluation_incomplete",
     );
     let (attempts, candidate_count) =
-        materialize_local_standard_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_standard_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
     if candidate_count == 0 {
         return Ok(Vec::new());
@@ -226,7 +229,8 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         "candidate_evaluation_incomplete",
     );
     let (attempts, candidate_count) =
-        materialize_local_standard_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_standard_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
     if candidate_count == 0 {
         return Ok(Vec::new());

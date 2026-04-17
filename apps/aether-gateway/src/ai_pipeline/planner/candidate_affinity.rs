@@ -1040,6 +1040,7 @@ mod tests {
             "openai:chat",
             "gpt-4.1",
             None,
+            None,
         )
         .await;
 
@@ -1115,6 +1116,7 @@ mod tests {
             "openai:chat",
             "gpt-4.1",
             None,
+            None,
         )
         .await;
 
@@ -1186,6 +1188,7 @@ mod tests {
             "openai:chat",
             "gpt-4.1",
             None,
+            None,
         )
         .await;
 
@@ -1243,6 +1246,7 @@ mod tests {
             ],
             "openai:chat",
             "gpt-4.1",
+            None,
             None,
         )
         .await;
@@ -1319,6 +1323,7 @@ mod tests {
             ],
             "openai:chat",
             "gpt-4.1",
+            None,
             None,
         )
         .await;

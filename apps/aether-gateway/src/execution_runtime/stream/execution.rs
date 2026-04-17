@@ -53,7 +53,8 @@ use crate::execution_runtime::transport::{
     DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
 };
 use crate::execution_runtime::{
-    local_failover_response_text, resolve_core_stream_direct_finalize_report_kind,
+    local_failover_response_text, record_pool_error_feedback, record_stream_pool_success_feedback,
+    resolve_core_stream_direct_finalize_report_kind,
     resolve_core_stream_error_finalize_report_kind,
     resolve_local_candidate_failover_decision_stream, should_fallback_to_control_stream,
     should_retry_next_local_candidate_stream, LocalFailoverDecision,
@@ -565,6 +566,15 @@ async fn execute_stream_from_frame_stream(
         let (body_json, body_base64) = decode_stream_error_body(&headers, &error_body);
         let error_response_text =
             local_failover_response_text(body_json.as_ref(), &error_body, None);
+        record_pool_error_feedback(
+            state,
+            &plan,
+            report_context.as_ref(),
+            status_code,
+            &headers,
+            error_response_text.as_deref(),
+        )
+        .await;
         let failover_decision = resolve_local_candidate_failover_decision_stream(
             state,
             &plan,
@@ -1492,6 +1502,13 @@ async fn execute_stream_from_frame_stream(
             }),
             telemetry: telemetry.clone(),
         };
+        record_stream_pool_success_feedback(
+            &state_for_report,
+            &plan_for_report,
+            report_context_owned.as_ref(),
+            &usage_payload,
+        )
+        .await;
         record_stream_terminal_usage(
             &state_for_report,
             &plan_for_report,

@@ -55,9 +55,10 @@ pub(crate) async fn maybe_build_sync_local_same_format_provider_decision_payload
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
-    let (attempts, candidate_count) =
-        materialize_local_same_format_provider_candidate_attempts(state, trace_id, &input, spec)
-            .await?;
+    let (attempts, candidate_count) = materialize_local_same_format_provider_candidate_attempts(
+        state, trace_id, &input, body_json, spec,
+    )
+    .await?;
     apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(
         state,
         trace_id,
@@ -121,9 +122,10 @@ pub(crate) async fn maybe_build_stream_local_same_format_provider_decision_paylo
         Some(input.requested_model.as_str()),
         "candidate_evaluation_incomplete",
     );
-    let (attempts, candidate_count) =
-        materialize_local_same_format_provider_candidate_attempts(state, trace_id, &input, spec)
-            .await?;
+    let (attempts, candidate_count) = materialize_local_same_format_provider_candidate_attempts(
+        state, trace_id, &input, body_json, spec,
+    )
+    .await?;
     apply_local_runtime_candidate_evaluation_progress_preserving_candidate_signal(
         state,
         trace_id,

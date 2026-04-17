@@ -94,6 +94,7 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
             GEMINI_FILES_CLIENT_API_FORMAT,
             None,
             input.required_capabilities.as_ref(),
+            None,
         )
         .await;
 

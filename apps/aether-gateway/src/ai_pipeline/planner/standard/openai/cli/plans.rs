@@ -33,7 +33,8 @@ pub(super) async fn build_local_sync_plan_and_reports(
     };
 
     let attempts =
-        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
 
     let mut plans = Vec::new();
     for attempt in attempts {
@@ -78,7 +79,8 @@ pub(super) async fn build_local_stream_plan_and_reports(
     };
 
     let attempts =
-        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, spec).await?;
+        materialize_local_openai_cli_candidate_attempts(state, trace_id, &input, body_json, spec)
+            .await?;
 
     let mut plans = Vec::new();
     for attempt in attempts {
