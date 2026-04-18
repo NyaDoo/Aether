@@ -1,15 +1,20 @@
 use std::io::Error as IoError;
 
 use aether_contracts::{
-    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionTelemetry, StreamFrame,
-    StreamFramePayload, StreamFrameType,
+    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionStreamTerminalSummary,
+    ExecutionTelemetry, StreamFrame, StreamFramePayload, StreamFrameType,
 };
 use async_stream::stream;
 use axum::body::Bytes;
 use base64::Engine as _;
 use futures_util::{Stream, StreamExt};
+use serde_json::Value;
 use tracing::warn;
 
+use crate::ai_pipeline_api::{
+    maybe_build_provider_private_stream_normalizer, normalize_provider_private_report_context,
+    StreamingStandardTerminalObserver,
+};
 use crate::execution_runtime::ndjson::encode_stream_frame_ndjson;
 use crate::execution_runtime::transport::DirectUpstreamResponse;
 use crate::execution_runtime::DirectUpstreamStreamExecution;
@@ -23,9 +28,34 @@ pub(crate) fn build_direct_execution_frame_stream(
             candidate_id: _,
             status_code,
             headers,
+            provider_api_format,
+            stream_summary_report_context,
             response,
             started_at,
         } = execution;
+
+        let mut observer_context = stream_summary_report_context;
+        if observer_context
+            .get("provider_api_format")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            if let Some(object) = observer_context.as_object_mut() {
+                object.insert(
+                    "provider_api_format".to_string(),
+                    Value::String(provider_api_format.clone()),
+                );
+            }
+        }
+        let normalized_observer_context =
+            normalize_provider_private_report_context(Some(&observer_context))
+                .unwrap_or_else(|| observer_context.clone());
+        let mut private_stream_normalizer =
+            maybe_build_provider_private_stream_normalizer(Some(&observer_context));
+        let mut stream_terminal_observer = StreamingStandardTerminalObserver::default();
+        let mut observer_buffered = Vec::new();
 
         match encode_headers_frame(status_code, headers) {
             Ok(frame) => yield Ok(frame),
@@ -58,6 +88,13 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 first_chunk_telemetry_emitted = true;
                             }
                             upstream_bytes += chunk.len() as u64;
+                            observe_stream_chunk(
+                                &mut stream_terminal_observer,
+                                &normalized_observer_context,
+                                private_stream_normalizer.as_mut(),
+                                &mut observer_buffered,
+                                chunk.as_ref(),
+                            );
                             match encode_data_frame(&chunk) {
                                 Ok(frame) => yield Ok(frame),
                                 Err(err) => {
@@ -105,6 +142,13 @@ pub(crate) fn build_direct_execution_frame_stream(
                             first_chunk_telemetry_emitted = true;
                         }
                         upstream_bytes += chunk.len() as u64;
+                        observe_stream_chunk(
+                            &mut stream_terminal_observer,
+                            &normalized_observer_context,
+                            private_stream_normalizer.as_mut(),
+                            &mut observer_buffered,
+                            chunk.as_ref(),
+                        );
                         match encode_data_frame(&chunk) {
                             Ok(frame) => yield Ok(frame),
                             Err(err) => {
@@ -135,6 +179,12 @@ pub(crate) fn build_direct_execution_frame_stream(
                 }
             }
         }
+        let summary = finalize_stream_terminal_summary(
+            &mut stream_terminal_observer,
+            &normalized_observer_context,
+            private_stream_normalizer.as_mut(),
+            &mut observer_buffered,
+        );
 
         match encode_telemetry_frame(
             ttfb_ms,
@@ -147,7 +197,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                 return;
             }
         }
-        match encode_stream_frame_ndjson(&StreamFrame::eof()) {
+        match encode_stream_frame_ndjson(&StreamFrame::eof_with_summary(summary)) {
             Ok(frame) => yield Ok(frame),
             Err(err) => yield Err(err),
         }
@@ -219,6 +269,83 @@ fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
         source = cause.source();
     }
     message
+}
+
+fn observe_stream_chunk(
+    observer: &mut StreamingStandardTerminalObserver,
+    report_context: &Value,
+    private_stream_normalizer: Option<&mut crate::ai_pipeline::ProviderPrivateStreamNormalizer>,
+    observer_buffered: &mut Vec<u8>,
+    chunk: &[u8],
+) {
+    let normalized = if let Some(normalizer) = private_stream_normalizer {
+        match normalizer.push_chunk(chunk) {
+            Ok(normalized) => normalized,
+            Err(err) => {
+                observer.disable_with_error(format!(
+                    "failed to normalize provider private stream chunk: {err:?}"
+                ));
+                return;
+            }
+        }
+    } else {
+        chunk.to_vec()
+    };
+
+    observe_normalized_bytes(observer, report_context, observer_buffered, &normalized);
+}
+
+fn finalize_stream_terminal_summary(
+    observer: &mut StreamingStandardTerminalObserver,
+    report_context: &Value,
+    private_stream_normalizer: Option<&mut crate::ai_pipeline::ProviderPrivateStreamNormalizer>,
+    observer_buffered: &mut Vec<u8>,
+) -> Option<ExecutionStreamTerminalSummary> {
+    if let Some(normalizer) = private_stream_normalizer {
+        match normalizer.finish() {
+            Ok(flushed) => {
+                observe_normalized_bytes(observer, report_context, observer_buffered, &flushed)
+            }
+            Err(err) => observer.disable_with_error(format!(
+                "failed to flush provider private stream normalization: {err:?}"
+            )),
+        }
+    }
+
+    if !observer_buffered.is_empty() {
+        let line = std::mem::take(observer_buffered);
+        if let Err(err) = observer.push_line(report_context, line) {
+            observer.disable_with_error(err.to_string());
+        }
+    }
+
+    match observer.finish(report_context) {
+        Ok(summary) => summary,
+        Err(err) => {
+            observer.disable_with_error(err.to_string());
+            observer.latest_summary().cloned()
+        }
+    }
+}
+
+fn observe_normalized_bytes(
+    observer: &mut StreamingStandardTerminalObserver,
+    report_context: &Value,
+    observer_buffered: &mut Vec<u8>,
+    normalized: &[u8],
+) {
+    if normalized.is_empty() {
+        return;
+    }
+    observer_buffered.extend_from_slice(normalized);
+    while let Some(line_end) = observer_buffered.iter().position(|byte| *byte == b'\n') {
+        let line = observer_buffered.drain(..=line_end).collect::<Vec<_>>();
+        if let Err(err) = observer.push_line(report_context, line) {
+            observer.disable_with_error(err.to_string());
+            observer_buffered.clear();
+            break;
+        }
+    }
 }
 
 #[cfg(test)]

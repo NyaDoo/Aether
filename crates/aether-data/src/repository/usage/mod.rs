@@ -45,6 +45,10 @@ pub(crate) fn usage_can_recover_terminal_failure(
         && incoming_usage_can_recover_terminal_failure(incoming_status, incoming_billing_status)
 }
 
+/// Clear legacy display-cache fields that still exist on `public.usage` for compatibility.
+///
+/// These values are no longer treated as authoritative read-model inputs; new writes should not
+/// repopulate the deprecated mirror columns.
 pub(crate) fn strip_deprecated_usage_display_fields(
     mut usage: UpsertUsageRecord,
 ) -> UpsertUsageRecord {
@@ -114,6 +118,10 @@ mod tests {
             client_response_headers: None,
             client_response_body: None,
             client_response_body_ref: None,
+            request_body_state: None,
+            provider_request_body_state: None,
+            response_body_state: None,
+            client_response_body_state: None,
             candidate_id: None,
             candidate_index: None,
             key_name: None,

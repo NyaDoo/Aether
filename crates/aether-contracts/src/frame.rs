@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::{ExecutionError, ExecutionTelemetry};
+use crate::{ExecutionError, ExecutionStreamTerminalSummary, ExecutionTelemetry};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -37,7 +36,7 @@ pub enum StreamFramePayload {
     },
     Eof {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        summary: Option<Value>,
+        summary: Option<ExecutionStreamTerminalSummary>,
     },
 }
 
@@ -50,9 +49,13 @@ pub struct StreamFrame {
 
 impl StreamFrame {
     pub fn eof() -> Self {
+        Self::eof_with_summary(None)
+    }
+
+    pub fn eof_with_summary(summary: Option<ExecutionStreamTerminalSummary>) -> Self {
         Self {
             frame_type: StreamFrameType::Eof,
-            payload: StreamFramePayload::Eof { summary: None },
+            payload: StreamFramePayload::Eof { summary },
         }
     }
 }

@@ -76,20 +76,24 @@ pub fn build_upsert_usage_record_from_event(
         request_body: data.request_body,
         request_body_ref: empty_to_none(data.request_body_ref)
             .or_else(|| metadata_string(data.request_metadata.as_ref(), "request_body_ref")),
+        request_body_state: data.request_body_state,
         provider_request_headers: data.provider_request_headers,
         provider_request_body: data.provider_request_body,
         provider_request_body_ref: empty_to_none(data.provider_request_body_ref).or_else(|| {
             metadata_string(data.request_metadata.as_ref(), "provider_request_body_ref")
         }),
+        provider_request_body_state: data.provider_request_body_state,
         response_headers: data.response_headers,
         response_body: data.response_body,
         response_body_ref: empty_to_none(data.response_body_ref)
             .or_else(|| metadata_string(data.request_metadata.as_ref(), "response_body_ref")),
+        response_body_state: data.response_body_state,
         client_response_headers: data.client_response_headers,
         client_response_body: data.client_response_body,
         client_response_body_ref: empty_to_none(data.client_response_body_ref).or_else(|| {
             metadata_string(data.request_metadata.as_ref(), "client_response_body_ref")
         }),
+        client_response_body_state: data.client_response_body_state,
         candidate_id: data
             .candidate_id
             .or_else(|| metadata_string(data.request_metadata.as_ref(), "candidate_id")),

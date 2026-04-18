@@ -1,3 +1,4 @@
+use aether_contracts::{ExecutionStreamTerminalSummary, StandardizedUsage};
 use serde_json::Value;
 
 use crate::conversion::{build_core_error_body_for_client_format, LocalCoreSyncErrorKind};
@@ -8,7 +9,9 @@ use crate::finalize::standard::openai::stream::{
     OpenAIChatClientEmitter, OpenAIChatProviderState, OpenAICliClientEmitter,
     OpenAICliProviderState,
 };
-use crate::finalize::standard::stream_core::common::{decode_json_data_line, CanonicalStreamFrame};
+use crate::finalize::standard::stream_core::common::{
+    decode_json_data_line, CanonicalStreamEvent, CanonicalStreamFrame, CanonicalUsage,
+};
 use crate::finalize::PipelineFinalizeError;
 
 #[derive(Default)]
@@ -60,18 +63,8 @@ impl StreamingStandardFormatMatrix {
             return;
         }
 
-        let provider_api_format = report_context
-            .get("provider_api_format")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        let client_api_format = report_context
-            .get("client_api_format")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
+        let provider_api_format = provider_api_format_for_context(report_context);
+        let client_api_format = client_api_format_for_context(report_context);
 
         self.provider = ProviderStreamParser::for_api_format(provider_api_format.as_str());
         self.client = ClientStreamEmitter::for_api_format(client_api_format.as_str());
@@ -96,6 +89,100 @@ impl StreamingStandardFormatMatrix {
             return Ok(Vec::new());
         };
         client.emit_error(error_body)
+    }
+}
+
+#[derive(Default)]
+pub struct StreamingStandardTerminalObserver {
+    provider: Option<ProviderStreamParser>,
+    latest_summary: Option<ExecutionStreamTerminalSummary>,
+}
+
+impl StreamingStandardTerminalObserver {
+    pub fn push_line(
+        &mut self,
+        report_context: &Value,
+        line: Vec<u8>,
+    ) -> Result<(), PipelineFinalizeError> {
+        self.ensure_initialized(report_context);
+        let Some(provider) = self.provider.as_mut() else {
+            return Ok(());
+        };
+        let frames = provider.push_line(report_context, line)?;
+        self.observe_frames(frames);
+        Ok(())
+    }
+
+    pub fn finish(
+        &mut self,
+        report_context: &Value,
+    ) -> Result<Option<ExecutionStreamTerminalSummary>, PipelineFinalizeError> {
+        self.ensure_initialized(report_context);
+        let Some(provider) = self.provider.as_mut() else {
+            return Ok(self.latest_summary.clone());
+        };
+        let frames = provider.finish(report_context)?;
+        self.observe_frames(frames);
+        Ok(self.latest_summary.clone())
+    }
+
+    pub fn disable_with_error(&mut self, parser_error: impl Into<String>) {
+        let parser_error = parser_error.into();
+        if let Some(summary) = self.latest_summary.as_mut() {
+            if summary.parser_error.is_none() {
+                summary.parser_error = Some(parser_error);
+            }
+        } else {
+            self.latest_summary = Some(ExecutionStreamTerminalSummary {
+                parser_error: Some(parser_error),
+                ..ExecutionStreamTerminalSummary::default()
+            });
+        }
+        self.provider = None;
+    }
+
+    pub fn latest_summary(&self) -> Option<&ExecutionStreamTerminalSummary> {
+        self.latest_summary.as_ref()
+    }
+
+    fn ensure_initialized(&mut self, report_context: &Value) {
+        if self.provider.is_some() || self.latest_summary.is_some() {
+            return;
+        }
+        let provider_api_format = provider_api_format_for_context(report_context);
+        self.provider = ProviderStreamParser::for_api_format(provider_api_format.as_str());
+    }
+
+    fn observe_frames(&mut self, frames: Vec<CanonicalStreamFrame>) {
+        for frame in frames {
+            self.observe_frame(frame);
+        }
+    }
+
+    fn observe_frame(&mut self, frame: CanonicalStreamFrame) {
+        let CanonicalStreamFrame { id, model, event } = frame;
+        let summary = self
+            .latest_summary
+            .get_or_insert_with(|| ExecutionStreamTerminalSummary {
+                response_id: Some(id.clone()),
+                model: Some(model.clone()),
+                ..ExecutionStreamTerminalSummary::default()
+            });
+        if summary.response_id.is_none() {
+            summary.response_id = Some(id);
+        }
+        if summary.model.is_none() {
+            summary.model = Some(model);
+        }
+        if let CanonicalStreamEvent::Finish {
+            finish_reason,
+            usage,
+        } = event
+        {
+            summary.finish_reason = finish_reason;
+            summary.standardized_usage = usage.map(standardized_usage_from_canonical);
+            summary.observed_finish = true;
+        }
     }
 }
 
@@ -148,6 +235,35 @@ enum ClientStreamEmitter {
     OpenAICli(OpenAICliClientEmitter),
     Claude(ClaudeClientEmitter),
     Gemini(GeminiClientEmitter),
+}
+
+fn provider_api_format_for_context(report_context: &Value) -> String {
+    report_context
+        .get("provider_api_format")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn client_api_format_for_context(report_context: &Value) -> String {
+    report_context
+        .get("client_api_format")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn standardized_usage_from_canonical(usage: CanonicalUsage) -> StandardizedUsage {
+    let mut standardized = StandardizedUsage::new();
+    standardized.input_tokens = usage.input_tokens as i64;
+    standardized.output_tokens = usage.output_tokens as i64;
+    standardized.dimensions.insert(
+        "total_tokens".to_string(),
+        serde_json::json!(usage.total_tokens),
+    );
+    standardized
 }
 
 impl ClientStreamEmitter {

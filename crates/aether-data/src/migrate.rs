@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static BASELINE_V2_SQL: &str = include_str!("../bootstrap/20260413020000_baseline_v2.sql");
-const BASELINE_V2_CUTOFF_VERSION: i64 = 20260415000000;
+const BASELINE_V2_CUTOFF_VERSION: i64 = 20260418000000;
 const MIGRATIONS_TABLE_EXISTS_SQL: &str =
     "SELECT to_regclass('public._sqlx_migrations') IS NOT NULL";
 const PUBLIC_BASE_TABLE_COUNT_SQL: &str = r#"
@@ -623,6 +623,7 @@ mod tests {
                 20260413020000,
                 20260413030000,
                 20260415000000,
+                20260418000000,
             ]
         );
     }
@@ -632,6 +633,10 @@ mod tests {
         assert!(BASELINE_V2_SQL.contains("CREATE TABLE IF NOT EXISTS public.usage_body_blobs"));
         assert!(BASELINE_V2_SQL.contains("ix_usage_body_blobs_request_id"));
         assert!(BASELINE_V2_SQL.contains("CREATE TABLE IF NOT EXISTS public.usage_http_audits"));
+        assert!(BASELINE_V2_SQL.contains("request_body_state character varying(32)"));
+        assert!(BASELINE_V2_SQL.contains("provider_request_body_state character varying(32)"));
+        assert!(BASELINE_V2_SQL.contains("response_body_state character varying(32)"));
+        assert!(BASELINE_V2_SQL.contains("client_response_body_state character varying(32)"));
         assert!(
             BASELINE_V2_SQL.contains("CREATE TABLE IF NOT EXISTS public.usage_routing_snapshots")
         );
@@ -717,7 +722,8 @@ mod tests {
                 20260410000000,
                 20260413020000,
                 20260413030000,
-                20260415000000
+                20260415000000,
+                20260418000000,
             ]
         );
     }

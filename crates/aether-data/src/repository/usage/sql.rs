@@ -6,8 +6,8 @@ use aether_data_contracts::repository::usage::{
     StoredUsageDashboardSummary, StoredUsageErrorDistributionRow, StoredUsageLeaderboardSummary,
     StoredUsagePerformancePercentilesRow, StoredUsageSettledCostSummary,
     StoredUsageTimeSeriesBucket, UsageAuditAggregationGroupBy, UsageAuditAggregationQuery,
-    UsageAuditKeywordSearchQuery, UsageAuditSummaryQuery, UsageBodyField, UsageBreakdownGroupBy,
-    UsageBreakdownSummaryQuery, UsageCacheAffinityHitSummaryQuery,
+    UsageAuditKeywordSearchQuery, UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBodyField,
+    UsageBreakdownGroupBy, UsageBreakdownSummaryQuery, UsageCacheAffinityHitSummaryQuery,
     UsageCacheAffinityIntervalGroupBy, UsageCacheAffinityIntervalQuery, UsageCacheHitSummaryQuery,
     UsageCostSavingsSummaryQuery, UsageDashboardDailyBreakdownQuery,
     UsageDashboardProviderCountsQuery, UsageDashboardSummaryQuery, UsageErrorDistributionQuery,
@@ -89,6 +89,10 @@ INSERT INTO usage_http_audits (
   provider_request_body_ref,
   response_body_ref,
   client_response_body_ref,
+  request_body_state,
+  provider_request_body_state,
+  response_body_state,
+  client_response_body_state,
   body_capture_mode
 ) VALUES (
   $1,
@@ -100,7 +104,11 @@ INSERT INTO usage_http_audits (
   $7,
   $8,
   $9,
-  $10
+  $10,
+  $11,
+  $12,
+  $13,
+  $14
 )
 ON CONFLICT (request_id)
 DO UPDATE SET
@@ -123,6 +131,22 @@ DO UPDATE SET
   client_response_body_ref = COALESCE(
     EXCLUDED.client_response_body_ref,
     usage_http_audits.client_response_body_ref
+  ),
+  request_body_state = COALESCE(
+    EXCLUDED.request_body_state,
+    usage_http_audits.request_body_state
+  ),
+  provider_request_body_state = COALESCE(
+    EXCLUDED.provider_request_body_state,
+    usage_http_audits.provider_request_body_state
+  ),
+  response_body_state = COALESCE(
+    EXCLUDED.response_body_state,
+    usage_http_audits.response_body_state
+  ),
+  client_response_body_state = COALESCE(
+    EXCLUDED.client_response_body_state,
+    usage_http_audits.client_response_body_state
   ),
   body_capture_mode = COALESCE(
     NULLIF(EXCLUDED.body_capture_mode, 'none'),
@@ -330,6 +354,10 @@ SELECT
   usage_http_audits.provider_request_body_ref AS http_provider_request_body_ref,
   usage_http_audits.response_body_ref AS http_response_body_ref,
   usage_http_audits.client_response_body_ref AS http_client_response_body_ref,
+  usage_http_audits.request_body_state AS http_request_body_state,
+  usage_http_audits.provider_request_body_state AS http_provider_request_body_state,
+  usage_http_audits.response_body_state AS http_response_body_state,
+  usage_http_audits.client_response_body_state AS http_client_response_body_state,
   usage_routing_snapshots.candidate_id AS routing_candidate_id,
   usage_routing_snapshots.candidate_index AS routing_candidate_index,
   usage_routing_snapshots.key_name AS routing_key_name,
@@ -597,6 +625,10 @@ SELECT
   NULL::varchar AS http_provider_request_body_ref,
   NULL::varchar AS http_response_body_ref,
   NULL::varchar AS http_client_response_body_ref,
+  NULL::varchar AS http_request_body_state,
+  NULL::varchar AS http_provider_request_body_state,
+  NULL::varchar AS http_response_body_state,
+  NULL::varchar AS http_client_response_body_state,
   COALESCE(
     usage_routing_snapshots.candidate_id,
     NULLIF(BTRIM("usage".request_metadata->>'candidate_id'), '')
@@ -813,6 +845,10 @@ SELECT
   NULL::varchar AS http_provider_request_body_ref,
   NULL::varchar AS http_response_body_ref,
   NULL::varchar AS http_client_response_body_ref,
+  NULL::varchar AS http_request_body_state,
+  NULL::varchar AS http_provider_request_body_state,
+  NULL::varchar AS http_response_body_state,
+  NULL::varchar AS http_client_response_body_state,
   COALESCE(
     usage_routing_snapshots.candidate_id,
     NULLIF(BTRIM("usage".request_metadata->>'candidate_id'), '')
@@ -1148,6 +1184,10 @@ RETURNING
   NULL::varchar AS http_provider_request_body_ref,
   NULL::varchar AS http_response_body_ref,
   NULL::varchar AS http_client_response_body_ref,
+  NULL::varchar AS http_request_body_state,
+  NULL::varchar AS http_provider_request_body_state,
+  NULL::varchar AS http_response_body_state,
+  NULL::varchar AS http_client_response_body_state,
   NULL::varchar AS routing_candidate_id,
   NULL::integer AS routing_candidate_index,
   NULL::varchar AS routing_key_name,
@@ -3991,6 +4031,12 @@ WHERE "usage".created_at >= TO_TIMESTAMP($1::double precision)"#,
                             None,
                         ),
                     };
+                    let http_audit_states = UsageHttpAuditStates {
+                        request_body_state: usage.request_body_state,
+                        provider_request_body_state: usage.provider_request_body_state,
+                        response_body_state: usage.response_body_state,
+                        client_response_body_state: usage.client_response_body_state,
+                    };
                     let request_metadata_value = prepare_request_metadata_for_body_storage(
                         usage.request_metadata.clone(),
                         [
@@ -4163,6 +4209,7 @@ WHERE "usage".created_at >= TO_TIMESTAMP($1::double precision)"#,
                         &usage.request_id,
                         &http_audit_headers,
                         &http_audit_refs,
+                        &http_audit_states,
                         http_audit_capture_mode,
                     )
                     .await?;
@@ -4224,6 +4271,16 @@ WHERE "usage".created_at >= TO_TIMESTAMP($1::double precision)"#,
                         client_response_body_storage.has_detached_blob(),
                         http_audit_refs.client_response_body_ref.as_deref(),
                     );
+                    stored.request_body_state =
+                        usage.request_body_state.or(stored.request_body_state);
+                    stored.provider_request_body_state = usage
+                        .provider_request_body_state
+                        .or(stored.provider_request_body_state);
+                    stored.response_body_state =
+                        usage.response_body_state.or(stored.response_body_state);
+                    stored.client_response_body_state = usage
+                        .client_response_body_state
+                        .or(stored.client_response_body_state);
                     stored.candidate_id = routing_snapshot.candidate_id.clone();
                     stored.candidate_index = routing_snapshot.candidate_index;
                     stored.key_name = routing_snapshot.key_name.clone();
@@ -4462,6 +4519,10 @@ impl UsageWriteRepository for SqlxUsageReadRepository {
     }
 }
 
+// Build the usage read model from the split storage layout.
+//
+// Query projections already prefer the newer audit/snapshot owners and only fall back to
+// deprecated `public.usage` mirror columns for historical rows that predate the split schema.
 fn map_usage_row(
     row: &sqlx::postgres::PgRow,
     resolve_compressed_bodies: bool,
@@ -4574,6 +4635,28 @@ fn map_usage_row(
             .try_get("http_client_response_body_ref")
             .map_postgres_err()?,
     };
+    let http_audit_states = UsageHttpAuditStates {
+        request_body_state: row
+            .try_get::<Option<String>, _>("http_request_body_state")
+            .map_postgres_err()?
+            .as_deref()
+            .and_then(parse_usage_body_capture_state),
+        provider_request_body_state: row
+            .try_get::<Option<String>, _>("http_provider_request_body_state")
+            .map_postgres_err()?
+            .as_deref()
+            .and_then(parse_usage_body_capture_state),
+        response_body_state: row
+            .try_get::<Option<String>, _>("http_response_body_state")
+            .map_postgres_err()?
+            .as_deref()
+            .and_then(parse_usage_body_capture_state),
+        client_response_body_state: row
+            .try_get::<Option<String>, _>("http_client_response_body_state")
+            .map_postgres_err()?
+            .as_deref()
+            .and_then(parse_usage_body_capture_state),
+    };
     let routing_snapshot = usage_routing_snapshot_from_row(row)?;
     let settlement_pricing_snapshot = usage_settlement_pricing_snapshot_from_row(row)?;
     usage.request_body = request_body.value;
@@ -4613,6 +4696,10 @@ fn map_usage_row(
         client_response_body.has_compressed_storage,
         http_audit_refs.client_response_body_ref.as_deref(),
     );
+    usage.request_body_state = http_audit_states.request_body_state;
+    usage.provider_request_body_state = http_audit_states.provider_request_body_state;
+    usage.response_body_state = http_audit_states.response_body_state;
+    usage.client_response_body_state = http_audit_states.client_response_body_state;
     usage.candidate_id = routing_snapshot.candidate_id.clone();
     usage.candidate_index = routing_snapshot.candidate_index;
     usage.key_name = routing_snapshot.key_name.clone();
@@ -4672,6 +4759,23 @@ impl UsageHttpAuditRefs {
             || self.provider_request_body_ref.is_some()
             || self.response_body_ref.is_some()
             || self.client_response_body_ref.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UsageHttpAuditStates {
+    request_body_state: Option<UsageBodyCaptureState>,
+    provider_request_body_state: Option<UsageBodyCaptureState>,
+    response_body_state: Option<UsageBodyCaptureState>,
+    client_response_body_state: Option<UsageBodyCaptureState>,
+}
+
+impl UsageHttpAuditStates {
+    fn any_present(&self) -> bool {
+        self.request_body_state.is_some()
+            || self.provider_request_body_state.is_some()
+            || self.response_body_state.is_some()
+            || self.client_response_body_state.is_some()
     }
 }
 
@@ -4800,6 +4904,24 @@ fn json_bind_text(value: Option<&Value>) -> Result<Option<String>, DataLayerErro
             })
         })
         .transpose()
+}
+
+fn usage_body_capture_state_bind_text(
+    value: Option<UsageBodyCaptureState>,
+) -> Option<&'static str> {
+    value.map(UsageBodyCaptureState::as_str)
+}
+
+fn parse_usage_body_capture_state(value: &str) -> Option<UsageBodyCaptureState> {
+    match value.trim() {
+        "none" => Some(UsageBodyCaptureState::None),
+        "inline" => Some(UsageBodyCaptureState::Inline),
+        "reference" => Some(UsageBodyCaptureState::Reference),
+        "truncated" => Some(UsageBodyCaptureState::Truncated),
+        "disabled" => Some(UsageBodyCaptureState::Disabled),
+        "unavailable" => Some(UsageBodyCaptureState::Unavailable),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -5042,6 +5164,10 @@ fn usage_settlement_pricing_snapshot_from_usage(
     }
 }
 
+// Decode deprecated inline/compressed body columns from `public.usage`.
+//
+// New writes keep these columns empty by forcing body storage through `usage_body_blobs` and
+// `usage_http_audits`; this helper exists only so older rows remain readable without backfill.
 fn usage_json_column(
     row: &sqlx::postgres::PgRow,
     inline_column: &str,
@@ -5286,12 +5412,17 @@ async fn sync_usage_http_audit_storage<'e, E>(
     request_id: &str,
     headers: &UsageHttpAuditHeaders<'_>,
     refs: &UsageHttpAuditRefs,
+    states: &UsageHttpAuditStates,
     body_capture_mode: &str,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    if !headers.any_present() && !refs.any_present() && body_capture_mode == "none" {
+    if !headers.any_present()
+        && !refs.any_present()
+        && !states.any_present()
+        && body_capture_mode == "none"
+    {
         return Ok(());
     }
 
@@ -5305,6 +5436,18 @@ where
         .bind(refs.provider_request_body_ref.as_deref())
         .bind(refs.response_body_ref.as_deref())
         .bind(refs.client_response_body_ref.as_deref())
+        .bind(usage_body_capture_state_bind_text(
+            states.request_body_state,
+        ))
+        .bind(usage_body_capture_state_bind_text(
+            states.provider_request_body_state,
+        ))
+        .bind(usage_body_capture_state_bind_text(
+            states.response_body_state,
+        ))
+        .bind(usage_body_capture_state_bind_text(
+            states.client_response_body_state,
+        ))
         .bind(body_capture_mode)
         .execute(executor)
         .await
@@ -5661,6 +5804,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -6276,6 +6423,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -6371,6 +6522,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -6445,6 +6600,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: Some("cand-typed".to_string()),
                 candidate_index: Some(2),
                 key_name: Some("primary".to_string()),
@@ -6576,6 +6735,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,

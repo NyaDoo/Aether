@@ -2194,6 +2194,9 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 .request_body
                 .or_else(|| existing.and_then(|existing| existing.request_body.clone())),
             request_body_ref,
+            request_body_state: usage
+                .request_body_state
+                .or_else(|| existing.and_then(|existing| existing.request_body_state)),
             provider_request_headers: usage.provider_request_headers.or_else(|| {
                 existing.and_then(|existing| existing.provider_request_headers.clone())
             }),
@@ -2201,6 +2204,9 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 .provider_request_body
                 .or_else(|| existing.and_then(|existing| existing.provider_request_body.clone())),
             provider_request_body_ref,
+            provider_request_body_state: usage
+                .provider_request_body_state
+                .or_else(|| existing.and_then(|existing| existing.provider_request_body_state)),
             response_headers: usage
                 .response_headers
                 .or_else(|| existing.and_then(|existing| existing.response_headers.clone())),
@@ -2208,6 +2214,9 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 .response_body
                 .or_else(|| existing.and_then(|existing| existing.response_body.clone())),
             response_body_ref,
+            response_body_state: usage
+                .response_body_state
+                .or_else(|| existing.and_then(|existing| existing.response_body_state)),
             client_response_headers: usage
                 .client_response_headers
                 .or_else(|| existing.and_then(|existing| existing.client_response_headers.clone())),
@@ -2215,6 +2224,9 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 .client_response_body
                 .or_else(|| existing.and_then(|existing| existing.client_response_body.clone())),
             client_response_body_ref,
+            client_response_body_state: usage
+                .client_response_body_state
+                .or_else(|| existing.and_then(|existing| existing.client_response_body_state)),
             candidate_id: usage.candidate_id.or_else(|| {
                 existing.and_then(|existing| existing.routing_candidate_id().map(ToOwned::to_owned))
             }),
@@ -2382,6 +2394,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -2451,6 +2467,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -2534,6 +2554,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -2603,6 +2627,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: Some("cand-1".to_string()),
                 candidate_index: Some(1),
                 key_name: Some("primary".to_string()),
@@ -2694,6 +2722,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: Some("cand-1".to_string()),
                 candidate_index: Some(1),
                 key_name: Some("primary".to_string()),
@@ -2765,6 +2797,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -2965,6 +3001,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -3052,6 +3092,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -3127,6 +3171,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -3205,6 +3253,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -3288,6 +3340,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: Some("cand-typed".to_string()),
                 candidate_index: Some(2),
                 key_name: Some("primary".to_string()),
@@ -3382,6 +3438,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,
@@ -3457,6 +3517,10 @@ mod tests {
             client_response_headers: None,
             client_response_body: None,
             client_response_body_ref: None,
+            request_body_state: None,
+            provider_request_body_state: None,
+            response_body_state: None,
+            client_response_body_state: None,
             candidate_id: None,
             candidate_index: None,
             key_name: None,
@@ -3523,6 +3587,10 @@ mod tests {
                 client_response_headers: None,
                 client_response_body: None,
                 client_response_body_ref: None,
+                request_body_state: None,
+                provider_request_body_state: None,
+                response_body_state: None,
+                client_response_body_state: None,
                 candidate_id: None,
                 candidate_index: None,
                 key_name: None,

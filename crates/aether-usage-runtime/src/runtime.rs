@@ -11,6 +11,7 @@ use tracing::warn;
 
 use crate::executor::spawn_on_usage_background_runtime;
 use crate::{
+    apply_usage_body_capture_policy_to_event, apply_usage_body_capture_policy_to_record,
     build_pending_usage_record_from_seed, build_stream_terminal_usage_seed,
     build_streaming_usage_record_from_seed, build_sync_terminal_usage_seed,
     build_terminal_usage_event_from_seed, build_upsert_usage_record_from_event,
@@ -31,6 +32,26 @@ pub enum UsageRequestRecordLevel {
     Full,
 }
 
+pub const DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+pub const DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageBodyCapturePolicy {
+    pub record_level: UsageRequestRecordLevel,
+    pub max_request_body_bytes: Option<usize>,
+    pub max_response_body_bytes: Option<usize>,
+}
+
+impl Default for UsageBodyCapturePolicy {
+    fn default() -> Self {
+        Self {
+            record_level: UsageRequestRecordLevel::Full,
+            max_request_body_bytes: Some(DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES),
+            max_response_body_bytes: Some(DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES),
+        }
+    }
+}
+
 #[async_trait]
 pub trait UsageRuntimeAccess:
     UsageRecordWriter + UsageSettlementWriter + UsageBillingEventEnricher + Send + Sync
@@ -39,8 +60,12 @@ pub trait UsageRuntimeAccess:
     fn has_usage_worker_runner(&self) -> bool;
     fn usage_worker_runner(&self) -> Option<RedisStreamRunner>;
 
+    async fn body_capture_policy(&self) -> Result<UsageBodyCapturePolicy, DataLayerError> {
+        Ok(UsageBodyCapturePolicy::default())
+    }
+
     async fn request_record_level(&self) -> Result<UsageRequestRecordLevel, DataLayerError> {
-        Ok(UsageRequestRecordLevel::Full)
+        Ok(self.body_capture_policy().await?.record_level)
     }
 }
 
@@ -114,7 +139,8 @@ impl UsageRuntime {
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             let now_unix_secs = now_unix_secs();
             match build_pending_usage_record_offthread(&seed, now_unix_secs).await {
-                Ok(record) => {
+                Ok(mut record) => {
+                    apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
                     if let Err(err) = data.upsert_usage_record(record).await {
                         warn!(
                             event_name = "usage_pending_record_failed",
@@ -164,7 +190,8 @@ impl UsageRuntime {
             )
             .await
             {
-                Ok(record) => {
+                Ok(mut record) => {
+                    apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
                     if let Err(err) = data.upsert_usage_record(record).await {
                         warn!(
                             event_name = "usage_stream_record_failed",
@@ -209,7 +236,7 @@ impl UsageRuntime {
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             match build_sync_terminal_usage_event_offthread(input).await {
                 Ok(mut event) => {
-                    apply_request_record_level_from_data(&data, &mut event).await;
+                    apply_body_capture_policy_from_data(&data, &mut event).await;
                     if let Err(err) = data.enrich_usage_event(&mut event).await {
                         warn!(
                             event_name = "usage_sync_terminal_billing_enrichment_failed",
@@ -257,7 +284,7 @@ impl UsageRuntime {
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
             match build_stream_terminal_usage_event_offthread(input).await {
                 Ok(mut event) => {
-                    apply_request_record_level_from_data(&data, &mut event).await;
+                    apply_body_capture_policy_from_data(&data, &mut event).await;
                     if let Err(err) = data.enrich_usage_event(&mut event).await {
                         warn!(
                             event_name = "usage_stream_terminal_billing_enrichment_failed",
@@ -303,7 +330,7 @@ impl UsageRuntime {
         if !self.is_enabled() {
             return;
         }
-        apply_request_record_level_from_data(data, &mut event).await;
+        apply_body_capture_policy_from_data(data, &mut event).await;
         if let Err(err) = data.enrich_usage_event(&mut event).await {
             warn!(
                 event_name = "usage_terminal_billing_enrichment_failed",
@@ -446,38 +473,44 @@ fn join_error_to_data_layer(err: tokio::task::JoinError) -> DataLayerError {
     DataLayerError::UnexpectedValue(format!("usage builder task join failed: {err}"))
 }
 
-async fn apply_request_record_level_from_data<T>(data: &T, event: &mut UsageEvent)
+async fn apply_body_capture_policy_from_data<T>(data: &T, event: &mut UsageEvent)
 where
     T: UsageRuntimeAccess,
 {
-    match data.request_record_level().await {
-        Ok(level) => apply_request_record_level(level, event),
+    match data.body_capture_policy().await {
+        Ok(policy) => apply_usage_body_capture_policy_to_event(policy, event),
         Err(err) => {
             warn!(
-                event_name = "usage_request_record_level_read_failed",
+                event_name = "usage_body_capture_policy_read_failed",
                 log_type = "event",
                 request_id = %event.request_id,
-                fallback = "full",
+                fallback = "default",
                 error = %err,
-                "usage runtime failed to read request record level; keeping full capture"
+                "usage runtime failed to read body capture policy; keeping default capture"
             );
+            apply_usage_body_capture_policy_to_event(UsageBodyCapturePolicy::default(), event);
         }
     }
 }
 
-fn apply_request_record_level(level: UsageRequestRecordLevel, event: &mut UsageEvent) {
-    if !matches!(level, UsageRequestRecordLevel::Basic) {
-        return;
+async fn apply_body_capture_policy_to_record_from_data<T>(data: &T, record: &mut UpsertUsageRecord)
+where
+    T: UsageRuntimeAccess,
+{
+    match data.body_capture_policy().await {
+        Ok(policy) => apply_usage_body_capture_policy_to_record(policy, record),
+        Err(err) => {
+            warn!(
+                event_name = "usage_body_capture_policy_read_failed",
+                log_type = "event",
+                request_id = %record.request_id,
+                fallback = "default",
+                error = %err,
+                "usage runtime failed to read body capture policy; keeping default capture"
+            );
+            apply_usage_body_capture_policy_to_record(UsageBodyCapturePolicy::default(), record);
+        }
     }
-
-    event.data.request_body = None;
-    event.data.request_body_ref = None;
-    event.data.provider_request_body = None;
-    event.data.provider_request_body_ref = None;
-    event.data.response_body = None;
-    event.data.response_body_ref = None;
-    event.data.client_response_body = None;
-    event.data.client_response_body_ref = None;
 }
 
 fn boxed_usage_task<F>(task: F) -> Pin<Box<dyn Future<Output = ()> + Send>>
@@ -498,7 +531,8 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use serde_json::json;
 
-    use super::{apply_request_record_level, UsageRequestRecordLevel};
+    use super::{UsageBodyCapturePolicy, UsageRequestRecordLevel};
+    use crate::apply_usage_body_capture_policy_to_event;
     use crate::{UsageEvent, UsageEventData, UsageEventType};
 
     #[test]
@@ -527,7 +561,13 @@ mod tests {
             },
         );
 
-        apply_request_record_level(UsageRequestRecordLevel::Basic, &mut event);
+        apply_usage_body_capture_policy_to_event(
+            UsageBodyCapturePolicy {
+                record_level: UsageRequestRecordLevel::Basic,
+                ..UsageBodyCapturePolicy::default()
+            },
+            &mut event,
+        );
 
         assert_eq!(event.data.total_tokens, Some(42));
         assert_eq!(event.data.error_message.as_deref(), Some("upstream failed"));

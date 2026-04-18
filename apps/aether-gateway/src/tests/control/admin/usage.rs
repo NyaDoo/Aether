@@ -1436,9 +1436,6 @@ async fn gateway_handles_admin_usage_detail_locally_with_trusted_admin_principal
     assert_eq!(payload["client_response_headers"]["X-Request-Id"], "req-1");
     assert!(payload["metadata"]["trace_id"].is_null());
     assert_eq!(payload["trace"]["trace_id"], "trace-123");
-    assert!(payload["metadata"]["request_preview_source"].is_null());
-    assert!(payload["metadata"]["original_request_body_available"].is_null());
-    assert!(payload["metadata"]["original_response_body_available"].is_null());
     assert!(payload["metadata"]["candidate_id"].is_null());
     assert!(payload["metadata"]["candidate_index"].is_null());
     assert!(payload["metadata"]["key_name"].is_null());
@@ -1460,7 +1457,7 @@ async fn gateway_handles_admin_usage_detail_locally_with_trusted_admin_principal
     assert_eq!(payload["body_capture"]["request"]["storage"], "inline");
     assert_eq!(payload["body_capture"]["request"]["available"], true);
     assert_eq!(
-        payload["body_capture"]["request"]["preview_source"],
+        payload["body_capture"]["request"]["capture_source"],
         "stored_original"
     );
     assert_eq!(
@@ -1605,13 +1602,10 @@ async fn gateway_handles_admin_usage_detail_with_ref_backed_bodies() {
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert!(payload["metadata"]["trace_id"].is_null());
     assert_eq!(payload["trace"]["trace_id"], "trace-ref-detail");
-    assert!(payload["metadata"]["request_preview_source"].is_null());
-    assert!(payload["metadata"]["original_request_body_available"].is_null());
-    assert!(payload["metadata"]["original_response_body_available"].is_null());
     assert_eq!(payload["body_capture"]["request"]["storage"], "reference");
     assert_eq!(payload["body_capture"]["request"]["available"], true);
     assert_eq!(
-        payload["body_capture"]["request"]["preview_source"],
+        payload["body_capture"]["request"]["capture_source"],
         "stored_reference"
     );
     assert_eq!(
@@ -1812,15 +1806,12 @@ async fn gateway_handles_admin_usage_replay_locally_with_trusted_admin_principal
         payload["request_headers"]["Content-Type"],
         "application/json"
     );
-    assert_eq!(payload["request_body"]["model"], "gpt-5");
-    assert_eq!(payload["request_body"]["target_model"], "gpt-5-target");
-    assert_eq!(payload["request_body"]["request_type"], "chat");
-    assert_eq!(payload["request_body"]["api_format"], "openai:chat");
-    assert_eq!(payload["request_body"]["stream"], false);
-    assert_eq!(payload["original_request_body_available"], false);
+    assert!(payload["request_body"].is_null());
+    assert_eq!(payload["captured_request_body_available"], false);
+    assert_eq!(payload["request_body_available"], false);
     assert_eq!(
-        payload["body_capture"]["request"]["preview_source"],
-        "local_reconstruction"
+        payload["body_capture"]["request"]["capture_source"],
+        "legacy_unknown"
     );
     assert_eq!(payload["body_capture"]["request"]["storage"], "missing");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
@@ -1909,9 +1900,10 @@ async fn gateway_handles_admin_usage_replay_with_ref_backed_request_body() {
         payload["request_body"]["messages"][0]["content"],
         "replay from ref"
     );
-    assert_eq!(payload["original_request_body_available"], true);
+    assert_eq!(payload["captured_request_body_available"], true);
+    assert_eq!(payload["request_body_available"], true);
     assert_eq!(
-        payload["body_capture"]["request"]["preview_source"],
+        payload["body_capture"]["request"]["capture_source"],
         "stored_reference"
     );
     assert_eq!(payload["body_capture"]["request"]["storage"], "reference");
@@ -1975,8 +1967,8 @@ async fn local_admin_usage_replay_attaches_explicit_audit() {
         .get::<AdminAuditEvent>()
         .cloned()
         .expect("usage replay should attach audit");
-    assert_eq!(audit.event_name, "admin_usage_replay_preview_generated");
-    assert_eq!(audit.action, "preview_usage_replay");
+    assert_eq!(audit.event_name, "admin_usage_replay_plan_generated");
+    assert_eq!(audit.action, "generate_usage_replay_plan");
     assert_eq!(audit.target_type, "usage_record");
     assert_eq!(audit.target_id, "usage-audit-replay");
 }
@@ -2063,11 +2055,11 @@ async fn gateway_handles_admin_usage_curl_locally_with_trusted_admin_principal()
     assert_eq!(payload["body"]["model"], "gpt-5-target");
     assert_eq!(payload["body"]["temperature"], 0.2);
     assert_eq!(payload["body"]["stream"], false);
-    assert_eq!(payload["original_request_body_available"], true);
+    assert_eq!(payload["captured_request_body_available"], true);
     assert_eq!(payload["body_capture"]["body_source"], "provider_request");
     assert_eq!(payload["body_capture"]["request"]["storage"], "inline");
     assert_eq!(
-        payload["body_capture"]["request"]["preview_source"],
+        payload["body_capture"]["request"]["capture_source"],
         "stored_original"
     );
     assert_eq!(
@@ -2164,11 +2156,11 @@ async fn gateway_handles_admin_usage_curl_with_ref_backed_provider_request_body(
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["body"]["model"], "gpt-5-target");
     assert_eq!(payload["body"]["temperature"], 0.2);
-    assert_eq!(payload["original_request_body_available"], true);
+    assert_eq!(payload["captured_request_body_available"], true);
     assert_eq!(payload["body_capture"]["body_source"], "provider_request");
     assert_eq!(payload["body_capture"]["request"]["storage"], "reference");
     assert_eq!(
-        payload["body_capture"]["request"]["preview_source"],
+        payload["body_capture"]["request"]["capture_source"],
         "stored_reference"
     );
     assert_eq!(

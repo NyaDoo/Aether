@@ -1,12 +1,21 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+/// Joined usage read model assembled from the accounting row plus the newer audit/snapshot
+/// satellite tables.
+///
+/// The canonical owners are split across `public.usage`, `public.usage_http_audits`,
+/// `public.usage_body_blobs`, `public.usage_routing_snapshots`, and
+/// `public.usage_settlement_snapshots`. Fallback reads from deprecated `public.usage.*` mirror
+/// columns still exist for historical rows, but those columns are compatibility-only.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredRequestUsageAudit {
     pub id: String,
     pub request_id: String,
     pub user_id: Option<String>,
     pub api_key_id: Option<String>,
+    // Legacy display-cache mirrors from `public.usage`. New writes intentionally avoid treating
+    // them as authoritative fields.
     pub username: Option<String>,
     pub api_key_name: Option<String>,
     pub provider_name: String,
@@ -42,7 +51,12 @@ pub struct StoredRequestUsageAudit {
     pub response_time_ms: Option<u64>,
     pub first_byte_time_ms: Option<u64>,
     pub status: String,
+    // Settlement state prefers `public.usage_settlement_snapshots` and only falls back to the
+    // deprecated `public.usage.billing_status` mirror for older rows.
     pub billing_status: String,
+    // HTTP capture read model. Canonical owners are `public.usage_http_audits` plus
+    // `public.usage_body_blobs`; deprecated `public.usage.*headers/*body*` columns are historical
+    // fallback only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_headers: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,11 +64,15 @@ pub struct StoredRequestUsageAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_state: Option<UsageBodyCaptureState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_request_headers: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_request_body: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_request_body_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_body_state: Option<UsageBodyCaptureState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,11 +80,15 @@ pub struct StoredRequestUsageAudit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_body_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_state: Option<UsageBodyCaptureState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_response_headers: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_response_body: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_response_body_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_response_body_state: Option<UsageBodyCaptureState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,15 +232,19 @@ impl StoredRequestUsageAudit {
             request_headers: None,
             request_body: None,
             request_body_ref: None,
+            request_body_state: None,
             provider_request_headers: None,
             provider_request_body: None,
             provider_request_body_ref: None,
+            provider_request_body_state: None,
             response_headers: None,
             response_body: None,
             response_body_ref: None,
+            response_body_state: None,
             client_response_headers: None,
             client_response_body: None,
             client_response_body_ref: None,
+            client_response_body_state: None,
             candidate_id: None,
             candidate_index: None,
             key_name: None,
@@ -347,6 +373,108 @@ impl StoredRequestUsageAudit {
             UsageBodyField::ProviderRequestBody => self.provider_request_body_ref.as_deref(),
             UsageBodyField::ResponseBody => self.response_body_ref.as_deref(),
             UsageBodyField::ClientResponseBody => self.client_response_body_ref.as_deref(),
+        }
+    }
+
+    pub fn body_value(&self, field: UsageBodyField) -> Option<&Value> {
+        match field {
+            UsageBodyField::RequestBody => self.request_body.as_ref(),
+            UsageBodyField::ProviderRequestBody => self.provider_request_body.as_ref(),
+            UsageBodyField::ResponseBody => self.response_body.as_ref(),
+            UsageBodyField::ClientResponseBody => self.client_response_body.as_ref(),
+        }
+    }
+
+    pub fn body_state(&self, field: UsageBodyField) -> Option<UsageBodyCaptureState> {
+        match field {
+            UsageBodyField::RequestBody => self.request_body_state,
+            UsageBodyField::ProviderRequestBody => self.provider_request_body_state,
+            UsageBodyField::ResponseBody => self.response_body_state,
+            UsageBodyField::ClientResponseBody => self.client_response_body_state,
+        }
+    }
+
+    pub fn body_capture_result(
+        &self,
+        field: UsageBodyField,
+        body: Option<&Value>,
+    ) -> UsageBodyCaptureResult {
+        resolve_usage_body_capture_result(
+            self.body_state(field),
+            body.is_some(),
+            self.body_ref(field).is_some(),
+        )
+    }
+
+    pub fn body_capture_json_entry(
+        &self,
+        field: UsageBodyField,
+        body: Option<&Value>,
+    ) -> serde_json::Map<String, Value> {
+        self.body_capture_result(field, body)
+            .as_json_entry(self.body_ref(field))
+    }
+
+    pub fn request_body_capture_json_entry(&self) -> serde_json::Map<String, Value> {
+        let mut entry =
+            self.body_capture_json_entry(UsageBodyField::RequestBody, self.request_body.as_ref());
+        entry.insert(
+            "capture_source".to_string(),
+            Value::String(
+                self.body_capture_result(UsageBodyField::RequestBody, self.request_body.as_ref())
+                    .request_capture_source()
+                    .to_string(),
+            ),
+        );
+        entry
+    }
+
+    pub fn body_capture_json_object_for_fields(
+        &self,
+        fields: &[UsageBodyField],
+    ) -> serde_json::Map<String, Value> {
+        let mut object = serde_json::Map::new();
+        for field in fields {
+            let entry = match field {
+                UsageBodyField::RequestBody => self.request_body_capture_json_entry(),
+                other => self.body_capture_json_entry(*other, self.body_value(*other)),
+            };
+            object.insert(field.as_capture_key().to_string(), Value::Object(entry));
+        }
+        object
+    }
+
+    pub fn body_capture_json_for_fields(&self, fields: &[UsageBodyField]) -> Value {
+        Value::Object(self.body_capture_json_object_for_fields(fields))
+    }
+
+    pub fn preferred_request_body_source_field(&self) -> Option<UsageBodyField> {
+        if self
+            .body_capture_result(
+                UsageBodyField::ProviderRequestBody,
+                self.body_value(UsageBodyField::ProviderRequestBody),
+            )
+            .available
+        {
+            Some(UsageBodyField::ProviderRequestBody)
+        } else if self
+            .body_capture_result(
+                UsageBodyField::RequestBody,
+                self.body_value(UsageBodyField::RequestBody),
+            )
+            .available
+        {
+            Some(UsageBodyField::RequestBody)
+        } else {
+            None
+        }
+    }
+
+    pub fn curl_body_source(&self) -> &'static str {
+        match self.preferred_request_body_source_field() {
+            Some(UsageBodyField::ProviderRequestBody) => "provider_request",
+            Some(UsageBodyField::RequestBody) => "request",
+            _ => "unavailable",
         }
     }
 
@@ -897,6 +1025,143 @@ pub struct StoredUsageDailySummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum UsageBodyCaptureState {
+    None,
+    Inline,
+    Reference,
+    Truncated,
+    Disabled,
+    Unavailable,
+}
+
+impl UsageBodyCaptureState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Inline => "inline",
+            Self::Reference => "reference",
+            Self::Truncated => "truncated",
+            Self::Disabled => "disabled",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn from_capture_parts(
+        has_inline_body: bool,
+        has_reference: bool,
+        unavailable: bool,
+    ) -> Self {
+        if has_inline_body {
+            Self::Inline
+        } else if has_reference {
+            Self::Reference
+        } else if unavailable {
+            Self::Unavailable
+        } else {
+            Self::None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageBodyCaptureStorage {
+    Inline,
+    Reference,
+    Truncated,
+    Disabled,
+    Unavailable,
+    None,
+    Missing,
+}
+
+impl UsageBodyCaptureStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Reference => "reference",
+            Self::Truncated => "truncated",
+            Self::Disabled => "disabled",
+            Self::Unavailable => "unavailable",
+            Self::None => "none",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageBodyCaptureResult {
+    pub available: bool,
+    pub storage: UsageBodyCaptureStorage,
+    pub state: Option<UsageBodyCaptureState>,
+}
+
+impl UsageBodyCaptureResult {
+    pub fn state_label(self) -> &'static str {
+        self.state
+            .map(UsageBodyCaptureState::as_str)
+            .unwrap_or("legacy_unknown")
+    }
+
+    pub fn as_json_entry(self, body_ref: Option<&str>) -> serde_json::Map<String, Value> {
+        let mut entry = serde_json::Map::new();
+        entry.insert("available".to_string(), Value::Bool(self.available));
+        entry.insert(
+            "storage".to_string(),
+            Value::String(self.storage.as_str().to_string()),
+        );
+        entry.insert(
+            "state".to_string(),
+            Value::String(self.state_label().to_string()),
+        );
+        if let Some(body_ref) = body_ref {
+            entry.insert("body_ref".to_string(), Value::String(body_ref.to_string()));
+        }
+        entry
+    }
+
+    pub fn request_capture_source(self) -> &'static str {
+        match self.state {
+            Some(UsageBodyCaptureState::Reference) => "stored_reference",
+            Some(UsageBodyCaptureState::Inline) => "stored_original",
+            Some(UsageBodyCaptureState::Truncated) => "stored_truncated",
+            Some(UsageBodyCaptureState::Disabled) => "disabled",
+            Some(UsageBodyCaptureState::Unavailable) => "unavailable",
+            Some(UsageBodyCaptureState::None) => "not_captured",
+            None => match self.storage {
+                UsageBodyCaptureStorage::Reference => "stored_reference",
+                UsageBodyCaptureStorage::Inline => "stored_original",
+                _ => "legacy_unknown",
+            },
+        }
+    }
+}
+
+pub fn resolve_usage_body_capture_result(
+    state: Option<UsageBodyCaptureState>,
+    has_inline_body: bool,
+    has_reference: bool,
+) -> UsageBodyCaptureResult {
+    let (available, storage) = match state {
+        Some(UsageBodyCaptureState::Inline) => (true, UsageBodyCaptureStorage::Inline),
+        Some(UsageBodyCaptureState::Reference) => (true, UsageBodyCaptureStorage::Reference),
+        Some(UsageBodyCaptureState::Truncated) => (true, UsageBodyCaptureStorage::Truncated),
+        Some(UsageBodyCaptureState::Disabled) => (false, UsageBodyCaptureStorage::Disabled),
+        Some(UsageBodyCaptureState::Unavailable) => (false, UsageBodyCaptureStorage::Unavailable),
+        Some(UsageBodyCaptureState::None) => (false, UsageBodyCaptureStorage::None),
+        None if has_reference => (true, UsageBodyCaptureStorage::Reference),
+        None if has_inline_body => (true, UsageBodyCaptureStorage::Inline),
+        None => (false, UsageBodyCaptureStorage::Missing),
+    };
+
+    UsageBodyCaptureResult {
+        available,
+        storage,
+        state,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UsageBodyField {
     RequestBody,
     ProviderRequestBody,
@@ -905,6 +1170,15 @@ pub enum UsageBodyField {
 }
 
 impl UsageBodyField {
+    pub fn as_capture_key(&self) -> &'static str {
+        match self {
+            Self::RequestBody => "request",
+            Self::ProviderRequestBody => "provider_request",
+            Self::ResponseBody => "response",
+            Self::ClientResponseBody => "client_response",
+        }
+    }
+
     pub fn as_ref_key(&self) -> &'static str {
         match self {
             Self::RequestBody => "request_body_ref",
@@ -1111,11 +1385,18 @@ pub trait UsageReadRepository: Send + Sync {
     ) -> Result<Vec<StoredUsageDailySummary>, crate::DataLayerError>;
 }
 
+/// Repository write model for a single usage aggregate.
+///
+/// Request/response headers and bodies here are capture inputs that the repository persists into
+/// the dedicated HTTP audit/body stores. Deprecated mirror columns on `public.usage` remain in the
+/// schema for compatibility only and are not the intended long-term destination for new writes.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UpsertUsageRecord {
     pub request_id: String,
     pub user_id: Option<String>,
     pub api_key_id: Option<String>,
+    // Legacy display-cache mirrors on `public.usage`. Repository write paths strip these so new
+    // values do not keep populating the deprecated columns.
     pub username: Option<String>,
     pub api_key_name: Option<String>,
     pub provider_name: String,
@@ -1151,19 +1432,27 @@ pub struct UpsertUsageRecord {
     pub response_time_ms: Option<u64>,
     pub first_byte_time_ms: Option<u64>,
     pub status: String,
+    // Settlement state is also projected into `public.usage_settlement_snapshots`; the base usage
+    // row mirror exists for compatibility and indexing until a later schema cleanup.
     pub billing_status: String,
+    // HTTP capture payload. Canonical persistence goes through `usage_http_audits` and
+    // `usage_body_blobs`; any remaining `public.usage` body/header columns are compatibility-only.
     pub request_headers: Option<Value>,
     pub request_body: Option<Value>,
     pub request_body_ref: Option<String>,
+    pub request_body_state: Option<UsageBodyCaptureState>,
     pub provider_request_headers: Option<Value>,
     pub provider_request_body: Option<Value>,
     pub provider_request_body_ref: Option<String>,
+    pub provider_request_body_state: Option<UsageBodyCaptureState>,
     pub response_headers: Option<Value>,
     pub response_body: Option<Value>,
     pub response_body_ref: Option<String>,
+    pub response_body_state: Option<UsageBodyCaptureState>,
     pub client_response_headers: Option<Value>,
     pub client_response_body: Option<Value>,
     pub client_response_body_ref: Option<String>,
+    pub client_response_body_state: Option<UsageBodyCaptureState>,
     pub candidate_id: Option<String>,
     pub candidate_index: Option<u64>,
     pub key_name: Option<String>,
@@ -1293,8 +1582,11 @@ fn parse_timestamp(value: i64, field_name: &str) -> Result<u64, crate::DataLayer
 
 #[cfg(test)]
 mod tests {
-    use super::{StoredRequestUsageAudit, UpsertUsageRecord, UsageBodyField};
-    use serde_json::json;
+    use super::{
+        StoredRequestUsageAudit, UpsertUsageRecord, UsageBodyCaptureState, UsageBodyCaptureStorage,
+        UsageBodyField,
+    };
+    use serde_json::{json, Value};
 
     fn sample_usage() -> StoredRequestUsageAudit {
         StoredRequestUsageAudit::new(
@@ -1478,6 +1770,10 @@ mod tests {
             client_response_headers: None,
             client_response_body: None,
             client_response_body_ref: None,
+            request_body_state: None,
+            provider_request_body_state: None,
+            response_body_state: None,
+            client_response_body_state: None,
             candidate_id: None,
             candidate_index: None,
             key_name: None,
@@ -1622,5 +1918,88 @@ mod tests {
         assert_eq!(usage.body_ref(UsageBodyField::ProviderRequestBody), None);
         assert_eq!(usage.body_ref(UsageBodyField::ResponseBody), None);
         assert_eq!(usage.body_ref(UsageBodyField::ClientResponseBody), None);
+    }
+
+    #[test]
+    fn body_capture_result_prefers_typed_state_over_inline_body_presence() {
+        let mut usage = sample_usage();
+        usage.request_body = Some(json!({"model": "gpt-5"}));
+        usage.request_body_ref = Some("usage://request/req-1/request_body".to_string());
+        usage.request_body_state = Some(UsageBodyCaptureState::Disabled);
+
+        let result =
+            usage.body_capture_result(UsageBodyField::RequestBody, usage.request_body.as_ref());
+
+        assert!(!result.available);
+        assert_eq!(result.storage, UsageBodyCaptureStorage::Disabled);
+        assert_eq!(result.state_label(), "disabled");
+        assert_eq!(result.request_capture_source(), "disabled");
+    }
+
+    #[test]
+    fn body_capture_result_infers_legacy_inline_storage_when_typed_state_is_missing() {
+        let mut usage = sample_usage();
+        usage.request_body = Some(json!({"model": "gpt-5"}));
+
+        let result =
+            usage.body_capture_result(UsageBodyField::RequestBody, usage.request_body.as_ref());
+
+        assert!(result.available);
+        assert_eq!(result.storage, UsageBodyCaptureStorage::Inline);
+        assert_eq!(result.state_label(), "legacy_unknown");
+        assert_eq!(result.request_capture_source(), "stored_original");
+    }
+
+    #[test]
+    fn request_body_capture_json_entry_includes_capture_source_and_body_ref() {
+        let mut usage = sample_usage();
+        usage.request_body_ref = Some("usage://request/req-1/request_body".to_string());
+        usage.request_body_state = Some(UsageBodyCaptureState::Reference);
+
+        let entry = usage.request_body_capture_json_entry();
+
+        assert_eq!(entry.get("available"), Some(&Value::Bool(true)));
+        assert_eq!(
+            entry.get("storage"),
+            Some(&Value::String("reference".to_string()))
+        );
+        assert_eq!(
+            entry.get("state"),
+            Some(&Value::String("reference".to_string()))
+        );
+        assert_eq!(
+            entry.get("body_ref"),
+            Some(&Value::String(
+                "usage://request/req-1/request_body".to_string()
+            ))
+        );
+        assert_eq!(
+            entry.get("capture_source"),
+            Some(&Value::String("stored_reference".to_string()))
+        );
+    }
+
+    #[test]
+    fn curl_body_source_prefers_provider_request_body_over_request_body() {
+        let mut usage = sample_usage();
+        usage.request_body = Some(json!({"client": true}));
+        usage.provider_request_body = Some(json!({"provider": true}));
+
+        assert_eq!(
+            usage.preferred_request_body_source_field(),
+            Some(UsageBodyField::ProviderRequestBody)
+        );
+        assert_eq!(usage.curl_body_source(), "provider_request");
+
+        usage.provider_request_body = None;
+        assert_eq!(
+            usage.preferred_request_body_source_field(),
+            Some(UsageBodyField::RequestBody)
+        );
+        assert_eq!(usage.curl_body_source(), "request");
+
+        usage.request_body = None;
+        assert_eq!(usage.preferred_request_body_source_field(), None);
+        assert_eq!(usage.curl_body_source(), "unavailable");
     }
 }

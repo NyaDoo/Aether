@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Error as IoError;
 
-use aether_contracts::{ExecutionPlan, ExecutionTelemetry, StreamFrame, StreamFramePayload};
+use aether_contracts::{
+    ExecutionPlan, ExecutionStreamTerminalSummary, ExecutionTelemetry, StreamFrame,
+    StreamFramePayload,
+};
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
+use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 use aether_scheduler_core::{
     parse_request_candidate_report_context, SchedulerRequestCandidateStatusUpdate,
 };
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
     build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
+    UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntimeAccess,
+    DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
 use async_stream::stream;
 use axum::body::{Body, Bytes};
@@ -102,6 +108,27 @@ fn record_stream_terminal_usage(
     );
 }
 
+fn append_stream_capture_bytes(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+    truncated: &mut bool,
+) {
+    if chunk.is_empty() || max_bytes == 0 {
+        return;
+    }
+    if buffer.len() >= max_bytes {
+        *truncated = true;
+        return;
+    }
+    let remaining = max_bytes - buffer.len();
+    let keep_len = remaining.min(chunk.len());
+    buffer.extend_from_slice(&chunk[..keep_len]);
+    if keep_len < chunk.len() {
+        *truncated = true;
+    }
+}
+
 async fn execute_in_process_stream(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -165,7 +192,10 @@ pub(crate) async fn execute_execution_runtime_stream(
     #[cfg(not(test))]
     {
         let execution = match execute_in_process_stream(state, &plan).await {
-            Ok(execution) => execution,
+            Ok(mut execution) => {
+                apply_stream_summary_report_context(&mut execution, report_context.as_ref());
+                execution
+            }
             Err(err) => {
                 info!(
                     event_name = "stream_execution_runtime_unavailable",
@@ -221,7 +251,10 @@ pub(crate) async fn execute_execution_runtime_stream(
             .unwrap_or_default();
         if remote_execution_runtime_base_url.trim().is_empty() {
             let execution = match execute_in_process_stream(state, &plan).await {
-                Ok(execution) => execution,
+                Ok(mut execution) => {
+                    apply_stream_summary_report_context(&mut execution, report_context.as_ref());
+                    execution
+                }
                 Err(err) => {
                     info!(
                         event_name = "stream_execution_runtime_unavailable",
@@ -513,6 +546,7 @@ async fn execute_stream_from_frame_stream(
         ));
     };
     let mut buffered_frames = VecDeque::new();
+    let mut stream_terminal_summary: Option<ExecutionStreamTerminalSummary> = None;
     if status_code == 200 {
         let success_probe_text =
             probe_local_stream_success_failover_text(&mut buffered_frames, &mut lines).await?;
@@ -1038,7 +1072,8 @@ async fn execute_stream_from_frame_stream(
                 } => {
                     prefetched_telemetry = Some(frame_telemetry);
                 }
-                StreamFramePayload::Eof { .. } => {
+                StreamFramePayload::Eof { summary } => {
+                    stream_terminal_summary = summary;
                     reached_eof = true;
                     break;
                 }
@@ -1125,13 +1160,51 @@ async fn execute_stream_from_frame_stream(
     let candidate_id_for_report = candidate_id.map(ToOwned::to_owned);
     let emit_passthrough_sse_terminal_error =
         skip_direct_finalize_prefetch && response_headers_indicate_sse(&headers);
+    let body_capture_policy = match UsageRuntimeAccess::body_capture_policy(state.data.as_ref())
+        .await
+    {
+        Ok(policy) => policy,
+        Err(err) => {
+            warn!(
+                event_name = "stream_execution_body_capture_policy_read_failed",
+                log_type = "ops",
+                trace_id = %trace_id,
+                request_id = %request_id_for_report_log,
+                candidate_id = ?candidate_id_for_report.as_deref(),
+                error = %err,
+                fallback_request_body_bytes = DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
+                "gateway failed to read body capture policy; falling back to default stream capture limits"
+            );
+            UsageBodyCapturePolicy::default()
+        }
+    };
+    let max_stream_body_buffer_bytes = if matches!(
+        body_capture_policy.record_level,
+        UsageRequestRecordLevel::Basic
+    ) {
+        0
+    } else {
+        body_capture_policy
+            .max_response_body_bytes
+            .unwrap_or(DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES)
+    };
     tokio::spawn(async move {
-        const MAX_STREAM_BODY_BUFFER_BYTES: usize = 256 * 1024; // 256KB
-
-        let mut provider_buffered_body: VecDeque<u8> = provider_prefetched_body_for_report.into();
-        let mut buffered_body: VecDeque<u8> = prefetched_body_for_report.into();
+        let mut provider_buffered_body = Vec::new();
+        let mut buffered_body = Vec::new();
         let mut provider_body_truncated = false;
         let mut client_body_truncated = false;
+        append_stream_capture_bytes(
+            &mut provider_buffered_body,
+            &provider_prefetched_body_for_report,
+            max_stream_body_buffer_bytes,
+            &mut provider_body_truncated,
+        );
+        append_stream_capture_bytes(
+            &mut buffered_body,
+            &prefetched_body_for_report,
+            max_stream_body_buffer_bytes,
+            &mut client_body_truncated,
+        );
         let mut telemetry: Option<ExecutionTelemetry> = initial_telemetry.clone();
         let mut usage_stream_telemetry: Option<ExecutionTelemetry> = initial_telemetry;
         let reached_eof = initial_reached_eof;
@@ -1193,13 +1266,12 @@ async fn execute_stream_from_frame_stream(
                             continue;
                         }
 
-                        provider_buffered_body.extend(chunk.iter().copied());
-                        if provider_buffered_body.len() > MAX_STREAM_BODY_BUFFER_BYTES {
-                            let tail_start =
-                                provider_buffered_body.len() - MAX_STREAM_BODY_BUFFER_BYTES;
-                            provider_buffered_body.drain(..tail_start);
-                            provider_body_truncated = true;
-                        }
+                        append_stream_capture_bytes(
+                            &mut provider_buffered_body,
+                            &chunk,
+                            max_stream_body_buffer_bytes,
+                            &mut provider_body_truncated,
+                        );
                         let normalized_chunk = if let Some(normalizer) =
                             private_stream_normalizer.as_mut()
                         {
@@ -1256,12 +1328,12 @@ async fn execute_stream_from_frame_stream(
                             continue;
                         }
 
-                        buffered_body.extend(&rewritten_chunk);
-                        if buffered_body.len() > MAX_STREAM_BODY_BUFFER_BYTES {
-                            let tail_start = buffered_body.len() - MAX_STREAM_BODY_BUFFER_BYTES;
-                            buffered_body.drain(..tail_start);
-                            client_body_truncated = true;
-                        }
+                        append_stream_capture_bytes(
+                            &mut buffered_body,
+                            &rewritten_chunk,
+                            max_stream_body_buffer_bytes,
+                            &mut client_body_truncated,
+                        );
                         if tx.send(Ok(Bytes::from(rewritten_chunk))).await.is_err() {
                             warn!(
                                 event_name = "stream_execution_downstream_disconnected",
@@ -1293,7 +1365,8 @@ async fn execute_stream_from_frame_stream(
                             usage_stream_telemetry = Some(frame_telemetry);
                         }
                     }
-                    StreamFramePayload::Eof { .. } => {
+                    StreamFramePayload::Eof { summary } => {
+                        stream_terminal_summary = summary;
                         break;
                     }
                     StreamFramePayload::Error { error } => {
@@ -1355,7 +1428,12 @@ async fn execute_stream_from_frame_stream(
                             normalized_chunk
                         };
                         if !rewritten_chunk.is_empty() {
-                            buffered_body.extend(&rewritten_chunk);
+                            append_stream_capture_bytes(
+                                &mut buffered_body,
+                                &rewritten_chunk,
+                                max_stream_body_buffer_bytes,
+                                &mut client_body_truncated,
+                            );
                             if tx.send(Ok(Bytes::from(rewritten_chunk))).await.is_err() {
                                 warn!(
                                     event_name = "stream_execution_downstream_flush_disconnected",
@@ -1394,7 +1472,12 @@ async fn execute_stream_from_frame_stream(
                 if let Some(rewriter) = local_stream_rewriter.as_mut() {
                     match rewriter.finish() {
                         Ok(flushed_chunk) if !flushed_chunk.is_empty() => {
-                            buffered_body.extend(&flushed_chunk);
+                            append_stream_capture_bytes(
+                                &mut buffered_body,
+                                &flushed_chunk,
+                                max_stream_body_buffer_bytes,
+                                &mut client_body_truncated,
+                            );
                             if tx.send(Ok(Bytes::from(flushed_chunk))).await.is_err() {
                                 warn!(
                                     event_name = "stream_execution_downstream_rewrite_flush_disconnected",
@@ -1435,12 +1518,12 @@ async fn execute_stream_from_frame_stream(
             if let Some(failure) = terminal_failure.as_ref() {
                 match encode_terminal_sse_error_event(failure) {
                     Ok(error_event) => {
-                        buffered_body.extend(error_event.iter().copied());
-                        if buffered_body.len() > MAX_STREAM_BODY_BUFFER_BYTES {
-                            let tail_start = buffered_body.len() - MAX_STREAM_BODY_BUFFER_BYTES;
-                            buffered_body.drain(..tail_start);
-                            client_body_truncated = true;
-                        }
+                        append_stream_capture_bytes(
+                            &mut buffered_body,
+                            error_event.as_ref(),
+                            max_stream_body_buffer_bytes,
+                            &mut client_body_truncated,
+                        );
                         if tx.send(Ok(error_event)).await.is_err() {
                             warn!(
                                 event_name = "stream_execution_downstream_terminal_error_disconnected",
@@ -1490,18 +1573,26 @@ async fn execute_stream_from_frame_stream(
                     report_context: report_context_owned.clone(),
                     status_code: 499,
                     headers: headers_for_report.clone(),
-                    provider_body_base64: (!provider_body_truncated
-                        && !provider_buffered_body.is_empty())
-                    .then(|| {
-                        base64::engine::general_purpose::STANDARD
-                            .encode(provider_buffered_body.make_contiguous())
+                    provider_body_base64: (!provider_buffered_body.is_empty()).then(|| {
+                        base64::engine::general_purpose::STANDARD.encode(&provider_buffered_body)
                     }),
-                    client_body_base64: (!client_body_truncated && !buffered_body.is_empty()).then(
-                        || {
-                            base64::engine::general_purpose::STANDARD
-                                .encode(buffered_body.make_contiguous())
-                        },
-                    ),
+                    provider_body_state: Some(if provider_body_truncated {
+                        UsageBodyCaptureState::Truncated
+                    } else if provider_buffered_body.is_empty() {
+                        UsageBodyCaptureState::None
+                    } else {
+                        UsageBodyCaptureState::Inline
+                    }),
+                    client_body_base64: (!buffered_body.is_empty())
+                        .then(|| base64::engine::general_purpose::STANDARD.encode(&buffered_body)),
+                    client_body_state: Some(if client_body_truncated {
+                        UsageBodyCaptureState::Truncated
+                    } else if buffered_body.is_empty() {
+                        UsageBodyCaptureState::None
+                    } else {
+                        UsageBodyCaptureState::Inline
+                    }),
+                    terminal_summary: stream_terminal_summary.clone(),
                     telemetry: telemetry.clone(),
                 },
                 true,
@@ -1533,11 +1624,7 @@ async fn execute_stream_from_frame_stream(
                 report_context_owned.as_ref(),
                 &headers_for_report,
                 telemetry.clone(),
-                if provider_body_truncated {
-                    &[]
-                } else {
-                    provider_buffered_body.make_contiguous()
-                },
+                &provider_buffered_body,
                 candidate_started_unix_secs_for_report,
                 failure,
             )
@@ -1551,14 +1638,25 @@ async fn execute_stream_from_frame_stream(
             report_context: report_context_owned.clone(),
             status_code,
             headers: headers_for_report.clone(),
-            provider_body_base64: (!provider_body_truncated && !provider_buffered_body.is_empty())
-                .then(|| {
-                    base64::engine::general_purpose::STANDARD
-                        .encode(provider_buffered_body.make_contiguous())
-                }),
-            client_body_base64: (!client_body_truncated && !buffered_body.is_empty()).then(|| {
-                base64::engine::general_purpose::STANDARD.encode(buffered_body.make_contiguous())
+            provider_body_base64: (!provider_buffered_body.is_empty())
+                .then(|| base64::engine::general_purpose::STANDARD.encode(&provider_buffered_body)),
+            provider_body_state: Some(if provider_body_truncated {
+                UsageBodyCaptureState::Truncated
+            } else if provider_buffered_body.is_empty() {
+                UsageBodyCaptureState::None
+            } else {
+                UsageBodyCaptureState::Inline
             }),
+            client_body_base64: (!buffered_body.is_empty())
+                .then(|| base64::engine::general_purpose::STANDARD.encode(&buffered_body)),
+            client_body_state: Some(if client_body_truncated {
+                UsageBodyCaptureState::Truncated
+            } else if buffered_body.is_empty() {
+                UsageBodyCaptureState::None
+            } else {
+                UsageBodyCaptureState::Inline
+            }),
+            terminal_summary: stream_terminal_summary,
             telemetry: telemetry.clone(),
         };
         apply_local_execution_effect(
@@ -1654,6 +1752,15 @@ async fn execute_stream_from_frame_stream(
         trace_id,
         Some(decision),
     )?))
+}
+
+fn apply_stream_summary_report_context(
+    execution: &mut DirectUpstreamStreamExecution,
+    report_context: Option<&Value>,
+) {
+    if let Some(report_context) = report_context.cloned() {
+        execution.stream_summary_report_context = report_context;
+    }
 }
 
 #[cfg(test)]

@@ -14,4 +14,5 @@ pub(crate) use private_envelope::{
     maybe_normalize_provider_private_sync_report_payload,
     normalize_provider_private_report_context, normalize_provider_private_response_value,
     provider_private_response_allows_sync_finalize, transform_provider_private_stream_line,
+    ProviderPrivateStreamNormalizer,
 };

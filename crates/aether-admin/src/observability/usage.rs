@@ -265,84 +265,7 @@ fn admin_usage_has_body_value(
     body: Option<&Value>,
     field: UsageBodyField,
 ) -> bool {
-    body.is_some() || item.body_ref(field).is_some()
-}
-
-fn admin_usage_body_capture_storage(
-    item: &StoredRequestUsageAudit,
-    body: Option<&Value>,
-    field: UsageBodyField,
-) -> &'static str {
-    if item.body_ref(field).is_some() {
-        "reference"
-    } else if body.is_some() {
-        "inline"
-    } else {
-        "missing"
-    }
-}
-
-fn admin_usage_body_capture_entry(
-    item: &StoredRequestUsageAudit,
-    body: Option<&Value>,
-    field: UsageBodyField,
-) -> serde_json::Map<String, Value> {
-    let mut entry = serde_json::Map::new();
-    entry.insert(
-        "available".to_string(),
-        json!(admin_usage_has_body_value(item, body, field)),
-    );
-    entry.insert(
-        "storage".to_string(),
-        json!(admin_usage_body_capture_storage(item, body, field)),
-    );
-    if let Some(body_ref) = item.body_ref(field) {
-        entry.insert("body_ref".to_string(), json!(body_ref));
-    }
-    entry
-}
-
-fn admin_usage_request_preview_source(item: &StoredRequestUsageAudit) -> &'static str {
-    if item.body_ref(UsageBodyField::RequestBody).is_some() {
-        "stored_reference"
-    } else if item.request_body.is_some() {
-        "stored_original"
-    } else {
-        "local_reconstruction"
-    }
-}
-
-fn admin_usage_request_capture_entry(
-    item: &StoredRequestUsageAudit,
-) -> serde_json::Map<String, Value> {
-    let mut request = admin_usage_body_capture_entry(
-        item,
-        item.request_body.as_ref(),
-        UsageBodyField::RequestBody,
-    );
-    request.insert(
-        "preview_source".to_string(),
-        json!(admin_usage_request_preview_source(item)),
-    );
-    request
-}
-
-fn admin_usage_curl_body_source(item: &StoredRequestUsageAudit) -> &'static str {
-    if admin_usage_has_body_value(
-        item,
-        item.provider_request_body.as_ref(),
-        UsageBodyField::ProviderRequestBody,
-    ) {
-        "provider_request"
-    } else if admin_usage_has_body_value(
-        item,
-        item.request_body.as_ref(),
-        UsageBodyField::RequestBody,
-    ) {
-        "request"
-    } else {
-        "local_reconstruction"
-    }
+    item.body_capture_result(field, body).available
 }
 
 fn admin_usage_strip_body_ref_metadata(metadata: &mut serde_json::Map<String, Value>) {
@@ -411,28 +334,12 @@ fn maybe_insert_bool_field(
 }
 
 fn admin_usage_body_capture_json(item: &StoredRequestUsageAudit) -> Value {
-    let request = admin_usage_request_capture_entry(item);
-    let provider_request = admin_usage_body_capture_entry(
-        item,
-        item.provider_request_body.as_ref(),
+    item.body_capture_json_for_fields(&[
+        UsageBodyField::RequestBody,
         UsageBodyField::ProviderRequestBody,
-    );
-    let response = admin_usage_body_capture_entry(
-        item,
-        item.response_body.as_ref(),
         UsageBodyField::ResponseBody,
-    );
-    let client_response = admin_usage_body_capture_entry(
-        item,
-        item.client_response_body.as_ref(),
         UsageBodyField::ClientResponseBody,
-    );
-    json!({
-        "request": request,
-        "provider_request": provider_request,
-        "response": response,
-        "client_response": client_response,
-    })
+    ])
 }
 
 fn admin_usage_settlement_json(item: &StoredRequestUsageAudit) -> Value {
@@ -511,21 +418,19 @@ fn admin_usage_trace_json(item: &StoredRequestUsageAudit) -> Value {
 }
 
 fn admin_usage_replay_body_capture_json(item: &StoredRequestUsageAudit) -> Value {
-    json!({
-        "request": admin_usage_request_capture_entry(item),
-    })
+    item.body_capture_json_for_fields(&[UsageBodyField::RequestBody])
 }
 
 fn admin_usage_curl_body_capture_json(item: &StoredRequestUsageAudit) -> Value {
-    json!({
-        "body_source": admin_usage_curl_body_source(item),
-        "request": admin_usage_request_capture_entry(item),
-        "provider_request": admin_usage_body_capture_entry(
-            item,
-            item.provider_request_body.as_ref(),
-            UsageBodyField::ProviderRequestBody,
-        ),
-    })
+    let mut object = item.body_capture_json_object_for_fields(&[
+        UsageBodyField::RequestBody,
+        UsageBodyField::ProviderRequestBody,
+    ]);
+    object.insert(
+        "body_source".to_string(),
+        Value::String(item.curl_body_source().to_string()),
+    );
+    Value::Object(object)
 }
 
 pub fn admin_usage_provider_key_name(
@@ -1339,19 +1244,12 @@ fn admin_usage_resolve_replay_mode(same_provider: bool, same_endpoint: bool) -> 
     }
 }
 
-pub fn admin_usage_resolve_request_preview_body(
+pub fn admin_usage_resolve_request_capture_body(
     item: &StoredRequestUsageAudit,
     body_override: Option<Value>,
-) -> Value {
+) -> Option<Value> {
     let resolved_model = item.model.clone();
-    let mut request_body = body_override
-        .or_else(|| item.request_body.clone())
-        .unwrap_or_else(|| {
-            json!({
-                "model": resolved_model,
-                "stream": item.is_stream,
-            })
-        });
+    let mut request_body = body_override.or_else(|| item.request_body.clone())?;
     if let Some(body) = request_body.as_object_mut() {
         body.entry("model".to_string())
             .or_insert_with(|| json!(resolved_model));
@@ -1383,7 +1281,7 @@ pub fn admin_usage_resolve_request_preview_body(
                 .or_insert_with(|| json!(api_format));
         }
     }
-    request_body
+    Some(request_body)
 }
 
 pub fn admin_usage_headers_from_value(value: &Value) -> Option<BTreeMap<String, String>> {
@@ -1597,17 +1495,17 @@ pub fn build_admin_usage_curl_response(
     url: Option<String>,
     headers_json: Option<Value>,
     headers: &BTreeMap<String, String>,
-    body: &Value,
+    body: Option<&Value>,
 ) -> Response<Body> {
-    let curl = admin_usage_build_curl_command(url.as_deref(), headers, Some(body));
+    let curl = admin_usage_build_curl_command(url.as_deref(), headers, body);
     Json(json!({
         "url": url,
         "method": "POST",
         "headers": headers_json.unwrap_or_else(|| json!(headers.clone())),
-        "body": body,
+        "body": body.cloned().unwrap_or(Value::Null),
         "curl": curl,
         "body_capture": admin_usage_curl_body_capture_json(item),
-        "original_request_body_available": admin_usage_has_body_value(
+        "captured_request_body_available": admin_usage_has_body_value(
             item,
             item.request_body.as_ref(),
             UsageBodyField::RequestBody
@@ -1630,7 +1528,7 @@ pub fn build_admin_usage_detail_payload(
     auth_api_key_reader_available: bool,
     provider_key_name: Option<&str>,
     include_bodies: bool,
-    request_body: Value,
+    request_body: Option<Value>,
     default_headers: &BTreeMap<String, String>,
 ) -> Value {
     let mut payload = admin_usage_record_json(
@@ -1651,9 +1549,6 @@ pub fn build_admin_usage_detail_payload(
         admin_usage_strip_routing_metadata(object);
         admin_usage_strip_settlement_metadata(object);
         admin_usage_strip_trace_metadata(object);
-        object.remove("request_preview_source");
-        object.remove("original_request_body_available");
-        object.remove("original_response_body_available");
     }
     payload["user"] = match item.user_id.as_ref() {
         Some(user_id) => json!({
@@ -1689,7 +1584,11 @@ pub fn build_admin_usage_detail_payload(
     payload["body_capture"] = admin_usage_body_capture_json(item);
     payload["settlement"] = admin_usage_settlement_json(item);
     payload["trace"] = admin_usage_trace_json(item);
-    payload["has_request_body"] = json!(true);
+    payload["has_request_body"] = json!(admin_usage_has_body_value(
+        item,
+        item.request_body.as_ref(),
+        UsageBodyField::RequestBody
+    ));
     payload["has_provider_request_body"] = json!(admin_usage_has_body_value(
         item,
         item.provider_request_body.as_ref(),
@@ -1707,7 +1606,7 @@ pub fn build_admin_usage_detail_payload(
     ));
     payload["tiered_pricing"] = Value::Null;
     if include_bodies {
-        payload["request_body"] = request_body;
+        payload["request_body"] = request_body.unwrap_or(Value::Null);
         payload["provider_request_body"] =
             item.provider_request_body.clone().unwrap_or(Value::Null);
         payload["response_body"] = item.response_body.clone().unwrap_or(Value::Null);
@@ -1727,7 +1626,7 @@ pub fn build_admin_usage_replay_plan_response(
     target_provider: &StoredProviderCatalogProvider,
     target_endpoint: &StoredProviderCatalogEndpoint,
     target_api_key_id: Option<String>,
-    request_body: Value,
+    request_body: Option<Value>,
     url: &str,
     headers: &BTreeMap<String, String>,
     same_provider: bool,
@@ -1735,7 +1634,7 @@ pub fn build_admin_usage_replay_plan_response(
 ) -> Response<Body> {
     let resolved_model = item.model.clone();
     let mapping_source = "none";
-    let curl = admin_usage_build_curl_command(Some(url), headers, Some(&request_body));
+    let curl = admin_usage_build_curl_command(Some(url), headers, request_body.as_ref());
 
     Json(json!({
         "dry_run": true,
@@ -1752,13 +1651,14 @@ pub fn build_admin_usage_replay_plan_response(
         "method": "POST",
         "url": url,
         "request_headers": headers,
-        "request_body": request_body,
+        "request_body": request_body.clone().unwrap_or(Value::Null),
         "body_capture": admin_usage_replay_body_capture_json(item),
-        "original_request_body_available": admin_usage_has_body_value(
+        "captured_request_body_available": admin_usage_has_body_value(
             item,
             item.request_body.as_ref(),
             UsageBodyField::RequestBody
         ),
+        "request_body_available": request_body.is_some(),
         "note": "Rust local replay currently exposes a dry-run plan and does not dispatch upstream",
         "curl": curl,
     }))
@@ -1911,13 +1811,10 @@ mod tests {
             false,
             None,
             false,
-            json!({"model": "gpt-5"}),
+            Some(json!({"model": "gpt-5"})),
             &BTreeMap::new(),
         );
 
-        assert!(payload["metadata"]["request_preview_source"].is_null());
-        assert!(payload["metadata"]["original_request_body_available"].is_null());
-        assert!(payload["metadata"]["original_response_body_available"].is_null());
         assert!(payload["metadata"]["request_body_ref"].is_null());
         assert!(payload["metadata"]["provider_request_body_ref"].is_null());
         assert!(payload["metadata"]["response_body_ref"].is_null());
@@ -1929,7 +1826,7 @@ mod tests {
             "usage://request/req-1/request_body"
         );
         assert_eq!(
-            payload["body_capture"]["request"]["preview_source"],
+            payload["body_capture"]["request"]["capture_source"],
             "stored_reference"
         );
         assert_eq!(
@@ -1952,6 +1849,42 @@ mod tests {
         assert_eq!(payload["has_provider_request_body"], true);
         assert_eq!(payload["has_response_body"], true);
         assert_eq!(payload["has_client_response_body"], true);
+    }
+
+    #[test]
+    fn detail_payload_preserves_legacy_body_capture_metadata_keys() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "request_preview_source": "stored_original",
+                "original_request_body_available": true,
+                "original_response_body_available": true,
+                "custom_key": "keep-me"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let payload = build_admin_usage_detail_payload(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+            false,
+            Some(json!({"model": "gpt-5"})),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            payload["metadata"]["request_preview_source"],
+            "stored_original"
+        );
+        assert_eq!(payload["metadata"]["original_request_body_available"], true);
+        assert_eq!(
+            payload["metadata"]["original_response_body_available"],
+            true
+        );
+        assert_eq!(payload["metadata"]["custom_key"], "keep-me");
     }
 
     #[test]
@@ -2022,7 +1955,7 @@ mod tests {
             false,
             None,
             false,
-            json!({"model": "gpt-5"}),
+            Some(json!({"model": "gpt-5"})),
             &BTreeMap::new(),
         );
 
@@ -2096,7 +2029,7 @@ mod tests {
             false,
             Some("resolved-primary"),
             false,
-            json!({"model": "gpt-5"}),
+            Some(json!({"model": "gpt-5"})),
             &BTreeMap::new(),
         );
 
@@ -2119,9 +2052,6 @@ mod tests {
         assert!(payload["metadata"]["key_name"].is_null());
         assert!(payload["metadata"]["planner_kind"].is_null());
         assert!(payload["metadata"]["trace_id"].is_null());
-        assert!(payload["metadata"]["request_preview_source"].is_null());
-        assert!(payload["metadata"]["original_request_body_available"].is_null());
-        assert!(payload["metadata"]["original_response_body_available"].is_null());
         assert!(payload["metadata"]["route_family"].is_null());
         assert!(payload["metadata"]["route_kind"].is_null());
         assert!(payload["metadata"]["execution_path"].is_null());

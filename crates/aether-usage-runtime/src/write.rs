@@ -1,11 +1,16 @@
 use std::collections::BTreeMap;
 
-use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
-use aether_data_contracts::repository::usage::UpsertUsageRecord;
+use aether_contracts::{ExecutionPlan, ExecutionStreamTerminalSummary, ExecutionTelemetry};
+use aether_data_contracts::repository::usage::{UpsertUsageRecord, UsageBodyCaptureState};
 use aether_data_contracts::DataLayerError;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
+use crate::body_capture::{
+    append_runtime_body_capture_metadata, build_payload_body_capture_metadata,
+    build_plan_body_capture_metadata, build_runtime_body_capture_states, decoded_base64_len_hint,
+    RuntimeBodyCaptureMetadataInput,
+};
 use crate::request_metadata::{
     build_usage_request_metadata_seed, merge_usage_request_metadata,
     sanitize_usage_request_metadata,
@@ -41,6 +46,14 @@ struct UsageBodyRefsSeed {
     client_response_body_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UsageBodyStatesSeed {
+    request_body_state: Option<UsageBodyCaptureState>,
+    provider_request_body_state: Option<UsageBodyCaptureState>,
+    response_body_state: Option<UsageBodyCaptureState>,
+    client_response_body_state: Option<UsageBodyCaptureState>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleUsageSeed {
     pub request_id: String,
@@ -64,6 +77,7 @@ pub struct LifecycleUsageSeed {
     pub has_format_conversion: Option<bool>,
     pub is_stream: bool,
     routing: UsageRoutingSeed,
+    body_states: UsageBodyStatesSeed,
     pub request_metadata: Option<Value>,
 }
 
@@ -97,6 +111,7 @@ pub struct TerminalUsageContextSeed {
     pub provider_request_headers: Option<Value>,
     pub provider_request: Option<Value>,
     body_refs: UsageBodyRefsSeed,
+    body_states: UsageBodyStatesSeed,
     routing: UsageRoutingSeed,
     pub request_metadata: Option<Value>,
 }
@@ -109,8 +124,10 @@ pub struct SyncTerminalUsagePayloadSeed {
     pub first_byte_time_ms: Option<u64>,
     pub provider_response_headers: Option<Value>,
     pub provider_response_full: Option<Value>,
+    pub provider_response_body_state: Option<UsageBodyCaptureState>,
     pub client_response_headers: Option<Value>,
     pub client_response: Option<Value>,
+    pub client_response_body_state: Option<UsageBodyCaptureState>,
     pub capture_metadata: Option<Value>,
 }
 
@@ -122,8 +139,11 @@ pub struct StreamTerminalUsagePayloadSeed {
     pub first_byte_time_ms: Option<u64>,
     pub provider_response_headers: Option<Value>,
     pub provider_response_full: Option<Value>,
+    pub provider_response_body_state: Option<UsageBodyCaptureState>,
     pub client_response_headers: Option<Value>,
     pub client_response: Option<Value>,
+    pub client_response_body_state: Option<UsageBodyCaptureState>,
+    pub terminal_summary: Option<ExecutionStreamTerminalSummary>,
     pub capture_metadata: Option<Value>,
 }
 
@@ -154,6 +174,7 @@ pub struct TerminalUsageSeed {
     pub provider_request_headers: Option<Value>,
     pub provider_request: Option<Value>,
     body_refs: UsageBodyRefsSeed,
+    body_states: UsageBodyStatesSeed,
     pub provider_response_headers: Option<Value>,
     pub provider_response: Option<Value>,
     pub client_response_headers: Option<Value>,
@@ -162,6 +183,7 @@ pub struct TerminalUsageSeed {
     pub request_metadata: Option<Value>,
     pub audit_payload: Option<Value>,
     pub standardized_usage: Option<StandardizedUsage>,
+    pub terminal_summary: Option<ExecutionStreamTerminalSummary>,
 }
 
 pub type TerminalUsageOutcome = TerminalUsageSeed;
@@ -241,6 +263,7 @@ pub fn build_lifecycle_usage_seed(
         has_format_conversion: context_bool(context, "needs_conversion"),
         is_stream: plan.stream,
         routing: build_runtime_routing_seed(plan, context),
+        body_states: build_runtime_body_states_seed(plan, context),
         request_metadata: build_runtime_request_metadata_seed(plan, context),
     }
 }
@@ -391,15 +414,19 @@ pub fn build_terminal_usage_event_from_seed(
         request_headers: seed.request_headers,
         request_body: seed.request_body,
         request_body_ref: body_refs.request_body_ref,
+        request_body_state: seed.body_states.request_body_state,
         provider_request_headers: seed.provider_request_headers,
         provider_request_body: seed.provider_request,
         provider_request_body_ref: body_refs.provider_request_body_ref,
+        provider_request_body_state: seed.body_states.provider_request_body_state,
         response_headers: seed.provider_response_headers,
         response_body: provider_response.clone(),
         response_body_ref: body_refs.response_body_ref,
+        response_body_state: seed.body_states.response_body_state,
         client_response_headers: seed.client_response_headers,
         client_response_body: client_response.clone(),
         client_response_body_ref: body_refs.client_response_body_ref,
+        client_response_body_state: seed.body_states.client_response_body_state,
         candidate_id: routing.candidate_id,
         key_name: routing.key_name,
         planner_kind: routing.planner_kind,
@@ -415,12 +442,14 @@ pub fn build_terminal_usage_event_from_seed(
         apply_standardized_usage_seed(usage, &mut data);
     }
 
-    if let Some(response_body) = provider_response.as_ref() {
-        apply_standardized_usage(
-            Some(seed.provider_contract.clone()),
-            response_body,
-            &mut data,
-        );
+    if seed.standardized_usage.is_none() {
+        if let Some(response_body) = provider_response.as_ref() {
+            apply_standardized_usage(
+                Some(seed.provider_contract.clone()),
+                response_body,
+                &mut data,
+            );
+        }
     }
     if data.total_tokens.is_none() {
         if let Some(tokens) = provider_response
@@ -494,9 +523,10 @@ pub fn build_terminal_usage_context_seed(
         provider_request: context_body_value(context, "provider_request_body")
             .or_else(|| plan_json_body_capture_for_usage(plan)),
         body_refs: build_runtime_body_refs_seed(plan, context),
+        body_states: build_runtime_body_states_seed(plan, context),
         request_metadata: merge_usage_request_metadata(
             build_usage_request_metadata_seed(plan, context),
-            build_plan_body_capture_metadata(plan),
+            build_plan_body_capture_metadata(plan.body.body_bytes_b64.as_deref()),
         ),
     }
 }
@@ -504,6 +534,12 @@ pub fn build_terminal_usage_context_seed(
 pub fn build_sync_terminal_usage_payload_seed(
     payload: &GatewaySyncReportRequest,
 ) -> SyncTerminalUsagePayloadSeed {
+    let provider_response_full = payload
+        .body_json
+        .as_ref()
+        .cloned()
+        .or_else(|| decode_body_for_storage(payload.body_base64.as_deref()));
+    let client_response = payload.client_body_json.as_ref().cloned();
     SyncTerminalUsagePayloadSeed {
         report_kind: payload.report_kind.clone(),
         status_code: payload.status_code,
@@ -513,14 +549,33 @@ pub fn build_sync_terminal_usage_payload_seed(
             .and_then(|value| value.elapsed_ms),
         first_byte_time_ms: payload.telemetry.as_ref().and_then(|value| value.ttfb_ms),
         provider_response_headers: Some(headers_to_json(&payload.headers)),
-        provider_response_full: payload
-            .body_json
-            .as_ref()
-            .cloned()
-            .or_else(|| decode_body_for_storage(payload.body_base64.as_deref())),
+        provider_response_full: provider_response_full.clone(),
+        provider_response_body_state: Some(UsageBodyCaptureState::from_capture_parts(
+            provider_response_full.is_some(),
+            false,
+            false,
+        )),
         client_response_headers: Some(headers_to_json(&payload.headers)),
-        client_response: payload.client_body_json.as_ref().cloned(),
-        capture_metadata: build_payload_body_capture_metadata(payload.body_base64.as_deref(), None),
+        client_response: client_response.clone(),
+        client_response_body_state: Some(UsageBodyCaptureState::from_capture_parts(
+            client_response.is_some(),
+            false,
+            false,
+        )),
+        capture_metadata: build_payload_body_capture_metadata(
+            payload.body_base64.as_deref(),
+            None,
+            Some(UsageBodyCaptureState::from_capture_parts(
+                provider_response_full.is_some(),
+                false,
+                false,
+            )),
+            Some(UsageBodyCaptureState::from_capture_parts(
+                client_response.is_some(),
+                false,
+                false,
+            )),
+        ),
     }
 }
 
@@ -537,11 +592,16 @@ pub fn build_stream_terminal_usage_payload_seed(
         first_byte_time_ms: payload.telemetry.as_ref().and_then(|value| value.ttfb_ms),
         provider_response_headers: Some(headers_to_json(&payload.headers)),
         provider_response_full: decode_body_for_storage(payload.provider_body_base64.as_deref()),
+        provider_response_body_state: payload.provider_body_state,
         client_response_headers: Some(headers_to_json(&payload.headers)),
         client_response: decode_body_for_storage(payload.client_body_base64.as_deref()),
+        client_response_body_state: payload.client_body_state,
+        terminal_summary: payload.terminal_summary.clone(),
         capture_metadata: build_payload_body_capture_metadata(
             payload.provider_body_base64.as_deref(),
             payload.client_body_base64.as_deref(),
+            payload.provider_body_state,
+            payload.client_body_state,
         ),
     }
 }
@@ -586,6 +646,12 @@ pub fn build_sync_terminal_usage_seed(
         provider_request_headers: context_seed.provider_request_headers,
         provider_request: context_seed.provider_request,
         body_refs: context_seed.body_refs,
+        body_states: UsageBodyStatesSeed {
+            request_body_state: context_seed.body_states.request_body_state,
+            provider_request_body_state: context_seed.body_states.provider_request_body_state,
+            response_body_state: payload_seed.provider_response_body_state,
+            client_response_body_state: payload_seed.client_response_body_state,
+        },
         routing: context_seed.routing,
         provider_response_headers: payload_seed.provider_response_headers,
         provider_response: payload_seed.provider_response_full,
@@ -594,6 +660,7 @@ pub fn build_sync_terminal_usage_seed(
         request_metadata: context_seed.request_metadata,
         audit_payload: payload_seed.capture_metadata,
         standardized_usage,
+        terminal_summary: None,
     }
 }
 
@@ -603,9 +670,17 @@ pub fn build_stream_terminal_usage_seed(
     cancelled: bool,
 ) -> TerminalUsageSeed {
     let standardized_usage = payload_seed
-        .provider_response_full
+        .terminal_summary
         .as_ref()
-        .map(|response| map_usage_from_response(response, context_seed.provider_contract.as_str()));
+        .and_then(|summary| summary.standardized_usage.clone())
+        .or_else(|| {
+            payload_seed
+                .provider_response_full
+                .as_ref()
+                .map(|response| {
+                    map_usage_from_response(response, context_seed.provider_contract.as_str())
+                })
+        });
     let terminal_state = infer_stream_terminal_state(
         payload_seed.report_kind.as_str(),
         payload_seed.status_code,
@@ -638,6 +713,12 @@ pub fn build_stream_terminal_usage_seed(
         provider_request_headers: context_seed.provider_request_headers,
         provider_request: context_seed.provider_request,
         body_refs: context_seed.body_refs,
+        body_states: UsageBodyStatesSeed {
+            request_body_state: context_seed.body_states.request_body_state,
+            provider_request_body_state: context_seed.body_states.provider_request_body_state,
+            response_body_state: payload_seed.provider_response_body_state,
+            client_response_body_state: payload_seed.client_response_body_state,
+        },
         routing: context_seed.routing,
         provider_response_headers: payload_seed.provider_response_headers,
         provider_response: payload_seed.provider_response_full,
@@ -646,6 +727,7 @@ pub fn build_stream_terminal_usage_seed(
         request_metadata: context_seed.request_metadata,
         audit_payload: payload_seed.capture_metadata,
         standardized_usage,
+        terminal_summary: payload_seed.terminal_summary,
     }
 }
 
@@ -758,15 +840,19 @@ fn build_lifecycle_usage_record(
         request_headers: None,
         request_body: None,
         request_body_ref: body_refs.request_body_ref,
+        request_body_state: seed.body_states.request_body_state,
         provider_request_headers: None,
         provider_request_body: None,
         provider_request_body_ref: body_refs.provider_request_body_ref,
+        provider_request_body_state: seed.body_states.provider_request_body_state,
         response_headers: sanitize_usage_header_capture(response_headers),
         response_body: None,
         response_body_ref: body_refs.response_body_ref,
+        response_body_state: Some(UsageBodyCaptureState::None),
         client_response_headers: sanitize_usage_header_capture(client_response_headers),
         client_response_body: None,
         client_response_body_ref: body_refs.client_response_body_ref,
+        client_response_body_state: Some(UsageBodyCaptureState::None),
         candidate_id: routing.candidate_id,
         candidate_index: routing.candidate_index,
         key_name: routing.key_name,
@@ -796,6 +882,7 @@ fn build_usage_event_data_seed_with_detail(
     let context = report_context.and_then(Value::as_object);
     let routing = build_runtime_routing_seed(plan, context);
     let body_refs = build_runtime_body_refs_seed(plan, context);
+    let body_states = build_runtime_body_states_seed(plan, context);
     let api_format = context_string(context, "client_api_format")
         .or_else(|| non_empty_string(Some(plan.client_api_format.clone())));
     let endpoint_api_format = context_string(context, "provider_api_format")
@@ -845,13 +932,17 @@ fn build_usage_event_data_seed_with_detail(
         request_headers: context_usage_value(context, "original_headers"),
         request_body: context_body_value(context, "original_request_body"),
         request_body_ref: body_refs.request_body_ref,
+        request_body_state: body_states.request_body_state,
         provider_request_headers: context_usage_value(context, "provider_request_headers")
             .or_else(|| Some(headers_to_json(&plan.headers))),
         provider_request_body: context_body_value(context, "provider_request_body")
             .or_else(|| plan_json_body_capture_for_usage(plan)),
         provider_request_body_ref: body_refs.provider_request_body_ref,
+        provider_request_body_state: body_states.provider_request_body_state,
         response_body_ref: body_refs.response_body_ref,
+        response_body_state: body_states.response_body_state,
         client_response_body_ref: body_refs.client_response_body_ref,
+        client_response_body_state: body_states.client_response_body_state,
         candidate_id: routing.candidate_id,
         candidate_index: routing.candidate_index,
         key_name: routing.key_name,
@@ -1007,7 +1098,37 @@ fn build_runtime_request_metadata_seed(
     if let Some(trace_id) = context_string(context, "trace_id") {
         metadata.insert("trace_id".to_string(), Value::String(trace_id));
     }
-    append_plan_body_capture_metadata(plan, &mut metadata);
+    let request_body = context_body_value(context, "original_request_body");
+    let request_body_ref = context_string(context, "request_body_ref");
+    let provider_request_body = context_body_value(context, "provider_request_body")
+        .or_else(|| plan_json_body_capture_for_usage(plan));
+    let provider_request_body_ref = context_string(context, "provider_request_body_ref")
+        .or_else(|| non_empty_string(plan.body.body_ref.clone()));
+    let provider_source_bytes = plan
+        .body
+        .body_bytes_b64
+        .as_deref()
+        .and_then(decoded_base64_len_hint);
+    append_runtime_body_capture_metadata(
+        &mut metadata,
+        RuntimeBodyCaptureMetadataInput {
+            request_has_inline_body: request_body.is_some(),
+            request_body_ref: request_body_ref.as_deref(),
+            provider_request_has_inline_body: provider_request_body.is_some(),
+            provider_request_body_ref: provider_request_body_ref.as_deref(),
+            provider_request_source_bytes: provider_source_bytes,
+            provider_request_unavailable: plan.body.body_bytes_b64.is_some(),
+            provider_request_unavailable_reason: plan
+                .body
+                .body_bytes_b64
+                .as_ref()
+                .map(|_| "body_bytes_base64_only"),
+        },
+    );
+    crate::body_capture::append_plan_body_capture_metadata(
+        &mut metadata,
+        plan.body.body_bytes_b64.as_deref(),
+    );
 
     (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
@@ -1026,23 +1147,6 @@ fn capture_usage_storage_value(value: Value) -> Value {
     })
 }
 
-fn build_plan_body_capture_metadata(plan: &ExecutionPlan) -> Option<Value> {
-    let mut metadata = Map::new();
-    append_plan_body_capture_metadata(plan, &mut metadata);
-    (!metadata.is_empty()).then_some(Value::Object(metadata))
-}
-
-fn append_plan_body_capture_metadata(plan: &ExecutionPlan, metadata: &mut Map<String, Value>) {
-    if let Some(body_bytes_b64) = plan.body.body_bytes_b64.as_deref() {
-        if let Some(decoded_len) = decoded_base64_len_hint(body_bytes_b64) {
-            metadata.insert(
-                "provider_request_body_base64_bytes".to_string(),
-                Value::Number(decoded_len.into()),
-            );
-        }
-    }
-}
-
 fn build_runtime_body_refs_seed(
     plan: &ExecutionPlan,
     context: Option<&Map<String, Value>>,
@@ -1053,6 +1157,32 @@ fn build_runtime_body_refs_seed(
             .or_else(|| non_empty_string(plan.body.body_ref.clone())),
         response_body_ref: context_string(context, "response_body_ref"),
         client_response_body_ref: context_string(context, "client_response_body_ref"),
+    }
+}
+
+fn build_runtime_body_states_seed(
+    plan: &ExecutionPlan,
+    context: Option<&Map<String, Value>>,
+) -> UsageBodyStatesSeed {
+    let request_body = context_body_value(context, "original_request_body");
+    let request_body_ref = context_string(context, "request_body_ref");
+    let provider_request_body = context_body_value(context, "provider_request_body")
+        .or_else(|| plan_json_body_capture_for_usage(plan));
+    let provider_request_body_ref = context_string(context, "provider_request_body_ref")
+        .or_else(|| non_empty_string(plan.body.body_ref.clone()));
+    let states = build_runtime_body_capture_states(
+        request_body.is_some(),
+        request_body_ref.as_deref(),
+        provider_request_body.is_some(),
+        provider_request_body_ref.as_deref(),
+        plan.body.body_bytes_b64.is_some(),
+    );
+
+    UsageBodyStatesSeed {
+        request_body_state: Some(states.request),
+        provider_request_body_state: Some(states.provider_request),
+        response_body_state: Some(UsageBodyCaptureState::None),
+        client_response_body_state: Some(UsageBodyCaptureState::None),
     }
 }
 
@@ -1079,26 +1209,6 @@ fn merge_body_refs_seed_with_metadata(
             .clone()
             .or_else(|| context_string(object, "client_response_body_ref")),
     }
-}
-
-fn build_payload_body_capture_metadata(
-    provider_body_base64: Option<&str>,
-    client_body_base64: Option<&str>,
-) -> Option<Value> {
-    let mut metadata = Map::new();
-    if let Some(decoded_len) = provider_body_base64.and_then(decoded_base64_len_hint) {
-        metadata.insert(
-            "provider_response_body_base64_bytes".to_string(),
-            Value::Number(decoded_len.into()),
-        );
-    }
-    if let Some(decoded_len) = client_body_base64.and_then(decoded_base64_len_hint) {
-        metadata.insert(
-            "client_response_body_base64_bytes".to_string(),
-            Value::Number(decoded_len.into()),
-        );
-    }
-    (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
 
 fn plan_json_body_capture_for_usage(plan: &ExecutionPlan) -> Option<Value> {
@@ -1438,38 +1548,6 @@ fn decode_body_for_storage(body_base64: Option<&str>) -> Option<Value> {
     Some(Value::String(body_base64.to_string()))
 }
 
-fn decoded_base64_len_hint(body_base64: &str) -> Option<u64> {
-    let body_base64 = body_base64.trim();
-    if body_base64.is_empty() {
-        return None;
-    }
-
-    let usable_len = body_base64.len();
-    if usable_len % 4 == 1 {
-        return None;
-    }
-
-    let padding = body_base64
-        .chars()
-        .rev()
-        .take_while(|char| *char == '=')
-        .count();
-    let full_quads = usable_len / 4;
-    let remainder = usable_len % 4;
-    let base_len = full_quads.saturating_mul(3);
-    let remainder_len = match remainder {
-        0 => 0,
-        2 => 1,
-        3 => 2,
-        _ => return None,
-    };
-    let decoded_len = base_len
-        .saturating_add(remainder_len)
-        .saturating_sub(padding.min(2));
-
-    Some(decoded_len as u64)
-}
-
 fn parse_sse_body_for_storage(text: &str) -> Option<Value> {
     if !text.contains("data:") {
         return None;
@@ -1641,14 +1719,15 @@ mod tests {
         build_terminal_usage_event_from_seed, build_usage_event_data_seed,
         extract_token_counts_from_json, headers_to_json, mask_header_value,
         mask_sensitive_headers_in_json_value, LifecycleUsageSeed, TerminalUsageSeed,
-        UsageBodyRefsSeed, UsageRoutingSeed, UsageTerminalState, MAX_USAGE_CAPTURE_BYTES,
-        MAX_USAGE_CAPTURE_DEPTH,
+        UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed, UsageTerminalState,
+        MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
     };
     use crate::{
         build_upsert_usage_record_from_event, GatewayStreamReportRequest, GatewaySyncReportRequest,
         UsageEvent, UsageEventData, UsageEventType,
     };
     use aether_contracts::{ExecutionPlan, RequestBody};
+    use aether_data_contracts::repository::usage::UsageBodyCaptureState;
     use base64::Engine as _;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -1933,10 +2012,13 @@ mod tests {
                     .expect("provider body should encode"),
                 ),
             ),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
             client_body_base64: Some(
                 base64::engine::general_purpose::STANDARD
                     .encode("data: {\"id\":\"chatcmpl_123\"}\n\ndata: [DONE]\n"),
             ),
+            client_body_state: Some(UsageBodyCaptureState::Inline),
+            terminal_summary: None,
             telemetry: None,
         };
 
@@ -2022,7 +2104,10 @@ mod tests {
             status_code: 200,
             headers: BTreeMap::new(),
             provider_body_base64: Some(base64::engine::general_purpose::STANDARD.encode(sse_body)),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
             client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
             telemetry: None,
         };
 
@@ -2350,9 +2435,12 @@ mod tests {
             provider_body_base64: Some(
                 base64::engine::general_purpose::STANDARD.encode(provider_bytes),
             ),
+            provider_body_state: Some(UsageBodyCaptureState::Inline),
             client_body_base64: Some(
                 base64::engine::general_purpose::STANDARD.encode(client_bytes),
             ),
+            client_body_state: Some(UsageBodyCaptureState::Inline),
+            terminal_summary: None,
             telemetry: None,
         };
 
@@ -2430,7 +2518,10 @@ mod tests {
             status_code: 200,
             headers: BTreeMap::new(),
             provider_body_base64: Some(base64::engine::general_purpose::STANDARD.encode(&sse_body)),
+            provider_body_state: Some(UsageBodyCaptureState::Truncated),
             client_body_base64: None,
+            client_body_state: Some(UsageBodyCaptureState::None),
+            terminal_summary: None,
             telemetry: None,
         };
 
@@ -2599,6 +2690,7 @@ mod tests {
             has_format_conversion: false,
             is_stream: false,
             body_refs: UsageBodyRefsSeed::default(),
+            body_states: UsageBodyStatesSeed::default(),
             routing: UsageRoutingSeed {
                 candidate_id: Some("cand-1".to_string()),
                 ..UsageRoutingSeed::default()
@@ -2639,6 +2731,7 @@ mod tests {
             })),
             audit_payload: None,
             standardized_usage: None,
+            terminal_summary: None,
         })
         .expect("usage event should build");
 
@@ -2726,6 +2819,7 @@ mod tests {
                 provider_endpoint_kind: Some("chat".to_string()),
                 has_format_conversion: Some(false),
                 is_stream: false,
+                body_states: UsageBodyStatesSeed::default(),
                 routing: UsageRoutingSeed {
                     candidate_id: Some("cand-1".to_string()),
                     ..UsageRoutingSeed::default()

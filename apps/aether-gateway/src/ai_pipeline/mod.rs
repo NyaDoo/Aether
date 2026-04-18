@@ -14,7 +14,9 @@ use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
 
 use self::contracts::ExecutionRuntimeAuthContext;
 
-pub(crate) use self::adaptation::maybe_build_provider_private_stream_normalizer;
+pub(crate) use self::adaptation::{
+    maybe_build_provider_private_stream_normalizer, ProviderPrivateStreamNormalizer,
+};
 pub(crate) use self::finalize::common::LocalCoreSyncFinalizeOutcome;
 pub(crate) use self::finalize::internal::{
     maybe_build_stream_response_rewriter, maybe_build_sync_finalize_outcome,

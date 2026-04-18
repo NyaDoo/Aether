@@ -91,7 +91,7 @@ pub use crate::finalize::standard::openai::stream::{
 };
 pub use crate::finalize::standard::stream_core::common::*;
 pub use crate::finalize::standard::stream_core::{
-    CanonicalStreamFrame, StreamingStandardFormatMatrix,
+    CanonicalStreamFrame, StreamingStandardFormatMatrix, StreamingStandardTerminalObserver,
 };
 pub use crate::finalize::sync_products::{
     aggregate_claude_stream_sync_response, aggregate_gemini_stream_sync_response,

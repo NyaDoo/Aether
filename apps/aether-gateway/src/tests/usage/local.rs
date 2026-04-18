@@ -12,6 +12,7 @@ use super::{
     UsageRuntimeConfig, DEVELOPMENT_ENCRYPTION_KEY, TRACE_ID_HEADER,
 };
 use crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER;
+use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 
 fn deep_nested_metadata(levels: usize) -> serde_json::Value {
     let mut current = json!({"leaf": "value"});
@@ -371,6 +372,144 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage() 
             .and_then(|value| value.get("child"))
             .and_then(|value| value.as_object())
             .map(|value| value.contains_key("depth")),
+        Some(true)
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_applies_system_max_request_body_size_to_local_openai_chat_sync_usage() {
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+
+    let upstream = Router::new().route(
+        "/api/internal/gateway/report-sync",
+        any(|_request: Request| async move { Json(json!({"ok": true})) }),
+    );
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(|_request: Request| async move {
+            Json(json!({
+                "request_id": "trace-openai-chat-local-report-sync-request-limit-123",
+                "status_code": 200,
+                "headers": {
+                    "content-type": "application/json"
+                },
+                "body": {
+                    "json_body": {
+                        "id": "chatcmpl-local-report-sync-request-limit-123",
+                        "object": "chat.completion",
+                        "model": "gpt-5-upstream",
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 2,
+                            "completion_tokens": 3,
+                            "total_tokens": 5
+                        }
+                    }
+                },
+                "telemetry": {
+                    "elapsed_ms": 25
+                }
+            }))
+        }),
+    );
+
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key(
+            "sk-client-openai-local-report-sync-request-limit",
+        )),
+        sample_local_openai_auth_snapshot(
+            "api-key-openai-usage-local-request-limit-1",
+            "user-openai-usage-local-request-limit-1",
+        ),
+    )]));
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_local_openai_candidate_row(),
+        ]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_local_openai_provider()],
+        vec![sample_local_openai_endpoint()],
+        vec![sample_local_openai_key()],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
+                auth_repository,
+                candidate_selection_repository,
+                provider_catalog_repository,
+                Arc::clone(&request_candidate_repository),
+                Arc::clone(&usage_repository),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            )
+            .with_system_config_values_for_tests([(
+                "max_request_body_size".to_string(),
+                json!(128),
+            )]),
+        )
+        .with_usage_runtime_for_tests(UsageRuntimeConfig {
+            enabled: true,
+            ..UsageRuntimeConfig::default()
+        });
+    let gateway = build_router_with_state(gateway_state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let request_body = serde_json::to_string(&json!({
+        "model": "gpt-5",
+        "messages": [{
+            "role": "user",
+            "content": "x".repeat(2048)
+        }]
+    }))
+    .expect("request should encode");
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            "Bearer sk-client-openai-local-report-sync-request-limit",
+        )
+        .header(
+            TRACE_ID_HEADER,
+            "trace-openai-chat-local-report-sync-request-limit-123",
+        )
+        .body(request_body)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-openai-chat-local-report-sync-request-limit-123",
+        "completed",
+    )
+    .await;
+    assert_eq!(stored_usage.total_tokens, 5);
+    assert_eq!(
+        stored_usage.request_body_state,
+        Some(UsageBodyCaptureState::Truncated)
+    );
+    assert_eq!(
+        stored_usage.provider_request_body_state,
+        Some(UsageBodyCaptureState::Truncated)
+    );
+    assert_eq!(
+        stored_usage
+            .request_body
+            .as_ref()
+            .and_then(|value| value.get("truncated"))
+            .and_then(|value| value.as_bool()),
         Some(true)
     );
 
@@ -1091,6 +1230,179 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
     assert_eq!(*decision_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*plan_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_preserves_stream_usage_when_max_response_body_size_truncates_capture() {
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+
+    let upstream = Router::new().route(
+        "/api/internal/gateway/report-stream",
+        any(|_request: Request| async move { Json(json!({"ok": true})) }),
+    );
+
+    let execution_runtime = Router::new().route(
+        "/v1/execute/stream",
+        any(|_request: Request| async move {
+            let delta_chunk = format!(
+                "data: {{\"id\":\"chatcmpl-local-report-stream-truncated-123\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                "x".repeat(2048)
+            );
+            let summary = json!({
+                "standardized_usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 4,
+                    "cache_creation_tokens": 0,
+                    "cache_creation_ephemeral_5m_tokens": 0,
+                    "cache_creation_ephemeral_1h_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cache_storage_token_hours": 0.0,
+                    "request_count": 1,
+                    "dimensions": {}
+                },
+                "finish_reason": "stop",
+                "response_id": "chatcmpl-local-report-stream-truncated-123",
+                "model": "gpt-5-upstream",
+                "observed_finish": true
+            });
+            let frames = [
+                json!({
+                    "type": "headers",
+                    "payload": {
+                        "kind": "headers",
+                        "status_code": 200,
+                        "headers": {"content-type": "text/event-stream"}
+                    }
+                }),
+                json!({
+                    "type": "data",
+                    "payload": {"kind": "data", "text": delta_chunk}
+                }),
+                json!({
+                    "type": "data",
+                    "payload": {"kind": "data", "text": "data: [DONE]\\n\\n"}
+                }),
+                json!({
+                    "type": "telemetry",
+                    "payload": {
+                        "kind": "telemetry",
+                        "telemetry": {"elapsed_ms": 31, "ttfb_ms": 11}
+                    }
+                }),
+                json!({
+                    "type": "eof",
+                    "payload": {"kind": "eof", "summary": summary}
+                }),
+            ]
+            .into_iter()
+            .map(|frame| serde_json::to_string(&frame).expect("frame should encode"))
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n";
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(frames))
+                .expect("response should build");
+            response.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-ndjson"),
+            );
+            response
+        }),
+    );
+
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key(
+            "sk-client-openai-local-report-stream-truncated",
+        )),
+        sample_local_openai_auth_snapshot(
+            "api-key-openai-usage-local-stream-truncated-1",
+            "user-openai-usage-local-stream-truncated-1",
+        ),
+    )]));
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_local_openai_candidate_row(),
+        ]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_local_openai_provider()],
+        vec![sample_local_openai_endpoint()],
+        vec![sample_local_openai_key()],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
+                auth_repository,
+                candidate_selection_repository,
+                provider_catalog_repository,
+                Arc::clone(&request_candidate_repository),
+                Arc::clone(&usage_repository),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            )
+            .with_system_config_values_for_tests([(
+                "max_response_body_size".to_string(),
+                json!(128),
+            )]),
+        )
+        .with_usage_runtime_for_tests(UsageRuntimeConfig {
+            enabled: true,
+            ..UsageRuntimeConfig::default()
+        });
+    let gateway = build_router_with_state(gateway_state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            "Bearer sk-client-openai-local-report-stream-truncated",
+        )
+        .header(
+            TRACE_ID_HEADER,
+            "trace-openai-chat-local-report-stream-truncated-123",
+        )
+        .body("{\"model\":\"gpt-5\",\"messages\":[],\"stream\":true}")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response.text().await.expect("stream body should read");
+    assert!(body_text.contains("chatcmpl-local-report-stream-truncated-123"));
+
+    let stored_usage = wait_for_usage_status(
+        usage_repository.as_ref(),
+        "trace-openai-chat-local-report-stream-truncated-123",
+        "completed",
+    )
+    .await;
+    assert_eq!(stored_usage.total_tokens, 6);
+    assert_eq!(
+        stored_usage.response_body_state,
+        Some(UsageBodyCaptureState::Truncated)
+    );
+    assert_eq!(
+        stored_usage.client_response_body_state,
+        Some(UsageBodyCaptureState::Truncated)
+    );
+    assert_eq!(
+        stored_usage
+            .response_body
+            .as_ref()
+            .and_then(|value| value.get("truncated"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

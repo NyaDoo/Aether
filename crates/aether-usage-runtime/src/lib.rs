@@ -1,3 +1,4 @@
+mod body_capture;
 pub mod config;
 pub mod event;
 mod executor;
@@ -13,6 +14,10 @@ pub mod usage_mapper;
 pub mod worker;
 pub mod write;
 
+pub use body_capture::{
+    apply_usage_body_capture_policy_to_event, apply_usage_body_capture_policy_to_record,
+    UsageBodyCaptureEngine,
+};
 pub use config::UsageRuntimeConfig;
 pub use event::{now_ms, UsageEvent, UsageEventData, UsageEventType, USAGE_EVENT_VERSION};
 pub use queue::UsageQueue;
@@ -31,7 +36,9 @@ pub use report_context::{
     build_locally_actionable_report_context_from_video_task, report_context_is_locally_actionable,
 };
 pub use runtime::{
-    UsageBillingEventEnricher, UsageRequestRecordLevel, UsageRuntime, UsageRuntimeAccess,
+    UsageBillingEventEnricher, UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntime,
+    UsageRuntimeAccess, DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES,
+    DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
 pub use settlement::{settle_usage_if_needed, UsageSettlementWriter};
 pub use standardized_usage::StandardizedUsage;

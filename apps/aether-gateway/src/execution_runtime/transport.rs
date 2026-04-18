@@ -18,6 +18,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::tls::Version;
 use serde::Serialize;
+use serde_json::json;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -147,6 +148,8 @@ pub(crate) struct DirectUpstreamStreamExecution {
     pub(crate) candidate_id: Option<String>,
     pub(crate) status_code: u16,
     pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) provider_api_format: String,
+    pub(crate) stream_summary_report_context: Value,
     pub(crate) response: DirectUpstreamResponse,
     pub(crate) started_at: Instant,
 }
@@ -226,11 +229,15 @@ impl DirectSyncExecutionRuntime {
         let status_code = response.status().as_u16();
         let headers = collect_response_headers(response.headers());
 
+        let stream_summary_report_context = build_stream_summary_report_context(&plan);
+
         Ok(DirectUpstreamStreamExecution {
             request_id: plan.request_id,
             candidate_id: plan.candidate_id,
             status_code,
             headers,
+            provider_api_format: plan.provider_api_format.clone(),
+            stream_summary_report_context,
             response: DirectUpstreamResponse::Reqwest(response),
             started_at,
         })
@@ -310,9 +317,18 @@ pub(crate) async fn execute_stream_plan_via_local_tunnel(
         candidate_id: plan.candidate_id.clone(),
         status_code,
         headers,
+        provider_api_format: plan.provider_api_format.clone(),
+        stream_summary_report_context: build_stream_summary_report_context(plan),
         response: DirectUpstreamResponse::LocalTunnel(response),
         started_at,
     }))
+}
+
+fn build_stream_summary_report_context(plan: &ExecutionPlan) -> Value {
+    json!({
+        "provider_api_format": plan.provider_api_format,
+        "model": plan.model_name,
+    })
 }
 
 async fn execute_sync_plan_via_local_tunnel(

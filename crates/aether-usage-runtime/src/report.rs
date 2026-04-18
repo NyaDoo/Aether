@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use aether_contracts::ExecutionTelemetry;
+use aether_contracts::{ExecutionStreamTerminalSummary, ExecutionTelemetry};
+use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,7 +38,13 @@ pub struct GatewayStreamReportRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_body_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_body_state: Option<UsageBodyCaptureState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_body_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_body_state: Option<UsageBodyCaptureState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_summary: Option<ExecutionStreamTerminalSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<ExecutionTelemetry>,
 }

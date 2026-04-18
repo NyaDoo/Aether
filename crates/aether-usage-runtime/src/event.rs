@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 use aether_data_contracts::DataLayerError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,11 +97,15 @@ pub struct UsageEventData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_state: Option<UsageBodyCaptureState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_request_headers: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_request_body: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_request_body_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_body_state: Option<UsageBodyCaptureState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,11 +113,15 @@ pub struct UsageEventData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_body_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_state: Option<UsageBodyCaptureState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_response_headers: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_response_body: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_response_body_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_response_body_state: Option<UsageBodyCaptureState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

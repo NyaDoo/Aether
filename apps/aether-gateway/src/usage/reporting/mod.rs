@@ -144,7 +144,10 @@ pub(crate) async fn submit_stream_report(
             status_code: payload.status_code,
             headers: payload.headers.clone(),
             provider_body_base64: payload.provider_body_base64.clone(),
+            provider_body_state: payload.provider_body_state,
             client_body_base64: payload.client_body_base64.clone(),
+            client_body_state: payload.client_body_state,
+            terminal_summary: payload.terminal_summary.clone(),
             telemetry: payload.telemetry.clone(),
         };
         if should_handle_local_stream_report(
@@ -637,7 +640,10 @@ mod tests {
                 status_code: 200,
                 headers: BTreeMap::new(),
                 provider_body_base64: None,
+                provider_body_state: None,
                 client_body_base64: None,
+                client_body_state: None,
+                terminal_summary: None,
                 telemetry: None,
             },
         )
@@ -751,7 +757,10 @@ mod tests {
                 status_code: 200,
                 headers: sample_codex_paid_headers(),
                 provider_body_base64: None,
+                provider_body_state: None,
                 client_body_base64: None,
+                client_body_state: None,
+                terminal_summary: None,
                 telemetry: None,
             },
         )
