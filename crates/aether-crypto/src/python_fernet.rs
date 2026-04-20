@@ -3,7 +3,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use cbc::{Decryptor, Encryptor};
 use hmac::{Hmac, Mac};
@@ -222,6 +222,7 @@ fn raw_fernet_key(secret: &str) -> [u8; 32] {
 fn decode_direct_fernet_key(secret: &str) -> Result<[u8; 32], PythonFernetError> {
     let decoded = URL_SAFE
         .decode(secret)
+        .or_else(|_| STANDARD.decode(secret))
         .map_err(|_| PythonFernetError::InvalidInnerBase64)?;
     let raw_key: [u8; 32] = decoded
         .as_slice()
@@ -263,6 +264,16 @@ mod tests {
     fn passes_through_existing_fernet_key_secret() {
         let direct_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
         assert_eq!(derive_python_fernet_key(direct_key), direct_key);
+    }
+
+    #[test]
+    fn decrypts_legacy_python_ciphertext_with_direct_fernet_key() {
+        let direct_key = "h0Wzfv1ieDOgsmGELpKEV7qH8QpFP+lRnPW4pI0g4/M=";
+        let ciphertext = "Z0FBQUFBQnA1YjlRNXowblFSVWYyVzdOT1VQbXBsQWY3RHF5UTFkaGtwbmsweWkyVTVLdExFSGYwSVE2aUNMOXhzdkNCSTlOUTRlOEFEbFlTN25jc0xFQ2xkWEpQaEkxTzhGMGhrUXFsQnlUN3JRRUdOcndWelU9";
+        let plaintext = decrypt_python_fernet_ciphertext(direct_key, ciphertext)
+            .expect("legacy ciphertext should decrypt");
+
+        assert_eq!(plaintext, "sk-sanitized-regression-token");
     }
 
     #[test]
