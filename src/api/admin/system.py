@@ -559,9 +559,28 @@ async def purge_audit_logs(request: Request, db: Session = Depends(get_db)) -> A
 
 @router.post("/purge/request-bodies")
 async def purge_request_bodies(request: Request, db: Session = Depends(get_db)) -> Any:
-    """清空全部请求体（管理员）"""
+    """提交"清空请求体"异步任务（管理员）。
+
+    请求体可选 `{ "cutoff_days": 7 | 30 | 90 | null }`。不传或 null 表示全部清空。
+    响应 `{ task_id, status, reused, total_cleaned }`，前端需轮询 status 端点查进度。
+    """
     adapter = AdminPurgeRequestBodiesAdapter()
     return await pipeline.run(adapter=adapter, http_request=request, db=db, mode=adapter.mode)
+
+
+@router.get("/purge/request-bodies/status/{task_id}")
+async def purge_request_bodies_status(
+    task_id: str, request: Request, db: Session = Depends(get_db)
+) -> Any:
+    """查询"清空请求体"任务状态（管理员）。"""
+    adapter = AdminPurgeRequestBodiesStatusAdapter()
+    return await pipeline.run(
+        adapter=adapter,
+        http_request=request,
+        db=db,
+        mode=adapter.mode,
+        path_params={"task_id": task_id},
+    )
 
 
 @router.post("/purge/stats")
@@ -3492,47 +3511,24 @@ def _purge_audit_logs_sync() -> dict[str, Any]:
 
 
 def _purge_request_bodies_sync() -> dict[str, Any]:
-    with get_db_context() as db:
-        with_body = int(
-            db.query(func.count(Usage.id))
-            .filter(
-                (Usage.request_body.isnot(None))
-                | (Usage.response_body.isnot(None))
-                | (Usage.provider_request_body.isnot(None))
-                | (Usage.client_response_body.isnot(None))
-                | (Usage.request_body_compressed.isnot(None))
-                | (Usage.response_body_compressed.isnot(None))
-                | (Usage.provider_request_body_compressed.isnot(None))
-                | (Usage.client_response_body_compressed.isnot(None))
-            )
-            .scalar()
-            or 0
-        )
+    """保留仅用于单元测试/命令行工具的同步全量清理入口。
 
-        db.query(Usage).update(
-            {
-                Usage.request_body: None,
-                Usage.response_body: None,
-                Usage.provider_request_body: None,
-                Usage.client_response_body: None,
-                Usage.request_body_compressed: None,
-                Usage.response_body_compressed: None,
-                Usage.provider_request_body_compressed: None,
-                Usage.client_response_body_compressed: None,
-                Usage.request_headers: None,
-                Usage.response_headers: None,
-                Usage.provider_request_headers: None,
-                Usage.client_response_headers: None,
-            },
-            synchronize_session=False,
-        )
+    生产环境的"清空请求体"按钮走
+    `src.services.system.purge_task.start_purge_request_bodies` 异步路径，
+    因此这里不再由 HTTP adapter 调用。
+    """
+    from src.services.system.purge_task import _run_purge_sync  # type: ignore
 
-        return {
-            "message": "请求体已清空",
-            "cleaned": {
-                "records_with_body": with_body,
-            },
-        }
+    def _noop(_: int) -> None:
+        return None
+
+    total = _run_purge_sync(cutoff=None, batch_size=2000, progress_cb=_noop)
+    return {
+        "message": "请求体已清空",
+        "cleaned": {
+            "records_with_body": total,
+        },
+    }
 
 
 def _purge_stats_sync() -> dict[str, Any]:
@@ -3630,8 +3626,40 @@ class AdminPurgeAuditLogsAdapter(AdminApiAdapter):
 
 class AdminPurgeRequestBodiesAdapter(AdminApiAdapter):
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        """清空全部请求体/响应体（保留使用记录的统计信息）"""
-        return await run_in_threadpool(_purge_request_bodies_sync)
+        """启动异步清空请求体任务，立即返回 task_id。"""
+        from src.services.system.purge_task import start_purge_request_bodies
+
+        cutoff_days: int | None = None
+        try:
+            raw = await context.ensure_raw_body_async()
+            if raw:
+                payload = json.loads(raw.decode("utf-8"))
+                if isinstance(payload, dict):
+                    value = payload.get("cutoff_days")
+                    if value is not None:
+                        cutoff_days = int(value)
+                        if cutoff_days <= 0:
+                            cutoff_days = None
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="请求体必须是 {cutoff_days: int|null} 的合法 JSON"
+            ) from exc
+
+        return await start_purge_request_bodies(cutoff_days)
+
+
+class AdminPurgeRequestBodiesStatusAdapter(AdminApiAdapter):
+    async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
+        """查询清空请求体任务状态。"""
+        from src.services.system.purge_task import get_purge_task_status
+
+        task_id = context.path_params.get("task_id")
+        if not task_id:
+            raise HTTPException(status_code=400, detail="缺少 task_id")
+        status = await get_purge_task_status(str(task_id))
+        if not status:
+            raise HTTPException(status_code=404, detail="任务不存在或已过期")
+        return status
 
 
 class AdminPurgeStatsAdapter(AdminApiAdapter):
