@@ -157,6 +157,9 @@ class StreamContext:
     perf_sampled: bool = False
     perf_metrics: dict[str, Any] = field(default_factory=dict)
 
+    # Provider behavior 请求级缓存（同一流生命周期内 provider_type/api_format 不变，避免每 chunk 重复查询）
+    _cached_behavior: Any = field(default=None, repr=False, compare=False)
+
     # 代理信息（用于 usage 记录和日志，含 ttfb_ms）
     proxy_info: dict[str, Any] | None = None
 
