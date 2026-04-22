@@ -12,7 +12,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import Any
 
-from sqlalchemy.exc import DatabaseError, IntegrityError
+from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
@@ -200,6 +200,11 @@ def retry_on_database_error(max_retries: int = 3, delay: float = 0.1) -> Any:
     """
     数据库错误重试装饰器
 
+    只对瞬时错误（OperationalError：死锁、连接抖动、序列化失败等）进行重试。
+    对 IntegrityError（外键/唯一/非空约束违反）以及其他 DatabaseError 子类
+    （DataError/ProgrammingError 等）直接抛出，不重试——这些都是确定性失败，
+    重试只会浪费时间和数据库连接。
+
     Args:
         max_retries: 最大重试次数
         delay: 重试延迟（秒）
@@ -217,7 +222,21 @@ def retry_on_database_error(max_retries: int = 3, delay: float = 0.1) -> Any:
                 try:
                     return func(*args, **kwargs)
 
-                except (DatabaseError, IntegrityError) as e:
+                except IntegrityError:
+                    # 确定性错误：约束违反，重试无意义，直接回滚并抛出
+                    if db_session is not None:
+                        try:
+                            db_session.rollback()
+                        except Exception as rollback_error:
+                            logger.warning(
+                                "数据库约束违反后回滚 Session 失败: {} - {}",
+                                type(rollback_error).__name__,
+                                str(rollback_error),
+                            )
+                    raise
+
+                except OperationalError as e:
+                    # 瞬时错误：允许重试
                     if db_session is not None:
                         try:
                             db_session.rollback()
@@ -241,6 +260,20 @@ def retry_on_database_error(max_retries: int = 3, delay: float = 0.1) -> Any:
                             f"数据库操作最终失败，已达最大重试次数({max_retries}): {func.__name__} - {str(e)}"
                         )
                         raise
+
+                except DatabaseError:
+                    # 其他 DatabaseError 子类（DataError / ProgrammingError 等）
+                    # 均为确定性错误，不重试
+                    if db_session is not None:
+                        try:
+                            db_session.rollback()
+                        except Exception as rollback_error:
+                            logger.warning(
+                                "数据库错误后回滚 Session 失败: {} - {}",
+                                type(rollback_error).__name__,
+                                str(rollback_error),
+                            )
+                    raise
 
         return wrapper
 
