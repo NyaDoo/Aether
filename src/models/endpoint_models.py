@@ -326,7 +326,7 @@ class ProviderEndpointCreate(BaseModel):
     api_format: str = Field(
         ...,
         description=(
-            "Endpoint signature（例如: claude:chat/claude:cli, openai:chat/openai:cli/openai:compact/openai:video, gemini:chat/gemini:cli/gemini:video）"
+            "Endpoint signature（例如: claude:chat/claude:cli, openai:chat/openai:cli/openai:compact/openai:video/openai:image, gemini:chat/gemini:cli/gemini:video）"
         ),
     )
     base_url: str = Field(..., min_length=1, max_length=500, description="API 基础 URL")

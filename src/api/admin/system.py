@@ -871,6 +871,7 @@ class AdminGetApiFormatsAdapter(AdminApiAdapter):
             "openai:cli",
             "openai:compact",
             "openai:video",
+            "openai:image",
             "claude:chat",
             "claude:cli",
             "gemini:chat",

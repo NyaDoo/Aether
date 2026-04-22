@@ -865,6 +865,7 @@ export const MOCK_API_FORMATS = {
     { value: 'openai:chat', label: 'OpenAI Chat', default_path: '/v1/chat/completions', aliases: [] },
     { value: 'openai:cli', label: 'OpenAI CLI', default_path: '/v1/responses', aliases: [] },
     { value: 'openai:video', label: 'OpenAI Video', default_path: '/v1/videos', aliases: [] },
+    { value: 'openai:image', label: 'OpenAI Image', default_path: '/v1/images/generations', aliases: [] },
     { value: 'gemini:chat', label: 'Gemini Chat', default_path: '/v1beta/models/{model}:{action}', aliases: [] },
     { value: 'gemini:cli', label: 'Gemini CLI', default_path: '/v1beta/models/{model}:{action}', aliases: [] },
     { value: 'gemini:video', label: 'Gemini Video', default_path: '/v1beta/models/{model}:predictLongRunning', aliases: [] }

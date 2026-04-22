@@ -344,14 +344,28 @@ def register_all() -> None:
     from src.core.api_format.capabilities import register_provider_format_capability
     from src.core.provider_oauth_utils import register_auth_enricher
     from src.services.model.upstream_fetcher import UpstreamModelsFetcherRegistry
+    from src.services.provider.body_transformer import register_body_transformer
     from src.services.provider.transport import register_transport_hook
     from src.services.provider.upstream_headers import register_upstream_headers_hook
+
+    from src.services.provider.adapters.codex.image_transform import (
+        transform_image_request_to_responses,
+    )
 
     # Transport
     register_transport_hook("codex", "openai:cli", build_codex_url)
     register_transport_hook("codex", "openai:compact", build_codex_url)
+    register_transport_hook("codex", "openai:image", build_codex_url)
     register_upstream_headers_hook("codex", "openai:cli", build_codex_cli_headers)
     register_upstream_headers_hook("codex", "openai:compact", build_codex_compact_headers)
+    register_upstream_headers_hook("codex", "openai:image", build_codex_cli_headers)
+
+    # Body transformer: Codex image reverse proxy rewrites the full request body
+    register_body_transformer(
+        "codex",
+        "openai:image",
+        transform_image_request_to_responses,
+    )
 
     # Auth
     register_auth_enricher("codex", enrich_codex)
@@ -372,6 +386,14 @@ def register_all() -> None:
         same_format_variant="codex",
         cross_format_variant="codex",
         default_body_rules=CODEX_DEFAULT_BODY_RULES,
+    )
+    # Codex image 走 responses payload，不复用 CLI 的 body_rules
+    register_provider_format_capability(
+        "codex",
+        "openai:image",
+        same_format_variant="codex",
+        cross_format_variant="codex",
+        default_body_rules=(),
     )
 
     # Export: Codex uses the default export builder (strip null + temp fields)
