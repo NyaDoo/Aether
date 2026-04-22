@@ -76,10 +76,6 @@ class CandidateResolver:
         Raises:
             ProviderNotAvailableException: 没有找到任何可用候选时
         """
-        all_candidates: list[ProviderCandidate] = []
-        provider_offset = 0
-        provider_batch_size = 20
-        global_model_id: str | None = None
         api_format_norm = normalize_endpoint_signature(api_format)
 
         logger.debug(
@@ -88,40 +84,20 @@ class CandidateResolver:
             api_format_norm,
         )
 
-        while True:
-            candidates, resolved_global_model_id, provider_batch_count = (
-                await self.cache_scheduler.list_all_candidates(
-                    db=self.db,
-                    api_format=api_format_norm,
-                    model_name=model_name,
-                    affinity_key=affinity_key,
-                    user_api_key=user_api_key,
-                    provider_offset=provider_offset,
-                    provider_limit=provider_batch_size,
-                    is_stream=is_stream,
-                    capability_requirements=capability_requirements,
-                    request_body=request_body,
-                )
-            )
-
-            logger.debug(
-                "[CandidateResolver] list_all_candidates batch: offset={}, providers={}, returned={} candidates",
-                provider_offset,
-                provider_batch_count,
-                len(candidates),
-            )
-
-            if resolved_global_model_id and global_model_id is None:
-                global_model_id = resolved_global_model_id
-
-            if provider_batch_count == 0:
-                break
-
-            all_candidates.extend(candidates)
-            provider_offset += provider_batch_size
-
-            if provider_batch_count < provider_batch_size:
-                break
+        # 一次性全量获取：分页后仍要走 reorder_candidates 全局重排，
+        # 分页不会降低工作量，只会让 DB 查询翻倍（Provider × UserGroup 每页都查）。
+        all_candidates, global_model_id, _ = await self.cache_scheduler.list_all_candidates(
+            db=self.db,
+            api_format=api_format_norm,
+            model_name=model_name,
+            affinity_key=affinity_key,
+            user_api_key=user_api_key,
+            provider_offset=0,
+            provider_limit=None,
+            is_stream=is_stream,
+            capability_requirements=capability_requirements,
+            request_body=request_body,
+        )
 
         logger.debug(
             "[CandidateResolver] fetch_candidates completed: total={} candidates",
