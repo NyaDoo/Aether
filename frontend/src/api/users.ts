@@ -50,12 +50,15 @@ export interface UpdateUserRequest {
   group_id?: string | null
 }
 
+export type UserGroupSchedulingMode = 'cache_affinity' | 'load_balance' | 'fixed_order'
+
 export interface UserGroup {
   id: string
   name: string
   description?: string | null
   is_default: boolean
   allowed_api_formats: string[] | null
+  scheduling_mode: UserGroupSchedulingMode
   model_group_bindings: UserGroupModelGroupBindingResponse[]
   rate_limit?: number | null
   user_count: number
@@ -79,6 +82,7 @@ export interface CreateUserGroupRequest {
   name: string
   description?: string | null
   allowed_api_formats?: string[] | null
+  scheduling_mode?: UserGroupSchedulingMode
   model_group_bindings?: UserGroupModelGroupBinding[] | null
   rate_limit?: number | null
 }

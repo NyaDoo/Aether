@@ -39,6 +39,7 @@ from src.services.user.bulk_cleanup import pre_clean_api_key
 from src.services.user.group_service import UserGroupService
 from src.services.user.service import UserService
 from src.services.wallet import WalletService
+from src.services.scheduling.scheduling_config import SchedulingConfig
 
 router = APIRouter(prefix="/api/admin/users", tags=["Admin - Users"])
 pipeline = get_pipeline()
@@ -145,6 +146,9 @@ def _serialize_user_group(group: UserGroup, user_count: int = 0) -> dict[str, An
         "allowed_api_formats": group.allowed_api_formats,
         "model_group_bindings": model_group_bindings,
         "rate_limit": group.rate_limit,
+        "scheduling_mode": SchedulingConfig.normalize_scheduling_mode(
+            getattr(group, "scheduling_mode", None)
+        ),
         "user_count": int(user_count),
         "created_at": group.created_at.isoformat(),
         "updated_at": group.updated_at.isoformat() if group.updated_at else None,
@@ -310,12 +314,14 @@ def _create_user_group_sync(
             description=request.description,
             allowed_api_formats=request.allowed_api_formats,
             rate_limit=request.rate_limit,
+            scheduling_mode=request.scheduling_mode,
             model_group_bindings=model_group_bindings,
         )
         return _serialize_user_group(group, 0), {
             "action": "create_user_group",
             "group_id": group.id,
             "group_name": group.name,
+            "scheduling_mode": getattr(group, "scheduling_mode", None),
         }
 
 

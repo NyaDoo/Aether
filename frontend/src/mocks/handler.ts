@@ -151,21 +151,16 @@ function syncMockUserAccess(user: (typeof MOCK_ALL_USERS)[number]) {
   )
   user.effective_allowed_models = effectiveModels.length > 0 ? effectiveModels : null
 
-  const hasInheritedRouting = linkedModelGroups.some(modelGroup => modelGroup?.routing_mode !== 'custom')
-  if (hasInheritedRouting) {
-    user.effective_allowed_providers = null
-  } else {
-    const providerIds = Array.from(
-      new Set(
-        linkedModelGroups.flatMap(modelGroup =>
-          (modelGroup?.routes || [])
-            .filter(route => route.is_active)
-            .map(route => route.provider_id),
-        ),
+  const providerIds = Array.from(
+    new Set(
+      linkedModelGroups.flatMap(modelGroup =>
+        (modelGroup?.routes || [])
+          .filter(route => route.is_active)
+          .map(route => route.provider_id),
       ),
-    )
-    user.effective_allowed_providers = providerIds.length > 0 ? providerIds : null
-  }
+    ),
+  )
+  user.effective_allowed_providers = providerIds.length > 0 ? providerIds : null
   user.effective_rate_limit = group?.rate_limit ?? null
 }
 
@@ -188,7 +183,6 @@ function getMockModelGroupsList() {
     display_name: group.display_name,
     description: group.description ?? null,
     default_user_billing_multiplier: group.default_user_billing_multiplier,
-    routing_mode: group.routing_mode,
     is_default: group.is_default,
     is_active: group.is_active,
     sort_order: group.sort_order,
@@ -1969,7 +1963,6 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
       display_name: body.display_name || body.name,
       description: body.description ?? null,
       default_user_billing_multiplier: body.default_user_billing_multiplier ?? 1,
-      routing_mode: body.routing_mode ?? 'inherit',
       is_default: false,
       is_active: body.is_active !== false,
       sort_order: body.sort_order ?? 100,
@@ -1988,7 +1981,6 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
           priority: Number(route.priority ?? 50),
           user_billing_multiplier_override: route.user_billing_multiplier_override == null ? null : Number(route.user_billing_multiplier_override),
           is_active: route.is_active !== false,
-          notes: route.notes ? String(route.notes) : null,
         }))
         : [],
       user_groups: [],
@@ -2852,7 +2844,6 @@ registerDynamicRoute('POST', '/api/admin/endpoints/providers/:providerId/keys', 
     rate_multiplier: body.rate_multiplier ?? 1.0,
     rate_multipliers: body.rate_multipliers ?? null,
     internal_priority: body.internal_priority ?? 50,
-    global_priority: body.global_priority ?? null,
     rpm_limit: body.rpm_limit ?? null,
     allowed_models: body.allowed_models ?? null,
     capabilities: body.capabilities ?? null,
@@ -3078,7 +3069,6 @@ mockHandlers['GET /api/admin/endpoints/keys/grouped-by-format'] = async () => {
           api_format: fmt,
           provider_name: provider.name,
           pool_enabled: Boolean((provider.config as Record<string, unknown> | undefined)?.pool_advanced),
-          global_priority: key.global_priority ?? null,
           circuit_breaker_open: false,
           capabilities: [],
         })
@@ -3253,7 +3243,6 @@ registerDynamicRoute('PATCH', '/api/admin/models/groups/:groupId', async (config
   if ('default_user_billing_multiplier' in body && body.default_user_billing_multiplier != null) {
     group.default_user_billing_multiplier = Number(body.default_user_billing_multiplier)
   }
-  if ('routing_mode' in body && body.routing_mode != null) group.routing_mode = body.routing_mode
   if ('is_active' in body && body.is_active != null) group.is_active = Boolean(body.is_active)
   if ('sort_order' in body && body.sort_order != null) group.sort_order = Number(body.sort_order)
   if ('routes' in body) {
@@ -3269,7 +3258,6 @@ registerDynamicRoute('PATCH', '/api/admin/models/groups/:groupId', async (config
         priority: Number(route.priority ?? 50),
         user_billing_multiplier_override: route.user_billing_multiplier_override == null ? null : Number(route.user_billing_multiplier_override),
         is_active: route.is_active !== false,
-        notes: route.notes ? String(route.notes) : null,
       }))
       : []
   }

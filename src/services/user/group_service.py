@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from src.models.database import User, UserGroup, UserGroupModelGroup
 from src.services.model.group_service import ModelGroupBindingPayload, ModelGroupService
+from src.services.scheduling.scheduling_config import SchedulingConfig
 from src.utils.transaction_manager import retry_on_database_error, transactional
 
 DEFAULT_USER_GROUP_NAME = "默认分组"
@@ -54,41 +55,19 @@ class UserGroupService:
         )
 
     @staticmethod
-    def get_or_create_default_group(db: Session, *, commit: bool = False) -> UserGroup:
+    def get_required_default_group(db: Session) -> UserGroup:
         group = UserGroupService.get_default_group(db)
         if group is not None:
             return group
 
         group = UserGroupService.get_group_by_name(db, DEFAULT_USER_GROUP_NAME)
-        if group is None:
-            group = UserGroup(
-                name=DEFAULT_USER_GROUP_NAME,
-                description=DEFAULT_USER_GROUP_DESCRIPTION,
-                is_default=True,
-                allowed_api_formats=None,
-                rate_limit=None,
-            )
-            db.add(group)
-            db.flush()
-            ModelGroupService.ensure_user_group_default_binding(db, group, commit=False)
-        else:
-            group.is_default = True
-            if not group.description:
-                group.description = DEFAULT_USER_GROUP_DESCRIPTION
-            group.updated_at = datetime.now(timezone.utc)
-            db.flush()
-            ModelGroupService.ensure_user_group_default_binding(db, group, commit=False)
+        if group is not None:
+            return group
 
-        if commit:
-            db.commit()
-            db.refresh(group)
-        else:
-            db.flush()
-        return group
+        raise ValueError("默认用户分组不存在，请先初始化系统默认用户分组")
 
     @staticmethod
     def list_groups(db: Session) -> list[tuple[UserGroup, int]]:
-        UserGroupService.get_or_create_default_group(db, commit=True)
         user_count = func.count(User.id).label("user_count")
         return (
             db.query(UserGroup, user_count)
@@ -108,6 +87,7 @@ class UserGroupService:
         description: str | None = None,
         allowed_api_formats: list[str] | None = None,
         rate_limit: int | None = None,
+        scheduling_mode: str = SchedulingConfig.SCHEDULING_MODE_CACHE_AFFINITY,
         model_group_bindings: list[ModelGroupBindingPayload] | None = None,
     ) -> UserGroup:
         if UserGroupService.get_group_by_name(db, name):
@@ -119,6 +99,7 @@ class UserGroupService:
             is_default=False,
             allowed_api_formats=allowed_api_formats,
             rate_limit=rate_limit,
+            scheduling_mode=SchedulingConfig.normalize_scheduling_mode(scheduling_mode),
         )
         db.add(group)
         db.flush()
@@ -134,8 +115,10 @@ class UserGroupService:
             ModelGroupService.ensure_user_group_default_binding(db, group, commit=False)
 
         db.commit()
-        db.refresh(group)
-        return group
+        created = UserGroupService.get_group(db, str(group.id))
+        if created is None:
+            raise ValueError("用户分组创建后读取失败")
+        return created
 
     @staticmethod
     @transactional()
@@ -150,11 +133,20 @@ class UserGroupService:
             if existing and existing.id != group_id:
                 raise ValueError(f"用户分组已存在: {kwargs['name']}")
 
-        updatable_fields = ["name", "description", "allowed_api_formats", "rate_limit"]
+        updatable_fields = [
+            "name",
+            "description",
+            "allowed_api_formats",
+            "rate_limit",
+            "scheduling_mode",
+        ]
         nullable_fields = ["description", "allowed_api_formats", "rate_limit"]
 
         for field, value in kwargs.items():
             if field not in updatable_fields:
+                continue
+            if field == "scheduling_mode" and value is not None:
+                setattr(group, field, SchedulingConfig.normalize_scheduling_mode(value))
                 continue
             if field in nullable_fields:
                 setattr(group, field, value)
@@ -169,13 +161,13 @@ class UserGroupService:
                 bindings,
                 commit=False,
             )
-        elif group.is_default and not group.model_group_links:
-            ModelGroupService.ensure_user_group_default_binding(db, group, commit=False)
 
         group.updated_at = datetime.now(timezone.utc)
         db.commit()
-        db.refresh(group)
-        return group
+        updated = UserGroupService.get_group(db, str(group.id))
+        if updated is None:
+            raise ValueError("用户分组更新后读取失败")
+        return updated
 
     @staticmethod
     @transactional()
@@ -193,6 +185,43 @@ class UserGroupService:
         if int(assigned_users) > 0:
             raise ValueError("该分组仍有关联用户，请先移除分组成员")
 
+        # 订阅产品/计划通过外键 RESTRICT 引用分组，必须前置检查以避免数据库层面的
+        # IntegrityError 上浮为 500。延迟 import 避免与订阅服务循环依赖。
+        from src.models.database import SubscriptionPlan, SubscriptionProduct
+
+        plan_count = int(
+            db.query(func.count(SubscriptionPlan.id))
+            .filter(SubscriptionPlan.user_group_id == group_id)
+            .scalar()
+            or 0
+        )
+        if plan_count > 0:
+            raise ValueError(
+                f"该分组仍被 {plan_count} 个订阅计划引用，请先删除或改绑相关订阅计划"
+            )
+
+        product_count = int(
+            db.query(func.count(SubscriptionProduct.id))
+            .filter(SubscriptionProduct.user_group_id == group_id)
+            .scalar()
+            or 0
+        )
+        if product_count > 0:
+            raise ValueError(
+                f"该分组仍被 {product_count} 个订阅产品引用，请先删除或改绑相关订阅产品"
+            )
+
         db.delete(group)
         db.commit()
         return True
+
+    @staticmethod
+    def resolve_effective_scheduling_mode(db: Session, user: User | None) -> str:
+        if user is None:
+            return SchedulingConfig.SCHEDULING_MODE_CACHE_AFFINITY
+
+        from src.services.subscription import SubscriptionService
+
+        effective_group = SubscriptionService.resolve_effective_user_group(db, user)
+        group_mode = getattr(effective_group, "scheduling_mode", None) if effective_group else None
+        return SchedulingConfig.normalize_scheduling_mode(group_mode)

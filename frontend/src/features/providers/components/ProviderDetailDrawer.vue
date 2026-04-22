@@ -264,16 +264,16 @@
                     :key="key.id"
                     class="px-4 py-2.5 hover:bg-muted/30 transition-colors group/item"
                     :class="{
-                      'opacity-50': keyDragState.isDragging && keyDragState.draggedIndex === getGlobalKeyIndex(localIdx),
-                      'bg-primary/5 border-l-2 border-l-primary': keyDragState.targetIndex === getGlobalKeyIndex(localIdx) && keyDragState.isDragging,
+                      'opacity-50': keyDragState.isDragging && keyDragState.draggedIndex === getKeyListIndex(localIdx),
+                      'bg-primary/5 border-l-2 border-l-primary': keyDragState.targetIndex === getKeyListIndex(localIdx) && keyDragState.isDragging,
                       'opacity-40 bg-muted/20': !key.is_active
                     }"
                     draggable="true"
-                    @dragstart="handleKeyDragStart($event, getGlobalKeyIndex(localIdx))"
+                    @dragstart="handleKeyDragStart($event, getKeyListIndex(localIdx))"
                     @dragend="handleKeyDragEnd"
-                    @dragover="handleKeyDragOver($event, getGlobalKeyIndex(localIdx))"
+                    @dragover="handleKeyDragOver($event, getKeyListIndex(localIdx))"
                     @dragleave="handleKeyDragLeave"
-                    @drop="handleKeyDrop($event, getGlobalKeyIndex(localIdx))"
+                    @drop="handleKeyDrop($event, getKeyListIndex(localIdx))"
                   >
                     <!-- 第一行：名称 + 状态 + 操作按钮 -->
                     <div class="flex items-center justify-between gap-2">
@@ -1394,7 +1394,7 @@ const {
   shouldPaginate: shouldPaginateKeys,
   paginatedItems: paginatedKeys,
   fixedHeight: keysFixedHeight,
-  getGlobalIndex: getGlobalKeyIndex,
+  getGlobalIndex: getKeyListIndex,
   reset: resetKeysPagination,
 } = useSmartPagination(allKeys, keysListRef)
 

@@ -450,6 +450,7 @@ class CandidateBuilder:
         model_group_name: str | None = None,
         model_group_routes_by_provider: dict[str, list[dict[str, Any]]] | None = None,
         default_user_billing_multiplier: float = 1.0,
+        user_group_binding_priority: int | None = None,
     ) -> "list[ProviderCandidate]":
         """
         构建候选列表
@@ -702,14 +703,7 @@ class CandidateBuilder:
                         )
                     except Exception:
                         provider_priority = 999999
-                    try:
-                        pool_priority = (
-                            int(pool_cfg.global_priority)
-                            if pool_cfg.global_priority is not None
-                            else provider_priority
-                        )
-                    except Exception:
-                        pool_priority = provider_priority
+                    pool_priority = provider_priority
 
                     pool_keys_by_route: dict[str, tuple[dict[str, Any] | None, list[ProviderAPIKey]]] = {}
                     for pool_key in pool_keys:
@@ -767,6 +761,7 @@ class CandidateBuilder:
                                 is not None
                                 else float(default_user_billing_multiplier)
                             ),
+                            user_group_binding_priority=user_group_binding_priority,
                         )
 
                         # 打包延迟检查参数，供 PoolManager 排序后分页调用
@@ -850,6 +845,7 @@ class CandidateBuilder:
                             is not None
                             else float(default_user_billing_multiplier)
                         ),
+                        user_group_binding_priority=user_group_binding_priority,
                     )
 
                     if needs_conversion:

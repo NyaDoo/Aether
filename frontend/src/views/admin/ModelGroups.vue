@@ -12,7 +12,7 @@
                 模型分组
               </h3>
               <p class="mt-0.5 hidden text-[11px] text-muted-foreground sm:block">
-                独立维护模型成员、路由优先级和用户计费倍率。
+                独立维护模型成员、渠道顺序和用户计费倍率。
               </p>
             </div>
             <Button
@@ -188,10 +188,10 @@
               <div class="rounded-xl border border-border/60 bg-muted/30 p-3">
                 <div class="flex items-center gap-2 text-muted-foreground">
                   <Network class="h-4 w-4" />
-                  <span class="text-xs font-medium">路由模式</span>
+                  <span class="text-xs font-medium">路由排序</span>
                 </div>
                 <div class="mt-2 text-sm font-medium text-foreground">
-                  {{ selectedGroup.routing_mode === 'custom' ? '自定义渠道路由' : '继承全局路由' }}
+                  显式顺序
                 </div>
               </div>
 
@@ -276,17 +276,10 @@
 
           <div class="px-3.5 py-3.5 sm:px-5 sm:py-4">
             <div
-              v-if="selectedGroup.routing_mode !== 'custom'"
+              v-if="selectedGroup.routes.length === 0"
               class="rounded-xl border border-dashed border-border/60 px-4 py-8 text-center text-sm text-muted-foreground"
             >
-              当前继承全局路由，未启用分组级渠道覆盖。
-            </div>
-
-            <div
-              v-else-if="selectedGroup.routes.length === 0"
-              class="rounded-xl border border-dashed border-border/60 px-4 py-8 text-center text-sm text-muted-foreground"
-            >
-              当前已切换到自定义路由，但还没有配置渠道规则。
+              当前还没有配置渠道规则。
             </div>
 
             <div
@@ -303,7 +296,7 @@
                       供应商 Key
                     </TableHead>
                     <TableHead class="w-[120px]">
-                      优先级
+                      顺位
                     </TableHead>
                     <TableHead class="w-[140px]">
                       计费倍率
@@ -311,14 +304,11 @@
                     <TableHead class="w-[120px]">
                       状态
                     </TableHead>
-                    <TableHead>
-                      备注
-                    </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   <TableRow
-                    v-for="route in selectedGroup.routes"
+                    v-for="(route, index) in selectedGroup.routes"
                     :key="route.id"
                     class="border-b border-border/40"
                   >
@@ -329,7 +319,7 @@
                       {{ formatRouteKey(route) }}
                     </TableCell>
                     <TableCell>
-                      {{ route.priority }}
+                      {{ index + 1 }}
                     </TableCell>
                     <TableCell>
                       {{ route.user_billing_multiplier_override == null ? '跟随分组默认' : formatMultiplier(route.user_billing_multiplier_override) }}
@@ -339,9 +329,6 @@
                         {{ route.is_active ? '启用' : '停用' }}
                       </Badge>
                     </TableCell>
-                    <TableCell class="text-muted-foreground">
-                      {{ route.notes || '-' }}
-                    </TableCell>
                   </TableRow>
                 </TableBody>
               </Table>
@@ -349,7 +336,7 @@
 
             <div class="space-y-2.5 xl:hidden">
               <div
-                v-for="route in selectedGroup.routes"
+                v-for="(route, index) in selectedGroup.routes"
                 :key="route.id"
                 class="rounded-xl border border-border/60 bg-card p-3"
               >
@@ -372,10 +359,10 @@
                   </div>
                   <div class="rounded-lg border border-border/50 bg-muted/20 px-2.5 py-2">
                     <div class="text-muted-foreground">
-                      优先级
+                      顺位
                     </div>
                     <div class="mt-1 truncate font-medium text-foreground">
-                      {{ route.priority }}
+                      {{ index + 1 }}
                     </div>
                   </div>
                   <div class="rounded-lg border border-border/50 bg-muted/20 px-2.5 py-2">
@@ -384,14 +371,6 @@
                     </div>
                     <div class="mt-1 truncate font-medium text-foreground">
                       {{ route.user_billing_multiplier_override == null ? '跟随分组默认' : formatMultiplier(route.user_billing_multiplier_override) }}
-                    </div>
-                  </div>
-                  <div class="rounded-lg border border-border/50 bg-muted/20 px-2.5 py-2">
-                    <div class="text-muted-foreground">
-                      备注
-                    </div>
-                    <div class="mt-1 truncate font-medium text-foreground">
-                      {{ route.notes || '-' }}
                     </div>
                   </div>
                 </div>
@@ -535,7 +514,6 @@ async function handleSubmit(data: ModelGroupFormData) {
         display_name: data.display_name,
         description: data.description ?? null,
         default_user_billing_multiplier: data.default_user_billing_multiplier,
-        routing_mode: data.routing_mode,
         is_active: data.is_active,
         sort_order: data.sort_order,
         model_ids: data.model_ids ?? [],
@@ -549,7 +527,6 @@ async function handleSubmit(data: ModelGroupFormData) {
         display_name: data.display_name,
         description: data.description ?? null,
         default_user_billing_multiplier: data.default_user_billing_multiplier,
-        routing_mode: data.routing_mode,
         is_active: data.is_active,
         sort_order: data.sort_order,
         model_ids: data.model_ids ?? [],

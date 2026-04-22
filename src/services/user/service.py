@@ -77,7 +77,7 @@ class UserService:
             if not group:
                 raise ValueError("用户分组不存在")
         else:
-            group = UserGroupService.get_or_create_default_group(db)
+            group = UserGroupService.get_required_default_group(db)
             group_id = group.id
 
         # 检查用户名是否已存在
@@ -251,7 +251,7 @@ class UserService:
                 if not resolved_group:
                     raise ValueError("用户分组不存在")
             else:
-                resolved_group = UserGroupService.get_or_create_default_group(db)
+                resolved_group = UserGroupService.get_required_default_group(db)
                 kwargs["group_id"] = resolved_group.id
 
         for field, value in kwargs.items():
@@ -327,7 +327,7 @@ class UserService:
         updated_users: list[User] = []
         skipped_count = 0
         now = datetime.now(timezone.utc)
-        default_group = UserGroupService.get_or_create_default_group(db)
+        default_group = UserGroupService.get_required_default_group(db)
 
         for user_id in normalized_user_ids:
             user = users_by_id.get(user_id)

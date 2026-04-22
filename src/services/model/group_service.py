@@ -42,7 +42,6 @@ class ModelGroupRoutePayload:
     priority: int = 50
     user_billing_multiplier_override: float | None = None
     is_active: bool = True
-    notes: str | None = None
 
 
 class ModelGroupService:
@@ -66,41 +65,16 @@ class ModelGroupService:
         )
 
     @staticmethod
-    def get_or_create_default_group(db: Session, *, commit: bool = False) -> ModelGroup:
+    def get_required_default_group(db: Session) -> ModelGroup:
         group = ModelGroupService.get_default_group(db)
-        if group is None:
-            group = ModelGroupService.get_group_by_name(db, DEFAULT_MODEL_GROUP_NAME)
+        if group is not None:
+            return group
 
-        if group is None:
-            group = ModelGroup(
-                name=DEFAULT_MODEL_GROUP_NAME,
-                display_name=DEFAULT_MODEL_GROUP_DISPLAY_NAME,
-                description=DEFAULT_MODEL_GROUP_DESCRIPTION,
-                default_user_billing_multiplier=Decimal("1.0"),
-                routing_mode="inherit",
-                is_default=True,
-                is_active=True,
-                sort_order=0,
-            )
-            db.add(group)
-        else:
-            group.is_default = True
-            if not group.display_name:
-                group.display_name = DEFAULT_MODEL_GROUP_DISPLAY_NAME
-            if not group.description:
-                group.description = DEFAULT_MODEL_GROUP_DESCRIPTION
-            if not group.routing_mode:
-                group.routing_mode = "inherit"
-            if group.sort_order is None:
-                group.sort_order = 0
-            group.updated_at = datetime.now(timezone.utc)
+        group = ModelGroupService.get_group_by_name(db, DEFAULT_MODEL_GROUP_NAME)
+        if group is not None:
+            return group
 
-        if commit:
-            db.commit()
-            db.refresh(group)
-        else:
-            db.flush()
-        return group
+        raise ValueError("默认模型分组不存在，请先初始化系统默认模型分组")
 
     @staticmethod
     def ensure_user_group_default_binding(
@@ -109,7 +83,7 @@ class ModelGroupService:
         *,
         commit: bool = False,
     ) -> UserGroupModelGroup:
-        default_model_group = ModelGroupService.get_or_create_default_group(db, commit=False)
+        default_model_group = ModelGroupService.get_required_default_group(db)
         link = (
             db.query(UserGroupModelGroup)
             .filter(
@@ -141,7 +115,6 @@ class ModelGroupService:
 
     @staticmethod
     def list_groups(db: Session) -> list[tuple[ModelGroup, int, int]]:
-        ModelGroupService.get_or_create_default_group(db, commit=True)
         model_count = func.count(func.distinct(ModelGroupModel.global_model_id)).label("model_count")
         user_group_count = func.count(func.distinct(UserGroupModelGroup.user_group_id)).label(
             "user_group_count"
@@ -195,7 +168,6 @@ class ModelGroupService:
         display_name: str,
         description: str | None = None,
         default_user_billing_multiplier: float | Decimal = 1.0,
-        routing_mode: str = "inherit",
         is_active: bool = True,
         sort_order: int = 100,
         commit: bool = True,
@@ -208,7 +180,6 @@ class ModelGroupService:
             display_name=display_name,
             description=description,
             default_user_billing_multiplier=Decimal(str(default_user_billing_multiplier)),
-            routing_mode=routing_mode,
             is_default=False,
             is_active=is_active,
             sort_order=sort_order,
@@ -216,7 +187,10 @@ class ModelGroupService:
         db.add(group)
         if commit:
             db.commit()
-            db.refresh(group)
+            created = ModelGroupService.get_group_detail(db, str(group.id))
+            if created is None:
+                raise ValueError("模型分组创建后读取失败")
+            return created
         else:
             db.flush()
         return group
@@ -242,7 +216,6 @@ class ModelGroupService:
             "display_name",
             "description",
             "default_user_billing_multiplier",
-            "routing_mode",
             "is_active",
             "sort_order",
         }
@@ -258,7 +231,10 @@ class ModelGroupService:
         group.updated_at = datetime.now(timezone.utc)
         if commit:
             db.commit()
-            db.refresh(group)
+            updated = ModelGroupService.get_group_detail(db, str(group.id))
+            if updated is None:
+                raise ValueError("模型分组更新后读取失败")
+            return updated
         else:
             db.flush()
         return group
@@ -305,12 +281,12 @@ class ModelGroupService:
             valid_ids = {
                 row[0]
                 for row in db.query(GlobalModel.id)
-                .filter(GlobalModel.id.in_(normalized_ids), GlobalModel.is_active.is_(True))
+                .filter(GlobalModel.id.in_(normalized_ids))
                 .all()
             }
             missing = [model_id for model_id in normalized_ids if model_id not in valid_ids]
             if missing:
-                raise ValueError(f"模型不存在或不可用: {', '.join(missing)}")
+                raise ValueError(f"模型不存在: {', '.join(missing)}")
 
         existing_links = {str(link.global_model_id): link for link in group.model_links}
         keep_ids = set(normalized_ids)
@@ -327,7 +303,10 @@ class ModelGroupService:
         group.updated_at = datetime.now(timezone.utc)
         if commit:
             db.commit()
-            db.refresh(group)
+            updated = ModelGroupService.get_group_detail(db, str(group.id))
+            if updated is None:
+                raise ValueError("模型分组更新后读取失败")
+            return updated
         else:
             db.flush()
         return group
@@ -366,14 +345,14 @@ class ModelGroupService:
             valid_provider_ids = {
                 row[0]
                 for row in db.query(Provider.id)
-                .filter(Provider.id.in_(provider_ids), Provider.is_active.is_(True))
+                .filter(Provider.id.in_(provider_ids))
                 .all()
             }
             missing_provider_ids = [
                 provider_id for provider_id in provider_ids if provider_id not in valid_provider_ids
             ]
             if missing_provider_ids:
-                raise ValueError(f"Provider 不存在或不可用: {', '.join(missing_provider_ids)}")
+                raise ValueError(f"Provider 不存在: {', '.join(missing_provider_ids)}")
 
             provider_api_key_ids = [key_id for _, key_id in requested.keys() if key_id]
             if provider_api_key_ids:
@@ -426,12 +405,14 @@ class ModelGroupService:
                 else None
             )
             route.is_active = bool(payload.is_active)
-            route.notes = payload.notes
 
         group.updated_at = datetime.now(timezone.utc)
         if commit:
             db.commit()
-            db.refresh(group)
+            updated = ModelGroupService.get_group_detail(db, str(group.id))
+            if updated is None:
+                raise ValueError("模型分组更新后读取失败")
+            return updated
         else:
             db.flush()
         return group
@@ -529,12 +510,12 @@ class ModelGroupService:
             valid_ids = {
                 row[0]
                 for row in db.query(ModelGroup.id)
-                .filter(ModelGroup.id.in_(normalized_ids), ModelGroup.is_active.is_(True))
+                .filter(ModelGroup.id.in_(normalized_ids))
                 .all()
             }
             missing = [model_group_id for model_group_id in normalized_ids if model_group_id not in valid_ids]
             if missing:
-                raise ValueError(f"模型分组不存在或不可用: {', '.join(missing)}")
+                raise ValueError(f"模型分组不存在: {', '.join(missing)}")
 
         existing_links = {str(link.model_group_id): link for link in global_model.model_group_links}
         keep_ids = set(normalized_ids)

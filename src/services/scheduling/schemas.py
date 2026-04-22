@@ -39,6 +39,9 @@ class ProviderCandidate:
     model_group_name: str | None = None
     model_group_route_id: str | None = None
     user_billing_multiplier: float = 1.0
+    # 用户分组绑定该模型分组的 priority（数字越小越靠前）；跨分组聚合后
+    # _candidate_priority_tuple 以此为首要排序键，保证分组间不交错。
+    user_group_binding_priority: int | None = None
 
     def _stable_order_key(self) -> tuple[int, int, str, str, str]:
         """

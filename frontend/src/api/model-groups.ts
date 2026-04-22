@@ -9,7 +9,6 @@ export interface ModelGroupRoute {
   priority: number
   user_billing_multiplier_override?: number | null
   is_active: boolean
-  notes?: string | null
 }
 
 export interface ModelGroupModelRef {
@@ -33,7 +32,6 @@ export interface ModelGroupSummary {
   display_name: string
   description?: string | null
   default_user_billing_multiplier: number
-  routing_mode: 'inherit' | 'custom'
   is_default: boolean
   is_active: boolean
   sort_order: number
@@ -54,7 +52,6 @@ export interface UpsertModelGroupRequest {
   display_name: string
   description?: string | null
   default_user_billing_multiplier?: number
-  routing_mode?: 'inherit' | 'custom'
   is_active?: boolean
   sort_order?: number
   model_ids?: string[]

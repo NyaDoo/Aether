@@ -311,7 +311,6 @@ def _build_test_request_payload(request: TestModelFailoverRequest) -> dict[str, 
         "model": request.model_name,
         "messages": [{"role": "user", "content": _resolve_test_message(request.message)}],
         "max_tokens": 30,
-        "temperature": 0.7,
         "stream": True,
     }
 
@@ -1067,7 +1066,6 @@ async def test_model(
             "model": request.model_name,
             "messages": [{"role": "user", "content": _resolve_test_message(request.message)}],
             "max_tokens": 30,
-            "temperature": 0.7,
             "stream": True,
         }
 

@@ -487,7 +487,6 @@ export interface SchedulingPresetItem {
 }
 
 export interface PoolAdvancedConfig {
-  global_priority?: number | null
   sticky_session_ttl_seconds?: number | null
   load_threshold_percent?: number | null
   // 旧字段（兼容读取）

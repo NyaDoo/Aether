@@ -14,15 +14,6 @@
               用户管理
             </h3>
             <div class="flex items-center gap-2">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8"
-                title="用户分组"
-                @click="goToUserGroupsPage"
-              >
-                <UsersIcon class="w-3.5 h-3.5" />
-              </Button>
               <!-- 新增用户按钮 -->
               <Button
                 variant="ghost"
@@ -191,16 +182,6 @@
 
             <!-- 分隔线 -->
             <div class="h-4 w-px bg-border" />
-
-            <Button
-              variant="outline"
-              size="sm"
-              class="h-8 px-3 text-xs"
-              @click="goToUserGroupsPage"
-            >
-              <UsersIcon class="mr-1.5 h-3.5 w-3.5" />
-              分组
-            </Button>
 
             <!-- 新增用户按钮 -->
             <Button
@@ -1194,7 +1175,6 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import { useUsersStore } from '@/stores/users'
 import { usersApi, type User, type ApiKey, type UserSession, type UserGroup } from '@/api/users'
 import { formatSessionMeta } from '@/types/session'
@@ -1262,7 +1242,6 @@ const { success, error } = useToast()
 const { confirmDanger } = useConfirm()
 const { copyToClipboard } = useClipboard()
 const usersStore = useUsersStore()
-const router = useRouter()
 
 // 用户表单对话框状态
 const showUserFormDialog = ref(false)
@@ -1518,10 +1497,6 @@ async function toggleUserStatus(user: User) {
 function openCreateDialog() {
   editingUser.value = null
   showUserFormDialog.value = true
-}
-
-function goToUserGroupsPage() {
-  void router.push('/admin/user-groups')
 }
 
 function editUser(user: User) {

@@ -344,7 +344,6 @@ class ModelGroupRouteRequest(BaseModel):
         description="用户计费倍率覆盖；null 表示使用模型分组默认倍率",
     )
     is_active: bool = Field(default=True, description="是否启用")
-    notes: str | None = Field(default=None, max_length=500, description="备注")
 
 
 class ModelGroupRouteResponse(ModelGroupRouteRequest):
@@ -381,7 +380,6 @@ class ModelGroupCreate(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=100)
     description: str | None = Field(None, max_length=500)
     default_user_billing_multiplier: float = Field(default=1.0, ge=0)
-    routing_mode: str = Field(default="inherit", pattern="^(inherit|custom)$")
     is_active: bool = Field(default=True)
     sort_order: int = Field(default=100, ge=0, le=999999)
     model_ids: list[str] = Field(default_factory=list, description="绑定的 GlobalModel ID 列表")
@@ -395,7 +393,6 @@ class ModelGroupUpdate(BaseModel):
     display_name: str | None = Field(None, min_length=1, max_length=100)
     description: str | None = Field(None, max_length=500)
     default_user_billing_multiplier: float | None = Field(default=None, ge=0)
-    routing_mode: str | None = Field(default=None, pattern="^(inherit|custom)$")
     is_active: bool | None = None
     sort_order: int | None = Field(default=None, ge=0, le=999999)
     model_ids: list[str] | None = Field(default=None, description="完整替换的 GlobalModel ID 列表")
@@ -413,7 +410,6 @@ class ModelGroupResponse(BaseModel):
     display_name: str
     description: str | None = None
     default_user_billing_multiplier: float
-    routing_mode: str
     is_default: bool = False
     is_active: bool = True
     sort_order: int

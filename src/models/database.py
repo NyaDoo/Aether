@@ -85,6 +85,7 @@ class UserGroup(Base):
     rate_limit = Column(
         Integer, nullable=True, default=None
     )  # NULL=继承系统默认，0=不限制，N=N RPM
+    scheduling_mode = Column(String(32), nullable=False, default="cache_affinity")
 
     created_at = Column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
@@ -1808,7 +1809,6 @@ class ModelGroup(ExportMixin, Base):
     display_name = Column(String(100), nullable=False)
     description = Column(String(500), nullable=True)
     default_user_billing_multiplier = Column(Numeric(10, 4), nullable=False, default=1.0)
-    routing_mode = Column(String(20), nullable=False, default="inherit")
     is_default = Column(Boolean, default=False, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     sort_order = Column(Integer, default=100, nullable=False)
@@ -1909,7 +1909,6 @@ class ModelGroupRoute(Base):
     priority = Column(Integer, default=50, nullable=False)
     user_billing_multiplier_override = Column(Numeric(10, 4), nullable=True, default=None)
     is_active = Column(Boolean, default=True, nullable=False)
-    notes = Column(String(500), nullable=True)
     created_at = Column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from src.api.base.admin_adapter import AdminApiAdapter
 from src.api.base.context import ApiRequestContext
 from src.api.base.pipeline import get_pipeline
+from src.core.exceptions import InvalidRequestException
 from src.database import get_db
 from src.models.pydantic_models import (
     ModelGroupCreate,
@@ -53,7 +54,6 @@ def _serialize_model_group(group: Any, *, model_count: int = 0, user_group_count
         display_name=str(group.display_name),
         description=group.description,
         default_user_billing_multiplier=float(group.default_user_billing_multiplier or 1.0),
-        routing_mode=str(group.routing_mode),
         is_default=bool(group.is_default),
         is_active=bool(group.is_active),
         sort_order=int(group.sort_order or 0),
@@ -94,7 +94,6 @@ def _serialize_model_group_detail(group: Any) -> ModelGroupDetailResponse:
                 else None
             ),
             is_active=bool(link.is_active),
-            notes=link.notes,
         )
         for link in list(getattr(group, "route_links", None) or [])
     ]
@@ -139,7 +138,6 @@ def _to_route_payloads(routes: list[ModelGroupRouteRequest]) -> list[ModelGroupR
             priority=item.priority,
             user_billing_multiplier_override=item.user_billing_multiplier_override,
             is_active=item.is_active,
-            notes=item.notes,
         )
         for item in routes
     ]
@@ -231,33 +229,35 @@ class AdminCreateModelGroupAdapter(AdminApiAdapter):
     payload: ModelGroupCreate
 
     async def handle(self, context: ApiRequestContext) -> ModelGroupDetailResponse:  # type: ignore[override]
-        group = ModelGroupService.create_group(
-            context.db,
-            name=self.payload.name,
-            display_name=self.payload.display_name,
-            description=self.payload.description,
-            default_user_billing_multiplier=self.payload.default_user_billing_multiplier,
-            routing_mode=self.payload.routing_mode,
-            is_active=self.payload.is_active,
-            sort_order=self.payload.sort_order,
-            commit=False,
-        )
-        ModelGroupService.replace_group_models(
-            context.db,
-            group.id,
-            self.payload.model_ids,
-            commit=False,
-        )
-        ModelGroupService.replace_group_routes(
-            context.db,
-            group.id,
-            _to_route_payloads(self.payload.routes),
-            commit=False,
-        )
-        context.db.commit()
-        detail = ModelGroupService.get_group_detail(context.db, group.id)
-        if detail is None:
-            raise ValueError("模型分组创建后读取失败")
+        try:
+            group = ModelGroupService.create_group(
+                context.db,
+                name=self.payload.name,
+                display_name=self.payload.display_name,
+                description=self.payload.description,
+                default_user_billing_multiplier=self.payload.default_user_billing_multiplier,
+                is_active=self.payload.is_active,
+                sort_order=self.payload.sort_order,
+                commit=False,
+            )
+            ModelGroupService.replace_group_models(
+                context.db,
+                group.id,
+                self.payload.model_ids,
+                commit=False,
+            )
+            ModelGroupService.replace_group_routes(
+                context.db,
+                group.id,
+                _to_route_payloads(self.payload.routes),
+                commit=False,
+            )
+            context.db.commit()
+            detail = ModelGroupService.get_group_detail(context.db, group.id)
+            if detail is None:
+                raise ValueError("模型分组创建后读取失败")
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
         return _serialize_model_group_detail(detail)
 
 
@@ -284,30 +284,33 @@ class AdminUpdateModelGroupAdapter(AdminApiAdapter):
         model_ids = data.pop("model_ids", None)
         routes = data.pop("routes", None)
 
-        group = ModelGroupService.update_group(context.db, self.group_id, commit=False, **data)
-        if group is None:
-            from fastapi import HTTPException
+        try:
+            group = ModelGroupService.update_group(context.db, self.group_id, commit=False, **data)
+            if group is None:
+                from fastapi import HTTPException
 
-            raise HTTPException(status_code=404, detail="模型分组不存在")
+                raise HTTPException(status_code=404, detail="模型分组不存在")
 
-        if model_ids is not None:
-            ModelGroupService.replace_group_models(
-                context.db,
-                self.group_id,
-                model_ids,
-                commit=False,
-            )
-        if routes is not None:
-            ModelGroupService.replace_group_routes(
-                context.db,
-                self.group_id,
-                _to_route_payloads([ModelGroupRouteRequest.model_validate(route) for route in routes]),
-                commit=False,
-            )
-        context.db.commit()
-        detail = ModelGroupService.get_group_detail(context.db, self.group_id)
-        if detail is None:
-            raise ValueError("模型分组更新后读取失败")
+            if model_ids is not None:
+                ModelGroupService.replace_group_models(
+                    context.db,
+                    self.group_id,
+                    model_ids,
+                    commit=False,
+                )
+            if routes is not None:
+                ModelGroupService.replace_group_routes(
+                    context.db,
+                    self.group_id,
+                    _to_route_payloads([ModelGroupRouteRequest.model_validate(route) for route in routes]),
+                    commit=False,
+                )
+            context.db.commit()
+            detail = ModelGroupService.get_group_detail(context.db, self.group_id)
+            if detail is None:
+                raise ValueError("模型分组更新后读取失败")
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
         return _serialize_model_group_detail(detail)
 
 
@@ -316,7 +319,10 @@ class AdminDeleteModelGroupAdapter(AdminApiAdapter):
     group_id: str
 
     async def handle(self, context: ApiRequestContext) -> Any:  # type: ignore[override]
-        deleted = ModelGroupService.delete_group(context.db, self.group_id)
+        try:
+            deleted = ModelGroupService.delete_group(context.db, self.group_id)
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
         if not deleted:
             from fastapi import HTTPException
 
@@ -330,11 +336,14 @@ class AdminReplaceModelGroupModelsAdapter(AdminApiAdapter):
     payload: ReplaceModelGroupModelsRequest
 
     async def handle(self, context: ApiRequestContext) -> ModelGroupDetailResponse:  # type: ignore[override]
-        ModelGroupService.replace_group_models(
-            context.db,
-            self.group_id,
-            self.payload.model_ids,
-        )
+        try:
+            ModelGroupService.replace_group_models(
+                context.db,
+                self.group_id,
+                self.payload.model_ids,
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
         detail = ModelGroupService.get_group_detail(context.db, self.group_id)
         if detail is None:
             from fastapi import HTTPException
@@ -349,11 +358,14 @@ class AdminReplaceModelGroupRoutesAdapter(AdminApiAdapter):
     payload: ReplaceModelGroupRoutesRequest
 
     async def handle(self, context: ApiRequestContext) -> ModelGroupDetailResponse:  # type: ignore[override]
-        ModelGroupService.replace_group_routes(
-            context.db,
-            self.group_id,
-            _to_route_payloads(self.payload.routes),
-        )
+        try:
+            ModelGroupService.replace_group_routes(
+                context.db,
+                self.group_id,
+                _to_route_payloads(self.payload.routes),
+            )
+        except ValueError as exc:
+            raise InvalidRequestException(str(exc)) from exc
         detail = ModelGroupService.get_group_detail(context.db, self.group_id)
         if detail is None:
             from fastapi import HTTPException

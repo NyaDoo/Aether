@@ -213,13 +213,6 @@ class SchedulingPresetItem(BaseModel):
 
 class PoolAdvancedConfig(BaseModel):
     """通用号池配置（适用于所有 Provider 类型）。"""
-
-    global_priority: int | None = Field(
-        None,
-        ge=0,
-        le=999999,
-        description="global_key 模式下号池整体优先级（数字越小越优先）",
-    )
     sticky_session_ttl_seconds: int | None = Field(
         None,
         ge=60,

@@ -118,7 +118,7 @@ class OAuthService:
                 default_initial_gift = SystemConfigService.get_config(
                     db, "default_user_initial_gift_usd", default=None
                 )
-                default_group = UserGroupService.get_or_create_default_group(db)
+                default_group = UserGroupService.get_required_default_group(db)
 
                 user: User | None = None
                 last_error: Exception | None = None

@@ -995,6 +995,10 @@ class UserGroupBase(BaseModel):
         ge=0,
         description="分组默认 RPM 限制；null 表示继承系统默认，0 表示不限制",
     )
+    scheduling_mode: Literal["cache_affinity", "load_balance", "fixed_order"] = Field(
+        default="cache_affinity",
+        description="分组调度模式",
+    )
 
     @field_validator("name")
     @classmethod
@@ -1050,6 +1054,10 @@ class UpdateUserGroupRequest(BaseModel):
         ge=0,
         description="分组默认 RPM 限制；null 表示继承系统默认，0 表示不限制",
     )
+    scheduling_mode: Literal["cache_affinity", "load_balance", "fixed_order"] | None = Field(
+        default=None,
+        description="分组调度模式",
+    )
 
     @field_validator("name")
     @classmethod
@@ -1101,6 +1109,7 @@ class UserGroupResponse(BaseModel):
     allowed_api_formats: list[str] | None = None
     model_group_bindings: list[UserGroupModelGroupBindingResponse] = Field(default_factory=list)
     rate_limit: int | None = None
+    scheduling_mode: Literal["cache_affinity", "load_balance", "fixed_order"] = "cache_affinity"
     user_count: int = 0
     created_at: datetime
     updated_at: datetime

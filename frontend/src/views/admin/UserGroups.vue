@@ -130,22 +130,6 @@
                   variant="outline"
                   size="sm"
                   class="h-8 w-full px-3 text-xs sm:w-auto"
-                  @click="goToModelGroupsPage"
-                >
-                  模型分组
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  class="h-8 w-full px-3 text-xs sm:w-auto"
-                  @click="goToUsersPage"
-                >
-                  用户页
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  class="h-8 w-full px-3 text-xs sm:w-auto"
                   @click="editUserGroup(selectedGroup)"
                 >
                   <SquarePen class="mr-1.5 h-3.5 w-3.5" />
@@ -164,7 +148,7 @@
               </div>
             </div>
 
-            <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
               <div class="rounded-xl border border-border/60 bg-muted/30 p-3">
                 <div class="flex items-center gap-2 text-muted-foreground">
                   <UsersIcon class="h-4 w-4" />
@@ -188,7 +172,7 @@
               <div class="rounded-xl border border-border/60 bg-muted/30 p-3">
                 <div class="flex items-center gap-2 text-muted-foreground">
                   <Braces class="h-4 w-4" />
-                  <span class="text-xs font-medium">默认 API 格式</span>
+                  <span class="text-xs font-medium">API 格式</span>
                 </div>
                 <div class="mt-2 text-sm font-medium text-foreground">
                   {{ formatRestrictionSummary(selectedGroup.allowed_api_formats, '个格式') }}
@@ -197,8 +181,18 @@
 
               <div class="rounded-xl border border-border/60 bg-muted/30 p-3">
                 <div class="flex items-center gap-2 text-muted-foreground">
+                  <Shield class="h-4 w-4" />
+                  <span class="text-xs font-medium">调度策略</span>
+                </div>
+                <div class="mt-2 text-sm font-medium text-foreground">
+                  {{ formatSchedulingMode(selectedGroup.scheduling_mode) }}
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-border/60 bg-muted/30 p-3">
+                <div class="flex items-center gap-2 text-muted-foreground">
                   <Gauge class="h-4 w-4" />
-                  <span class="text-xs font-medium">默认速率</span>
+                  <span class="text-xs font-medium">分组速率</span>
                 </div>
                 <div class="mt-2 text-sm font-medium text-foreground">
                   {{ formatRateLimitInheritable(selectedGroup.rate_limit) }}
@@ -534,7 +528,6 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import {
   Braces,
   Gauge,
@@ -572,6 +565,7 @@ import {
   usersApi,
   type BatchUserGroupBindingRequest,
   type UserGroup,
+  type UserGroupSchedulingMode,
 } from '@/api/users'
 import UserGroupFormDialog, {
   type UserGroupFormData,
@@ -583,7 +577,6 @@ import { formatRateLimitInheritable } from '@/utils/format'
 
 type MembershipFilter = 'all' | 'current' | 'default' | 'other'
 
-const router = useRouter()
 const usersStore = useUsersStore()
 const { success, error } = useToast()
 const { confirmDanger, confirmWarning } = useConfirm()
@@ -695,6 +688,18 @@ function formatUserGroupName(groupName: string | null | undefined): string {
   return groupName || defaultGroup.value?.name || '默认分组'
 }
 
+function formatSchedulingMode(mode: UserGroupSchedulingMode | string | null | undefined): string {
+  switch (mode) {
+    case 'fixed_order':
+      return '固定顺序'
+    case 'load_balance':
+      return '负载均衡'
+    case 'cache_affinity':
+    default:
+      return '缓存亲和'
+  }
+}
+
 function toggleUserSelection(userId: string, checked: boolean) {
   if (checked) {
     if (!selectedUserIdSet.value.has(userId)) {
@@ -745,6 +750,7 @@ function editUserGroup(group: UserGroup) {
     id: group.id,
     name: group.name,
     description: group.description ?? null,
+    scheduling_mode: group.scheduling_mode,
     allowed_api_formats: group.allowed_api_formats == null ? null : [...group.allowed_api_formats],
     model_group_bindings: group.model_group_bindings.map((binding) => ({
       model_group_id: binding.model_group_id,
@@ -771,6 +777,7 @@ async function handleUserGroupFormSubmit(data: UserGroupFormData) {
       const updated = await usersApi.updateUserGroup(data.id, {
         name: data.name,
         description: data.description ?? null,
+        scheduling_mode: data.scheduling_mode,
         allowed_api_formats: data.allowed_api_formats,
         model_group_bindings: data.model_group_bindings?.map((binding) => ({
           model_group_id: binding.model_group_id,
@@ -785,6 +792,7 @@ async function handleUserGroupFormSubmit(data: UserGroupFormData) {
       const created = await usersApi.createUserGroup({
         name: data.name,
         description: data.description ?? null,
+        scheduling_mode: data.scheduling_mode,
         allowed_api_formats: data.allowed_api_formats,
         model_group_bindings: data.model_group_bindings?.map((binding) => ({
           model_group_id: binding.model_group_id,
@@ -906,14 +914,6 @@ async function handleSingleUnbind(userId: string) {
     },
     '用户已移回默认分组'
   )
-}
-
-function goToUsersPage() {
-  void router.push('/admin/users')
-}
-
-function goToModelGroupsPage() {
-  void router.push('/admin/model-groups')
 }
 
 watch([groupSearchQuery], () => {

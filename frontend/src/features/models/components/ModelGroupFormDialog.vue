@@ -15,7 +15,7 @@
               {{ isEditMode ? '编辑模型分组' : '新增模型分组' }}
             </h3>
             <p class="text-xs text-muted-foreground">
-              统一管理模型成员、路由策略和用户计费倍率
+              统一管理模型成员、渠道顺序和用户计费倍率
             </p>
           </div>
         </div>
@@ -54,29 +54,13 @@
             <Textarea
               v-model="form.description"
               rows="5"
-              placeholder="描述这个模型分组面向什么用户、承载什么路由策略"
+              placeholder="描述这个模型分组面向什么用户、承载什么渠道顺序"
             />
           </div>
 
-          <div class="grid grid-cols-2 gap-3">
+          <div class="grid grid-cols-3 gap-3">
             <div class="space-y-2">
-              <Label class="text-sm font-medium">路由模式</Label>
-              <Select v-model="form.routing_mode">
-                <SelectTrigger class="h-10">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="inherit">
-                    继承全局路由
-                  </SelectItem>
-                  <SelectItem value="custom">
-                    自定义渠道路由
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div class="space-y-2">
-              <Label class="text-sm font-medium">默认用户计费倍率</Label>
+              <Label class="text-sm font-medium">默认倍率</Label>
               <Input
                 :model-value="form.default_user_billing_multiplier"
                 type="number"
@@ -86,9 +70,6 @@
                 @update:model-value="(v) => form.default_user_billing_multiplier = parseNumberInput(v, { allowFloat: true, min: 0 }) ?? 1"
               />
             </div>
-          </div>
-
-          <div class="grid grid-cols-2 gap-3">
             <div class="space-y-2">
               <Label class="text-sm font-medium">排序</Label>
               <Input
@@ -101,18 +82,9 @@
             </div>
             <div class="space-y-2">
               <Label class="text-sm font-medium">分组状态</Label>
-              <div class="flex h-10 items-center justify-between rounded-lg border border-border/60 px-3">
-                <span class="text-sm text-muted-foreground">
-                  {{ form.is_active ? '已启用' : '已停用' }}
-                </span>
-                <Switch
-                  v-model="form.is_active"
-                  class="shrink-0"
-                />
+              <div class="flex h-10 items-center justify-center rounded-lg border border-border/60 px-3">
+                <Switch v-model="form.is_active" />
               </div>
-              <p class="text-xs text-muted-foreground">
-                停用后不会参与用户路由匹配
-              </p>
             </div>
           </div>
 
@@ -149,13 +121,6 @@
           </div>
 
           <div
-            v-if="form.routing_mode !== 'custom'"
-            class="rounded-lg border border-dashed border-border/60 px-3 py-4 text-xs text-muted-foreground"
-          >
-            当前使用“继承全局路由”，下面的渠道规则不会参与调度。切换为“自定义渠道路由”后，系统只会在这里配置的 Provider / Key 里选路。
-          </div>
-
-          <div
             v-if="form.routes.length === 0"
             class="rounded-lg border border-dashed border-border/60 px-3 py-4 text-xs text-muted-foreground"
           >
@@ -169,15 +134,29 @@
             <div
               v-for="(route, index) in form.routes"
               :key="route.key"
-              class="rounded-lg border border-border/60 bg-muted/15 p-3"
+              class="group rounded-xl border p-3 transition-all duration-200"
+              :class="draggedRouteIndex === index
+                ? 'border-primary/50 bg-primary/5 shadow-md scale-[1.01]'
+                : dragOverRouteIndex === index
+                  ? 'border-primary/30 bg-primary/5'
+                  : 'border-border/60 bg-muted/15 hover:border-border hover:bg-muted/25'"
+              draggable="true"
+              @dragstart="handleRouteDragStart(index, $event)"
+              @dragend="handleRouteDragEnd"
+              @dragover.prevent="handleRouteDragOver(index)"
+              @dragleave="handleRouteDragLeave"
+              @drop="handleRouteDrop(index)"
             >
               <div class="mb-3 flex items-center justify-between gap-2">
                 <div class="flex items-center gap-2">
+                  <div class="cursor-grab rounded-md p-1 text-muted-foreground/40 transition-colors group-hover:text-muted-foreground active:cursor-grabbing">
+                    <GripVertical class="h-4 w-4" />
+                  </div>
                   <Badge
                     variant="secondary"
-                    class="h-5 px-1.5 py-0 text-[10px]"
+                    class="h-6 min-w-6 justify-center px-1.5 py-0 text-[10px]"
                   >
-                    #{{ index + 1 }}
+                    {{ index + 1 }}
                   </Badge>
                   <span class="text-sm font-medium text-foreground">渠道规则</span>
                 </div>
@@ -195,7 +174,7 @@
                 </div>
               </div>
 
-              <div class="grid grid-cols-2 gap-3">
+              <div class="grid grid-cols-3 gap-3">
                 <div class="space-y-2">
                   <Label class="text-xs font-medium">Provider</Label>
                   <Select
@@ -239,17 +218,6 @@
                 </div>
 
                 <div class="space-y-2">
-                  <Label class="text-xs font-medium">优先级</Label>
-                  <Input
-                    :model-value="route.priority"
-                    type="number"
-                    min="0"
-                    class="h-9"
-                    @update:model-value="(v) => route.priority = parseNumberInput(v, { min: 0 }) ?? 50"
-                  />
-                </div>
-
-                <div class="space-y-2">
                   <Label class="text-xs font-medium">计费倍率覆盖</Label>
                   <Input
                     :model-value="route.user_billing_multiplier_override ?? ''"
@@ -257,17 +225,8 @@
                     step="0.01"
                     min="0"
                     class="h-9"
-                    placeholder="留空 = 使用分组默认倍率"
+                    placeholder="留空 = 分组默认倍率"
                     @update:model-value="(v) => route.user_billing_multiplier_override = parseNumberInput(v, { allowFloat: true, min: 0 }) ?? null"
-                  />
-                </div>
-
-                <div class="col-span-2 space-y-2">
-                  <Label class="text-xs font-medium">备注</Label>
-                  <Input
-                    v-model="route.notes"
-                    class="h-9"
-                    placeholder="可选，说明这条渠道规则的用途"
                   />
                 </div>
               </div>
@@ -299,7 +258,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Layers3, Plus, Trash2 } from 'lucide-vue-next'
+import { GripVertical, Layers3, Plus, Trash2 } from 'lucide-vue-next'
 import {
   Badge,
   Button,
@@ -335,7 +294,6 @@ interface RouteFormItem {
   priority: number
   user_billing_multiplier_override: number | null
   is_active: boolean
-  notes: string
 }
 
 export interface ModelGroupFormData extends UpsertModelGroupRequest {
@@ -356,6 +314,8 @@ const saving = ref(false)
 const providers = ref<ProviderWithEndpointsSummary[]>([])
 const globalModels = ref<GlobalModelResponse[]>([])
 const providerKeysByProviderId = ref<Record<string, EndpointAPIKey[]>>({})
+const draggedRouteIndex = ref<number | null>(null)
+const dragOverRouteIndex = ref<number | null>(null)
 
 const providerOptions = computed(() =>
   providers.value.map((provider) => ({
@@ -376,7 +336,6 @@ const form = ref({
   display_name: '',
   description: '',
   default_user_billing_multiplier: 1,
-  routing_mode: 'inherit' as 'inherit' | 'custom',
   is_active: true,
   sort_order: 100,
   model_ids: [] as string[],
@@ -395,17 +354,24 @@ function toRouteFormItem(route?: ModelGroupRoute): RouteFormItem {
     priority: route?.priority ?? 50,
     user_billing_multiplier_override: route?.user_billing_multiplier_override ?? null,
     is_active: route?.is_active ?? true,
-    notes: route?.notes ?? '',
   }
 }
 
+function reindexRoutes() {
+  form.value.routes = form.value.routes.map((route, index) => ({
+    ...route,
+    priority: (index + 1) * 10,
+  }))
+}
+
 function resetForm() {
+  draggedRouteIndex.value = null
+  dragOverRouteIndex.value = null
   form.value = {
     name: '',
     display_name: '',
     description: '',
     default_user_billing_multiplier: 1,
-    routing_mode: 'inherit',
     is_active: true,
     sort_order: 100,
     model_ids: [],
@@ -414,6 +380,8 @@ function resetForm() {
 }
 
 function loadGroupData() {
+  draggedRouteIndex.value = null
+  dragOverRouteIndex.value = null
   if (!props.group) {
     resetForm()
     return
@@ -423,12 +391,12 @@ function loadGroupData() {
     display_name: props.group.display_name,
     description: props.group.description ?? '',
     default_user_billing_multiplier: props.group.default_user_billing_multiplier ?? 1,
-    routing_mode: props.group.routing_mode,
     is_active: props.group.is_active,
     sort_order: props.group.sort_order ?? 100,
     model_ids: props.group.models.map((item) => item.global_model_id),
     routes: props.group.routes.map((route) => toRouteFormItem(route)),
   }
+  reindexRoutes()
 }
 
 const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
@@ -441,10 +409,9 @@ const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
 })
 
 const nameError = computed(() => {
-  if (!form.value.name.trim()) return '分组标识不能为空'
-  if (!/^[a-zA-Z0-9_.-]+$/.test(form.value.name.trim())) {
-    return '分组标识仅支持字母、数字、点、下划线和连字符'
-  }
+  const value = form.value.name.trim()
+  if (!value) return '分组标识不能为空'
+  if (value.length > 100) return '分组标识不能超过 100 个字符'
   return ''
 })
 
@@ -453,9 +420,8 @@ const displayNameError = computed(() => {
 })
 
 const routeError = computed(() => {
-  if (form.value.routing_mode !== 'custom') return ''
   const invalidRoute = form.value.routes.find((route) => !route.provider_id.trim())
-  if (invalidRoute) return '自定义路由模式下，所有渠道规则都必须选择 Provider'
+  if (invalidRoute) return '所有渠道规则都必须选择 Provider'
   return ''
 })
 
@@ -463,10 +429,51 @@ const isFormValid = computed(() => !nameError.value && !displayNameError.value &
 
 function addRoute() {
   form.value.routes.push(toRouteFormItem())
+  reindexRoutes()
 }
 
 function removeRoute(index: number) {
   form.value.routes.splice(index, 1)
+  reindexRoutes()
+}
+
+function handleRouteDragStart(index: number, event: DragEvent) {
+  draggedRouteIndex.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', '')
+  }
+}
+
+function handleRouteDragEnd() {
+  draggedRouteIndex.value = null
+  dragOverRouteIndex.value = null
+}
+
+function handleRouteDragOver(index: number) {
+  if (draggedRouteIndex.value !== null && draggedRouteIndex.value !== index) {
+    dragOverRouteIndex.value = index
+  }
+}
+
+function handleRouteDragLeave() {
+  dragOverRouteIndex.value = null
+}
+
+function handleRouteDrop(targetIndex: number) {
+  const dragIndex = draggedRouteIndex.value
+  if (dragIndex === null || dragIndex === targetIndex) {
+    dragOverRouteIndex.value = null
+    return
+  }
+
+  const items = [...form.value.routes]
+  const [draggedItem] = items.splice(dragIndex, 1)
+  items.splice(targetIndex, 0, draggedItem)
+  form.value.routes = items
+  reindexRoutes()
+  draggedRouteIndex.value = null
+  dragOverRouteIndex.value = null
 }
 
 function getProviderKeyOptions(providerId: string) {
@@ -535,21 +542,19 @@ async function handleSubmit() {
       display_name: form.value.display_name.trim(),
       description: form.value.description.trim() || null,
       default_user_billing_multiplier: form.value.default_user_billing_multiplier,
-      routing_mode: form.value.routing_mode,
       is_active: form.value.is_active,
       sort_order: form.value.sort_order,
       model_ids: [...form.value.model_ids],
       routes: form.value.routes
         .filter((route) => route.provider_id.trim())
-        .map((route) => ({
+        .map((route, index) => ({
           provider_id: route.provider_id.trim(),
           provider_api_key_id: route.provider_api_key_id === '__all__'
             ? null
             : route.provider_api_key_id,
-          priority: route.priority,
+          priority: (index + 1) * 10,
           user_billing_multiplier_override: route.user_billing_multiplier_override,
           is_active: route.is_active,
-          notes: route.notes.trim() || null,
         })),
     })
   } finally {

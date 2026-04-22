@@ -15,7 +15,7 @@
               {{ isEditMode ? '编辑用户分组' : '新增用户分组' }}
             </h3>
             <p class="text-xs text-muted-foreground">
-              配置该分组的模型分组绑定顺序与访问限制
+              配置该分组的调度策略、模型分组顺序与访问限制
             </p>
           </div>
         </div>
@@ -75,6 +75,28 @@
           </div>
 
           <div class="space-y-2">
+            <Label class="text-sm font-medium">调度策略</Label>
+            <div class="rounded-xl border border-border/60 bg-muted/20 p-1">
+              <div class="grid grid-cols-3 gap-1">
+                <button
+                  v-for="option in schedulingModeOptions"
+                  :key="option.value"
+                  type="button"
+                  class="rounded-lg px-3 py-2 text-center transition-all duration-200"
+                  :class="form.scheduling_mode === option.value
+                    ? 'bg-primary text-primary-foreground shadow-sm'
+                    : 'text-muted-foreground hover:bg-background/70 hover:text-foreground'"
+                  @click="form.scheduling_mode = option.value"
+                >
+                  <div class="text-sm font-medium">
+                    {{ option.label }}
+                  </div>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="space-y-2">
             <Label class="text-sm font-medium">模型分组绑定顺序</Label>
             <div class="flex gap-2">
               <Select v-model="pendingModelGroupId">
@@ -101,10 +123,6 @@
                 添加
               </Button>
             </div>
-            <p class="text-[11px] text-muted-foreground">
-              请求会按从上到下顺序尝试命中模型分组，首个可用分组生效。
-            </p>
-
             <div
               v-if="form.model_group_bindings.length === 0"
               class="rounded-lg border border-dashed border-border/60 px-3 py-4 text-xs text-muted-foreground"
@@ -116,11 +134,27 @@
               v-else
               class="space-y-2"
             >
+
               <div
                 v-for="(binding, index) in form.model_group_bindings"
                 :key="binding.model_group_id"
-                class="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/15 px-3 py-2"
+                class="group flex items-center gap-3 rounded-xl border px-3 py-2.5 transition-all duration-200"
+                :class="draggedBindingIndex === index
+                  ? 'border-primary/50 bg-primary/5 shadow-md scale-[1.01]'
+                  : dragOverBindingIndex === index
+                    ? 'border-primary/30 bg-primary/5'
+                    : 'border-border/60 bg-muted/15 hover:border-border hover:bg-muted/25'"
+                draggable="true"
+                @dragstart="handleBindingDragStart(index, $event)"
+                @dragend="handleBindingDragEnd"
+                @dragover.prevent="handleBindingDragOver(index)"
+                @dragleave="handleBindingDragLeave"
+                @drop="handleBindingDrop(index)"
               >
+                <div class="cursor-grab rounded-md p-1 text-muted-foreground/40 transition-colors group-hover:text-muted-foreground active:cursor-grabbing">
+                  <GripVertical class="h-4 w-4" />
+                </div>
+
                 <Badge
                   variant="secondary"
                   class="h-6 min-w-6 shrink-0 justify-center px-1.5 py-0 text-[10px]"
@@ -143,29 +177,6 @@
                       已停用
                     </span>
                   </div>
-                </div>
-
-                <div class="flex shrink-0 items-center gap-0.5">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    class="h-7 w-7"
-                    :disabled="index === 0"
-                    @click="moveBinding(index, -1)"
-                  >
-                    <ArrowUp class="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    class="h-7 w-7"
-                    :disabled="index === form.model_group_bindings.length - 1"
-                    @click="moveBinding(index, 1)"
-                  >
-                    <ArrowDown class="h-3.5 w-3.5" />
-                  </Button>
                 </div>
 
                 <Switch
@@ -263,8 +274,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import {
-  ArrowDown,
-  ArrowUp,
+  GripVertical,
   Trash2,
   Users,
 } from 'lucide-vue-next'
@@ -286,6 +296,7 @@ import { MultiSelect } from '@/components/common'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { adminApi } from '@/api/admin'
 import { modelGroupsApi, type ModelGroupSummary } from '@/api/model-groups'
+import type { UserGroupSchedulingMode } from '@/api/users'
 import { log } from '@/utils/logger'
 import { parseNumberInput } from '@/utils/form'
 
@@ -302,6 +313,7 @@ export interface UserGroupFormData {
   id?: string
   name: string
   description?: string | null
+  scheduling_mode?: UserGroupSchedulingMode
   allowed_api_formats?: string[] | null
   model_group_bindings?: UserGroupFormBinding[] | null
   rate_limit?: number | null
@@ -321,6 +333,17 @@ const saving = ref(false)
 const modelGroups = ref<ModelGroupSummary[]>([])
 const apiFormats = ref<Array<{ value: string; label: string }>>([])
 const pendingModelGroupId = ref('')
+const draggedBindingIndex = ref<number | null>(null)
+const dragOverBindingIndex = ref<number | null>(null)
+
+const schedulingModeOptions: Array<{
+  value: UserGroupSchedulingMode
+  label: string
+}> = [
+  { value: 'cache_affinity', label: '缓存亲和' },
+  { value: 'load_balance', label: '负载均衡' },
+  { value: 'fixed_order', label: '固定顺序' },
+]
 
 const apiFormatOptions = computed(() =>
   apiFormats.value.map((format) => ({
@@ -341,6 +364,7 @@ const defaultModelGroup = computed(() => {
 const form = ref({
   name: '',
   description: '',
+  scheduling_mode: 'cache_affinity' as UserGroupSchedulingMode,
   api_format_unrestricted: true,
   rate_limit_inherited: true,
   allowed_api_formats: [] as string[],
@@ -370,9 +394,12 @@ function cloneBindings(bindings: UserGroupFormBinding[] | null | undefined): Use
 
 function resetForm() {
   pendingModelGroupId.value = ''
+  draggedBindingIndex.value = null
+  dragOverBindingIndex.value = null
   form.value = {
     name: '',
     description: '',
+    scheduling_mode: 'cache_affinity',
     api_format_unrestricted: true,
     rate_limit_inherited: true,
     allowed_api_formats: [],
@@ -399,6 +426,8 @@ function ensureCreateDefaultBinding() {
 
 function loadGroupData() {
   pendingModelGroupId.value = ''
+  draggedBindingIndex.value = null
+  dragOverBindingIndex.value = null
   if (!props.group) {
     resetForm()
     ensureCreateDefaultBinding()
@@ -407,6 +436,7 @@ function loadGroupData() {
   form.value = {
     name: props.group.name,
     description: props.group.description ?? '',
+    scheduling_mode: props.group.scheduling_mode ?? 'cache_affinity',
     api_format_unrestricted: props.group.allowed_api_formats == null,
     rate_limit_inherited: props.group.rate_limit == null,
     allowed_api_formats: props.group.allowed_api_formats ? [...props.group.allowed_api_formats] : [],
@@ -466,14 +496,43 @@ function addModelGroupBinding() {
   reindexBindings()
 }
 
-function moveBinding(index: number, direction: -1 | 1) {
-  const targetIndex = index + direction
-  if (targetIndex < 0 || targetIndex >= form.value.model_group_bindings.length) return
-  const next = [...form.value.model_group_bindings]
-  const [current] = next.splice(index, 1)
-  next.splice(targetIndex, 0, current)
-  form.value.model_group_bindings = next
+function handleBindingDragStart(index: number, event: DragEvent) {
+  draggedBindingIndex.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', '')
+  }
+}
+
+function handleBindingDragEnd() {
+  draggedBindingIndex.value = null
+  dragOverBindingIndex.value = null
+}
+
+function handleBindingDragOver(index: number) {
+  if (draggedBindingIndex.value !== null && draggedBindingIndex.value !== index) {
+    dragOverBindingIndex.value = index
+  }
+}
+
+function handleBindingDragLeave() {
+  dragOverBindingIndex.value = null
+}
+
+function handleBindingDrop(targetIndex: number) {
+  const dragIndex = draggedBindingIndex.value
+  if (dragIndex === null || dragIndex === targetIndex) {
+    dragOverBindingIndex.value = null
+    return
+  }
+
+  const items = [...form.value.model_group_bindings]
+  const [draggedItem] = items.splice(dragIndex, 1)
+  items.splice(targetIndex, 0, draggedItem)
+  form.value.model_group_bindings = items
   reindexBindings()
+  draggedBindingIndex.value = null
+  dragOverBindingIndex.value = null
 }
 
 function removeBinding(index: number) {
@@ -488,6 +547,20 @@ function updateBindingActive(index: number, value: boolean) {
   }
 }
 
+function hydrateBindingMeta() {
+  if (form.value.model_group_bindings.length === 0) return
+
+  form.value.model_group_bindings = form.value.model_group_bindings.map((binding) => {
+    const meta = getModelGroupMeta(binding.model_group_id)
+    return {
+      ...binding,
+      model_group_name: binding.model_group_name ?? meta?.name ?? null,
+      model_group_display_name: binding.model_group_display_name ?? meta?.display_name ?? null,
+      model_group_is_default: binding.model_group_is_default ?? meta?.is_default ?? false,
+    }
+  })
+}
+
 async function loadAccessControlOptions(): Promise<void> {
   try {
     const [groups, formatsData] = await Promise.all([
@@ -496,9 +569,8 @@ async function loadAccessControlOptions(): Promise<void> {
     ])
     modelGroups.value = groups
     apiFormats.value = formatsData.formats || []
-    if (props.open) {
-      loadGroupData()
-    }
+    hydrateBindingMeta()
+    ensureCreateDefaultBinding()
   } catch (err) {
     log.error('加载用户分组选项失败:', err)
   }
@@ -512,6 +584,7 @@ async function handleSubmit() {
       id: props.group?.id,
       name: form.value.name.trim(),
       description: form.value.description.trim() || null,
+      scheduling_mode: form.value.scheduling_mode,
       allowed_api_formats: form.value.api_format_unrestricted ? null : [...form.value.allowed_api_formats],
       model_group_bindings: form.value.model_group_bindings.length > 0
         ? form.value.model_group_bindings.map((binding, index) => ({

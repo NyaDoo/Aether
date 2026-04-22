@@ -727,38 +727,6 @@ class AdminSetSystemConfigAdapter(AdminApiAdapter):
             except Exception as e:
                 logger.warning(f"更新签到任务时间失败: {e}")
 
-        # 如果更新的是调度模式或优先级模式，立即更新当前 Worker 的 Scheduler 单例
-        if self.key in ("scheduling_mode", "provider_priority_mode"):
-            try:
-                from src.clients.redis_client import get_redis_client_sync
-                from src.services.scheduling.aware_scheduler import get_cache_aware_scheduler
-
-                redis_client = get_redis_client_sync()
-                # 从数据库读取两个调度配置的最新值，确保一致性
-                priority_mode = _system_config_service().get_config(
-                    context.db,
-                    "provider_priority_mode",
-                    "provider",
-                )
-                scheduling_mode = _system_config_service().get_config(
-                    context.db,
-                    "scheduling_mode",
-                    "cache_affinity",
-                )
-                await get_cache_aware_scheduler(
-                    redis_client,
-                    priority_mode=priority_mode,
-                    scheduling_mode=scheduling_mode,
-                )
-                logger.info(
-                    "[AdminSetSystemConfig] 已同步更新 Scheduler: "
-                    "priority_mode={}, scheduling_mode={}",
-                    priority_mode,
-                    scheduling_mode,
-                )
-            except Exception as e:
-                logger.warning("同步更新 Scheduler 失败: {}", e)
-
         # 返回时不暴露加密后的值
         display_value = "********" if self.key in self.ENCRYPTED_KEYS else config.value
 
@@ -2267,7 +2235,6 @@ class AdminExportUsersAdapter(AdminApiAdapter):
                 "is_default": bool(group.is_default),
                 "is_active": bool(group.is_active),
                 "sort_order": int(group.sort_order or 0),
-                "routing_mode": group.routing_mode,
                 "default_user_billing_multiplier": float(
                     group.default_user_billing_multiplier or 1.0
                 ),
@@ -2296,7 +2263,6 @@ class AdminExportUsersAdapter(AdminApiAdapter):
                             else None
                         ),
                         "is_active": bool(link.is_active),
-                        "notes": link.notes,
                     }
                     for link in sorted(
                         list(getattr(group, "route_links", None) or []),
@@ -2346,6 +2312,7 @@ class AdminExportUsersAdapter(AdminApiAdapter):
                     if getattr(link, "model_group", None) is not None
                 ],
                 "rate_limit": group.rate_limit,
+                "scheduling_mode": getattr(group, "scheduling_mode", "cache_affinity"),
                 "user_count": int(user_count),
             }
             for group, user_count in user_groups
@@ -2479,6 +2446,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
             ModelGroupRoutePayload,
             ModelGroupService,
         )
+        from src.services.scheduling.scheduling_config import SchedulingConfig
         from src.services.user.group_service import UserGroupService
 
         # 检查请求体大小
@@ -2542,8 +2510,8 @@ class AdminImportUsersAdapter(AdminApiAdapter):
             .filter(GlobalModel.is_active.is_(True))
             .all()
         }
-        default_model_group = ModelGroupService.get_or_create_default_group(db, commit=False)
-        default_user_group = UserGroupService.get_or_create_default_group(db, commit=False)
+        default_model_group = ModelGroupService.get_required_default_group(db)
+        default_user_group = UserGroupService.get_required_default_group(db)
         model_group_name_to_id[default_model_group.name] = default_model_group.id
         existing_model_group_names.add(default_model_group.name)
         group_name_to_id[default_user_group.name] = default_user_group.id
@@ -2720,7 +2688,6 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                     str(model_group_data.get("display_name") or "").strip() or model_group_name
                 )
                 description = model_group_data.get("description")
-                routing_mode = str(model_group_data.get("routing_mode") or "inherit").strip() or "inherit"
                 is_active = bool(model_group_data.get("is_active", True))
                 is_default = bool(model_group_data.get("is_default", False))
                 sort_order = int(model_group_data.get("sort_order", 100) or 100)
@@ -2775,7 +2742,6 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                                 "user_billing_multiplier_override"
                             ),
                             is_active=bool(route_data.get("is_active", True)),
-                            notes=route_data.get("notes"),
                         )
                     )
 
@@ -2798,7 +2764,6 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         display_name=display_name,
                         description=description,
                         default_user_billing_multiplier=default_user_billing_multiplier,
-                        routing_mode=routing_mode,
                         is_active=is_active,
                         sort_order=sort_order,
                         commit=False,
@@ -2826,7 +2791,6 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                     display_name=display_name,
                     description=description,
                     default_user_billing_multiplier=default_user_billing_multiplier,
-                    routing_mode=routing_mode,
                     is_active=is_active,
                     sort_order=sort_order,
                     commit=False,
@@ -2868,6 +2832,9 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                     label=f"用户分组 '{group_name}'",
                 )
                 normalized_rate_limit = self._normalize_imported_user_rate_limit(group_data)
+                scheduling_mode = SchedulingConfig.normalize_scheduling_mode(
+                    group_data.get("scheduling_mode")
+                )
 
                 existing_group = db.query(UserGroup).filter(UserGroup.name == group_name).first()
                 if existing_group:
@@ -2881,6 +2848,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         existing_group.description = group_data.get("description")
                         existing_group.allowed_api_formats = group_data.get("allowed_api_formats")
                         existing_group.rate_limit = normalized_rate_limit
+                        existing_group.scheduling_mode = scheduling_mode
                         existing_group.updated_at = datetime.now(timezone.utc)
                         ModelGroupService.replace_user_group_bindings(
                             db,
@@ -2899,6 +2867,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                     description=group_data.get("description"),
                     allowed_api_formats=group_data.get("allowed_api_formats"),
                     rate_limit=normalized_rate_limit,
+                    scheduling_mode=scheduling_mode,
                 )
                 db.add(new_group)
                 db.flush()
@@ -2972,7 +2941,7 @@ class AdminImportUsersAdapter(AdminApiAdapter):
                         f"用户 '{import_email}' 包含旧版用户级访问限制字段，当前版本已忽略"
                     )
                 if imported_group_id is None:
-                    imported_group_id = UserGroupService.get_or_create_default_group(db).id
+                    imported_group_id = UserGroupService.get_required_default_group(db).id
 
                 if existing_user:
                     user_id = existing_user.id

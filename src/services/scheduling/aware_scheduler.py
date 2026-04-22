@@ -9,11 +9,13 @@
 
 核心设计思想:
 ===============
-1. 用户首次请求: 按 provider_priority 选择最优 Provider+Endpoint+Key
-2. 用户后续请求:
-   - 优先使用缓存的Endpoint+Key (利用Prompt Caching)
-   - 如果缓存的Key并发满，尝试同Endpoint其他Key
-   - 如果Endpoint不可用，按 provider_priority 切换到其他Provider
+1. 用户组多模型组聚合: 用户组绑定的所有模型组按 binding_priority 顺序聚合，
+   跨组按 (provider, endpoint, key) 去重——先出现的分组占位并保留其 route 优先级、
+   计费倍率和归属元数据，不做"首个可用分组生效"的短路。
+2. 调度模式:
+   - cache_affinity: 缓存命中候选优先；无缓存时按 route 优先级排序
+   - load_balance: 忽略缓存，同优先级内随机轮换
+   - fixed_order: 严格按 route 优先级，忽略缓存
 
 3. 并发控制（动态预留机制）:
    - 探测阶段：使用低预留（10%），让系统快速学习真实并发限制
@@ -23,7 +25,7 @@
 
 4. 故障转移:
    - Key故障: 同Endpoint内切换其他Key（检查模型支持）
-   - Endpoint故障: 按 provider_priority 切换到其他Provider
+   - Endpoint故障: 按聚合后的候选顺序切换
    - 注意：不同Endpoint的协议完全不兼容，不能在同Provider内切换Endpoint
    - 失效缓存亲和性，避免重复选择故障资源
 """
@@ -97,10 +99,6 @@ class CacheAwareScheduler:
     - CacheAffinityManager: 缓存亲和性管理
     """
 
-    # 类常量 re-export（保持外部访问兼容性）
-    PRIORITY_MODE_PROVIDER = SchedulingConfig.PRIORITY_MODE_PROVIDER
-    PRIORITY_MODE_GLOBAL_KEY = SchedulingConfig.PRIORITY_MODE_GLOBAL_KEY
-    ALLOWED_PRIORITY_MODES = SchedulingConfig.ALLOWED_PRIORITY_MODES
     SCHEDULING_MODE_FIXED_ORDER = SchedulingConfig.SCHEDULING_MODE_FIXED_ORDER
     SCHEDULING_MODE_CACHE_AFFINITY = SchedulingConfig.SCHEDULING_MODE_CACHE_AFFINITY
     SCHEDULING_MODE_LOAD_BALANCE = SchedulingConfig.SCHEDULING_MODE_LOAD_BALANCE
@@ -109,7 +107,6 @@ class CacheAwareScheduler:
     def __init__(
         self,
         redis_client: Any | None = None,
-        priority_mode: str | None = None,
         scheduling_mode: str | None = None,
         *,
         candidate_builder: CandidateBuilderProtocol | None = None,
@@ -125,11 +122,10 @@ class CacheAwareScheduler:
 
         Args:
             redis_client: Redis客户端（可选）
-            priority_mode: 候选排序策略（provider | global_key）
             scheduling_mode: 调度模式（fixed_order | cache_affinity）
         """
         self.redis = redis_client
-        self._config = SchedulingConfig(priority_mode, scheduling_mode)
+        self._config = SchedulingConfig(scheduling_mode)
 
         # 异步子组件（将在第一次使用时初始化，可通过构造函数注入）
         self._affinity_manager: CacheAffinityManagerProtocol | None = affinity_manager
@@ -164,24 +160,12 @@ class CacheAwareScheduler:
     # ── 属性代理（保持外部访问兼容性）──────────────────────────
 
     @property
-    def priority_mode(self) -> str:
-        return self._config.priority_mode
-
-    @priority_mode.setter
-    def priority_mode(self, value: str) -> None:
-        self._config.priority_mode = value
-
-    @property
     def scheduling_mode(self) -> str:
         return self._config.scheduling_mode
 
     @scheduling_mode.setter
     def scheduling_mode(self, value: str) -> None:
         self._config.scheduling_mode = value
-
-    def set_priority_mode(self, mode: str | None) -> None:
-        """运行时更新候选排序策略"""
-        self._config.set_priority_mode(mode)
 
     def set_scheduling_mode(self, mode: str | None) -> None:
         """运行时更新调度模式"""
@@ -488,12 +472,17 @@ class CacheAwareScheduler:
         global_conversion_enabled = SystemConfigService.is_format_conversion_enabled(db)
         group_attempts = matched_model_group_links or [None]
 
+        aggregated_candidates: list[ProviderCandidate] = []
+        seen_candidate_sigs: set[tuple[str, str, str]] = set()
+        total_queried_provider_count = 0
+
         for group_link in group_attempts:
             current_allowed_providers = allowed_providers
             model_group_id: str | None = None
             model_group_name: str | None = None
             default_user_billing_multiplier = 1.0
             model_group_routes_by_provider: dict[str, list[dict[str, Any]]] | None = None
+            group_binding_priority: int | None = None
 
             if group_link is not None:
                 model_group = group_link.model_group
@@ -502,6 +491,10 @@ class CacheAwareScheduler:
                 default_user_billing_multiplier = float(
                     getattr(model_group, "default_user_billing_multiplier", 1.0) or 1.0
                 )
+                try:
+                    group_binding_priority = int(getattr(group_link, "priority", None) or 0)
+                except Exception:
+                    group_binding_priority = None
 
                 active_route_entries = [
                     {
@@ -523,43 +516,43 @@ class CacheAwareScheduler:
                     if getattr(route, "is_active", True)
                 ]
 
-                if str(getattr(model_group, "routing_mode", "inherit")) == "custom":
-                    if not active_route_entries:
-                        logger.debug(
-                            "[Scheduler] 模型分组 {} 处于 custom 路由模式但没有有效 route，跳过",
-                            model_group_name,
-                        )
-                        continue
-                    model_group_routes_by_provider = {}
-                    for entry in active_route_entries:
-                        model_group_routes_by_provider.setdefault(entry["provider_id"], []).append(entry)
-
-                    route_provider_ids = list(model_group_routes_by_provider.keys())
-                    if current_allowed_providers is not None:
-                        allowed_set = {value for value in current_allowed_providers if value}
-                        route_provider_ids = [
-                            provider_id for provider_id in route_provider_ids if provider_id in allowed_set
-                        ]
-                        model_group_routes_by_provider = {
-                            provider_id: model_group_routes_by_provider[provider_id]
-                            for provider_id in route_provider_ids
-                        }
-                    current_allowed_providers = route_provider_ids
-
-                    if not current_allowed_providers:
-                        logger.debug(
-                            "[Scheduler] 模型分组 {} 与 API Key Provider 限制交集为空，跳过",
-                            model_group_name,
-                        )
-                        continue
-
-                    current_allowed_providers = sorted(
-                        current_allowed_providers,
-                        key=lambda provider_id: min(
-                            entry["priority"]
-                            for entry in model_group_routes_by_provider.get(provider_id, [])
-                        ),
+                if not active_route_entries:
+                    logger.debug(
+                        "[Scheduler] 模型分组 {} 没有有效 route，跳过",
+                        model_group_name,
                     )
+                    continue
+
+                model_group_routes_by_provider = {}
+                for entry in active_route_entries:
+                    model_group_routes_by_provider.setdefault(entry["provider_id"], []).append(entry)
+
+                route_provider_ids = list(model_group_routes_by_provider.keys())
+                if current_allowed_providers is not None:
+                    allowed_set = {value for value in current_allowed_providers if value}
+                    route_provider_ids = [
+                        provider_id for provider_id in route_provider_ids if provider_id in allowed_set
+                    ]
+                    model_group_routes_by_provider = {
+                        provider_id: model_group_routes_by_provider[provider_id]
+                        for provider_id in route_provider_ids
+                    }
+                current_allowed_providers = route_provider_ids
+
+                if not current_allowed_providers:
+                    logger.debug(
+                        "[Scheduler] 模型分组 {} 与 API Key Provider 限制交集为空，跳过",
+                        model_group_name,
+                    )
+                    continue
+
+                current_allowed_providers = sorted(
+                    current_allowed_providers,
+                    key=lambda provider_id: min(
+                        entry["priority"]
+                        for entry in model_group_routes_by_provider.get(provider_id, [])
+                    ),
+                )
 
             # 1. 查询 Providers（委托给 CandidateBuilder）
             providers = []
@@ -599,6 +592,8 @@ class CacheAwareScheduler:
 
             release_db_connection_before_await(db)
 
+            total_queried_provider_count += queried_provider_count
+
             logger.debug(
                 "[Scheduler] Found {} active providers for model_group={}: {}",
                 len(providers),
@@ -625,33 +620,69 @@ class CacheAwareScheduler:
                 model_group_name=model_group_name,
                 model_group_routes_by_provider=model_group_routes_by_provider,
                 default_user_billing_multiplier=default_user_billing_multiplier,
+                user_group_binding_priority=group_binding_priority,
             )
 
             if not candidates:
                 continue
 
-            candidates = await self.reorder_candidates(
-                candidates=candidates,
-                db=db,
-                affinity_key=affinity_key,
-                api_format=target_format,
-                global_model_id=global_model_id,
-            )
+            # 按 (provider, endpoint, key) 去重跨组候选：先出现的分组占据该候选位，
+            # 其 priority / 计费倍率 / model_group_id 随之绑定。
+            # PoolCandidate 需要细化到 pool_keys 层面去重，pool_keys 被掏空则整体丢弃。
+            for candidate in candidates:
+                if isinstance(candidate, PoolCandidate):
+                    dedup_pool_keys: list[Any] = []
+                    for pool_key in candidate.pool_keys:
+                        sig = (
+                            str(candidate.provider.id),
+                            str(candidate.endpoint.id),
+                            str(getattr(pool_key, "id", "") or ""),
+                        )
+                        if sig in seen_candidate_sigs:
+                            continue
+                        seen_candidate_sigs.add(sig)
+                        dedup_pool_keys.append(pool_key)
+                    if not dedup_pool_keys:
+                        continue
+                    candidate.pool_keys = dedup_pool_keys
+                    candidate.key = dedup_pool_keys[0]
+                    aggregated_candidates.append(candidate)
+                else:
+                    sig = (
+                        str(candidate.provider.id),
+                        str(candidate.endpoint.id),
+                        str(candidate.key.id),
+                    )
+                    if sig in seen_candidate_sigs:
+                        continue
+                    seen_candidate_sigs.add(sig)
+                    aggregated_candidates.append(candidate)
 
-            self._metrics["total_candidates"] += len(candidates)
-            self._metrics["last_candidate_count"] = len(candidates)
+        if not aggregated_candidates:
+            return [], global_model_id, total_queried_provider_count
 
-            logger.debug(
-                "预先获取到 {} 个可用组合 (api_format={}, model={}, model_group={})",
-                len(candidates),
-                target_format,
-                model_name,
-                model_group_name or "<default>",
-            )
+        # 末端统一排序：binding_priority 已写入候选，_sort_by_route_priority 会
+        # 以 (binding_priority, effective_priority, secondary) 为键保证分组间不交错。
+        final_candidates = await self.reorder_candidates(
+            candidates=aggregated_candidates,
+            db=db,
+            affinity_key=affinity_key,
+            api_format=target_format,
+            global_model_id=global_model_id,
+        )
 
-            return candidates, global_model_id, queried_provider_count
+        self._metrics["total_candidates"] += len(final_candidates)
+        self._metrics["last_candidate_count"] = len(final_candidates)
 
-        return [], global_model_id, queried_provider_count
+        logger.debug(
+            "预先获取到 {} 个可用组合 (api_format={}, model={}, model_groups={})",
+            len(final_candidates),
+            target_format,
+            model_name,
+            len(group_attempts),
+        )
+
+        return final_candidates, global_model_id, total_queried_provider_count
 
     async def reorder_candidates(
         self,
@@ -661,7 +692,7 @@ class CacheAwareScheduler:
         api_format: str | None = None,
         global_model_id: str | None = None,
     ) -> list[ProviderCandidate]:
-        """对候选列表应用优先级模式排序和调度模式排序。
+        """对候选列表应用模型组路由排序和调度模式排序。
 
         在分页汇总后调用此方法可修正跨页排序失真。
 
@@ -678,8 +709,8 @@ class CacheAwareScheduler:
         if not candidates:
             return candidates
 
-        # 1. 优先级模式排序（委托给 CandidateSorter）
-        candidates = self._candidate_sorter._apply_priority_mode_sort(
+        # 1. 模型组路由优先级排序（委托给 CandidateSorter）
+        candidates = self._candidate_sorter._sort_by_route_priority(
             candidates, db, affinity_key, api_format
         )
 
@@ -987,13 +1018,8 @@ class CacheAwareScheduler:
         }
 
 
-# 全局单例
-_scheduler: CacheAwareScheduler | None = None
-
-
 async def get_cache_aware_scheduler(
     redis_client: Any | None = None,
-    priority_mode: str | None = None,
     scheduling_mode: str | None = None,
 ) -> CacheAwareScheduler:
     """
@@ -1004,22 +1030,12 @@ async def get_cache_aware_scheduler(
 
     Args:
         redis_client: Redis客户端（可选）
-        priority_mode: 外部覆盖的优先级模式（provider | global_key）
         scheduling_mode: 外部覆盖的调度模式（fixed_order | cache_affinity）
 
     Returns:
         CacheAwareScheduler实例
     """
-    global _scheduler
-
-    if _scheduler is None:
-        _scheduler = CacheAwareScheduler(
-            redis_client, priority_mode=priority_mode, scheduling_mode=scheduling_mode
-        )
-    else:
-        if priority_mode:
-            _scheduler.set_priority_mode(priority_mode)
-        if scheduling_mode:
-            _scheduler.set_scheduling_mode(scheduling_mode)
-
-    return _scheduler
+    return CacheAwareScheduler(
+        redis_client,
+        scheduling_mode=scheduling_mode,
+    )

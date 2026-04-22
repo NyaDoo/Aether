@@ -137,7 +137,7 @@ class CandidateResolver:
 
         logger.debug(f"  [{request_id}] 获取到 {len(all_candidates)} 个候选组合")
 
-        # Provider 分页会导致候选在全局维度上排序失真（尤其是 global_key / 降级分组 / cache_affinity）。
+        # Provider 分页会导致候选在全局维度上排序失真（尤其是路由降级分组 / cache_affinity）。
         # 这里在汇总后再次应用全局排序规则，保证遍历顺序符合当前调度配置。
         try:
             all_candidates = await self.cache_scheduler.reorder_candidates(
