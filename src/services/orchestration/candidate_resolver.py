@@ -360,6 +360,7 @@ class CandidateResolver:
                             "endpoint_id": endpoint.id,
                             "key_id": key.id,
                             "status": "available",
+                            "skip_reason": None,
                             "is_cached": candidate.is_cached,
                             "extra_data": base_extra,
                             "required_capabilities": active_capabilities,
