@@ -29,7 +29,10 @@ _LOCK_KEY = "purge:request_bodies:lock"
 _TASK_KEY_PREFIX = "purge:request_bodies:task:"
 _LOCK_TTL_SECONDS = 3600
 _TASK_TTL_SECONDS = 86400
-_HEARTBEAT_TIMEOUT_SECONDS = 120
+# 心跳独立协程每 10s 写一次 Redis；超时阈值给 10 分钟缓冲，
+# 避免事件循环偶发拥塞被误判为僵尸。
+_HEARTBEAT_INTERVAL_SECONDS = 10
+_HEARTBEAT_TIMEOUT_SECONDS = 600
 
 STATE_PENDING = "pending"
 STATE_RUNNING = "running"
@@ -165,10 +168,12 @@ def _run_purge_sync(
     last_id: str | None = None
     values = _clear_values()
     nonempty = _nonempty_filter()
+    batch_no = 0
 
     while True:
         batch_db = create_session()
         try:
+            select_start = time.monotonic()
             query = batch_db.query(Usage.id).filter(nonempty)
             if cutoff is not None:
                 query = query.filter(Usage.created_at < cutoff)
@@ -176,19 +181,37 @@ def _run_purge_sync(
                 query = query.filter(Usage.id > last_id)
             rows = query.order_by(Usage.id.asc()).limit(batch_size).all()
             ids = [r.id for r in rows]
+            select_ms = int((time.monotonic() - select_start) * 1000)
             if not ids:
+                logger.info(
+                    "清空请求体扫描完毕：共 {} 批，累计 {} 条（末批 SELECT 耗时 {}ms）",
+                    batch_no,
+                    total_cleaned,
+                    select_ms,
+                )
                 break
 
             # 推进游标
             last_id = ids[-1]
 
+            update_start = time.monotonic()
             result = batch_db.execute(
                 update(Usage).where(Usage.id.in_(ids)).values(values)
             )
             batch_db.commit()
+            update_ms = int((time.monotonic() - update_start) * 1000)
             updated = result.rowcount or 0
 
             total_cleaned += updated
+            batch_no += 1
+            logger.info(
+                "清空请求体 batch#{} select={}ms update+commit={}ms rowcount={} total={}",
+                batch_no,
+                select_ms,
+                update_ms,
+                updated,
+                total_cleaned,
+            )
             try:
                 progress_cb(total_cleaned)
             except Exception as cb_exc:
@@ -203,6 +226,23 @@ def _run_purge_sync(
             batch_db.close()
 
     return total_cleaned
+
+
+async def _heartbeat_loop(task_id: str, state: dict[str, Any]) -> None:
+    """独立心跳：与业务循环解耦，周期性刷新 Redis 的 heartbeat_at。
+
+    这样即便某一批 SELECT/UPDATE 在大表上跑好几分钟，状态检测也不会
+    把活着的任务误判为僵尸。
+    """
+    try:
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                await _save_state(task_id, dict(state))
+            except Exception as exc:
+                logger.debug("清空请求体心跳写 Redis 失败: {}", exc)
+    except asyncio.CancelledError:
+        return
 
 
 async def _run_task(task_id: str, cutoff: datetime | None, cutoff_days: int | None) -> None:
@@ -222,16 +262,18 @@ async def _run_task(task_id: str, cutoff: datetime | None, cutoff_days: int | No
 
     loop = asyncio.get_running_loop()
 
+    # 进度回调在工作线程里被调用。不等待写 Redis 完成，避免长时间阻塞工作线程。
+    # 真正的"还活着"证明靠独立心跳协程，这里只需尽力更新 total_cleaned。
     def progress_cb(total: int) -> None:
         state["total_cleaned"] = total
-        fut = asyncio.run_coroutine_threadsafe(
-            _save_state(task_id, dict(state)), loop
-        )
         try:
-            fut.result(timeout=5)
+            asyncio.run_coroutine_threadsafe(
+                _save_state(task_id, dict(state)), loop
+            )
         except Exception as exc:
-            logger.debug("清空请求体进度写入 Redis 失败: {}", exc)
+            logger.debug("清空请求体进度分派失败: {}", exc)
 
+    hb_task = asyncio.create_task(_heartbeat_loop(task_id, state))
     try:
         total = await loop.run_in_executor(
             None,
@@ -250,6 +292,11 @@ async def _run_task(task_id: str, cutoff: datetime | None, cutoff_days: int | No
         state["finished_at"] = _now_iso()
         logger.exception("清空请求体任务 {} 失败", task_id)
     finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except (asyncio.CancelledError, Exception):
+            pass
         await _save_state(task_id, state)
         await _release_lock(task_id)
 
