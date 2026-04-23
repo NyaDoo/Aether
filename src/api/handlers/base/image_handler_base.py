@@ -50,6 +50,12 @@ from src.services.provider.body_transformer import (
 )
 from src.services.provider.transport import build_provider_url
 from src.services.provider.upstream_headers import build_upstream_extra_headers
+from src.services.proxy_node.resolver import (
+    get_proxy_label,
+    resolve_delegate_config_async,
+    resolve_effective_proxy,
+    resolve_proxy_info_async,
+)
 from src.services.scheduling.aware_scheduler import ProviderCandidate
 from src.services.usage.service import UsageService
 
@@ -311,14 +317,38 @@ class ImageHandlerBase(ABC):
             )
             raise HTTPException(status_code=503, detail="No available provider for image generation")
 
-        # 依次尝试候选
+        # 依次尝试候选（与 chat 流式 failover 行为一致：连续失败后做退避+客户端轮换）
         last_error: str | None = None
         last_status: int | None = None
+        last_exc: Exception | None = None
         chosen: ProviderCandidate | None = None
         opened_stream: httpx.Response | None = None
         codex_transformed_body: dict[str, Any] | None = None
+        consecutive_failures = 0
 
         for candidate in candidates:
+            # 在尝试本候选前按 chat 同款节奏做退避+客户端轮换
+            await self._apply_stream_retry_pacing(
+                candidate=candidate,
+                consecutive_failures=consecutive_failures,
+                error=last_exc,
+            )
+
+            # 调试日志：带代理标签，便于生产排障
+            try:
+                proxy_info = await resolve_proxy_info_async(
+                    self._resolve_effective_proxy(candidate)
+                )
+                logger.debug(
+                    "  [{}] 图像流式请求 provider={} 模型={} 代理={}",
+                    self.request_id,
+                    getattr(candidate.provider, "name", "?"),
+                    str(original_request_body.get("model") or "?"),
+                    get_proxy_label(proxy_info),
+                )
+            except Exception:
+                pass
+
             try:
                 opened = await self._open_stream_for_candidate(
                     candidate=candidate,
@@ -331,6 +361,8 @@ class ImageHandlerBase(ABC):
                 )
             except Exception as exc:
                 last_error = f"open_failed:{exc}"
+                last_exc = exc
+                consecutive_failures += 1
                 continue
 
             response, transformed_body = opened
@@ -339,6 +371,9 @@ class ImageHandlerBase(ABC):
                 await response.aclose()
                 last_status = response.status_code
                 last_error = err_bytes.decode(errors="ignore")[:500]
+                # 让 FailoverEngine 的 stream-capacity 检测能嗅到错误文本
+                last_exc = RuntimeError(last_error)
+                consecutive_failures += 1
                 continue
 
             chosen = candidate
@@ -437,7 +472,7 @@ class ImageHandlerBase(ABC):
                 provider_type=provider_type,
                 decrypted_auth_config=decrypted_auth_config,
             )
-            client = await HTTPClientPool.get_default_client_async()
+            client = await self._get_upstream_client(candidate)
             return await client.post(upstream_url, headers=headers, content=raw_body)
 
         headers = self._build_upstream_headers(
@@ -449,7 +484,7 @@ class ImageHandlerBase(ABC):
             provider_type=provider_type,
             decrypted_auth_config=decrypted_auth_config,
         )
-        client = await HTTPClientPool.get_default_client_async()
+        client = await self._get_upstream_client(candidate)
         return await client.post(upstream_url, headers=headers, json=original_request_body)
 
     async def _perform_codex_sync_call(
@@ -486,7 +521,7 @@ class ImageHandlerBase(ABC):
             decrypted_auth_config=decrypted_auth_config,
         )
 
-        client = await HTTPClientPool.get_default_client_async()
+        client = await self._get_upstream_client(candidate)
         request = client.build_request(
             "POST",
             upstream_url,
@@ -542,7 +577,7 @@ class ImageHandlerBase(ABC):
         transformed_body: dict[str, Any] | None = None
         is_codex = _is_codex_candidate(candidate)
 
-        client = await HTTPClientPool.get_default_client_async()
+        client = await self._get_upstream_client(candidate)
 
         if is_codex:
             transformed_body = await self._build_codex_request_body(
@@ -852,6 +887,93 @@ class ImageHandlerBase(ABC):
                 usage = obj.get("usage")
                 if isinstance(usage, dict):
                     captured_usage.update(usage)
+
+    def _resolve_effective_proxy(
+        self, candidate: ProviderCandidate
+    ) -> dict[str, Any] | None:
+        """Key 级代理优先于 Provider 级，行为与 chat handler 一致。"""
+        return resolve_effective_proxy(
+            getattr(candidate.provider, "proxy", None),
+            getattr(candidate.key, "proxy", None),
+        )
+
+    async def _get_upstream_client(
+        self, candidate: ProviderCandidate
+    ) -> httpx.AsyncClient:
+        """解析候选的有效代理 → 返回代理感知的上游 HTTP 客户端。
+
+        与 chat handler 同一机制（Key 级代理覆盖 Provider 级，回落系统默认代理节点）。
+        直连场景等价于默认客户端，对本地开发无影响。
+
+        tls_profile 目前传 None：Codex provider 未注册 envelope，chat 路径
+        同样得到 None，两端保持一致。后续 Codex 若引入 envelope.prepare_context，
+        此处需对齐。
+        """
+        effective_proxy = self._resolve_effective_proxy(candidate)
+        delegate_cfg = await resolve_delegate_config_async(effective_proxy)
+        return await HTTPClientPool.get_upstream_client(
+            delegate_cfg,
+            proxy_config=effective_proxy,
+            tls_profile=None,
+        )
+
+    async def _reset_upstream_client(self, candidate: ProviderCandidate) -> bool:
+        """重建上游客户端，释放失联的 HTTP/2 连接与流配额。
+
+        与 src/services/candidate/failover.py 的 _rotate_upstream_client 同一实现，
+        用于连续失败时轮换连接池。
+        """
+        effective_proxy = self._resolve_effective_proxy(candidate)
+        delegate_cfg = await resolve_delegate_config_async(effective_proxy)
+        return await HTTPClientPool.reset_upstream_client(
+            delegate_cfg,
+            proxy_config=effective_proxy,
+            tls_profile=None,
+        )
+
+    async def _apply_stream_retry_pacing(
+        self,
+        *,
+        candidate: ProviderCandidate,
+        consecutive_failures: int,
+        error: Exception | None,
+    ) -> None:
+        """复用 FailoverEngine 的节奏策略：连续失败触发退避+客户端轮换。
+
+        策略完全等同 chat 流式 failover（RETRY_BACKOFF_EVERY_FAILURES /
+        RETRY_ROTATE_CLIENT_EVERY_FAILURES / STREAM_CAPACITY_BACKOFF_SECONDS）。
+        """
+        if consecutive_failures <= 0:
+            return
+
+        import asyncio
+
+        from src.services.candidate.failover import FailoverEngine
+
+        if FailoverEngine._should_rotate_upstream_client(
+            consecutive_failures=consecutive_failures,
+            error=error,
+        ):
+            rotated = await self._reset_upstream_client(candidate)
+            if rotated:
+                logger.warning(
+                    "  [{}] 图像流式连续失败 {} 次，已重建上游客户端",
+                    self.request_id,
+                    consecutive_failures,
+                )
+
+        backoff_seconds = FailoverEngine._compute_retry_backoff_seconds(
+            consecutive_failures=consecutive_failures,
+            error=error,
+        )
+        if backoff_seconds > 0:
+            logger.warning(
+                "  [{}] 图像流式连续失败 {} 次，退避 {:.0f}ms 后继续",
+                self.request_id,
+                consecutive_failures,
+                backoff_seconds * 1000,
+            )
+            await asyncio.sleep(backoff_seconds)
 
     async def _resolve_upstream_key(
         self, candidate: ProviderCandidate
