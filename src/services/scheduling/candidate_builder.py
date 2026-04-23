@@ -265,20 +265,10 @@ class CandidateBuilder:
         Returns:
             (is_supported, skip_reason, supported_capabilities, provider_model_names)
         """
-        # 确保 global_model 附加到当前 Session
-        # 注意：从缓存重建的对象是 transient 状态，不能使用 load=False
-        # 使用 load=True（默认）允许 SQLAlchemy 正确处理 transient 对象
-        from sqlalchemy import inspect
-
-        insp = inspect(global_model)
-        if insp.transient or insp.detached:
-            # transient/detached 对象：使用默认 merge（会查询 DB 检查是否存在）
-            global_model = db.merge(global_model)
-        else:
-            # persistent 对象：已经附加到 session，无需 merge
-            pass
-
-        # 获取模型支持的能力列表
+        # 本函数只读取 global_model 的标量字段（id / is_active / supported_capabilities），
+        # 不需要把对象附加到 session。早期这里用 db.merge 把缓存/detached 对象拉进 session，
+        # 副作用是 SQLAlchemy 会把缓存里的字段值盖回 DB 行，一旦后续同 session commit
+        # 就会覆盖 admin 刚改的 GlobalModel 配置，参见记账路径的同类修复。
         model_supported_capabilities: list[str] = list(global_model.supported_capabilities or [])
 
         # 查询该 Provider 是否有实现这个 GlobalModel

@@ -223,18 +223,18 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         update_existing_usage(existing_usage, usage_params, target_model)
 
     @staticmethod
-    def _increment_user_model_usage(
-        db: Session, user: User | None, model: str, count: int = 1
+    def _increment_user_model_usage_by_id(
+        db: Session, user_id: str | None, model: str, count: int = 1
     ) -> None:
-        """原子递增用户-模型调用次数计数器"""
-        if user is None:
+        """原子递增用户-模型调用次数计数器（按 ID 而非 User 对象，避免隐式持有脏对象）"""
+        if not user_id:
             return
         from sqlalchemy import func as sa_func
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
         stmt = pg_insert(UserModelUsageCount).values(
             id=str(uuid.uuid4()),
-            user_id=user.id,
+            user_id=user_id,
             model=model,
             usage_count=count,
         )
@@ -246,6 +246,14 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
             },
         )
         db.execute(stmt)
+
+    @classmethod
+    def _increment_user_model_usage(
+        cls, db: Session, user: User | None, model: str, count: int = 1
+    ) -> None:
+        """兼容旧签名：仍被 record_usage_async 等路径以 User 对象调用。"""
+        user_id = str(user.id) if user is not None else None
+        cls._increment_user_model_usage_by_id(db, user_id, model, count=count)
 
     @classmethod
     def _sanitize_request_metadata(cls, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -584,12 +592,10 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     usage = Usage(**usage_params)
                     db.add(usage)
 
-                # 确保 user 和 api_key 在会话中
-                nonlocal user, api_key
-                if user and db.object_session(user) is not db:
-                    user = db.merge(user)
-                if api_key and db.object_session(api_key) is not db:
-                    api_key = db.merge(api_key)
+                # 记账仅使用 user.id / api_key.id，避免 db.merge 把鉴权时持有的
+                # 旧对象整行写回 —— 高并发下会覆盖 admin 刚改的 group_id 等字段。
+                user_id_for_stats = str(user.id) if user else None
+                api_key_id_for_stats = str(api_key.id) if api_key else None
 
                 accounted, charge_applied = cls._finalize_usage_billing(
                     db,
@@ -608,7 +614,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 if accounted:
                     _increment_api_key_totals(
                         db,
-                        str(api_key.id) if api_key else None,
+                        api_key_id_for_stats,
                         request_count=1,
                         total_cost=float(total_cost) if charge_applied else 0.0,
                     )
@@ -619,7 +625,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                         total_cost=_get_actual_total_cost_usd(usage_params),
                     )
                     _increment_global_model_usage(db, model)
-                    cls._increment_user_model_usage(db, user, model)
+                    cls._increment_user_model_usage_by_id(db, user_id_for_stats, model)
                     manual_node_id = _extract_manual_proxy_node_id(metadata)
                     if manual_node_id:
                         failed = {manual_node_id: 1} if status == "failed" else None
@@ -794,12 +800,9 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                     usage = Usage(**usage_params)
                     db.add(usage)
 
-                # 确保 user 和 api_key 在会话中（与 record_usage 保持一致）
-                nonlocal user, api_key
-                if user and db.object_session(user) is not db:
-                    user = db.merge(user)
-                if api_key and db.object_session(api_key) is not db:
-                    api_key = db.merge(api_key)
+                # 记账仅使用 user.id / api_key.id，避免 db.merge 覆盖 admin 刚改的字段。
+                user_id_for_stats = str(user.id) if user else None
+                api_key_id_for_stats = str(api_key.id) if api_key else None
 
                 accounted, charge_applied = cls._finalize_usage_billing(
                     db,
@@ -818,7 +821,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 if accounted:
                     _increment_api_key_totals(
                         db,
-                        str(api_key.id) if api_key else None,
+                        api_key_id_for_stats,
                         request_count=1,
                         total_cost=float(total_cost_decimal) if charge_applied else 0.0,
                     )
@@ -829,7 +832,7 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                         total_cost=_get_actual_total_cost_usd(usage_params),
                     )
                     _increment_global_model_usage(db, model)
-                    cls._increment_user_model_usage(db, user, model)
+                    cls._increment_user_model_usage_by_id(db, user_id_for_stats, model)
                     _increment_provider_monthly_usage(
                         db,
                         provider_id,
