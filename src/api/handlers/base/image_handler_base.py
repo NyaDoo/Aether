@@ -1,33 +1,40 @@
 """
-Image Handler 基类
+Image Handler 基类 — 对齐 chat handler 基础设施。
 
-两条路径共用同一个客户端入口 `openai:image`：
+设计要点：
+- 继承 :class:`BaseMessageHandler`，复用 ``self.telemetry`` / ``self.redis`` /
+  ``_create_pending_usage`` / ``_log_request_error``，不再各自手写 Usage 落库。
+- 所有请求统一走 ``TaskService.execute(task_mode=SYNC, is_stream=False)``：
+  FailoverEngine 负责候选遍历、ErrorClassifier 分类、RequestCandidate 写入、
+  OAuth 401 force_refresh 重试、连续失败退避与客户端轮换。
+- Codex 分支在 ``request_func`` 内做流式聚合（上游 stream=true → 聚合成 dict），
+  对 FailoverEngine 层表现为同步。
+- 客户端 ``stream=true`` 时把聚合 JSON 包成单帧 ``image_generation.completed`` SSE，
+  这样无论 Codex 还是透传都走同一条路径。
+- multipart ``/v1/images/edits`` 与 JSON ``/v1/images/generations`` 共用同一管线，
+  仅在上游请求阶段按 ``raw_body`` / ``raw_content_type`` 切换字节转发。
 
-1. 透传路径（非 Codex 候选）— 请求原样转发到上游 `/v1/images/generations`，
-   流式 SSE 原样透传，尾帧解 usage 落库。
-
-2. Codex 反代路径 — 把 OpenAI images payload 转成 Responses API + image_generation
-   tool 的 payload，上游强制 stream=true，读取 SSE 并聚合
-   `response.output_item.done` 里的 base64 为标准 images JSON。
-   - 客户端 stream=false: 返回聚合 JSON
-   - 客户端 stream=true:  伪造一帧 `image_generation.completed` + `[DONE]` SSE
-
-握手阶段（首字节前）遇到上游错误仍可切换候选，和 chat 流式一致。
+成功/失败的 Usage 记录：
+- 成功：``self.telemetry.record_success(request_type="image", provider=ctx.provider_name,
+  provider_id/endpoint_id/key_id=ctx.*, target_model=ctx.mapped_model,
+  endpoint_api_format=ctx.provider_api_format, has_format_conversion=..., ...)``
+- 失败：``self.telemetry.record_failure(..., provider=ctx.provider_name or "unknown",
+  target_model=ctx.mapped_model, ...)`` —— 只在真正拿不到候选时才会落到 "unknown"。
 """
 
 from __future__ import annotations
 
 import json
-import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy.orm import Session
 
+from src.api.handlers.base.base_handler import BaseMessageHandler
 from src.api.handlers.base.request_builder import evaluate_condition
 from src.clients.http_client import HTTPClientPool
 from src.core.api_format import (
@@ -39,11 +46,20 @@ from src.core.api_format import (
 )
 from src.core.api_format.headers import HOP_BY_HOP_HEADERS
 from src.core.crypto import crypto_service
+from src.core.exceptions import ProviderNotAvailableException, UpstreamClientException
 from src.core.logger import logger
 from src.core.provider_types import ProviderType
-from src.database.database import create_session
-from src.models.database import ApiKey, ProviderAPIKey, ProviderEndpoint, User
+from src.models.database import ProviderAPIKey, ProviderEndpoint
 from src.services.provider.auth import get_provider_auth
+from src.services.provider.adapters.codex.image_transform import (
+    _CodexImageStreamTranslator,
+    build_codex_stream_error_frame,
+    iter_codex_image_stream_frames,
+)
+from src.services.provider.adapters.codex.sse_events import (
+    CodexStreamError,
+    extract_codex_image_usage,
+)
 from src.services.provider.body_transformer import (
     get_body_transformer,
     transform_request_body,
@@ -60,51 +76,103 @@ from src.services.scheduling.aware_scheduler import ProviderCandidate
 from src.services.usage.service import UsageService
 
 
-def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
+def _sanitize_headers(headers: dict[str, str] | None) -> dict[str, str]:
     """脱敏请求头用于审计。"""
+    if not headers:
+        return {}
     drop = {"authorization", "x-api-key", "cookie", "x-goog-api-key"}
     return {k: v for k, v in headers.items() if k.lower() not in drop}
 
 
-def _is_codex_candidate(candidate: ProviderCandidate) -> bool:
+def _is_codex_candidate(candidate: ProviderCandidate | None) -> bool:
+    if candidate is None:
+        return False
     pt = str(getattr(candidate.provider, "provider_type", "") or "").strip().lower()
     return pt == ProviderType.CODEX.value
 
 
-class ImageHandlerBase(ABC):
+def _strip_internal_fields(body: dict[str, Any]) -> dict[str, Any]:
+    """聚合 JSON 过滤掉下划线前缀的内部元数据（如 ``_codex_image_gen``）。
+
+    这些字段供 handler 内部做 usage metadata / 观察性统计使用，不应透出给客户端。
+    """
+    if not isinstance(body, dict):
+        return body
+    return {k: v for k, v in body.items() if not str(k).startswith("_")}
+
+
+@dataclass
+class ImageRequestContext:
+    """单次图像请求的上下文，跨 request_func / telemetry 共享。"""
+
+    provider_name: str | None = None
+    provider_id: str | None = None
+    endpoint_id: str | None = None
+    key_id: str | None = None
+    candidate: ProviderCandidate | None = None
+    mapped_model: str | None = None
+    provider_api_format: str | None = None
+    provider_request_headers: dict[str, str] = field(default_factory=dict)
+    provider_request_body: Any = None
+    has_format_conversion: bool = False
+    model_group_id: str | None = None
+    model_group_route_id: str | None = None
+    user_billing_multiplier: float = 1.0
+    first_byte_time_ms: int | None = None
+    # scheduling 元信息（从 ExecutionResult 回填，供 telemetry request_metadata）
+    candidate_keys: list[Any] = field(default_factory=list)
+    scheduling_audit: dict[str, Any] | None = None
+    pool_summary: dict[str, Any] | None = None
+
+
+class ImageHandlerBase(BaseMessageHandler, ABC):
     """图像生成处理器基类。
 
-    子类必须提供：
-    - FORMAT_ID / API_FAMILY
-    - _build_upstream_url(base_url) → str (透传路径使用；Codex 走 transport hook)
+    子类必须定义：
+    - ``FORMAT_ID`` / ``API_FAMILY`` / ``ENDPOINT_KIND``
+    - ``_build_upstream_url`` —— 透传路径的 URL 构建（Codex 走 transport hook 不经此）
     """
 
     FORMAT_ID: str = "UNKNOWN"
     API_FAMILY: ClassVar[ApiFamily | None] = None
     ENDPOINT_KIND: ClassVar[EndpointKind] = EndpointKind.IMAGE
 
-    # 流式握手阶段最多等待的时间（秒）——用于 failover 决策窗口
+    # Codex 上游 /responses 流式读取握手窗口（秒）
     STREAM_HANDSHAKE_TIMEOUT: ClassVar[float] = 30.0
+    # Codex 生图总 deadline（秒）—— 防止上游卡住无限吊死。
+    # 生图单张一般 15-60s，给到 180s 足够容纳重图 + 网络抖动。
+    STREAM_READ_TIMEOUT: ClassVar[float] = 180.0
 
     def __init__(
         self,
-        db: Session,
-        user: User,
-        api_key: ApiKey,
+        *,
+        db: Any,
+        user: Any,
+        api_key: Any,
         request_id: str,
         client_ip: str,
         user_agent: str,
         start_time: float,
         allowed_api_formats: list[str] | None = None,
-    ):
-        self.db = db
-        self.user = user
-        self.api_key = api_key
-        self.request_id = request_id
-        self.client_ip = client_ip
-        self.user_agent = user_agent
-        self.start_time = start_time
-        self.allowed_api_formats = allowed_api_formats or [self.FORMAT_ID]
+        adapter_detector: Any | None = None,
+        perf_metrics: dict[str, Any] | None = None,
+        api_family: str | None = None,
+        endpoint_kind: str | None = None,
+    ) -> None:
+        super().__init__(
+            db=db,
+            user=user,
+            api_key=api_key,
+            request_id=request_id,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            start_time=start_time,
+            allowed_api_formats=allowed_api_formats or [self.FORMAT_ID],
+            adapter_detector=adapter_detector,
+            perf_metrics=perf_metrics,
+            api_family=api_family or (self.API_FAMILY.value if self.API_FAMILY else None),
+            endpoint_kind=endpoint_kind or self.ENDPOINT_KIND.value,
+        )
 
     # ------------------------------------------------------------------ #
     # 子类抽象接口
@@ -114,7 +182,7 @@ class ImageHandlerBase(ABC):
     def _build_upstream_url(
         self, base_url: str | None, *, path_suffix: str | None = None
     ) -> str:
-        """透传路径的 URL 构建。Codex 候选不走这个，由 transport hook 改写到 /responses。
+        """透传路径的 URL 构建。
 
         path_suffix: "generations" | "edits"，由 adapter 根据路由传入。
         """
@@ -135,24 +203,11 @@ class ImageHandlerBase(ABC):
         raw_content_type: str | None = None,
         upstream_path_suffix: str | None = None,
     ) -> JSONResponse:
-        """同步图像生成。成功后 candidate 选中 Codex 会在闭包内聚合 SSE 再返回 JSON。
+        """同步图像生成。"""
+        _ = (http_request, query_params)
 
-        raw_body + raw_content_type: 用于 multipart /v1/images/edits 透传路径。
-        upstream_path_suffix: "generations" | "edits"，决定透传 URL 尾部。
-        """
-        _ = query_params
-        model = str(original_request_body.get("model") or "unknown")
-
-        self._create_pending_usage(
-            model=model,
-            is_stream=False,
-            original_headers=original_headers,
-            original_request_body=original_request_body,
-        )
-
-        async def _submit(candidate: ProviderCandidate) -> httpx.Response:
-            return await self._perform_candidate_call(
-                candidate=candidate,
+        ctx, response_body, status_code, _response_headers = (
+            await self._execute_image_request(
                 original_headers=original_headers,
                 original_request_body=original_request_body,
                 multipart_context=multipart_context,
@@ -161,101 +216,9 @@ class ImageHandlerBase(ABC):
                 upstream_path_suffix=upstream_path_suffix,
                 client_is_stream=False,
             )
-
-        def _extract_task_id(payload: dict[str, Any]) -> str | None:
-            _ = payload
-            return self.request_id
-
-        from src.services.candidate.submit import (
-            AllCandidatesFailedError,
-            UpstreamClientRequestError,
-        )
-        from src.services.task import TaskService
-
-        try:
-            outcome = await TaskService(self.db).submit_with_failover(
-                api_format=self.FORMAT_ID,
-                model_name=model,
-                affinity_key=str(self.api_key.id),
-                user_api_key=self.api_key,
-                request_id=self.request_id,
-                task_type="image",
-                submit_func=_submit,
-                extract_external_task_id=_extract_task_id,
-                # Codex 反代走 oauth；其他上游是 api_key
-                supported_auth_types={"api_key", "oauth"},
-                allow_format_conversion=False,
-                max_candidates=10,
-                request_body=original_request_body,
-            )
-        except UpstreamClientRequestError as exc:
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=exc.response.status_code,
-                error_message="upstream_client_error",
-                is_stream=False,
-            )
-            return self._build_error_response_from_httpx(exc.response)
-        except AllCandidatesFailedError as exc:
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=exc.last_status_code or 503,
-                error_message=f"all_candidates_failed:{exc.reason}",
-                is_stream=False,
-            )
-            raise HTTPException(status_code=503, detail="No available provider for image generation")
-        except HTTPException as exc:
-            # ProviderNotAvailableException / ProxyException 都是 HTTPException 子类，
-            # 必须在 re-raise 前把 pending usage 结算成 failed。
-            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=exc.status_code,
-                error_message=detail[:500],
-                is_stream=False,
-            )
-            raise
-        except Exception as exc:
-            logger.warning(
-                "[ImageHandler] sync submit failed request_id={}: {}",
-                self.request_id,
-                exc,
-            )
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=500,
-                error_message=str(exc)[:500],
-                is_stream=False,
-            )
-            raise HTTPException(status_code=500, detail="Image generation failed")
-
-        response_body = outcome.upstream_payload or {}
-        response_headers = outcome.upstream_headers or {}
-        status_code = outcome.upstream_status_code or 200
-
-        await self._record_success(
-            model=model,
-            candidate=outcome.candidate,
-            original_request_body=original_request_body,
-            original_headers=original_headers,
-            upstream_request_headers=self._build_upstream_headers_safe(
-                original_headers, outcome.candidate.endpoint, original_request_body
-            ),
-            response_body=response_body,
-            response_headers=response_headers,
-            status_code=status_code,
-            is_stream=False,
-            has_format_conversion=_is_codex_candidate(outcome.candidate),
         )
 
+        self._log_ok(ctx, status_code)
         return JSONResponse(response_body, status_code=status_code)
 
     async def process_stream(
@@ -270,169 +233,29 @@ class ImageHandlerBase(ABC):
         raw_content_type: str | None = None,
         upstream_path_suffix: str | None = None,
     ) -> StreamingResponse | JSONResponse:
-        """流式图像生成。Codex 候选会把响应合成一帧 completed SSE。"""
-        _ = query_params
-        model = str(original_request_body.get("model") or "unknown")
+        """真流式图像生成：Codex 候选实时翻译 SSE 推给客户端；非 Codex 候选
+        退回到聚合+单帧合成（因为 OpenAI /v1/images/generations 原生不 stream）。
 
-        self._create_pending_usage(
-            model=model,
-            is_stream=True,
+        与 sub2api ``handleOpenAIImagesOAuthStreamingResponse`` 行为对齐。
+        """
+        _ = (http_request, query_params)
+
+        return await self._execute_image_stream_request(
             original_headers=original_headers,
             original_request_body=original_request_body,
-        )
-
-        try:
-            candidates = await self._prepare_stream_candidates(model, original_request_body)
-        except HTTPException as exc:
-            # ProviderNotAvailableException 等也是 HTTPException 子类，必须先结算 pending
-            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=exc.status_code,
-                error_message=detail[:500],
-                is_stream=True,
-            )
-            raise
-        except Exception as exc:
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=500,
-                error_message=str(exc)[:500],
-                is_stream=True,
-            )
-            raise HTTPException(status_code=500, detail="Image generation failed")
-
-        if not candidates:
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=503,
-                error_message="no_candidates",
-                is_stream=True,
-            )
-            raise HTTPException(status_code=503, detail="No available provider for image generation")
-
-        # 依次尝试候选（与 chat 流式 failover 行为一致：连续失败后做退避+客户端轮换）
-        last_error: str | None = None
-        last_status: int | None = None
-        last_exc: Exception | None = None
-        chosen: ProviderCandidate | None = None
-        opened_stream: httpx.Response | None = None
-        codex_transformed_body: dict[str, Any] | None = None
-        consecutive_failures = 0
-
-        for candidate in candidates:
-            # 在尝试本候选前按 chat 同款节奏做退避+客户端轮换
-            await self._apply_stream_retry_pacing(
-                candidate=candidate,
-                consecutive_failures=consecutive_failures,
-                error=last_exc,
-            )
-
-            # 调试日志：带代理标签，便于生产排障
-            try:
-                proxy_info = await resolve_proxy_info_async(
-                    self._resolve_effective_proxy(candidate)
-                )
-                logger.debug(
-                    "  [{}] 图像流式请求 provider={} 模型={} 代理={}",
-                    self.request_id,
-                    getattr(candidate.provider, "name", "?"),
-                    str(original_request_body.get("model") or "?"),
-                    get_proxy_label(proxy_info),
-                )
-            except Exception:
-                pass
-
-            try:
-                opened = await self._open_stream_for_candidate(
-                    candidate=candidate,
-                    original_headers=original_headers,
-                    original_request_body=original_request_body,
-                    multipart_context=multipart_context,
-                    raw_body=raw_body,
-                    raw_content_type=raw_content_type,
-                    upstream_path_suffix=upstream_path_suffix,
-                )
-            except Exception as exc:
-                last_error = f"open_failed:{exc}"
-                last_exc = exc
-                consecutive_failures += 1
-                continue
-
-            response, transformed_body = opened
-            if response.status_code >= 400:
-                err_bytes = await response.aread()
-                await response.aclose()
-                last_status = response.status_code
-                last_error = err_bytes.decode(errors="ignore")[:500]
-                # 让 FailoverEngine 的 stream-capacity 检测能嗅到错误文本
-                last_exc = RuntimeError(last_error)
-                consecutive_failures += 1
-                continue
-
-            chosen = candidate
-            opened_stream = response
-            codex_transformed_body = transformed_body
-            break
-
-        if opened_stream is None or chosen is None:
-            await self._record_failure(
-                model=model,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                status_code=last_status or 502,
-                error_message=last_error or "all_candidates_failed",
-                is_stream=True,
-            )
-            raise HTTPException(
-                status_code=last_status or 502,
-                detail="Upstream image generation failed",
-            )
-
-        # Codex 流式：聚合完整 SSE → 合成单帧返回
-        if _is_codex_candidate(chosen):
-            aggregated = await self._consume_codex_stream_to_dict(opened_stream)
-            await self._record_success(
-                model=model,
-                candidate=chosen,
-                original_request_body=original_request_body,
-                original_headers=original_headers,
-                upstream_request_headers=self._build_upstream_headers_safe(
-                    original_headers,
-                    chosen.endpoint,
-                    codex_transformed_body or original_request_body,
-                ),
-                response_body=aggregated,
-                response_headers=dict(opened_stream.headers),
-                status_code=opened_stream.status_code,
-                is_stream=True,
-                has_format_conversion=True,
-            )
-            return self._synthesize_stream_response(aggregated, opened_stream.status_code)
-
-        # 透传路径：原样转发 SSE 字节
-        return self._passthrough_stream_response(
-            stream_response=opened_stream,
-            candidate=chosen,
-            model=model,
-            original_request_body=original_request_body,
-            original_headers=original_headers,
+            multipart_context=multipart_context,
+            raw_body=raw_body,
+            raw_content_type=raw_content_type,
+            upstream_path_suffix=upstream_path_suffix,
         )
 
     # ------------------------------------------------------------------ #
-    # 候选执行：同步路径与流式握手阶段共用
+    # 统一执行入口：走 TaskService.execute + self.telemetry
     # ------------------------------------------------------------------ #
 
-    async def _perform_candidate_call(
+    async def _execute_image_request(
         self,
         *,
-        candidate: ProviderCandidate,
         original_headers: dict[str, str],
         original_request_body: dict[str, Any],
         multipart_context: dict[str, Any] | None,
@@ -440,151 +263,587 @@ class ImageHandlerBase(ABC):
         raw_content_type: str | None,
         upstream_path_suffix: str | None,
         client_is_stream: bool,
-    ) -> httpx.Response:
-        """发起一次上游调用。Codex 走 Responses + SSE 聚合；其他走透传。"""
-        _ = client_is_stream  # 当前只影响 stream 路径的调用者
+    ) -> tuple[ImageRequestContext, dict[str, Any], int, dict[str, str]]:
+        """运行一次图像请求的完整流程：
 
-        if _is_codex_candidate(candidate):
-            aggregated, synthetic = await self._perform_codex_sync_call(
+        1. 创建 pending Usage；
+        2. 构造 request_func，内部按候选类型（Codex / 透传）发 HTTP，捕获 ctx；
+        3. 走 ``TaskService.execute`` 让 FailoverEngine 处理候选遍历与错误分类；
+        4. 根据成功/失败走 ``self.telemetry`` 写 Usage（带完整归因字段）；
+        5. 返回 ``(ctx, response_body, status_code, response_headers)``。
+        """
+        model = str(original_request_body.get("model") or "unknown")
+
+        pending_created = self._create_pending_usage(
+            model=model,
+            is_stream=client_is_stream,
+            request_type="image",
+            api_format=self.FORMAT_ID,
+            request_headers=_sanitize_headers(original_headers),
+            request_body=original_request_body,
+        )
+
+        ctx = ImageRequestContext()
+        ctx.mapped_model = None  # 在 request_func 内填入
+        response_ref: dict[str, Any] = {
+            "body": None,
+            "status_code": 200,
+            "headers": {},
+        }
+
+        async def request_func(
+            provider: Any, endpoint: Any, key: Any, candidate: ProviderCandidate
+        ) -> Any:
+            # 切候选前清空 response_ref，避免上一次候选的残留污染归因
+            response_ref["body"] = None
+            response_ref["status_code"] = 200
+            response_ref["headers"] = {}
+
+            # 一次候选的归因信息先全部记到 ctx，即使后面抛错也能用
+            ctx.candidate = candidate
+            ctx.provider_name = str(getattr(provider, "name", "") or "") or ctx.provider_name
+            ctx.provider_id = str(getattr(provider, "id", "") or "") or ctx.provider_id
+            ctx.endpoint_id = str(getattr(endpoint, "id", "") or "") or ctx.endpoint_id
+            ctx.key_id = str(getattr(key, "id", "") or "") or ctx.key_id
+            fam = str(getattr(endpoint, "api_family", "")).strip().lower()
+            kind = str(getattr(endpoint, "endpoint_kind", "")).strip().lower()
+            ctx.provider_api_format = make_signature_key(fam, kind) or self.FORMAT_ID
+            ctx.model_group_id = getattr(candidate, "model_group_id", None)
+            ctx.model_group_route_id = getattr(candidate, "model_group_route_id", None)
+            ctx.user_billing_multiplier = float(
+                getattr(candidate, "user_billing_multiplier", None) or 1.0
+            )
+            ctx.has_format_conversion = _is_codex_candidate(candidate)
+            ctx.mapped_model = await self._resolve_mapped_model(
+                candidate, original_request_body
+            )
+
+            try:
+                proxy_info = await resolve_proxy_info_async(
+                    self._resolve_effective_proxy(candidate)
+                )
+                logger.debug(
+                    "  [{}] 图像请求 provider={} 模型={} -> {} 代理={}",
+                    self.request_id,
+                    ctx.provider_name or "?",
+                    model,
+                    ctx.mapped_model or "无映射",
+                    get_proxy_label(proxy_info),
+                )
+            except Exception:
+                pass
+
+            # 立刻把 pending 行推进成 streaming + 回填 provider/key/target_model。
+            # 对齐 chat 的 _update_usage_to_streaming_with_ctx —— 让管理面"使用记录"页
+            # 能实时看到当前哪个 provider 在处理，不再卡在"待分配提供商/等待中"。
+            # Codex 生图可能 30-60s，不推进就永远看不到归因。
+            self._update_image_usage_to_streaming(ctx)
+
+            return await self._invoke_upstream(
                 candidate=candidate,
                 original_headers=original_headers,
                 original_request_body=original_request_body,
                 multipart_context=multipart_context,
+                raw_body=raw_body,
+                raw_content_type=raw_content_type,
+                upstream_path_suffix=upstream_path_suffix,
+                ctx=ctx,
+                response_ref=response_ref,
             )
-            _ = aggregated
-            return synthetic
 
-        # 透传路径：标准 OpenAI 生图端点
-        upstream_key, endpoint, _provider_key, decrypted_auth_config = (
-            await self._resolve_upstream_key(candidate)
-        )
-        provider_type = str(getattr(candidate.provider, "provider_type", "") or "").lower() or None
-        upstream_url = self._build_upstream_url(
-            endpoint.base_url, path_suffix=upstream_path_suffix
-        )
-        if raw_body is not None:
-            # multipart 透传：保留原 content-type（含 boundary），按字节转发
-            headers = self._build_upstream_headers_raw(
-                original_headers,
-                upstream_key,
-                endpoint,
-                content_type=raw_content_type,
-                provider_type=provider_type,
-                decrypted_auth_config=decrypted_auth_config,
-            )
-            client = await self._get_upstream_client(candidate)
-            return await client.post(upstream_url, headers=headers, content=raw_body)
-
-        headers = self._build_upstream_headers(
-            original_headers,
-            upstream_key,
-            endpoint,
-            body=original_request_body,
-            original_body=original_request_body,
-            provider_type=provider_type,
-            decrypted_auth_config=decrypted_auth_config,
-        )
-        client = await self._get_upstream_client(candidate)
-        return await client.post(upstream_url, headers=headers, json=original_request_body)
-
-    async def _perform_codex_sync_call(
-        self,
-        *,
-        candidate: ProviderCandidate,
-        original_headers: dict[str, str],
-        original_request_body: dict[str, Any],
-        multipart_context: dict[str, Any] | None,
-    ) -> tuple[dict[str, Any], httpx.Response]:
-        """Codex 同步路径：转换 → 流式上行 → 聚合 → 构造 synthetic JSON Response。"""
-        upstream_key, endpoint, provider_key, decrypted_auth_config = (
-            await self._resolve_upstream_key(candidate)
-        )
-
-        provider_body = await self._build_codex_request_body(
-            candidate=candidate,
-            original_request_body=original_request_body,
-            multipart_context=multipart_context,
-        )
-        upstream_url = build_provider_url(
-            endpoint,
-            is_stream=True,
-            key=provider_key,
-            decrypted_auth_config=decrypted_auth_config,
-        )
-        headers = self._build_upstream_headers(
-            original_headers,
-            upstream_key,
-            endpoint,
-            body=provider_body,
-            original_body=original_request_body,
-            provider_type="codex",
-            decrypted_auth_config=decrypted_auth_config,
-        )
-
-        client = await self._get_upstream_client(candidate)
-        request = client.build_request(
-            "POST",
-            upstream_url,
-            headers=headers,
-            json=provider_body,
-            timeout=httpx.Timeout(self.STREAM_HANDSHAKE_TIMEOUT, read=None),
-        )
-        stream_response = await client.send(request, stream=True)
-
-        if stream_response.status_code >= 400:
-            err_bytes = await stream_response.aread()
-            await stream_response.aclose()
-            # 返回错误响应供 submit_with_failover 抉择
-            return ({}, httpx.Response(
-                status_code=stream_response.status_code,
-                headers=stream_response.headers,
-                content=err_bytes,
-            ))
+        from src.services.task import TaskService
+        from src.services.task.core.context import TaskMode
 
         try:
-            aggregated = await self._consume_codex_stream_to_dict(stream_response)
-        finally:
-            await stream_response.aclose()
+            exec_result = await TaskService(self.db, self.redis).execute(
+                task_type="image",
+                task_mode=TaskMode.SYNC,
+                api_format=self.FORMAT_ID,
+                model_name=model,
+                user_api_key=self.api_key,
+                request_func=request_func,
+                request_id=self.request_id,
+                is_stream=False,
+                capability_requirements=None,
+                request_headers=original_headers,
+                request_body=original_request_body,
+                supported_auth_types={"api_key", "oauth"},
+                allow_format_conversion=False,
+                max_candidates=10,
+                create_pending_usage=not pending_created,
+            )
+        except Exception as exc:  # noqa: BLE001 — 需要统一结算失败 Usage
+            await self._record_failure(
+                ctx=ctx,
+                model=model,
+                original_headers=original_headers,
+                original_request_body=original_request_body,
+                exc=exc,
+                is_stream=client_is_stream,
+            )
+            raise self._to_http_exception(exc) from exc
 
-        synthetic = httpx.Response(
-            status_code=200,
-            headers={
-                k: v
-                for k, v in stream_response.headers.items()
-                if k.lower() not in HOP_BY_HOP_HEADERS
-            },
-            content=json.dumps(aggregated, ensure_ascii=False).encode("utf-8"),
+        # ExecutionResult 是最终权威：回填 ctx
+        if exec_result.candidate:
+            ctx.candidate = exec_result.candidate
+        if exec_result.provider_name:
+            ctx.provider_name = exec_result.provider_name
+        if exec_result.provider_id:
+            ctx.provider_id = exec_result.provider_id
+        if exec_result.endpoint_id:
+            ctx.endpoint_id = exec_result.endpoint_id
+        if exec_result.key_id:
+            ctx.key_id = exec_result.key_id
+        if exec_result.candidate_keys:
+            ctx.candidate_keys = list(exec_result.candidate_keys)
+        if exec_result.pool_summary:
+            ctx.pool_summary = exec_result.pool_summary
+
+        response_body = response_ref.get("body")
+        if not isinstance(response_body, dict):
+            candidate_body = exec_result.response
+            if isinstance(candidate_body, dict):
+                response_body = candidate_body
+            else:
+                # request_func 正常返回但 response_ref 未填（不该发生）——
+                # 把 exec_result 里能拿到的任何痕迹吐出来，避免客户端拿到空 {}
+                logger.warning(
+                    "[ImageHandler] response_ref missing body request_id={} candidate={}",
+                    self.request_id,
+                    getattr(ctx.candidate, "provider", None)
+                    and getattr(ctx.candidate.provider, "name", "?"),
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="Upstream returned no response body",
+                )
+        status_code = int(response_ref.get("status_code") or 200)
+        response_headers = response_ref.get("headers") or {}
+
+        # Usage 记账走聚合后的完整 body（含 _codex_image_gen 等内部 metadata）
+        await self._record_success(
+            ctx=ctx,
+            model=model,
+            original_headers=original_headers,
+            original_request_body=original_request_body,
+            response_body=response_body,
+            response_headers=response_headers,
+            status_code=status_code,
+            is_stream=client_is_stream,
         )
-        return aggregated, synthetic
 
-    async def _open_stream_for_candidate(
+        # 返回给客户端前过滤 _codex_* 内部元数据（不能泄漏给调用方）
+        client_body = _strip_internal_fields(response_body)
+
+        return ctx, client_body, status_code, response_headers
+
+    # ------------------------------------------------------------------ #
+    # 真流式入口（client stream=true）
+    # ------------------------------------------------------------------ #
+
+    async def _execute_image_stream_request(
+        self,
+        *,
+        original_headers: dict[str, str],
+        original_request_body: dict[str, Any],
+        multipart_context: dict[str, Any] | None,
+        raw_body: bytes | None,
+        raw_content_type: str | None,
+        upstream_path_suffix: str | None,
+    ) -> StreamingResponse | JSONResponse:
+        """真流式生图执行链 —— 手动候选迭代 + Codex SSE 实时翻译。
+
+        路由策略：
+        - **Codex 候选** → 打开 /responses 流、用 ``_CodexImageStreamTranslator``
+          实时翻译 SSE 事件，把 ``image_generation.partial_image`` /
+          ``image_generation.completed`` 帧推给客户端
+        - **非 Codex 候选** → OpenAI 原生 ``/v1/images/generations`` 没有稳定的
+          流式协议（gpt-image-1 公版 stream=true 行为因模型而异），为稳妥退回到
+          聚合 JSON 再用 ``_synthesize_stream_response`` 合成单帧
+        - **故意不走 TaskService** —— Codex 首字节可能 10-30s（内部路由 +
+          partial_image 生成），FailoverEngine 的 first-chunk probe 默认 30s 容易
+          误报；sub2api 也是自己迭代候选，不用通用 failover。
+
+        与 ``sub2api`` 的 ``handleOpenAIImagesOAuthStreamingResponse`` 行为严格对齐。
+        """
+        model = str(original_request_body.get("model") or "unknown")
+        pending_created = self._create_pending_usage(
+            model=model,
+            is_stream=True,
+            request_type="image",
+            api_format=self.FORMAT_ID,
+            request_headers=_sanitize_headers(original_headers),
+            request_body=original_request_body,
+        )
+        _ = pending_created
+
+        candidates = await self._fetch_stream_candidates(
+            model=model, request_body=original_request_body
+        )
+        ctx = ImageRequestContext()
+
+        if not candidates:
+            exc = HTTPException(
+                status_code=503,
+                detail="No available provider for image generation",
+            )
+            await self._record_failure(
+                ctx=ctx,
+                model=model,
+                original_headers=original_headers,
+                original_request_body=original_request_body,
+                exc=exc,
+                is_stream=True,
+            )
+            raise exc
+
+        last_exc: Exception | None = None
+        for candidate in candidates[:10]:
+            # Codex 只支持 OAuth；非 OAuth 的 codex provider 直接跳
+            if _is_codex_candidate(candidate):
+                auth_type = str(
+                    getattr(candidate.key, "auth_type", "") or ""
+                ).lower()
+                if auth_type != "oauth":
+                    last_exc = UpstreamClientException(
+                        "Codex provider requires OAuth",
+                        provider_name=str(getattr(candidate.provider, "name", "") or ""),
+                        status_code=400,
+                    )
+                    continue
+
+            # 归因信息写入 ctx
+            self._populate_ctx_from_candidate(ctx, candidate)
+            try:
+                ctx.mapped_model = await self._resolve_mapped_model(
+                    candidate, original_request_body
+                )
+            except Exception:  # noqa: BLE001
+                ctx.mapped_model = str(
+                    original_request_body.get("model") or ""
+                ) or None
+
+            is_codex = _is_codex_candidate(candidate)
+            ctx.has_format_conversion = is_codex
+
+            try:
+                if is_codex:
+                    upstream_response = await self._open_codex_upstream_stream(
+                        candidate=candidate,
+                        original_headers=original_headers,
+                        original_request_body=original_request_body,
+                        multipart_context=multipart_context,
+                        ctx=ctx,
+                    )
+                else:
+                    # 非 Codex 一律走聚合 + 单帧（保守策略）
+                    upstream_response = None
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "[ImageHandler] stream open failed provider={}: {}",
+                    ctx.provider_name or "?",
+                    exc,
+                )
+                continue
+
+            # ---- 非 Codex fallback：直接 sync POST + 聚合 + 单帧 ----
+            if not is_codex:
+                try:
+                    response_ref: dict[str, Any] = {
+                        "body": None,
+                        "status_code": 200,
+                        "headers": {},
+                    }
+                    body = await self._invoke_passthrough_upstream(
+                        candidate=candidate,
+                        original_headers=original_headers,
+                        original_request_body=original_request_body,
+                        raw_body=raw_body,
+                        raw_content_type=raw_content_type,
+                        upstream_path_suffix=upstream_path_suffix,
+                        ctx=ctx,
+                        response_ref=response_ref,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    continue
+
+                self._update_image_usage_to_streaming(ctx)
+                await self._record_success(
+                    ctx=ctx,
+                    model=model,
+                    original_headers=original_headers,
+                    original_request_body=original_request_body,
+                    response_body=body,
+                    response_headers=response_ref.get("headers") or {},
+                    status_code=int(response_ref.get("status_code") or 200),
+                    is_stream=True,
+                )
+                self._log_ok(ctx, int(response_ref.get("status_code") or 200))
+                return self._synthesize_stream_response(
+                    _strip_internal_fields(body),
+                    int(response_ref.get("status_code") or 200),
+                )
+
+            # ---- Codex 路径：检查上游状态 + 真流式翻译 ----
+            assert upstream_response is not None
+            if upstream_response.status_code >= 400:
+                err_bytes = b""
+                try:
+                    err_bytes = await upstream_response.aread()
+                except Exception:  # noqa: BLE001
+                    pass
+                await upstream_response.aclose()
+                last_exc = self._build_status_error(upstream_response, err_bytes)
+                continue
+
+            # 上游 200：commit to this candidate，开始真流式
+            self._update_image_usage_to_streaming(ctx)
+
+            operation = "edit" if multipart_context else "generate"
+            response_format = str(
+                original_request_body.get("response_format") or "b64_json"
+            ).strip().lower() or "b64_json"
+
+            self._log_ok(ctx, 200)
+            return self._build_codex_streaming_response(
+                upstream_response=upstream_response,
+                ctx=ctx,
+                model=model,
+                original_headers=original_headers,
+                original_request_body=original_request_body,
+                operation=operation,
+                response_format=response_format,
+            )
+
+        # 所有候选失败
+        final_exc = last_exc or HTTPException(
+            status_code=502, detail="All candidates failed"
+        )
+        await self._record_failure(
+            ctx=ctx,
+            model=model,
+            original_headers=original_headers,
+            original_request_body=original_request_body,
+            exc=final_exc,
+            is_stream=True,
+        )
+        raise self._to_http_exception(final_exc)
+
+    def _build_codex_streaming_response(
+        self,
+        *,
+        upstream_response: httpx.Response,
+        ctx: ImageRequestContext,
+        model: str,
+        original_headers: dict[str, str],
+        original_request_body: dict[str, Any],
+        operation: str,
+        response_format: str,
+    ) -> StreamingResponse:
+        """把上游 Codex SSE 实时翻译成客户端 SSE，结束后记 Usage。"""
+        translator = _CodexImageStreamTranslator(
+            operation=operation, response_format=response_format
+        )
+
+        async def _pump() -> AsyncIterator[bytes]:
+            stream_error: Exception | None = None
+            try:
+                async for frame in iter_codex_image_stream_frames(
+                    upstream_response.aiter_bytes(),
+                    translator=translator,
+                ):
+                    yield frame
+            except CodexStreamError as err:
+                stream_error = err
+                logger.warning(
+                    "[ImageHandler] codex stream error request_id={}: {}",
+                    self.request_id,
+                    err,
+                )
+                yield build_codex_stream_error_frame(str(err))
+            except Exception as err:  # noqa: BLE001
+                stream_error = err
+                logger.warning(
+                    "[ImageHandler] stream interrupted request_id={}: {}",
+                    self.request_id,
+                    err,
+                )
+                yield build_codex_stream_error_frame(str(err))
+            finally:
+                # 所有分支都以 [DONE] 收尾（OpenAI SSE 惯例）
+                yield b"data: [DONE]\n\n"
+                try:
+                    await upstream_response.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # 流结束后记账 —— 此时 client 可能已断开，只影响服务端 Usage 行
+            try:
+                if stream_error is None and translator.state.images:
+                    response_body: dict[str, Any] = {
+                        "created": int(translator.state.created_at or 0),
+                        "data": list(translator.state.images),
+                    }
+                    billing_usage, tool_usage_meta = extract_codex_image_usage(
+                        translator.state.completed_response
+                    )
+                    if billing_usage:
+                        response_body["usage"] = billing_usage
+                    if tool_usage_meta:
+                        response_body["_codex_image_gen"] = tool_usage_meta
+                    if translator.state.event_count:
+                        response_body["_codex_event_count"] = translator.state.event_count
+                    await self._record_success(
+                        ctx=ctx,
+                        model=model,
+                        original_headers=original_headers,
+                        original_request_body=original_request_body,
+                        response_body=response_body,
+                        response_headers={},
+                        status_code=200,
+                        is_stream=True,
+                    )
+                else:
+                    exc = stream_error or HTTPException(
+                        status_code=502,
+                        detail="Stream ended without images",
+                    )
+                    await self._record_failure(
+                        ctx=ctx,
+                        model=model,
+                        original_headers=original_headers,
+                        original_request_body=original_request_body,
+                        exc=exc,
+                        is_stream=True,
+                    )
+            except Exception as rec_err:  # noqa: BLE001
+                logger.warning(
+                    "[ImageHandler] stream usage record failed request_id={}: {}",
+                    self.request_id,
+                    rec_err,
+                )
+
+        safe_headers: dict[str, str] = {
+            k: v
+            for k, v in upstream_response.headers.items()
+            if k.lower() not in HOP_BY_HOP_HEADERS
+        }
+        safe_headers["content-type"] = "text/event-stream"
+
+        return StreamingResponse(
+            _pump(),
+            status_code=upstream_response.status_code or 200,
+            headers=safe_headers,
+            media_type="text/event-stream",
+        )
+
+    async def _fetch_stream_candidates(
+        self,
+        *,
+        model: str,
+        request_body: dict[str, Any],
+    ) -> list[ProviderCandidate]:
+        """手动拉候选列表（stream 入口不走 TaskService）。"""
+        from src.services.candidate.resolver import CandidateResolver
+        from src.services.scheduling.aware_scheduler import (
+            get_cache_aware_scheduler,
+        )
+        from src.services.user.group_service import UserGroupService
+
+        try:
+            scheduling_mode = UserGroupService.resolve_effective_scheduling_mode(
+                self.db, self.api_key.user
+            )
+            scheduler = await get_cache_aware_scheduler(
+                self.redis, scheduling_mode=scheduling_mode
+            )
+            resolver = CandidateResolver(db=self.db, cache_scheduler=scheduler)
+            candidates, _ = await resolver.fetch_candidates(
+                api_format=self.FORMAT_ID,
+                model_name=model,
+                affinity_key=str(self.api_key.id),
+                user_api_key=self.api_key,
+                request_id=self.request_id,
+                is_stream=True,
+                capability_requirements=None,
+                request_body=request_body,
+            )
+            return list(candidates or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[ImageHandler] fetch_stream_candidates failed: {}", exc
+            )
+            return []
+
+    def _populate_ctx_from_candidate(
+        self,
+        ctx: ImageRequestContext,
+        candidate: ProviderCandidate,
+    ) -> None:
+        """从候选的 provider/endpoint/key 对象填 ctx 的归因字段。"""
+        provider = candidate.provider
+        endpoint = candidate.endpoint
+        key = candidate.key
+
+        ctx.candidate = candidate
+        ctx.provider_name = (
+            str(getattr(provider, "name", "") or "") or ctx.provider_name
+        )
+        ctx.provider_id = (
+            str(getattr(provider, "id", "") or "") or ctx.provider_id
+        )
+        ctx.endpoint_id = (
+            str(getattr(endpoint, "id", "") or "") or ctx.endpoint_id
+        )
+        ctx.key_id = str(getattr(key, "id", "") or "") or ctx.key_id
+        fam = str(getattr(endpoint, "api_family", "")).strip().lower()
+        kind = str(getattr(endpoint, "endpoint_kind", "")).strip().lower()
+        ctx.provider_api_format = make_signature_key(fam, kind) or self.FORMAT_ID
+        ctx.model_group_id = getattr(candidate, "model_group_id", None)
+        ctx.model_group_route_id = getattr(candidate, "model_group_route_id", None)
+        ctx.user_billing_multiplier = float(
+            getattr(candidate, "user_billing_multiplier", None) or 1.0
+        )
+
+    async def _open_codex_upstream_stream(
         self,
         *,
         candidate: ProviderCandidate,
         original_headers: dict[str, str],
         original_request_body: dict[str, Any],
         multipart_context: dict[str, Any] | None,
-        raw_body: bytes | None = None,
-        raw_content_type: str | None = None,
-        upstream_path_suffix: str | None = None,
-    ) -> tuple[httpx.Response, dict[str, Any] | None]:
-        """建立一次流式上行连接。Codex 会改写 URL/body；multipart 透传保留原字节。"""
-        upstream_key, endpoint, provider_key, decrypted_auth_config = (
-            await self._resolve_upstream_key(candidate)
-        )
-        provider_type = str(getattr(candidate.provider, "provider_type", "") or "").lower() or None
+        ctx: ImageRequestContext,
+    ) -> httpx.Response:
+        """只打开 Codex /responses 流式上行 —— 不消费不聚合。
 
-        transformed_body: dict[str, Any] | None = None
-        is_codex = _is_codex_candidate(candidate)
+        - OAuth 401 force_refresh 单次重试
+        - 返回处于 open 状态的 httpx.Response，调用方负责 aclose()
+        - 如果 force_refresh 后仍 401，抛 ``UpstreamClientException``
+        - 不做 HTTP 4xx/5xx 判断（调用方用 ``response.status_code`` 自己决定）
+        """
+        auth_type = str(getattr(candidate.key, "auth_type", "") or "").lower()
+        is_oauth = auth_type == "oauth"
 
-        client = await self._get_upstream_client(candidate)
+        provider_body: dict[str, Any] | None = None
+        stream_response: httpx.Response | None = None
 
-        if is_codex:
-            transformed_body = await self._build_codex_request_body(
-                candidate=candidate,
-                original_request_body=original_request_body,
-                multipart_context=multipart_context,
+        for attempt in range(2 if is_oauth else 1):
+            upstream_key, endpoint, provider_key, decrypted_auth_config = (
+                await self._resolve_upstream_key(
+                    candidate, force_refresh=attempt > 0
+                )
             )
+
+            if provider_body is None:
+                provider_body = await self._build_codex_request_body(
+                    candidate=candidate,
+                    original_request_body=original_request_body,
+                    multipart_context=multipart_context,
+                )
+                ctx.provider_request_body = provider_body
+
             upstream_url = build_provider_url(
                 endpoint,
                 is_stream=True,
@@ -595,60 +854,378 @@ class ImageHandlerBase(ABC):
                 original_headers,
                 upstream_key,
                 endpoint,
-                body=transformed_body,
+                body=provider_body,
                 original_body=original_request_body,
                 provider_type="codex",
                 decrypted_auth_config=decrypted_auth_config,
             )
+            ctx.provider_request_headers = _sanitize_headers(headers)
+
+            client = await self._get_upstream_client(candidate)
             request = client.build_request(
                 "POST",
                 upstream_url,
                 headers=headers,
-                json=transformed_body,
-                timeout=httpx.Timeout(self.STREAM_HANDSHAKE_TIMEOUT, read=None),
+                json=provider_body,
+                timeout=httpx.Timeout(
+                    self.STREAM_HANDSHAKE_TIMEOUT,
+                    read=self.STREAM_READ_TIMEOUT,
+                ),
             )
-            response = await client.send(request, stream=True)
-            return response, transformed_body
+            stream_response = await client.send(request, stream=True)
 
-        # 透传路径
-        upstream_url = self._build_upstream_url(
-            endpoint.base_url, path_suffix=upstream_path_suffix
+            if (
+                is_oauth
+                and attempt == 0
+                and stream_response.status_code == 401
+            ):
+                await stream_response.aclose()
+                logger.warning(
+                    "  [{}] Codex image OAuth 401 key_id={}，force_refresh 后重试",
+                    self.request_id,
+                    getattr(candidate.key, "id", "?"),
+                )
+                continue
+
+            return stream_response
+
+        # force_refresh 后仍然 401
+        raise UpstreamClientException(
+            "Codex upstream returned 401 after force_refresh",
+            provider_name=ctx.provider_name,
+            status_code=401,
         )
-        if raw_body is not None:
-            headers = self._build_upstream_headers_raw(
-                original_headers,
-                upstream_key,
+
+    # ------------------------------------------------------------------ #
+    # 上游调用（Codex 聚合 / 透传）
+    # ------------------------------------------------------------------ #
+
+    async def _invoke_upstream(
+        self,
+        *,
+        candidate: ProviderCandidate,
+        original_headers: dict[str, str],
+        original_request_body: dict[str, Any],
+        multipart_context: dict[str, Any] | None,
+        raw_body: bytes | None,
+        raw_content_type: str | None,
+        upstream_path_suffix: str | None,
+        ctx: ImageRequestContext,
+        response_ref: dict[str, Any],
+    ) -> dict[str, Any]:
+        """对一个候选发起上游调用，捕获原始响应填入 ``response_ref``。
+
+        HTTP 4xx/5xx 以 ``httpx.HTTPStatusError`` 抛出，
+        让 ErrorClassifier 统一分类（OAuth 401 force_refresh / 限流 / 超时等）。
+        Codex 聚合异常包成 ``UpstreamClientException``。
+        """
+        if _is_codex_candidate(candidate):
+            return await self._invoke_codex_upstream(
+                candidate=candidate,
+                original_headers=original_headers,
+                original_request_body=original_request_body,
+                multipart_context=multipart_context,
+                ctx=ctx,
+                response_ref=response_ref,
+            )
+
+        return await self._invoke_passthrough_upstream(
+            candidate=candidate,
+            original_headers=original_headers,
+            original_request_body=original_request_body,
+            raw_body=raw_body,
+            raw_content_type=raw_content_type,
+            upstream_path_suffix=upstream_path_suffix,
+            ctx=ctx,
+            response_ref=response_ref,
+        )
+
+    async def _invoke_codex_upstream(
+        self,
+        *,
+        candidate: ProviderCandidate,
+        original_headers: dict[str, str],
+        original_request_body: dict[str, Any],
+        multipart_context: dict[str, Any] | None,
+        ctx: ImageRequestContext,
+        response_ref: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Codex 反代：/responses + image_generation tool，内部聚合 SSE。
+
+        - OAuth 401：force_refresh token 后单次重试（同 chat handler 行为）
+        - CodexStreamError：上游 SSE 里带错误事件（failed / content_filter 等）
+          转为 ``UpstreamClientException`` 进 ErrorClassifier
+        """
+        auth_type = str(getattr(candidate.key, "auth_type", "") or "").lower()
+        is_oauth = auth_type == "oauth"
+
+        provider_body: dict[str, Any] | None = None
+        last_exc: Exception | None = None
+
+        # OAuth 路径允许一次 force_refresh 重试；其它 auth_type 只试一次
+        for attempt in range(2 if is_oauth else 1):
+            upstream_key, endpoint, provider_key, decrypted_auth_config = (
+                await self._resolve_upstream_key(candidate, force_refresh=attempt > 0)
+            )
+
+            if provider_body is None:
+                provider_body = await self._build_codex_request_body(
+                    candidate=candidate,
+                    original_request_body=original_request_body,
+                    multipart_context=multipart_context,
+                )
+                ctx.provider_request_body = provider_body
+
+            upstream_url = build_provider_url(
                 endpoint,
-                content_type=raw_content_type,
-                provider_type=provider_type,
+                is_stream=True,
+                key=provider_key,
                 decrypted_auth_config=decrypted_auth_config,
             )
-            request = client.build_request(
-                "POST",
-                upstream_url,
-                headers=headers,
-                content=raw_body,
-                timeout=httpx.Timeout(self.STREAM_HANDSHAKE_TIMEOUT, read=None),
-            )
-        else:
             headers = self._build_upstream_headers(
                 original_headers,
                 upstream_key,
                 endpoint,
-                body=original_request_body,
+                body=provider_body,
                 original_body=original_request_body,
-                provider_type=provider_type,
+                provider_type="codex",
                 decrypted_auth_config=decrypted_auth_config,
             )
+            ctx.provider_request_headers = _sanitize_headers(headers)
+
+            client = await self._get_upstream_client(candidate)
             request = client.build_request(
                 "POST",
                 upstream_url,
                 headers=headers,
-                json=original_request_body,
-                timeout=httpx.Timeout(self.STREAM_HANDSHAKE_TIMEOUT, read=None),
+                json=provider_body,
+                # 不再用 read=None —— Codex 生图可能 30-60s 但必须有 deadline。
+                # STREAM_READ_TIMEOUT 给 SSE 聚合一个宽限值，避免上游卡住无限吊死。
+                timeout=httpx.Timeout(
+                    self.STREAM_HANDSHAKE_TIMEOUT,
+                    read=self.STREAM_READ_TIMEOUT,
+                ),
             )
-        response = await client.send(request, stream=True)
-        return response, None
+            stream_response = await client.send(request, stream=True)
+
+            # OAuth 401：force_refresh 一次重试
+            if (
+                is_oauth
+                and attempt == 0
+                and stream_response.status_code == 401
+            ):
+                await stream_response.aclose()
+                logger.warning(
+                    "  [{}] Codex image OAuth 401 key_id={}，force_refresh 后重试",
+                    self.request_id,
+                    getattr(candidate.key, "id", "?"),
+                )
+                continue
+
+            try:
+                if stream_response.status_code >= 400:
+                    err_bytes = await stream_response.aread()
+                    response_ref["status_code"] = stream_response.status_code
+                    response_ref["headers"] = dict(stream_response.headers)
+                    raise self._build_status_error(stream_response, err_bytes)
+
+                try:
+                    aggregated = await self._consume_codex_stream_to_dict(
+                        stream_response
+                    )
+                except CodexStreamError as exc:
+                    # 上游吐 response.failed / content_filter / incomplete 等致命事件
+                    # → 当成 400/502 让 ErrorClassifier 分类
+                    response_ref["status_code"] = 502
+                    raise UpstreamClientException(
+                        f"Codex stream error: {exc}",
+                        provider_name=ctx.provider_name,
+                        status_code=502,
+                        error_type=exc.event_type,
+                        upstream_error=str(exc)[:500],
+                    ) from exc
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise UpstreamClientException(
+                        f"Codex SSE aggregation failed: {exc}",
+                        provider_name=ctx.provider_name,
+                        status_code=502,
+                        upstream_error=str(exc)[:500],
+                    ) from exc
+            except Exception as exc:
+                last_exc = exc
+                raise
+            finally:
+                await stream_response.aclose()
+
+            response_ref["body"] = aggregated
+            response_ref["status_code"] = stream_response.status_code or 200
+            response_ref["headers"] = {
+                k: v
+                for k, v in stream_response.headers.items()
+                if k.lower() not in HOP_BY_HOP_HEADERS
+            }
+            return aggregated
+
+        # force_refresh 后仍然 401：抛出最后一次状态供 ErrorClassifier 分类
+        if last_exc is not None:
+            raise last_exc
+        raise UpstreamClientException(
+            "Codex upstream returned 401 after force_refresh",
+            provider_name=ctx.provider_name,
+            status_code=401,
+        )
+
+    async def _invoke_passthrough_upstream(
+        self,
+        *,
+        candidate: ProviderCandidate,
+        original_headers: dict[str, str],
+        original_request_body: dict[str, Any],
+        raw_body: bytes | None,
+        raw_content_type: str | None,
+        upstream_path_suffix: str | None,
+        ctx: ImageRequestContext,
+        response_ref: dict[str, Any],
+    ) -> dict[str, Any]:
+        """透传路径：标准 OpenAI /v1/images/{generations,edits}。
+
+        OAuth 401：force_refresh token 后单次重试（与 Codex 分支同策略）。
+        """
+        auth_type = str(getattr(candidate.key, "auth_type", "") or "").lower()
+        is_oauth = auth_type == "oauth"
+        provider_type = (
+            str(getattr(candidate.provider, "provider_type", "") or "").lower() or None
+        )
+
+        response: httpx.Response | None = None
+        for attempt in range(2 if is_oauth else 1):
+            upstream_key, endpoint, _provider_key, decrypted_auth_config = (
+                await self._resolve_upstream_key(candidate, force_refresh=attempt > 0)
+            )
+            upstream_url = self._build_upstream_url(
+                endpoint.base_url, path_suffix=upstream_path_suffix
+            )
+
+            if raw_body is not None:
+                headers = self._build_upstream_headers_raw(
+                    original_headers,
+                    upstream_key,
+                    endpoint,
+                    content_type=raw_content_type,
+                    provider_type=provider_type,
+                    decrypted_auth_config=decrypted_auth_config,
+                )
+                ctx.provider_request_headers = _sanitize_headers(headers)
+                ctx.provider_request_body = {
+                    "__multipart__": True,
+                    "size_bytes": len(raw_body),
+                }
+                client = await self._get_upstream_client(candidate)
+                response = await client.post(
+                    upstream_url, headers=headers, content=raw_body
+                )
+            else:
+                headers = self._build_upstream_headers(
+                    original_headers,
+                    upstream_key,
+                    endpoint,
+                    body=original_request_body,
+                    original_body=original_request_body,
+                    provider_type=provider_type,
+                    decrypted_auth_config=decrypted_auth_config,
+                )
+                ctx.provider_request_headers = _sanitize_headers(headers)
+                ctx.provider_request_body = original_request_body
+                client = await self._get_upstream_client(candidate)
+                response = await client.post(
+                    upstream_url, headers=headers, json=original_request_body
+                )
+
+            # OAuth 401: force_refresh retry once
+            if is_oauth and attempt == 0 and response.status_code == 401:
+                logger.warning(
+                    "  [{}] Passthrough image OAuth 401 key_id={}，force_refresh 后重试",
+                    self.request_id,
+                    getattr(candidate.key, "id", "?"),
+                )
+                continue
+            break
+
+        assert response is not None  # 循环至少跑一次
+
+        response_ref["status_code"] = response.status_code
+        response_ref["headers"] = {
+            k: v
+            for k, v in response.headers.items()
+            if k.lower() not in HOP_BY_HOP_HEADERS
+        }
+
+        if response.status_code >= 400:
+            try:
+                err_bytes = response.content
+            except Exception:
+                err_bytes = b""
+            raise self._build_status_error(response, err_bytes)
+
+        try:
+            body = response.json()
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raw_text = ""
+            try:
+                raw_text = (response.text or "")[:500]
+            except Exception:
+                raw_text = ""
+            raise ProviderNotAvailableException(
+                "上游服务返回了无效的响应",
+                provider_name=ctx.provider_name,
+                upstream_status=response.status_code,
+                upstream_response=raw_text,
+            ) from exc
+
+        if not isinstance(body, dict):
+            body = {"data": body}
+
+        response_ref["body"] = body
+        return body
+
+    @staticmethod
+    def _build_status_error(
+        response: httpx.Response, body_bytes: bytes
+    ) -> httpx.HTTPStatusError:
+        text = ""
+        try:
+            text = body_bytes.decode("utf-8", errors="ignore")[:4000]
+        except Exception:
+            text = ""
+        request = getattr(response, "request", None) or httpx.Request(
+            "POST", str(response.url or "")
+        )
+        # httpx.Response 只读 stream；重建一个可读 response 供 raise_for_status
+        err = httpx.HTTPStatusError(
+            f"Upstream returned {response.status_code}",
+            request=request,
+            response=response,
+        )
+        err.upstream_response = text  # type: ignore[attr-defined]
+        return err
+
+    @staticmethod
+    def _to_http_exception(exc: Exception) -> HTTPException:
+        if isinstance(exc, HTTPException):
+            return exc
+        status = int(getattr(exc, "status_code", 0) or 0)
+        if not status:
+            status = int(getattr(exc, "http_status", 0) or 0)
+        if not status:
+            status = 503
+        detail = str(getattr(exc, "detail", "") or exc)[:500] or "Image generation failed"
+        return HTTPException(status_code=status, detail=detail)
+
+    # ------------------------------------------------------------------ #
+    # Codex 相关
+    # ------------------------------------------------------------------ #
 
     async def _build_codex_request_body(
         self,
@@ -657,17 +1234,21 @@ class ImageHandlerBase(ABC):
         original_request_body: dict[str, Any],
         multipart_context: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """调用注册的 body transformer；使用候选的 mapped_model。"""
+        """调用注册的 body transformer 构造 Codex Responses payload。
+
+        ``mapped_model`` 不再通过 context 传入 —— Codex 反代要求 outer model
+        固定为路由模型（``gpt-5.4-mini``），``tool.model`` 直接用 ``body["model"]``
+        （用户后台配置的真实图像模型），映射不在此处生效。
+        """
         transformer = get_body_transformer("codex", self.FORMAT_ID)
         if transformer is None:
             raise HTTPException(
                 status_code=500,
                 detail="Codex image body transformer not registered",
             )
-        mapped_model = await self._resolve_mapped_model(candidate, original_request_body)
+        _ = candidate
         operation = "edit" if multipart_context else "generate"
         context = {
-            "mapped_model": mapped_model,
             "operation": operation,
             "multipart": multipart_context,
         }
@@ -683,12 +1264,7 @@ class ImageHandlerBase(ABC):
         candidate: ProviderCandidate,
         request_body: dict[str, Any],
     ) -> str:
-        """解析候选对应的 mapped_model。完整 fallback 链与 chat 对齐：
-
-        1. candidate.mapping_matched_model（通配符/pool 侧匹配）
-        2. ModelMapperMiddleware.get_mapping(source, provider_id) — 读 Model.provider_model_mappings
-        3. 原始 source 模型名（最终兜底）
-        """
+        """解析候选对应的 mapped_model，fallback 链与 chat 对齐。"""
         mapped = getattr(candidate, "mapping_matched_model", None)
         if isinstance(mapped, str) and mapped.strip():
             return mapped.strip()
@@ -707,12 +1283,6 @@ class ImageHandlerBase(ABC):
                         affinity_key, api_format=self.FORMAT_ID
                     )
                     if isinstance(picked, str) and picked.strip():
-                        logger.debug(
-                            "[ImageHandler] model mapping {} -> {} (provider={})",
-                            source,
-                            picked,
-                            provider_id[:8],
-                        )
                         return picked.strip()
             except Exception as exc:
                 logger.warning(
@@ -727,7 +1297,6 @@ class ImageHandlerBase(ABC):
         self,
         stream_response: httpx.Response,
     ) -> dict[str, Any]:
-        """读取 Codex Responses SSE 字节流并聚合成标准 images JSON。"""
         from src.services.provider.adapters.codex.image_transform import (
             aggregate_codex_image_sse,
         )
@@ -755,143 +1324,13 @@ class ImageHandlerBase(ABC):
             headers={"content-type": "text/event-stream"},
         )
 
-    def _passthrough_stream_response(
-        self,
-        *,
-        stream_response: httpx.Response,
-        candidate: ProviderCandidate,
-        model: str,
-        original_request_body: dict[str, Any],
-        original_headers: dict[str, str],
-    ) -> StreamingResponse:
-        captured_usage: dict[str, Any] = {}
-        captured_completed_frame: dict[str, Any] = {}
-
-        async def _iter_sse() -> AsyncIterator[bytes]:
-            buffer = b""
-            try:
-                async for chunk in stream_response.aiter_bytes():
-                    yield chunk
-                    buffer += chunk
-                    while b"\n\n" in buffer:
-                        event_bytes, buffer = buffer.split(b"\n\n", 1)
-                        self._maybe_capture_completion(
-                            event_bytes, captured_usage, captured_completed_frame
-                        )
-            except Exception as exc:
-                logger.warning(
-                    "[ImageHandler] stream interrupted request_id={}: {}",
-                    self.request_id,
-                    exc,
-                )
-            finally:
-                await stream_response.aclose()
-                try:
-                    await self._record_success(
-                        model=model,
-                        candidate=candidate,
-                        original_request_body=original_request_body,
-                        original_headers=original_headers,
-                        upstream_request_headers=self._build_upstream_headers_safe(
-                            original_headers, candidate.endpoint, original_request_body
-                        ),
-                        response_body=captured_completed_frame
-                        or ({"usage": captured_usage} if captured_usage else {}),
-                        response_headers=dict(stream_response.headers),
-                        status_code=stream_response.status_code,
-                        is_stream=True,
-                        has_format_conversion=False,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "[ImageHandler] stream usage record failed request_id={}: {}",
-                        self.request_id,
-                        exc,
-                    )
-
-        safe_headers = {
-            k: v
-            for k, v in stream_response.headers.items()
-            if k.lower() not in HOP_BY_HOP_HEADERS
-        }
-        safe_headers.setdefault("content-type", "text/event-stream")
-
-        return StreamingResponse(
-            _iter_sse(),
-            status_code=stream_response.status_code,
-            headers=safe_headers,
-            media_type="text/event-stream",
-        )
-
     # ------------------------------------------------------------------ #
-    # 内部辅助
+    # 代理 / HTTP client
     # ------------------------------------------------------------------ #
-
-    async def _prepare_stream_candidates(
-        self,
-        model: str,
-        request_body: dict[str, Any],
-    ) -> list[ProviderCandidate]:
-        from src.clients.redis_client import get_redis_client_sync
-        from src.services.candidate.resolver import CandidateResolver
-        from src.services.scheduling.aware_scheduler import (
-            get_cache_aware_scheduler,
-        )
-        from src.services.user.group_service import UserGroupService
-
-        scheduling_mode = UserGroupService.resolve_effective_scheduling_mode(
-            self.db, self.api_key.user
-        )
-        redis = get_redis_client_sync()
-        scheduler = await get_cache_aware_scheduler(redis, scheduling_mode=scheduling_mode)
-        resolver = CandidateResolver(db=self.db, cache_scheduler=scheduler)
-        candidates, _ = await resolver.fetch_candidates(
-            api_format=self.FORMAT_ID,
-            model_name=model,
-            affinity_key=str(self.api_key.id),
-            user_api_key=self.api_key,
-            request_id=self.request_id,
-            is_stream=True,
-            capability_requirements=None,
-            request_body=request_body,
-        )
-        return candidates or []
-
-    def _maybe_capture_completion(
-        self,
-        event_bytes: bytes,
-        captured_usage: dict[str, Any],
-        captured_frame: dict[str, Any],
-    ) -> None:
-        try:
-            text = event_bytes.decode("utf-8", errors="ignore")
-        except Exception:
-            return
-        data_payloads: list[str] = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                data_payloads.append(line[5:].strip())
-        for raw in data_payloads:
-            if not raw or raw == "[DONE]":
-                continue
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            evt_type = obj.get("type") or ""
-            if str(evt_type).endswith("completed"):
-                captured_frame.update(obj)
-                usage = obj.get("usage")
-                if isinstance(usage, dict):
-                    captured_usage.update(usage)
 
     def _resolve_effective_proxy(
         self, candidate: ProviderCandidate
     ) -> dict[str, Any] | None:
-        """Key 级代理优先于 Provider 级，行为与 chat handler 一致。"""
         return resolve_effective_proxy(
             getattr(candidate.provider, "proxy", None),
             getattr(candidate.key, "proxy", None),
@@ -900,15 +1339,7 @@ class ImageHandlerBase(ABC):
     async def _get_upstream_client(
         self, candidate: ProviderCandidate
     ) -> httpx.AsyncClient:
-        """解析候选的有效代理 → 返回代理感知的上游 HTTP 客户端。
-
-        与 chat handler 同一机制（Key 级代理覆盖 Provider 级，回落系统默认代理节点）。
-        直连场景等价于默认客户端，对本地开发无影响。
-
-        tls_profile 目前传 None：Codex provider 未注册 envelope，chat 路径
-        同样得到 None，两端保持一致。后续 Codex 若引入 envelope.prepare_context，
-        此处需对齐。
-        """
+        """返回代理感知的上游 HTTP client（与 chat handler 一致语义）。"""
         effective_proxy = self._resolve_effective_proxy(candidate)
         delegate_cfg = await resolve_delegate_config_async(effective_proxy)
         return await HTTPClientPool.get_upstream_client(
@@ -917,79 +1348,39 @@ class ImageHandlerBase(ABC):
             tls_profile=None,
         )
 
-    async def _reset_upstream_client(self, candidate: ProviderCandidate) -> bool:
-        """重建上游客户端，释放失联的 HTTP/2 连接与流配额。
-
-        与 src/services/candidate/failover.py 的 _rotate_upstream_client 同一实现，
-        用于连续失败时轮换连接池。
-        """
-        effective_proxy = self._resolve_effective_proxy(candidate)
-        delegate_cfg = await resolve_delegate_config_async(effective_proxy)
-        return await HTTPClientPool.reset_upstream_client(
-            delegate_cfg,
-            proxy_config=effective_proxy,
-            tls_profile=None,
-        )
-
-    async def _apply_stream_retry_pacing(
-        self,
-        *,
-        candidate: ProviderCandidate,
-        consecutive_failures: int,
-        error: Exception | None,
-    ) -> None:
-        """复用 FailoverEngine 的节奏策略：连续失败触发退避+客户端轮换。
-
-        策略完全等同 chat 流式 failover（RETRY_BACKOFF_EVERY_FAILURES /
-        RETRY_ROTATE_CLIENT_EVERY_FAILURES / STREAM_CAPACITY_BACKOFF_SECONDS）。
-        """
-        if consecutive_failures <= 0:
-            return
-
-        import asyncio
-
-        from src.services.candidate.failover import FailoverEngine
-
-        if FailoverEngine._should_rotate_upstream_client(
-            consecutive_failures=consecutive_failures,
-            error=error,
-        ):
-            rotated = await self._reset_upstream_client(candidate)
-            if rotated:
-                logger.warning(
-                    "  [{}] 图像流式连续失败 {} 次，已重建上游客户端",
-                    self.request_id,
-                    consecutive_failures,
-                )
-
-        backoff_seconds = FailoverEngine._compute_retry_backoff_seconds(
-            consecutive_failures=consecutive_failures,
-            error=error,
-        )
-        if backoff_seconds > 0:
-            logger.warning(
-                "  [{}] 图像流式连续失败 {} 次，退避 {:.0f}ms 后继续",
-                self.request_id,
-                consecutive_failures,
-                backoff_seconds * 1000,
-            )
-            await asyncio.sleep(backoff_seconds)
+    # ------------------------------------------------------------------ #
+    # 凭证 / 头部构建
+    # ------------------------------------------------------------------ #
 
     async def _resolve_upstream_key(
-        self, candidate: ProviderCandidate
+        self,
+        candidate: ProviderCandidate,
+        *,
+        force_refresh: bool = False,
     ) -> tuple[str, ProviderEndpoint, ProviderAPIKey, dict[str, Any] | None]:
-        """解密/刷新上游凭证。
+        """解析上游凭证。
 
-        Returns:
-            (upstream_key, endpoint, key, decrypted_auth_config)
-            - upstream_key: 上游请求所用的 token（OAuth 是 access_token；api_key 是解密后的 key）
-            - decrypted_auth_config: OAuth key 的 auth_config（Codex 需要读 account_id）；api_key None
+        ``force_refresh=True`` 时穿透 Redis OAuth token 缓存，强制从 refresh_token
+        换新的 access_token。用于 401 单次重试。
         """
         auth_type = str(getattr(candidate.key, "auth_type", "api_key") or "api_key").lower()
 
+        # Codex 反代只支持 OAuth（需要 chatgpt-account-id）。API key 模式下不会注入
+        # 该 header，上游只会一路 401；这里前置校验，让 scheduler 直接切候选并
+        # 在日志里留痕，避免烧掉一次候选配额。
+        if _is_codex_candidate(candidate) and auth_type != "oauth":
+            raise UpstreamClientException(
+                "Codex provider requires OAuth key; api_key credentials are not supported",
+                provider_name=str(getattr(candidate.provider, "name", "") or ""),
+                status_code=400,
+                error_type="invalid_auth_type_for_codex",
+            )
+
         if auth_type == "oauth":
             try:
-                auth_info = await get_provider_auth(candidate.endpoint, candidate.key)
+                auth_info = await get_provider_auth(
+                    candidate.endpoint, candidate.key, force_refresh=force_refresh
+                )
             except Exception as exc:
                 logger.error(
                     "[ImageHandler] OAuth token resolve failed key_id={}: {}",
@@ -998,7 +1389,7 @@ class ImageHandlerBase(ABC):
                 )
                 raise HTTPException(
                     status_code=500, detail="Failed to resolve OAuth access token"
-                )
+                ) from exc
             if auth_info is None or not auth_info.auth_value:
                 raise HTTPException(
                     status_code=500, detail="OAuth access token unavailable"
@@ -1013,7 +1404,6 @@ class ImageHandlerBase(ABC):
                 auth_info.decrypted_auth_config,
             )
 
-        # api_key 路径
         try:
             upstream_key = crypto_service.decrypt(candidate.key.api_key)
         except Exception as exc:
@@ -1022,7 +1412,9 @@ class ImageHandlerBase(ABC):
                 candidate.key.id,
                 exc,
             )
-            raise HTTPException(status_code=500, detail="Failed to decrypt provider key")
+            raise HTTPException(
+                status_code=500, detail="Failed to decrypt provider key"
+            ) from exc
         return upstream_key, candidate.endpoint, candidate.key, None
 
     def _build_upstream_headers(
@@ -1042,7 +1434,6 @@ class ImageHandlerBase(ABC):
             str(getattr(endpoint, "endpoint_kind", "")).strip().lower(),
         )
 
-        # 调用 provider-specific headers hook（如 Codex 的 chatgpt-account-id 注入）
         if provider_type:
             try:
                 provider_extra = build_upstream_extra_headers(
@@ -1072,29 +1463,8 @@ class ImageHandlerBase(ABC):
             original_body=original_body,
             condition_evaluator=evaluate_condition,
         )
-        # 无论客户端怎么传，上游 body 我们已经序列化为 JSON
         headers["content-type"] = "application/json"
         return headers
-
-    def _build_upstream_headers_safe(
-        self,
-        original_headers: dict[str, str],
-        endpoint: ProviderEndpoint,
-        body: dict[str, Any],
-        *,
-        provider_type: str | None = None,
-        decrypted_auth_config: dict[str, Any] | None = None,
-    ) -> dict[str, str]:
-        """构建用于 usage 记录的脱敏版本 header。"""
-        return self._build_upstream_headers(
-            original_headers,
-            "",
-            endpoint,
-            body=body,
-            original_body=body,
-            provider_type=provider_type,
-            decrypted_auth_config=decrypted_auth_config,
-        )
 
     def _build_upstream_headers_raw(
         self,
@@ -1106,7 +1476,6 @@ class ImageHandlerBase(ABC):
         provider_type: str | None = None,
         decrypted_auth_config: dict[str, Any] | None = None,
     ) -> dict[str, str]:
-        """multipart 透传专用：保留原 content-type（含 boundary），不覆盖为 JSON。"""
         extra_headers = dict(get_extra_headers_from_endpoint(endpoint) or {})
         endpoint_sig = make_signature_key(
             str(getattr(endpoint, "api_family", "")).strip().lower(),
@@ -1146,196 +1515,249 @@ class ImageHandlerBase(ABC):
             headers["content-type"] = content_type
         return headers
 
-    def _build_error_response_from_httpx(self, response: httpx.Response) -> JSONResponse:
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            try:
-                return JSONResponse(status_code=response.status_code, content=response.json())
-            except Exception:
-                pass
-        return JSONResponse(
-            status_code=response.status_code,
-            content={
-                "error": {
-                    "type": "upstream_error",
-                    "message": (response.text or "Upstream error")[:500],
-                }
-            },
-        )
-
     # ------------------------------------------------------------------ #
     # Usage 记录
     # ------------------------------------------------------------------ #
 
-    def _create_pending_usage(
-        self,
-        *,
-        model: str,
-        is_stream: bool,
-        original_headers: dict[str, str],
-        original_request_body: dict[str, Any],
-    ) -> None:
-        """请求进入时同步写一条 pending usage，便于前端实时看到"处理中"。
+    def _update_image_usage_to_streaming(self, ctx: ImageRequestContext) -> None:
+        """把 pending 行推进成 ``streaming`` 并回填 provider/key/target_model。
 
-        失败容忍：pending 写入异常不阻塞请求，只记日志。后续 _record_success /
-        _record_failure 若找到相同 request_id 的记录会原位更新。
+        异步后台执行（仿 :meth:`BaseMessageHandler._update_usage_to_streaming_with_ctx`），
+        不阻塞主请求链路。失败只 warn。
+
+        这一步是管理面"使用记录"页实时展示归因的前提 —— 没有它，Codex 生图的
+        30-60 秒里 pending 行会一直显示"待分配提供商 / 等待中"。
         """
-        try:
-            UsageService.create_pending_usage(
-                db=self.db,
-                request_id=self.request_id,
-                user=self.user,
-                api_key=self.api_key,
-                model=model,
-                is_stream=is_stream,
-                request_type="image",
-                api_format=self.FORMAT_ID,
-                request_headers=_sanitize_headers(original_headers),
-                request_body=original_request_body,
-            )
-        except Exception as exc:
+        import asyncio
+
+        from src.database.database import get_db
+
+        target_request_id = self.request_id
+        provider = ctx.provider_name
+        provider_id = ctx.provider_id
+        endpoint_id = ctx.endpoint_id
+        key_id = ctx.key_id
+        target_model = ctx.mapped_model
+        api_format = self.FORMAT_ID
+        endpoint_api_format = ctx.provider_api_format
+        has_format_conversion = ctx.has_format_conversion
+        provider_request_headers = ctx.provider_request_headers or None
+        provider_request_body = ctx.provider_request_body
+
+        if not provider:
             logger.warning(
-                "[ImageHandler] create pending usage failed request_id={}: {}",
-                self.request_id,
-                exc,
+                "[ImageHandler] 推进 streaming 时 provider 为空: request_id={}",
+                target_request_id,
             )
+            return
+
+        def _sync_update() -> None:
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                UsageService.update_usage_status(
+                    db=db,
+                    request_id=target_request_id,
+                    status="streaming",
+                    provider=provider,
+                    target_model=target_model,
+                    provider_id=provider_id,
+                    provider_endpoint_id=endpoint_id,
+                    provider_api_key_id=key_id,
+                    api_format=api_format,
+                    endpoint_api_format=endpoint_api_format,
+                    has_format_conversion=has_format_conversion,
+                    provider_request_headers=provider_request_headers,
+                    provider_request_body=provider_request_body,
+                )
+            finally:
+                db.close()
+
+        async def _do_update() -> None:
+            try:
+                await asyncio.to_thread(_sync_update)
+            except Exception as exc:
+                logger.warning(
+                    "[ImageHandler] 推进 streaming 失败 request_id={}: {}",
+                    target_request_id,
+                    exc,
+                )
+
+        from src.utils.async_utils import safe_create_task
+
+        safe_create_task(_do_update())
 
     async def _record_success(
         self,
         *,
+        ctx: ImageRequestContext,
         model: str,
-        candidate: ProviderCandidate,
-        original_request_body: dict[str, Any],
         original_headers: dict[str, str],
-        upstream_request_headers: dict[str, str],
+        original_request_body: dict[str, Any],
         response_body: dict[str, Any],
-        response_headers: dict[str, Any],
+        response_headers: dict[str, str],
         status_code: int,
         is_stream: bool,
-        has_format_conversion: bool = False,
-        use_isolated_session: bool = False,
     ) -> None:
-        response_time_ms = int((time.time() - self.start_time) * 1000)
+        response_time_ms = self.elapsed_ms()
         usage = response_body.get("usage") if isinstance(response_body, dict) else None
         input_tokens = 0
         output_tokens = 0
         if isinstance(usage, dict):
             input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
-            output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+            output_tokens = int(
+                usage.get("output_tokens") or usage.get("completion_tokens") or 0
+            )
 
-        endpoint_api_format = make_signature_key(
-            str(getattr(candidate.endpoint, "api_family", "")).strip().lower(),
-            str(getattr(candidate.endpoint, "endpoint_kind", "")).strip().lower(),
-        )
+        request_metadata = self._build_image_request_metadata(ctx)
 
-        async def _do(db: Session) -> None:
-            await UsageService.record_usage(
-                db=db,
-                user=self.user,
-                api_key=self.api_key,
-                provider=candidate.provider.name,
+        try:
+            await self.telemetry.record_success(
+                provider=ctx.provider_name or "unknown",
                 model=model,
+                target_model=ctx.mapped_model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                request_type="image",
-                api_format=self.FORMAT_ID,
-                api_family=self.API_FAMILY.value if self.API_FAMILY else None,
-                endpoint_kind=self.ENDPOINT_KIND.value,
-                endpoint_api_format=endpoint_api_format,
-                has_format_conversion=has_format_conversion,
-                is_stream=is_stream,
                 response_time_ms=response_time_ms,
                 status_code=status_code,
-                request_headers=_sanitize_headers(original_headers),
                 request_body=original_request_body,
-                provider_request_headers=_sanitize_headers(upstream_request_headers),
-                response_headers=response_headers,
+                request_headers=_sanitize_headers(original_headers),
                 response_body=response_body,
-                request_id=self.request_id,
-                provider_id=candidate.provider.id,
-                provider_endpoint_id=candidate.endpoint.id,
-                provider_api_key_id=candidate.key.id,
-                status="completed",
+                response_headers=response_headers or {},
+                provider_request_headers=ctx.provider_request_headers,
+                provider_request_body=ctx.provider_request_body,
+                is_stream=is_stream,
+                provider_id=ctx.provider_id,
+                provider_endpoint_id=ctx.endpoint_id,
+                provider_api_key_id=ctx.key_id,
+                model_group_id=ctx.model_group_id,
+                model_group_route_id=ctx.model_group_route_id,
+                user_billing_multiplier=ctx.user_billing_multiplier,
+                api_format=self.FORMAT_ID,
+                api_family=self.api_family,
+                endpoint_kind=self.endpoint_kind,
+                endpoint_api_format=ctx.provider_api_format,
+                has_format_conversion=ctx.has_format_conversion,
+                request_metadata=request_metadata,
+                request_type="image",
             )
-            db.commit()
-
-        await self._run_usage_write(_do, use_isolated_session)
+        except Exception as exc:
+            logger.warning(
+                "[ImageHandler] record_success failed request_id={}: {}",
+                self.request_id,
+                exc,
+            )
 
     async def _record_failure(
         self,
         *,
+        ctx: ImageRequestContext,
         model: str,
-        original_request_body: dict[str, Any],
         original_headers: dict[str, str],
-        status_code: int,
-        error_message: str,
+        original_request_body: dict[str, Any],
+        exc: Exception,
         is_stream: bool,
-        use_isolated_session: bool = False,
     ) -> None:
-        response_time_ms = int((time.time() - self.start_time) * 1000)
+        response_time_ms = self.elapsed_ms()
+        status_code = self._extract_error_status_code(exc)
+        error_message = self._extract_error_message(exc)
 
-        async def _do(db: Session) -> None:
-            await UsageService.record_usage(
-                db=db,
-                user=self.user,
-                api_key=self.api_key,
-                provider="unknown",
-                model=model,
-                input_tokens=0,
-                output_tokens=0,
-                request_type="image",
-                api_format=self.FORMAT_ID,
-                api_family=self.API_FAMILY.value if self.API_FAMILY else None,
-                endpoint_kind=self.ENDPOINT_KIND.value,
-                has_format_conversion=False,
-                is_stream=is_stream,
-                response_time_ms=response_time_ms,
-                status_code=status_code,
-                error_message=error_message[:500],
-                request_headers=_sanitize_headers(original_headers),
-                request_body=original_request_body,
-                request_id=self.request_id,
-                status="failed",
-            )
-            db.commit()
-
-        await self._run_usage_write(_do, use_isolated_session)
-
-    async def _run_usage_write(
-        self,
-        write_fn,
-        use_isolated_session: bool,
-    ) -> None:
-        if use_isolated_session:
-            db = create_session()
-            try:
-                await write_fn(db)
-            except Exception as exc:
-                logger.warning(
-                    "[ImageHandler] isolated usage write failed request_id={}: {}",
-                    self.request_id,
-                    exc,
-                )
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-            finally:
-                db.close()
-            return
+        request_metadata = self._build_image_request_metadata(ctx)
 
         try:
-            await write_fn(self.db)
-        except Exception as exc:
-            logger.warning(
-                "[ImageHandler] usage write failed request_id={}: {}",
-                self.request_id,
-                exc,
+            await self.telemetry.record_failure(
+                provider=ctx.provider_name or "unknown",
+                model=model,
+                target_model=ctx.mapped_model,
+                response_time_ms=response_time_ms,
+                status_code=status_code,
+                error_message=error_message,
+                request_body=original_request_body,
+                request_headers=_sanitize_headers(original_headers),
+                is_stream=is_stream,
+                api_format=self.FORMAT_ID,
+                api_family=self.api_family,
+                endpoint_kind=self.endpoint_kind,
+                endpoint_api_format=ctx.provider_api_format,
+                has_format_conversion=ctx.has_format_conversion,
+                provider_request_headers=ctx.provider_request_headers,
+                provider_request_body=ctx.provider_request_body,
+                provider_id=ctx.provider_id,
+                provider_endpoint_id=ctx.endpoint_id,
+                provider_api_key_id=ctx.key_id,
+                model_group_id=ctx.model_group_id,
+                model_group_route_id=ctx.model_group_route_id,
+                user_billing_multiplier=ctx.user_billing_multiplier,
+                request_metadata=request_metadata,
+                request_type="image",
             )
-            try:
-                self.db.rollback()
-            except Exception:
-                pass
+        except Exception as inner:
+            logger.warning(
+                "[ImageHandler] record_failure failed request_id={}: {}",
+                self.request_id,
+                inner,
+            )
 
+    def _build_image_request_metadata(
+        self, ctx: ImageRequestContext
+    ) -> dict[str, Any] | None:
+        """把 perf + scheduling 信息打包为 request_metadata（参考 chat）。"""
+        meta = dict(self._build_request_metadata() or {})
+        if ctx.candidate_keys:
+            meta["candidate_keys"] = [
+                getattr(ck, "__dict__", {}) if hasattr(ck, "__dict__") else ck
+                for ck in ctx.candidate_keys
+            ]
+        if ctx.scheduling_audit:
+            meta["scheduling_audit"] = ctx.scheduling_audit
+        if ctx.pool_summary:
+            meta["pool_summary"] = ctx.pool_summary
+        return meta or None
 
-__all__ = ["ImageHandlerBase"]
+    @staticmethod
+    def _extract_error_status_code(exc: Exception) -> int:
+        status = int(getattr(exc, "status_code", 0) or 0)
+        if status:
+            return status
+        status = int(getattr(exc, "http_status", 0) or 0)
+        if status:
+            return status
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status:
+                return status
+        if isinstance(exc, HTTPException):
+            return int(exc.status_code or 503)
+        return 503
+
+    @staticmethod
+    def _extract_error_message(exc: Exception) -> str:
+        msg = str(getattr(exc, "detail", "") or "") or str(exc)
+        upstream = getattr(exc, "upstream_response", None) or getattr(
+            exc, "upstream_error", None
+        )
+        if upstream:
+            msg = f"{msg} | upstream={str(upstream)[:200]}"
+        return msg[:500]
+
+    # ------------------------------------------------------------------ #
+    # 日志
+    # ------------------------------------------------------------------ #
+
+    def _log_ok(self, ctx: ImageRequestContext, status_code: int) -> None:
+        model = "?"
+        try:
+            model = str(ctx.candidate.provider.name) if ctx.candidate else "?"
+        except Exception:
+            pass
+        logger.info(
+            "[OK] {} | {} -> {} | provider={} | {}ms | status={}",
+            self.request_id[:8],
+            ctx.mapped_model or "-",
+            ctx.provider_api_format or self.FORMAT_ID,
+            ctx.provider_name or "unknown",
+            self.elapsed_ms(),
+            status_code,
+        )
+        _ = model

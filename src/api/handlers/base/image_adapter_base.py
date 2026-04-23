@@ -1,38 +1,35 @@
 """
-Image Adapter 基类
+Image Adapter 基类 — 与 chat / cli adapter 共享 :class:`HandlerAdapterBase`
+提供的通用能力（异常转换、endpoint 测试、header/body 规则）。
 
 支持两个端点：
-- POST /v1/images/generations  (application/json)
-- POST /v1/images/edits        (multipart/form-data)
+- ``POST /v1/images/generations`` (application/json)
+- ``POST /v1/images/edits``       (multipart/form-data)
 
-multipart 路径：adapter 读原始字节、解析出一份 dict 用于 Codex 分支的
-body transformer；同时保留原始字节和 content-type 用于透传。
+multipart 路径下 adapter 会保留原始字节用于透传，同时解出结构化字段
+（``parse_multipart_image_edit``）让 Codex 分支的 body transformer 使用。
+
+``check_endpoint`` 复用 :func:`run_endpoint_check`（与 chat 一样），
+Codex 差异通过覆盖 :meth:`build_endpoint_url` / :meth:`build_request_body`
+实现，不再自实现测试流程。
 """
 
 from __future__ import annotations
 
-import json
-import time
 from typing import Any, ClassVar
 
-import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from src.api.base.adapter import ApiAdapter, ApiMode
+from src.api.base.adapter import ApiMode
 from src.api.base.context import ApiRequestContext
+from src.api.handlers.base.handler_adapter_base import HandlerAdapterBase
 from src.api.handlers.base.image_handler_base import ImageHandlerBase
-from src.core.api_format import (
-    ApiFamily,
-    EndpointKind,
-    get_auth_handler,
-    get_default_auth_method_for_endpoint,
-)
+from src.core.api_format import ApiFamily, EndpointKind
 from src.core.logger import logger
-from src.core.provider_types import ProviderType
 
 
-class ImageAdapterBase(ApiAdapter):
+class ImageAdapterBase(HandlerAdapterBase):
     """图像生成适配器基类。"""
 
     FORMAT_ID: str = "UNKNOWN"
@@ -56,17 +53,16 @@ class ImageAdapterBase(ApiAdapter):
         allowed_api_formats: list[str] | None = None,
         *,
         endpoint_operation: str | None = None,
-    ):
-        self.allowed_api_formats = allowed_api_formats or [self.FORMAT_ID]
+    ) -> None:
+        super().__init__(allowed_api_formats=allowed_api_formats or [self.FORMAT_ID])
         self.endpoint_operation = (
             (endpoint_operation or self.ENDPOINT_OPERATION).strip().lower()
             or "generations"
         )
 
-    def extract_api_key(self, request: Request) -> str | None:
-        auth_method = get_default_auth_method_for_endpoint(self.FORMAT_ID)
-        handler = get_auth_handler(auth_method)
-        return handler.extract_credentials(request)
+    # ------------------------------------------------------------------ #
+    # 主入口
+    # ------------------------------------------------------------------ #
 
     async def handle(
         self, context: ApiRequestContext
@@ -152,7 +148,6 @@ class ImageAdapterBase(ApiAdapter):
         http_request: Request,
         content_type: str,
     ) -> Response | StreamingResponse | JSONResponse:
-        # 读原始字节 — 透传路径需要它
         raw_body = await http_request.body()
         if not raw_body:
             return JSONResponse(
@@ -165,19 +160,19 @@ class ImageAdapterBase(ApiAdapter):
                 },
             )
 
-        # 解析出结构化字段，用于 Codex 分支的 body transformer
         from src.services.provider.adapters.codex.image_transform import (
             parse_multipart_image_edit,
         )
 
         parsed = parse_multipart_image_edit(raw_body, content_type) or {}
 
-        # 最小校验：edits 必须有 image（至少一张）和 prompt
         if self.endpoint_operation == "edits":
             images = parsed.get("images") or []
-            prompt = (parsed.get("prompt") or "").strip() if isinstance(
-                parsed.get("prompt"), str
-            ) else ""
+            prompt = (
+                (parsed.get("prompt") or "").strip()
+                if isinstance(parsed.get("prompt"), str)
+                else ""
+            )
             if not images:
                 return JSONResponse(
                     status_code=400,
@@ -199,13 +194,10 @@ class ImageAdapterBase(ApiAdapter):
                     },
                 )
 
-        # stream 字段在 multipart 表单里以字符串形式出现
         stream_raw = str(parsed.get("stream") or "").strip().lower()
         stream = stream_raw in {"true", "1", "yes"}
 
         model = str(parsed.get("model") or "unknown")
-        # 为 handler 构造一个最小 JSON-like 字段视图（用于审计 + 非 Codex 分支的 body 字段读取）
-        # 注意：透传路径实际用 raw_body 字节转发，这里的 dict 只给 Codex 用
         surface_body: dict[str, Any] = {
             "model": model,
             "prompt": parsed.get("prompt") or "",
@@ -239,24 +231,34 @@ class ImageAdapterBase(ApiAdapter):
         body_view: dict[str, Any],
     ) -> None:
         context.add_audit_metadata(
-            action=f"openai_image_{self.endpoint_operation}",
+            action=f"{self.FORMAT_ID.lower()}_{self.endpoint_operation}",
             model=model,
             stream=stream,
             image_count=body_view.get("n", 1),
             size=body_view.get("size"),
             quality=body_view.get("quality"),
         )
+        balance_remaining = getattr(context, "balance_remaining", None)
+        balance_display = (
+            "unlimited" if balance_remaining is None else f"${balance_remaining:.2f}"
+        )
         logger.info(
-            "[REQ] {} | {} | {} | {} | {} | {}",
+            "[REQ] {} | {} | {} | {} | {} | {} | balance:{}",
             context.request_id[:8],
             self.FORMAT_ID,
             getattr(context.api_key, "name", "unknown"),
             self.endpoint_operation,
             model,
             "stream" if stream else "sync",
+            balance_display,
         )
 
     def _create_handler(self, context: ApiRequestContext) -> ImageHandlerBase:
+        perf_metrics = None
+        try:
+            perf_metrics = context.extra.get("perf") if isinstance(context.extra, dict) else None
+        except Exception:
+            perf_metrics = None
         return self.HANDLER_CLASS(
             db=context.db,
             user=context.user,
@@ -266,214 +268,121 @@ class ImageAdapterBase(ApiAdapter):
             user_agent=context.user_agent,
             start_time=context.start_time,
             allowed_api_formats=self.allowed_api_formats,
+            perf_metrics=perf_metrics,
+            api_family=self.API_FAMILY.value if self.API_FAMILY else None,
+            endpoint_kind=self.ENDPOINT_KIND.value,
         )
 
     # ------------------------------------------------------------------ #
-    # 端点测试（后台“测试模型”功能调用）
+    # Endpoint 测试（管理面“测试模型”）
     # ------------------------------------------------------------------ #
+    #
+    # 继承 ``HandlerAdapterBase.check_endpoint``（统一走 ``run_endpoint_check`` →
+    # 写入 ``Usage request_type="endpoint_test"`` + ``RequestCandidate``）。
+    # Codex 差异仅靠覆盖下面两个类方法即可。
 
     @classmethod
-    async def check_endpoint(
+    def build_endpoint_url(
         cls,
-        client: httpx.AsyncClient | None,
         base_url: str,
-        api_key: str,
-        request_data: dict[str, Any],
-        extra_headers: dict[str, str] | None = None,
-        body_rules: list[dict[str, Any]] | None = None,
-        header_rules: list[dict[str, Any]] | None = None,
-        db: Any | None = None,
-        user: Any | None = None,
-        provider_name: str | None = None,
-        provider_id: str | None = None,
-        api_key_id: str | None = None,
+        request_data: dict[str, Any] | None = None,
         model_name: str | None = None,
-        auth_type: str | None = None,
-        provider_type: str | None = None,
-        decrypted_auth_config: dict[str, Any] | None = None,
-        provider_endpoint: Any | None = None,
-        provider_api_key: Any | None = None,
-        proxy_config: dict[str, Any] | None = None,
-        timeout_seconds: float | None = None,
-    ) -> dict[str, Any]:
-        """后台测试模型 —— 对 image 端点发一次最小请求。
-
-        Codex 反代：走 `/responses` + `image_generation` tool。
-        其他 provider：走 `/v1/images/generations`。
-        """
-        _ = (client, body_rules, header_rules, db, user, provider_id, api_key_id)
-        _ = (provider_api_key,)
-
-        pt = str(provider_type or "").strip().lower()
-        is_codex = pt == ProviderType.CODEX.value or pt == "codex"
-
-        test_model = str(model_name or request_data.get("model") or "").strip()
-        prompt = "test"
-
-        timeout = httpx.Timeout(float(timeout_seconds or 60.0))
-
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            proxy=(proxy_config or {}).get("url") if isinstance(proxy_config, dict) else None,
-        ) as http:
-            try:
-                if is_codex:
-                    result = await cls._check_codex_image_endpoint(
-                        http=http,
-                        base_url=base_url,
-                        api_key=api_key,
-                        extra_headers=extra_headers,
-                        test_model=test_model,
-                        prompt=prompt,
-                        decrypted_auth_config=decrypted_auth_config,
-                    )
-                else:
-                    result = await cls._check_standard_image_endpoint(
-                        http=http,
-                        base_url=base_url,
-                        api_key=api_key,
-                        extra_headers=extra_headers,
-                        test_model=test_model,
-                        prompt=prompt,
-                    )
-            except Exception as exc:
-                return {
-                    "success": False,
-                    "error": f"connection_failed: {exc}"[:500],
-                    "status_code": 0,
-                    "provider": {"name": provider_name},
-                    "model": test_model,
-                }
-
-        return result
-
-    @staticmethod
-    async def _check_standard_image_endpoint(
         *,
-        http: httpx.AsyncClient,
-        base_url: str,
-        api_key: str,
-        extra_headers: dict[str, str] | None,
-        test_model: str,
-        prompt: str,
-    ) -> dict[str, Any]:
+        provider_type: str | None = None,
+    ) -> str:
+        """Image 测试 URL：Codex 反代 → /responses；其它 → /v1/images/generations。"""
+        _ = (request_data, model_name)
         normalized = (base_url or "").rstrip("/")
-        url = (
-            f"{normalized}/images/generations"
-            if normalized.endswith("/v1")
-            else f"{normalized}/v1/images/generations"
-        )
-        headers: dict[str, str] = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        if extra_headers:
-            headers.update(extra_headers)
-        body: dict[str, Any] = {
-            "model": test_model,
+        pt = (provider_type or "").strip().lower()
+        if pt == "codex":
+            if normalized.endswith("/responses"):
+                return normalized
+            return f"{normalized}/responses"
+        # 透传路径：images/generations
+        if normalized.endswith("/v1"):
+            return f"{normalized}/images/generations"
+        if normalized.endswith("/images/generations"):
+            return normalized
+        return f"{normalized}/v1/images/generations"
+
+    @classmethod
+    def build_request_body(
+        cls,
+        request_data: dict[str, Any] | None = None,
+        *,
+        base_url: str | None = None,
+        provider_type: str | None = None,
+    ) -> dict[str, Any]:
+        """构建图像端点的测试 body。
+
+        **Codex 反代协议约束**（与 sub2api 最新实现严格对齐，不要擅改）：
+        https://github.com/Wei-Shaw/sub2api/commit/eea6f38881896ed8f78a8b340ee3a5b6223dbe74
+
+        - outer ``model`` = ``OPENAI_IMAGE_ROUTING_MODEL``（Codex 内部路由模型）
+        - ``tool.model`` = 管理员配置的真实图像模型
+        - ``instructions`` = ``""``；``tool_choice`` = ``{"type":"image_generation"}``
+        - 顶层带 ``reasoning`` / ``parallel_tool_calls`` / ``include``
+        """
+        _ = base_url
+        data = dict(request_data or {})
+        model = str(data.get("model") or "").strip() or "gpt-image-2"
+
+        pt = (provider_type or "").strip().lower()
+        if pt == "codex":
+            from src.services.provider.adapters.codex.image_transform import (
+                OPENAI_IMAGE_ROUTING_MODEL,
+            )
+
+            return {
+                "model": OPENAI_IMAGE_ROUTING_MODEL,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "Generate a small test image: a single "
+                                    "white dot on black background."
+                                ),
+                            }
+                        ],
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "image_generation",
+                        "action": "generate",
+                        "model": model,
+                        "size": "1024x1024",
+                        "quality": "low",
+                    }
+                ],
+                "tool_choice": {"type": "image_generation"},
+                "instructions": "",
+                "stream": True,
+                "store": False,
+                "reasoning": {"effort": "medium", "summary": "auto"},
+                "parallel_tool_calls": True,
+                "include": ["reasoning.encrypted_content"],
+            }
+
+        prompt = str(data.get("prompt") or "ping").strip() or "ping"
+        return {
+            "model": model,
             "prompt": prompt,
             "n": 1,
         }
-        start = time.time()
-        response = await http.post(url, headers=headers, json=body)
-        latency_ms = int((time.time() - start) * 1000)
-        return _normalize_test_response(response, latency_ms)
-
-    @staticmethod
-    async def _check_codex_image_endpoint(
-        *,
-        http: httpx.AsyncClient,
-        base_url: str,
-        api_key: str,
-        extra_headers: dict[str, str] | None,
-        test_model: str,
-        prompt: str,
-        decrypted_auth_config: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        # Codex: POST /responses with image_generation tool
-        normalized = (base_url or "").rstrip("/")
-        if normalized.endswith("/responses"):
-            url = normalized
-        else:
-            url = f"{normalized}/responses"
-        body: dict[str, Any] = {
-            "model": test_model,
-            "input": [{"role": "user", "content": prompt}],
-            "tools": [{"type": "image_generation"}],
-            "tool_choice": "auto",
-            "instructions": "you are a helpful assistant",
-            "stream": True,
-            "store": False,
-        }
-        headers: dict[str, str] = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
-        account_id = (decrypted_auth_config or {}).get("account_id")
-        if account_id:
-            headers["chatgpt-account-id"] = str(account_id)
-        if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items() if k.lower() != "content-type"})
-
-        start = time.time()
-        async with http.stream("POST", url, headers=headers, json=body) as response:
-            latency_ms = int((time.time() - start) * 1000)
-            status_code = response.status_code
-            if status_code >= 400:
-                err_text = (await response.aread()).decode("utf-8", errors="ignore")[:500]
-                return {
-                    "success": False,
-                    "status_code": status_code,
-                    "error": err_text or f"HTTP {status_code}",
-                    "latency_ms": latency_ms,
-                }
-            # 不需要读完整流，确认握手成功即可
-            return {
-                "success": True,
-                "status_code": status_code,
-                "latency_ms": latency_ms,
-                "content": "codex image handshake ok",
-            }
-
-
-def _normalize_test_response(
-    response: httpx.Response,
-    latency_ms: int,
-) -> dict[str, Any]:
-    status_code = response.status_code
-    content_type = response.headers.get("content-type", "")
-    if status_code >= 400:
-        err: Any
-        try:
-            err = response.json()
-        except Exception:
-            err = response.text[:500]
-        return {
-            "success": False,
-            "status_code": status_code,
-            "error": json.dumps(err)[:500] if not isinstance(err, str) else err,
-            "latency_ms": latency_ms,
-        }
-    if "application/json" in content_type:
-        try:
-            payload = response.json()
-        except Exception:
-            payload = {}
-    else:
-        payload = {"raw": response.text[:500]}
-    return {
-        "success": True,
-        "status_code": status_code,
-        "latency_ms": latency_ms,
-        "content": "image endpoint ok",
-        "usage": payload.get("usage") if isinstance(payload, dict) else None,
-    }
 
 
 # =========================================================================
 # Image Adapter 注册表
 # =========================================================================
+#
+# 与 chat / cli 的 ``_ADAPTER_REGISTRY`` 并列独立；``provider_query._get_adapter_for_format``
+# 按 chat→cli→image 顺序 fallback。保留独立注册表以避免 FORMAT_ID 碰撞时
+# chat 优先，image/cli 同名错误命中。
 
 _IMAGE_ADAPTER_REGISTRY: dict[str, type[ImageAdapterBase]] = {}
 _IMAGE_ADAPTERS_LOADED = False
@@ -482,7 +391,6 @@ _IMAGE_ADAPTERS_LOADED = False
 def register_image_adapter(
     adapter_class: type[ImageAdapterBase],
 ) -> type[ImageAdapterBase]:
-    """注册 Image Adapter 类。"""
     format_id = getattr(adapter_class, "FORMAT_ID", None)
     if format_id and format_id != "UNKNOWN":
         _IMAGE_ADAPTER_REGISTRY[format_id.upper()] = adapter_class
@@ -503,7 +411,6 @@ def _ensure_image_adapters_loaded() -> None:
 def get_image_adapter_class(
     api_format: str,
 ) -> type[ImageAdapterBase] | None:
-    """根据 API format 获取 Image Adapter 类。"""
     _ensure_image_adapters_loaded()
     return _IMAGE_ADAPTER_REGISTRY.get(api_format.upper()) if api_format else None
 

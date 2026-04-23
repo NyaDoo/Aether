@@ -14,6 +14,20 @@ This module wraps that套壳:
 4. SSE frame synth:      for client stream=true, emit one fake
                          `image_generation.completed` frame with the final
                          base64 image.
+
+**协议对齐参考**：实测 Codex 反代当前协议 (2026-04-23) 与 Rust 分支老版本不同，
+以 sub2api (Go) 最新实现为准：
+https://github.com/Wei-Shaw/sub2api/commit/eea6f38881896ed8f78a8b340ee3a5b6223dbe74
+
+关键不变式（不要改）：
+- 外层 ``model`` = ``OPENAI_IMAGE_ROUTING_MODEL``（Codex 内部路由模型）
+- ``tool.model`` = 用户真实的图像模型（``gpt-image-2`` 等）
+- ``instructions`` = ``""``（空字符串）
+- ``tool_choice`` = ``{"type": "image_generation"}``（强制）
+- 顶层带 ``reasoning`` / ``parallel_tool_calls`` / ``include``
+- ``input`` 用 ``[{"type":"message","role":"user","content":[...]}]`` 包装
+- mask 通过 ``tool.input_image_mask.image_url`` 传
+- ``n > 1`` 直接报 400（Codex /responses image tool 不支持）
 """
 
 from __future__ import annotations
@@ -25,16 +39,35 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from src.core.logger import logger
+from src.services.provider.adapters.codex.sse_events import (
+    FATAL_EVENT_TYPES,
+    CodexImageStreamState,
+    CodexStreamError,
+    build_stream_error,
+    extract_codex_image_usage,
+    iter_sse_data_lines,
+    parse_codex_sse_payload,
+)
 
-# Tool options that map directly from OpenAI images request to the
-# image_generation tool config.
+# Codex 反代内部"路由模型" —— 所有 image 请求的 outer model 都用它，
+# 真实图像模型放 tool.model。与 sub2api 的 openAIImagesResponsesMainModel 一致。
+OPENAI_IMAGE_ROUTING_MODEL: str = "gpt-5.4-mini"
+
+# 直接透传到 tool 参数的字段（值非空才写入）。
 _TOOL_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "size",
     "quality",
     "background",
     "output_format",
-    "output_compression",
     "moderation",
+    "input_fidelity",
+    "style",
+)
+
+# 整型透传字段（需要特殊校验）。
+_TOOL_PASSTHROUGH_INT_KEYS: tuple[str, ...] = (
+    "output_compression",
+    "partial_images",
 )
 
 
@@ -50,15 +83,20 @@ def transform_image_request_to_responses(
     """Convert an OpenAI images payload into a Codex Responses payload.
 
     context keys:
-        - mapped_model: str — model name resolved via provider_model_mappings
         - operation: "generate" | "edit" — derived by caller
         - multipart: dict | None — parsed multipart fields (for /images/edits)
 
+    真实图像模型直接从 ``body["model"]`` 取（用户在后台配的 provider 模型名），
+    **不经过模型映射**：Codex 反代要求的是真实的图像模型名，比如
+    ``gpt-image-2`` / ``gpt-image-1`` / ``dall-e-3``。``context.mapped_model``
+    仅用于日志和 Usage ``target_model``，不写入 request body。
+
     Returns a new dict; does not mutate input.
     """
-    mapped_model = str(context.get("mapped_model") or body.get("model") or "").strip()
-    if not mapped_model:
-        raise ValueError("Codex image transform requires a mapped model")
+    # tool.model：用户请求里写的真实图像模型
+    tool_model = str(body.get("model") or "").strip()
+    if not tool_model:
+        raise ValueError("Codex image transform requires model")
 
     operation = str(context.get("operation") or "").strip().lower()
     if operation not in {"generate", "edit"}:
@@ -68,53 +106,111 @@ def transform_image_request_to_responses(
     if not isinstance(source, dict):
         source = {}
 
-    prompt = _coerce_str(source.get("prompt")) or "Generate an image."
+    prompt = _coerce_str(source.get("prompt"))
+    if not prompt:
+        raise ValueError("Codex image transform requires a non-empty prompt")
+
+    # Codex /responses image_generation tool 目前只支持 n=1
+    n_raw = source.get("n") if source else body.get("n")
+    if isinstance(n_raw, (int, float)) and int(n_raw) > 1:
+        raise ValueError(
+            "Codex /responses image tool currently supports only n=1"
+        )
+    if isinstance(n_raw, str) and n_raw.strip().isdigit() and int(n_raw.strip()) > 1:
+        raise ValueError(
+            "Codex /responses image tool currently supports only n=1"
+        )
 
     images = _collect_input_images(source)
     mask = _collect_mask_image(source)
 
-    # Build the image_generation tool options
-    tool: dict[str, Any] = {"type": "image_generation"}
+    # ---- tool 构造 ----
+    tool: dict[str, Any] = {
+        "type": "image_generation",
+        "action": "edit" if operation == "edit" else "generate",
+        "model": tool_model,
+    }
     for key in _TOOL_PASSTHROUGH_KEYS:
+        value = source.get(key) if source else body.get(key)
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed:
+                tool[key] = trimmed
+        elif value is not None:
+            tool[key] = value
+
+    for key in _TOOL_PASSTHROUGH_INT_KEYS:
         value = source.get(key) if source else body.get(key)
         if value is None:
             continue
-        tool[key] = value
-    if operation == "edit" or images or mask is not None:
-        tool["action"] = "edit"
+        if isinstance(value, bool):
+            continue  # bool 是 int 的子类，显式排除
+        if isinstance(value, int):
+            tool[key] = value
+        elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            tool[key] = int(value.strip())
+
+    # mask 走 tool.input_image_mask.image_url（sub2api 最新协议）
     if mask is not None:
-        tool["mask"] = _build_mask_payload(mask)
+        mask_url = _extract_mask_image_url(mask)
+        if mask_url:
+            tool["input_image_mask"] = {"image_url": mask_url}
 
-    # Build the Responses `input` array
-    if not images and mask is None:
-        input_blocks: list[dict[str, Any]] = [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
-    else:
-        content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
-        content.extend(images)
-        if mask is not None:
-            content.append(mask)
-        input_blocks = [{"role": "user", "content": content}]
+    # ---- input 构造：统一用 message 包装 ----
+    content: list[dict[str, Any]] = [
+        {"type": "input_text", "text": prompt}
+    ]
+    for image_block in images:
+        content.append(image_block)
 
+    input_blocks: list[dict[str, Any]] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": content,
+        }
+    ]
+
+    # ---- 顶层 payload ----
+    # ⚠️ 以下字段是 Codex 反代私有协议的硬约束，与 sub2api 最新实现严格对齐。
+    # 不要自作主张改："instructions" 必须空串；"tool_choice" 必须强制对象；
+    # reasoning / parallel_tool_calls / include 必须同时存在。
+    # 少任何一个字段都可能让上游卡在 keepalive 不生图。
     payload: dict[str, Any] = {
-        "model": mapped_model,
+        "model": OPENAI_IMAGE_ROUTING_MODEL,
         "input": input_blocks,
         "tools": [tool],
-        "tool_choice": "auto",
-        "instructions": "you are a helpful assistant",
-        "stream": True,  # Codex requires stream
+        "tool_choice": {"type": "image_generation"},
+        "instructions": "",
+        "stream": True,
         "store": False,
+        "reasoning": {"effort": "medium", "summary": "auto"},
+        "parallel_tool_calls": True,
+        "include": ["reasoning.encrypted_content"],
     }
 
-    user = _coerce_str(body.get("user"))
-    if user:
-        payload["user"] = user
+    # user 字段：支持 str / int / float，转字符串透传给上游追溯 abuse
+    user_raw = body.get("user")
+    if user_raw is not None:
+        user_str = str(user_raw).strip()
+        if user_str:
+            payload["user"] = user_str
 
     return payload
+
+
+def _extract_mask_image_url(mask: dict[str, Any]) -> str | None:
+    """从 mask 结构取 image_url（支持 data: URL / http URL）。"""
+    if not isinstance(mask, dict):
+        return None
+    url = mask.get("image_url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    # 兼容老 dict：可能有 "url" 字段
+    alt = mask.get("url")
+    if isinstance(alt, str) and alt.strip():
+        return alt.strip()
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -128,16 +224,29 @@ async def aggregate_codex_image_sse(
     """Consume a Codex Responses SSE byte stream and produce a standard
     OpenAI images JSON response body.
 
-    Returns a dict shaped like:
+    Returns a dict shaped like::
+
         {
             "created": 1234,
             "data": [{"b64_json": "...", "revised_prompt": "..."}],
-            "usage": {"input_tokens": ..., "output_tokens": ..., ...}
+            "usage": {"input_tokens": ..., "output_tokens": ..., ...},
+            "_codex_image_gen": {...},   # 可选：tool_usage.image_gen 原始计数
+            "_codex_event_count": 42,
+            "_codex_unknown_events": [],
         }
+
+    如果流中出现 ``response.failed`` / ``response.error`` / ``response.incomplete`` /
+    ``response.content_filter.*``，抛 :class:`CodexStreamError` 让 handler 转为
+    ``UpstreamClientException`` 进入 ErrorClassifier；调用方**不应**把这种情况当成功。
+
+    **Billing usage 字段语义**：
+    - ``usage`` 仅包含 ``response.usage`` 的 openai 标准字段（``input_tokens`` /
+      ``output_tokens`` / ``total_tokens`` / ``input_tokens_details`` 等）
+    - ``tool_usage.image_gen`` 的 ``images`` / ``images_generated`` 等字段会被
+      放到 ``_codex_image_gen`` 里供观察性统计，**不**混入 ``usage`` 以免
+      billing collector 按 ``usage.input_tokens`` 取到错误值
     """
-    created: int | None = None
-    completed_response: dict[str, Any] = {}
-    images: list[dict[str, Any]] = []
+    state = CodexImageStreamState()
 
     buffer = b""
     async for chunk in byte_iter:
@@ -146,97 +255,330 @@ async def aggregate_codex_image_sse(
         buffer += chunk
         while b"\n\n" in buffer:
             event_bytes, buffer = buffer.split(b"\n\n", 1)
-            _consume_event(event_bytes, images, mutable_created := {"v": created},
-                           mutable_completed := {"v": completed_response})
-            created = mutable_created["v"]
-            if mutable_completed["v"]:
-                completed_response = mutable_completed["v"]
+            _feed_event_bytes_into_state(event_bytes, state)
 
-    # Handle trailing buffer (some servers don't emit terminating \n\n)
     if buffer.strip():
-        _consume_event(
-            buffer,
-            images,
-            mutable_created := {"v": created},
-            mutable_completed := {"v": completed_response},
-        )
-        created = mutable_created["v"]
-        if mutable_completed["v"]:
-            completed_response = mutable_completed["v"]
+        _feed_event_bytes_into_state(buffer, state)
 
-    usage = _extract_usage(completed_response)
-    return {
-        "created": int(created or 0),
-        "data": images,
-        "usage": usage,
+    billing_usage, tool_usage_metadata = extract_codex_image_usage(
+        state.completed_response
+    )
+
+    result: dict[str, Any] = {
+        "created": int(state.created_at or 0),
+        "data": state.images,
+        "usage": billing_usage,
     }
+    if tool_usage_metadata is not None:
+        result["_codex_image_gen"] = tool_usage_metadata
+    if state.event_count:
+        result["_codex_event_count"] = state.event_count
+    if state.unknown_event_types:
+        result["_codex_unknown_events"] = list(state.unknown_event_types)
+
+    # 聚合结束但一张图都没收到：多半是上游空响应或事件丢失，不能当成功
+    if not state.images:
+        raise CodexStreamError(
+            "Codex image stream produced no images",
+            event_type="response.empty",
+            raw={
+                "event_count": state.event_count,
+                "unknown_events": state.unknown_event_types,
+                "completed": bool(state.completed_response),
+            },
+        )
+
+    return result
 
 
-def _consume_event(
-    event_bytes: bytes,
-    images: list[dict[str, Any]],
-    created_ref: dict[str, Any],
-    completed_ref: dict[str, Any],
+def _feed_event_bytes_into_state(
+    event_bytes: bytes, state: CodexImageStreamState
 ) -> None:
-    try:
-        text = event_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        return
+    """把一段 SSE event bytes 里的所有 data 行喂给解析器。
 
-    data_lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("data:"):
-            data_lines.append(stripped[5:].strip())
-    for raw in data_lines:
-        if not raw or raw == "[DONE]":
-            continue
+    致命事件由 ``parse_codex_sse_payload`` 抛 ``CodexStreamError`` —— 在此**不**
+    吞异常，让聚合器立即中止。
+    """
+    for payload in iter_sse_data_lines(event_bytes):
+        parse_codex_sse_payload(payload, state)
+
+
+# --------------------------------------------------------------------------- #
+# Real streaming: translate upstream Codex SSE → client-facing OpenAI frames
+# --------------------------------------------------------------------------- #
+#
+# 与 sub2api 的 handleOpenAIImagesOAuthStreamingResponse 行为一致：实时把
+# 上游 image_generation_call.partial_image / output_item.done / response.completed
+# 翻译成 OpenAI 标准的 image_generation.partial_image / image_generation.completed
+# (edit 场景是 image_edit.*) 事件并推给客户端。支持 "b64_json" / "url" 两种
+# response_format。
+
+
+_PARTIAL_IMAGE_EVENT = "response.image_generation_call.partial_image"
+_OUTPUT_ITEM_DONE_EVENT = "response.output_item.done"
+_RESPONSE_COMPLETED_EVENT = "response.completed"
+
+
+def _output_format_to_mime(output_format: str | None) -> str:
+    """把 ``output_format`` 字面量映射成 MIME type，供 data: URL 使用。"""
+    if not output_format:
+        return "image/png"
+    value = output_format.strip()
+    if "/" in value:
+        return value
+    mapping = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }
+    return mapping.get(value.lower(), "image/png")
+
+
+def _build_sse_frame(event_name: str, data: dict[str, Any]) -> bytes:
+    """构建单帧 SSE：``event: X\\ndata: {...}\\n\\n``。"""
+    json_data = json.dumps(data, ensure_ascii=False)
+    return f"event: {event_name}\ndata: {json_data}\n\n".encode("utf-8")
+
+
+def _codex_stream_prefix(operation: str) -> str:
+    """``generate`` → ``image_generation``；``edit`` → ``image_edit``。"""
+    return "image_edit" if str(operation).strip().lower() == "edit" else "image_generation"
+
+
+def _dedup_key(item_id: str | None, b64: str, output_format: str | None) -> str:
+    """与 sub2api ``openAIResponsesImageResultKey`` 对齐的去重 key。"""
+    b64_clean = (b64 or "").strip()
+    if b64_clean:
+        return f"{(output_format or '').strip()}|{b64_clean}"
+    return f"item:{(item_id or '').strip()}"
+
+
+class _CodexImageStreamTranslator:
+    """单次流式翻译的状态机（非线程安全，一次性使用）。
+
+    持有：
+    - 已翻译的 ``state``（images/usage/error/completed_response）
+    - 已 emit 的去重 key 集合，避免 output_item.done 和 response.completed 重复
+
+    核心方法 ``translate_payload(payload_str)`` 读一个 SSE data 行，返回要推给客户端的
+    帧字节列表；非致命事件返回空列表；致命事件（response.failed 等）会抛
+    ``CodexStreamError`` —— 调用方应该捕获并转为客户端 error 帧。
+    """
+
+    def __init__(
+        self,
+        *,
+        operation: str = "generate",
+        response_format: str = "b64_json",
+    ) -> None:
+        self._prefix = _codex_stream_prefix(operation)
+        self._format = (response_format or "b64_json").strip().lower() or "b64_json"
+        self._emitted: set[str] = set()
+        self.state = CodexImageStreamState()
+
+    def translate_payload(self, payload: str) -> list[bytes]:
+        if not payload or payload == "[DONE]":
+            return []
         try:
-            obj = json.loads(raw)
+            obj = json.loads(payload)
         except Exception:
-            continue
+            return []
         if not isinstance(obj, dict):
-            continue
+            return []
+
+        self.state.event_count += 1
         evt_type = str(obj.get("type") or "")
+
+        # 致命事件：让 sse_events 的 parser 统一抛 CodexStreamError
+        # （这样 handler 可以 catch 后翻译成客户端 error 帧）
+        # 先用 sse_events.parse_codex_sse_payload 处理 error 识别
+        # 但我们需要自行处理成功事件 —— 所以分开写
         if evt_type == "response.created":
             response = obj.get("response")
             if isinstance(response, dict):
                 value = response.get("created_at")
                 if isinstance(value, int):
-                    created_ref["v"] = value
-        elif evt_type == "response.output_item.done":
-            item = obj.get("item")
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") != "image_generation_call":
-                continue
-            result = item.get("result")
-            if not isinstance(result, str) or not result:
-                continue
-            images.append(
-                {
-                    "b64_json": result,
-                    "revised_prompt": item.get("revised_prompt"),
-                }
+                    self.state.created_at = value
+            return []
+
+        if evt_type == _PARTIAL_IMAGE_EVENT:
+            return [self._emit_partial(obj)]
+
+        if evt_type == _OUTPUT_ITEM_DONE_EVENT:
+            frame = self._emit_output_item_done(obj)
+            return [frame] if frame else []
+
+        if evt_type == _RESPONSE_COMPLETED_EVENT:
+            return self._emit_response_completed(obj)
+
+        # 致命事件统一走共用模块的分类器
+        if evt_type in FATAL_EVENT_TYPES or evt_type.startswith(
+            "response.content_filter"
+        ):
+            raise build_stream_error(evt_type, obj)
+
+        return []
+
+    def _emit_partial(self, obj: dict[str, Any]) -> bytes:
+        b64 = str(obj.get("partial_image_b64") or "").strip()
+        frame_data: dict[str, Any] = {
+            "type": f"{self._prefix}.partial_image",
+            "partial_image_index": int(obj.get("partial_image_index") or 0),
+        }
+        output_format = obj.get("output_format")
+        if not b64:
+            # 无图数据：只发事件骨架（保持流活跃）
+            return _build_sse_frame(frame_data["type"], frame_data)
+        if self._format == "url":
+            mime = _output_format_to_mime(
+                output_format if isinstance(output_format, str) else None
             )
-        elif evt_type == "response.completed":
-            response = obj.get("response")
-            if isinstance(response, dict):
-                completed_ref["v"] = response
+            frame_data["url"] = f"data:{mime};base64,{b64}"
+        else:
+            frame_data["b64_json"] = b64
+        return _build_sse_frame(frame_data["type"], frame_data)
+
+    def _emit_output_item_done(self, obj: dict[str, Any]) -> bytes | None:
+        item = obj.get("item")
+        if not isinstance(item, dict):
+            return None
+        if item.get("type") != "image_generation_call":
+            return None
+        result = str(item.get("result") or "").strip()
+        if not result:
+            return None
+        item_id = str(item.get("id") or "")
+        output_format = item.get("output_format")
+        key = _dedup_key(
+            item_id,
+            result,
+            output_format if isinstance(output_format, str) else None,
+        )
+        if key in self._emitted:
+            return None
+        self._emitted.add(key)
+
+        # 记到 state.images 以便最终 usage 结算时有图列表
+        revised = item.get("revised_prompt")
+        self.state.images.append(
+            {"b64_json": result, "revised_prompt": revised}
+        )
+
+        frame_data: dict[str, Any] = {"type": f"{self._prefix}.completed"}
+        if self._format == "url":
+            mime = _output_format_to_mime(
+                output_format if isinstance(output_format, str) else None
+            )
+            frame_data["url"] = f"data:{mime};base64,{result}"
+        else:
+            frame_data["b64_json"] = result
+        if isinstance(revised, str) and revised.strip():
+            frame_data["revised_prompt"] = revised.strip()
+        return _build_sse_frame(frame_data["type"], frame_data)
+
+    def _emit_response_completed(self, obj: dict[str, Any]) -> list[bytes]:
+        response = obj.get("response")
+        if not isinstance(response, dict):
+            return []
+
+        # 检测 response 自身携带的错误
+        err = response.get("error") or response.get("incomplete_details")
+        if isinstance(err, dict) and (
+            err.get("message") or err.get("code") or err.get("reason")
+        ):
+            raise build_stream_error(_RESPONSE_COMPLETED_EVENT, obj)
+
+        self.state.completed_response = response
+
+        # 把 response.output 里还没 emit 过的 image_generation_call 补发
+        frames: list[bytes] = []
+        output = response.get("output")
+        # 取 usage 信息（附到最后一帧）
+        billing_usage, _ = extract_codex_image_usage(response)
+        usage_attached = False
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "image_generation_call":
+                    continue
+                result = str(item.get("result") or "").strip()
+                if not result:
+                    continue
+                item_id = str(item.get("id") or "")
+                output_format = item.get("output_format")
+                key = _dedup_key(
+                    item_id,
+                    result,
+                    output_format if isinstance(output_format, str) else None,
+                )
+                if key in self._emitted:
+                    continue
+                self._emitted.add(key)
+                revised = item.get("revised_prompt")
+                self.state.images.append(
+                    {"b64_json": result, "revised_prompt": revised}
+                )
+                frame_data: dict[str, Any] = {"type": f"{self._prefix}.completed"}
+                if self._format == "url":
+                    mime = _output_format_to_mime(
+                        output_format if isinstance(output_format, str) else None
+                    )
+                    frame_data["url"] = f"data:{mime};base64,{result}"
+                else:
+                    frame_data["b64_json"] = result
+                if isinstance(revised, str) and revised.strip():
+                    frame_data["revised_prompt"] = revised.strip()
+                if billing_usage and not usage_attached:
+                    frame_data["usage"] = billing_usage
+                    usage_attached = True
+                frames.append(_build_sse_frame(frame_data["type"], frame_data))
+        return frames
 
 
-def _extract_usage(completed_response: dict[str, Any]) -> dict[str, Any] | None:
-    if not completed_response:
-        return None
-    tool_usage = completed_response.get("tool_usage")
-    if isinstance(tool_usage, dict):
-        image_gen = tool_usage.get("image_gen")
-        if isinstance(image_gen, dict) and image_gen:
-            return image_gen
-    usage = completed_response.get("usage")
-    if isinstance(usage, dict):
-        return usage
-    return None
+async def iter_codex_image_stream_frames(
+    upstream_iter: AsyncIterator[bytes],
+    *,
+    translator: _CodexImageStreamTranslator,
+) -> AsyncIterator[bytes]:
+    """底层流式翻译迭代器。
+
+    职责：上游 Codex SSE bytes → 翻译器 → OpenAI image 格式 SSE bytes。
+
+    **不** 负责 ``[DONE]`` 结尾帧 —— 由 handler 层统一在自己的 finally 里 yield
+    ``data: [DONE]\\n\\n``，避免和 error 分支重复发送。
+
+    遇上游致命事件时由 ``translator.translate_payload`` 抛 :class:`CodexStreamError`，
+    生成器直接中止；handler 层捕获转为 error frame 推给客户端。
+    """
+    buffer = b""
+    async for chunk in upstream_iter:
+        if not chunk:
+            continue
+        buffer += chunk
+        while b"\n\n" in buffer:
+            event_bytes, buffer = buffer.split(b"\n\n", 1)
+            for payload in iter_sse_data_lines(event_bytes):
+                for frame in translator.translate_payload(payload):
+                    yield frame
+    if buffer.strip():
+        for payload in iter_sse_data_lines(buffer):
+            for frame in translator.translate_payload(payload):
+                yield frame
+
+
+def build_codex_stream_error_frame(message: str) -> bytes:
+    """构造一个 OpenAI 兼容的流 ``error`` 事件帧，供 handler 在 CodexStreamError
+    时推给客户端后再关闭流。"""
+    payload = {
+        "type": "error",
+        "error": {
+            "type": "upstream_error",
+            "message": (message or "upstream request failed")[:500],
+        },
+    }
+    return _build_sse_frame("error", payload)
 
 
 # --------------------------------------------------------------------------- #

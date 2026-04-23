@@ -98,6 +98,7 @@ class UsageRecorder:
         result: RequestResult,
         request_headers: dict[str, str] | None = None,
         request_body: dict[str, Any] | None = None,
+        request_type: str = "chat",
     ) -> None:
         """
         记录成功请求的 Usage
@@ -131,7 +132,7 @@ class UsageRecorder:
                 output_tokens=usage.output_tokens,
                 cache_creation_input_tokens=usage.cache_creation_input_tokens,
                 cache_read_input_tokens=usage.cache_read_input_tokens,
-                request_type="chat",
+                request_type=request_type,
                 api_format=metadata.api_format,
                 api_family=metadata.api_family,
                 endpoint_kind=metadata.endpoint_kind,
@@ -182,6 +183,7 @@ class UsageRecorder:
         result: RequestResult,
         request_headers: dict[str, str] | None = None,
         request_body: dict[str, Any] | None = None,
+        request_type: str = "chat",
     ) -> None:
         """
         记录失败请求的 Usage
@@ -208,7 +210,7 @@ class UsageRecorder:
                 target_model=target_model,
                 input_tokens=0,
                 output_tokens=0,
-                request_type="chat",
+                request_type=request_type,
                 api_format=metadata.api_format,
                 api_family=metadata.api_family,
                 endpoint_kind=metadata.endpoint_kind,

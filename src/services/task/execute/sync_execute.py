@@ -67,6 +67,7 @@ class SyncTaskExecutionService:
         request_headers: dict[str, Any] | None,
         request_body: dict[str, Any] | None,
         create_pending_usage: bool = True,
+        request_type: str = "chat",
     ) -> ExecutionResult:
         """
         Unified candidate traversal loop for SYNC.
@@ -151,6 +152,7 @@ class SyncTaskExecutionService:
                         api_key=user_api_key,
                         model=model_name,
                         is_stream=is_stream,
+                        request_type=request_type,
                         api_format=api_format_norm,
                         request_headers=request_headers,
                         request_body=request_body,

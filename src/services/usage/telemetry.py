@@ -137,6 +137,8 @@ class MessageTelemetry:
         response_metadata: dict[str, Any] | None = None,
         # 请求元数据（用于性能与调试记录）
         request_metadata: dict[str, Any] | None = None,
+        # 业务类型（chat / image / video / endpoint_test 等）
+        request_type: str = "chat",
     ) -> float:
         metadata = self._build_usage_metadata(
             request_metadata=request_metadata,
@@ -154,7 +156,7 @@ class MessageTelemetry:
                 output_tokens=output_tokens,
                 cache_creation_input_tokens=cache_creation_tokens,
                 cache_read_input_tokens=cache_read_tokens,
-                request_type="chat",
+                request_type=request_type,
                 api_format=api_format,
                 api_family=api_family,
                 endpoint_kind=endpoint_kind,
@@ -251,6 +253,8 @@ class MessageTelemetry:
         target_model: str | None = None,
         # 请求元数据（用于性能与调试记录）
         request_metadata: dict[str, Any] | None = None,
+        # 业务类型（chat / image / video / endpoint_test 等）
+        request_type: str = "chat",
     ) -> None:
         """
         记录失败请求
@@ -287,7 +291,7 @@ class MessageTelemetry:
                 output_tokens=output_tokens,
                 cache_creation_input_tokens=cache_creation_tokens,
                 cache_read_input_tokens=cache_read_tokens,
-                request_type="chat",
+                request_type=request_type,
                 api_format=api_format,
                 api_family=api_family,
                 endpoint_kind=endpoint_kind,
@@ -360,6 +364,8 @@ class MessageTelemetry:
         target_model: str | None = None,
         # 请求元数据（用于性能与调试记录）
         request_metadata: dict[str, Any] | None = None,
+        # 业务类型（chat / image / video / endpoint_test 等）
+        request_type: str = "chat",
     ) -> None:
         """
         记录客户端取消的请求
@@ -382,7 +388,7 @@ class MessageTelemetry:
                 output_tokens=output_tokens,
                 cache_creation_input_tokens=cache_creation_tokens,
                 cache_read_input_tokens=cache_read_tokens,
-                request_type="chat",
+                request_type=request_type,
                 api_format=api_format,
                 api_family=api_family,
                 endpoint_kind=endpoint_kind,

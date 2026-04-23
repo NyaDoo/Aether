@@ -239,8 +239,6 @@ class TaskService:
                 request_candidate_id=None,
             )
 
-        _ = task_type  # reserved for future routing (chat/cli/video/image)
-
         return await self._sync_ops.execute_sync_unified(
             api_format=api_format,
             model_name=model_name,
@@ -254,6 +252,7 @@ class TaskService:
             request_headers=request_headers,
             request_body=request_body,
             create_pending_usage=create_pending_usage,
+            request_type=task_type,
         )
 
     async def execute_sync_candidates(
