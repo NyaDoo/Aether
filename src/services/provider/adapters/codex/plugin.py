@@ -182,23 +182,18 @@ def build_codex_url(
 
     Codex upstream (chatgpt.com/backend-api/codex) 使用 /responses
     而非标准 OpenAI 的 /v1/responses。compact 模式使用 /responses/compact。
+    base_url 应只填到 codex namespace（不含 /responses），由本函数补齐 path。
     """
     _ = is_stream  # Codex 不需要根据 stream 切换路径
 
-    endpoint_sig = str(getattr(endpoint, "api_format", "") or "").strip().lower()
     from src.services.provider.adapters.codex.context import is_codex_compact_request
+    from src.utils.url_utils import join_url
 
+    endpoint_sig = str(getattr(endpoint, "api_format", "") or "").strip().lower()
     is_compact = is_codex_compact_request(endpoint_sig=endpoint_sig)
 
-    base = str(endpoint.base_url).rstrip("/")
-    # 如果用户已在 base_url 中包含了 /responses，不要重复追加
-    if base.endswith("/responses"):
-        url = f"{base}/compact" if is_compact else base
-    elif base.endswith("/responses/compact"):
-        url = base if is_compact else base.removesuffix("/compact")
-    else:
-        suffix = "/responses/compact" if is_compact else "/responses"
-        url = f"{base}{suffix}"
+    suffix = "/responses/compact" if is_compact else "/responses"
+    url = join_url(endpoint.base_url, suffix)
     if effective_query_params:
         query_string = urlencode(effective_query_params, doseq=True)
         if query_string:

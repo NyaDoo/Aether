@@ -292,19 +292,13 @@ class ImageAdapterBase(HandlerAdapterBase):
         provider_type: str | None = None,
     ) -> str:
         """Image 测试 URL：Codex 反代 → /responses；其它 → /v1/images/generations。"""
+        from src.utils.url_utils import join_url
+
         _ = (request_data, model_name)
-        normalized = (base_url or "").rstrip("/")
         pt = (provider_type or "").strip().lower()
         if pt == "codex":
-            if normalized.endswith("/responses"):
-                return normalized
-            return f"{normalized}/responses"
-        # 透传路径：images/generations
-        if normalized.endswith("/v1"):
-            return f"{normalized}/images/generations"
-        if normalized.endswith("/images/generations"):
-            return normalized
-        return f"{normalized}/v1/images/generations"
+            return join_url(base_url, "/responses")
+        return join_url(base_url, "/v1/images/generations")
 
     @classmethod
     def build_request_body(

@@ -598,11 +598,65 @@ class CreateEndpointRequest(BaseModel):
     @field_validator("base_url")
     @classmethod
     def validate_base_url(cls, v: str) -> str:
-        """验证 API URL"""
-        if not re.match(r"^https?://", v, re.IGNORECASE):
+        """验证并规范化 base_url。
+
+        规则：
+        - 去除前后空白
+        - 必须以 http:// 或 https:// 开头
+        - 不允许 query（?）、fragment（#）
+        - 不允许包含业务路径关键字（/chat/completions 等）——应填到 custom_path
+        - scheme 与 host 小写化，path 保留大小写
+        - 去除尾部斜杠
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        value = (v or "").strip()
+        if not value:
+            raise ValueError("URL 不能为空")
+        if not re.match(r"^https?://", value, re.IGNORECASE):
             raise ValueError("URL 必须以 http:// 或 https:// 开头")
 
-        return v.rstrip("/")  # 移除末尾斜杠
+        parsed = urlparse(value)
+        if parsed.query:
+            raise ValueError("base_url 不能包含查询参数（?xxx），请在对应位置单独配置")
+        if parsed.fragment:
+            raise ValueError("base_url 不能包含片段（#xxx）")
+
+        # 业务路径关键字：出现在 path 中即视为用户把完整端点塞进了 base_url
+        # Gemini 场景的路径是 `.../models/xxx:generateContent`（冒号分隔），
+        # 因此这里用包含匹配而不要求前导 "/"。
+        _BUSINESS_PATHS = (
+            "/chat/completions",
+            "/messages",
+            "/responses",
+            "/images/generations",
+            "/images/edits",
+            "/videos",
+            "generatecontent",
+            "streamgeneratecontent",
+            "predictlongrunning",
+        )
+        path_lower = (parsed.path or "").lower()
+        for biz in _BUSINESS_PATHS:
+            if biz in path_lower:
+                raise ValueError(
+                    f"base_url 不应包含业务路径（{biz}）。请把协议+域名（+反代前缀）"
+                    "填到 base_url，把完整端点路径填到自定义路径。"
+                )
+
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        netloc = host
+        if parsed.port is not None:
+            netloc = f"{host}:{parsed.port}"
+        if parsed.username or parsed.password:
+            userinfo = parsed.username or ""
+            if parsed.password:
+                userinfo = f"{userinfo}:{parsed.password}"
+            netloc = f"{userinfo}@{netloc}"
+
+        normalized = urlunparse((scheme, netloc, parsed.path or "", "", "", ""))
+        return normalized.rstrip("/")
 
     @field_validator("api_format")
     @classmethod
@@ -620,15 +674,27 @@ class CreateEndpointRequest(BaseModel):
     @field_validator("custom_path")
     @classmethod
     def validate_custom_path(cls, v: str | None) -> str | None:
-        """验证自定义路径"""
+        """验证自定义路径。
+
+        放开字符集以支持 Gemini 的 `:`、模板变量 `{model}` 等。
+        - 必须以 `/` 开头
+        - 允许字母、数字、斜杠、下划线、连字符、点、冒号、花括号
+        - 不允许 query/fragment/空白（由 transport hook 追加）
+        """
         if v is None:
             return v
 
-        # 确保路径不包含危险字符
-        if not re.match(r"^[/a-zA-Z0-9_-]+$", v):
-            raise ValueError("路径只能包含字母、数字、斜杠、下划线和连字符")
+        value = v.strip()
+        if not value:
+            return None
+        if not value.startswith("/"):
+            raise ValueError("自定义路径必须以 / 开头")
+        if not re.match(r"^/[A-Za-z0-9/_\-.:{}]+$", value):
+            raise ValueError(
+                "路径只能包含字母、数字、/、_、-、.、:、{、}（query/fragment 不允许）"
+            )
 
-        return v
+        return value
 
 
 class UpdateEndpointRequest(BaseModel):

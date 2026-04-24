@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from src.api.handlers.base.image_handler_base import ImageHandlerBase
 from src.core.api_format import ApiFamily, EndpointKind
+from src.utils.url_utils import join_url
 
 
 class OpenAIImageHandler(ImageHandlerBase):
@@ -23,10 +24,7 @@ class OpenAIImageHandler(ImageHandlerBase):
         suffix = (path_suffix or "generations").strip().lower()
         if suffix not in {"generations", "edits"}:
             suffix = "generations"
-        base = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
-        if base.endswith("/v1"):
-            return f"{base}/images/{suffix}"
-        return f"{base}/v1/images/{suffix}"
+        return join_url(base_url or self.DEFAULT_BASE_URL, f"/v1/images/{suffix}")
 
 
 __all__ = ["OpenAIImageHandler"]
