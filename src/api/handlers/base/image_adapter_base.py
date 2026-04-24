@@ -78,8 +78,9 @@ class ImageAdapterBase(HandlerAdapterBase):
             context.original_headers.get("content-type")
             or context.original_headers.get("Content-Type")
             or ""
-        ).lower()
-        is_multipart = content_type.startswith("multipart/form-data")
+        )
+        content_type_lower = content_type.lower()
+        is_multipart = content_type_lower.startswith("multipart/form-data")
 
         if self.endpoint_operation == "edits" and not is_multipart:
             return JSONResponse(
