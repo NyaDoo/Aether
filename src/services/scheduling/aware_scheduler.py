@@ -276,6 +276,7 @@ class CacheAwareScheduler:
                 provider = candidate.provider
                 endpoint = candidate.endpoint
                 key = candidate.key
+                candidate.cache_affinity_degraded = False
 
                 if endpoint.id in excluded_endpoints_set:
                     logger.debug("  └─ Endpoint {}... 在排除列表，跳过", endpoint.id[:8])
@@ -838,11 +839,15 @@ class CacheAwareScheduler:
 
             if not matched_candidate.is_skipped:
                 # 缓存命中且健康，无条件提升到最前面
+                matched_candidate.cache_affinity_degraded = bool(
+                    candidates and candidates[0] is not matched_candidate
+                )
                 other_candidates = [c for c in candidates if c is not matched_candidate]
                 result = [matched_candidate] + other_candidates
                 logger.debug(
-                    "缓存亲和性命中且健康，无条件优先使用 (needs_conversion={})",
+                    "缓存亲和性命中且健康，无条件优先使用 (needs_conversion={}, degraded={})",
                     matched_candidate.needs_conversion,
+                    matched_candidate.cache_affinity_degraded,
                 )
                 return result
 
