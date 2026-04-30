@@ -249,6 +249,12 @@ class QueueTelemetryWriter(TelemetryWriter):
             data["provider_endpoint_id"] = kwargs["provider_endpoint_id"]
         if kwargs.get("provider_api_key_id"):
             data["provider_api_key_id"] = kwargs["provider_api_key_id"]
+        if kwargs.get("model_group_id"):
+            data["model_group_id"] = kwargs["model_group_id"]
+        if kwargs.get("model_group_route_id"):
+            data["model_group_route_id"] = kwargs["model_group_route_id"]
+        if kwargs.get("user_billing_multiplier") is not None:
+            data["user_billing_multiplier"] = kwargs["user_billing_multiplier"]
 
         # 元数据
         if kwargs.get("metadata"):
