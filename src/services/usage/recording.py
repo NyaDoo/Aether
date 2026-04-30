@@ -6,11 +6,14 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.core.logger import logger
 from src.models.database import (
     ApiKey,
+    ModelGroup,
+    ModelGroupRoute,
     Provider,
     ProviderAPIKey,
     ProxyNode,
@@ -195,6 +198,131 @@ def _increment_provider_monthly_usage(
 
 def _get_actual_total_cost_usd(usage_params: dict[str, Any]) -> float:
     return float(to_money_decimal(usage_params.get("actual_total_cost_usd") or 0.0))
+
+
+def _clear_stale_usage_model_group_references(
+    db: Session,
+    usage_params: dict[str, Any],
+    *,
+    existing_model_group_ids: dict[str, bool] | None = None,
+    existing_model_group_route_ids: dict[str, bool] | None = None,
+) -> None:
+    """Clear stale nullable usage FKs that may have been deleted during a request."""
+
+    def _exists(
+        *,
+        cache: dict[str, bool] | None,
+        model: Any,
+        value: Any,
+    ) -> bool:
+        if not value:
+            return True
+        entity_id = str(value)
+        if cache is not None and entity_id in cache:
+            return cache[entity_id]
+        query = db.query(model.id).filter(model.id == entity_id)
+        try:
+            query = query.with_for_update(read=True, key_share=True)
+        except TypeError:
+            query = query.with_for_update()
+        found = query.first() is not None
+        if cache is not None:
+            cache[entity_id] = found
+        return found
+
+    group_id = usage_params.get("model_group_id")
+    if group_id and not _exists(
+        cache=existing_model_group_ids,
+        model=ModelGroup,
+        value=group_id,
+    ):
+        logger.warning(
+            "Usage 记录引用的模型分组已不存在，清空外键: request_id={}, group_id={}",
+            usage_params.get("request_id"),
+            group_id,
+        )
+        usage_params["model_group_id"] = None
+
+    route_id = usage_params.get("model_group_route_id")
+    if route_id and not _exists(
+        cache=existing_model_group_route_ids,
+        model=ModelGroupRoute,
+        value=route_id,
+    ):
+        logger.warning(
+            "Usage 记录引用的模型分组路由已不存在，清空外键: request_id={}, route_id={}",
+            usage_params.get("request_id"),
+            route_id,
+        )
+        usage_params["model_group_route_id"] = None
+
+
+_USAGE_MODEL_GROUP_FK_TARGETS: dict[str, tuple[str, ...]] = {
+    "usage_model_group_id_fkey": ("model_group_id", "model_group_route_id"),
+    "usage_model_group_route_id_fkey": ("model_group_route_id",),
+}
+
+
+def _usage_model_group_fk_violation_targets(exc: BaseException) -> set[str]:
+    targets: set[str] = set()
+    queue: list[BaseException] = [exc]
+    seen: set[int] = set()
+
+    while queue:
+        current = queue.pop(0)
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        orig = getattr(current, "orig", None)
+        diag = getattr(orig, "diag", None)
+        constraint_name = getattr(diag, "constraint_name", None)
+        if isinstance(constraint_name, str):
+            targets.update(_USAGE_MODEL_GROUP_FK_TARGETS.get(constraint_name, ()))
+
+        message = str(current).lower()
+        for constraint, constraint_targets in _USAGE_MODEL_GROUP_FK_TARGETS.items():
+            if constraint in message:
+                targets.update(constraint_targets)
+
+        for attr in ("orig", "__cause__", "__context__"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException):
+                queue.append(nested)
+
+    return targets
+
+
+def _clear_usage_model_group_refs_after_fk_violation(
+    usage_params: dict[str, Any],
+    exc: BaseException,
+) -> bool:
+    """Clear stale nullable model-group tracking FKs after a commit-time race."""
+
+    if not isinstance(exc, IntegrityError):
+        return False
+
+    targets = _usage_model_group_fk_violation_targets(exc)
+    if not targets:
+        return False
+
+    cleared: dict[str, Any] = {}
+    for field_name in sorted(targets):
+        current_value = usage_params.get(field_name)
+        if current_value:
+            cleared[field_name] = current_value
+            usage_params[field_name] = None
+
+    if not cleared:
+        return False
+
+    logger.warning(
+        "Usage 记录提交时检测到过期模型分组外键，清空后重试: request_id={}, cleared={}",
+        usage_params.get("request_id"),
+        cleared,
+    )
+    return True
 
 
 class UsageRecordingMixin(UsageBillingIntegrationMixin):
@@ -412,47 +540,59 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         total_cost = to_money_decimal(total_cost)
 
         def _sync_record() -> Usage:
-            try:
-                apply_postgres_statement_timeouts(db)
+            for attempt in range(2):
+                try:
+                    apply_postgres_statement_timeouts(db)
+                    _clear_stale_usage_model_group_references(db, usage_params)
 
-                # 创建 Usage 记录与相关统计；同步 SQLAlchemy 操作统一移到线程池，避免阻塞事件循环。
-                usage = Usage(**usage_params)
-                db.add(usage)
+                    # 创建 Usage 记录与相关统计；同步 SQLAlchemy 操作统一移到线程池，避免阻塞事件循环。
+                    usage = Usage(**usage_params)
+                    db.add(usage)
 
-                accounted, _charge_applied = cls._finalize_usage_billing(
-                    db,
-                    usage=usage,
-                    total_cost=total_cost,
-                    status=status,
-                    finalized_at=finalized_at,
-                )
-
-                dispatch_codex_quota_sync_from_response_headers(
-                    provider_api_key_id=provider_api_key_id,
-                    response_headers=response_headers,
-                    db=db,
-                )
-
-                if accounted:
-                    _increment_provider_api_key_totals(
+                    accounted, _charge_applied = cls._finalize_usage_billing(
                         db,
-                        provider_api_key_id,
-                        total_tokens=int(usage_params.get("total_tokens") or 0),
-                        total_cost=_get_actual_total_cost_usd(usage_params),
-                    )
-                    _increment_global_model_usage(db, model)
-                    cls._increment_user_model_usage(db, user, model)
-                    _increment_provider_monthly_usage(
-                        db,
-                        provider_id,
-                        total_cost=_get_actual_total_cost_usd(usage_params),
+                        usage=usage,
+                        total_cost=total_cost,
+                        status=status,
+                        finalized_at=finalized_at,
                     )
 
-                db.commit()  # 立即提交事务，释放数据库锁
-                return usage
-            except Exception:
-                db.rollback()
-                raise
+                    dispatch_codex_quota_sync_from_response_headers(
+                        provider_api_key_id=provider_api_key_id,
+                        response_headers=response_headers,
+                        db=db,
+                    )
+
+                    if accounted:
+                        _increment_provider_api_key_totals(
+                            db,
+                            provider_api_key_id,
+                            total_tokens=int(usage_params.get("total_tokens") or 0),
+                            total_cost=_get_actual_total_cost_usd(usage_params),
+                        )
+                        _increment_global_model_usage(db, model)
+                        cls._increment_user_model_usage(db, user, model)
+                        _increment_provider_monthly_usage(
+                            db,
+                            provider_id,
+                            total_cost=_get_actual_total_cost_usd(usage_params),
+                        )
+
+                    db.commit()  # 立即提交事务，释放数据库锁
+                    return usage
+                except Exception as exc:
+                    retry_without_refs = (
+                        attempt == 0
+                        and _clear_usage_model_group_refs_after_fk_violation(usage_params, exc)
+                    )
+                    if not retry_without_refs:
+                        logger.error("提交使用记录时出错: {}", exc)
+                    db.rollback()
+                    if retry_without_refs:
+                        continue
+                    raise
+
+            raise RuntimeError(f"unreachable usage.record_usage_async retry state: {request_id}")
 
         return await asyncio.to_thread(
             lambda: run_sync_db_retry(
@@ -567,81 +707,95 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
 
         def _sync_record() -> Usage:
             """同步 DB 操作: with_for_update + 批量 update + commit"""
-            try:
-                apply_postgres_statement_timeouts(db)
+            for attempt in range(2):
+                try:
+                    apply_postgres_statement_timeouts(db)
+                    _clear_stale_usage_model_group_references(db, usage_params)
 
-                # 检查是否已存在相同 request_id 的记录
-                existing_usage = (
-                    db.query(Usage).filter(Usage.request_id == request_id).with_for_update().first()
-                )
-                if existing_usage:
-                    if cls._is_usage_finalized(existing_usage):
+                    # 检查是否已存在相同 request_id 的记录
+                    existing_usage = (
+                        db.query(Usage)
+                        .filter(Usage.request_id == request_id)
+                        .with_for_update()
+                        .first()
+                    )
+                    if existing_usage:
+                        if cls._is_usage_finalized(existing_usage):
+                            logger.debug(
+                                "request_id {} 已完成结算，跳过重复记账 (billing_status={})",
+                                request_id,
+                                getattr(existing_usage, "billing_status", None),
+                            )
+                            return existing_usage
                         logger.debug(
-                            "request_id {} 已完成结算，跳过重复记账 (billing_status={})",
-                            request_id,
-                            getattr(existing_usage, "billing_status", None),
+                            f"request_id {request_id} 已存在，更新现有记录 "
+                            f"(status: {existing_usage.status} -> {status})"
                         )
-                        return existing_usage
-                    logger.debug(
-                        f"request_id {request_id} 已存在，更新现有记录 "
-                        f"(status: {existing_usage.status} -> {status})"
-                    )
-                    cls._update_existing_usage(existing_usage, usage_params, target_model)
-                    usage = existing_usage
-                else:
-                    usage = Usage(**usage_params)
-                    db.add(usage)
+                        cls._update_existing_usage(existing_usage, usage_params, target_model)
+                        usage = existing_usage
+                    else:
+                        usage = Usage(**usage_params)
+                        db.add(usage)
 
-                # 记账仅使用 user.id / api_key.id，避免 db.merge 把鉴权时持有的
-                # 旧对象整行写回 —— 高并发下会覆盖 admin 刚改的 group_id 等字段。
-                user_id_for_stats = str(user.id) if user else None
-                api_key_id_for_stats = str(api_key.id) if api_key else None
+                    # 记账仅使用 user.id / api_key.id，避免 db.merge 把鉴权时持有的
+                    # 旧对象整行写回 —— 高并发下会覆盖 admin 刚改的 group_id 等字段。
+                    user_id_for_stats = str(user.id) if user else None
+                    api_key_id_for_stats = str(api_key.id) if api_key else None
 
-                accounted, charge_applied = cls._finalize_usage_billing(
-                    db,
-                    usage=usage,
-                    total_cost=total_cost,
-                    status=status,
-                    finalized_at=finalized_at,
-                )
-
-                dispatch_codex_quota_sync_from_response_headers(
-                    provider_api_key_id=provider_api_key_id,
-                    response_headers=response_headers,
-                    db=db,
-                )
-
-                if accounted:
-                    _increment_api_key_totals(
+                    accounted, charge_applied = cls._finalize_usage_billing(
                         db,
-                        api_key_id_for_stats,
-                        request_count=1,
-                        total_cost=float(total_cost) if charge_applied else 0.0,
-                    )
-                    _increment_provider_api_key_totals(
-                        db,
-                        provider_api_key_id,
-                        total_tokens=int(usage_params.get("total_tokens") or 0),
-                        total_cost=_get_actual_total_cost_usd(usage_params),
-                    )
-                    _increment_global_model_usage(db, model)
-                    cls._increment_user_model_usage_by_id(db, user_id_for_stats, model)
-                    manual_node_id = _extract_manual_proxy_node_id(metadata)
-                    if manual_node_id:
-                        failed = {manual_node_id: 1} if status == "failed" else None
-                        _increment_proxy_node_requests(db, {manual_node_id: 1}, failed)
-                    _increment_provider_monthly_usage(
-                        db,
-                        provider_id,
-                        total_cost=_get_actual_total_cost_usd(usage_params),
+                        usage=usage,
+                        total_cost=total_cost,
+                        status=status,
+                        finalized_at=finalized_at,
                     )
 
-                db.commit()
-                return usage
-            except Exception as e:
-                logger.error("提交使用记录时出错: {}", e)
-                db.rollback()
-                raise
+                    dispatch_codex_quota_sync_from_response_headers(
+                        provider_api_key_id=provider_api_key_id,
+                        response_headers=response_headers,
+                        db=db,
+                    )
+
+                    if accounted:
+                        _increment_api_key_totals(
+                            db,
+                            api_key_id_for_stats,
+                            request_count=1,
+                            total_cost=float(total_cost) if charge_applied else 0.0,
+                        )
+                        _increment_provider_api_key_totals(
+                            db,
+                            provider_api_key_id,
+                            total_tokens=int(usage_params.get("total_tokens") or 0),
+                            total_cost=_get_actual_total_cost_usd(usage_params),
+                        )
+                        _increment_global_model_usage(db, model)
+                        cls._increment_user_model_usage_by_id(db, user_id_for_stats, model)
+                        manual_node_id = _extract_manual_proxy_node_id(metadata)
+                        if manual_node_id:
+                            failed = {manual_node_id: 1} if status == "failed" else None
+                            _increment_proxy_node_requests(db, {manual_node_id: 1}, failed)
+                        _increment_provider_monthly_usage(
+                            db,
+                            provider_id,
+                            total_cost=_get_actual_total_cost_usd(usage_params),
+                        )
+
+                    db.commit()
+                    return usage
+                except Exception as exc:
+                    retry_without_refs = (
+                        attempt == 0
+                        and _clear_usage_model_group_refs_after_fk_violation(usage_params, exc)
+                    )
+                    if not retry_without_refs:
+                        logger.error("提交使用记录时出错: {}", exc)
+                    db.rollback()
+                    if retry_without_refs:
+                        continue
+                    raise
+
+            raise RuntimeError(f"unreachable usage.record_usage retry state: {request_id}")
 
         return await asyncio.to_thread(
             lambda: run_sync_db_retry(
@@ -1032,6 +1186,13 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 provider_id=record.get("provider_id"),
                 provider_endpoint_id=record.get("provider_endpoint_id"),
                 provider_api_key_id=record.get("provider_api_key_id"),
+                model_group_id=record.get("model_group_id"),
+                model_group_route_id=record.get("model_group_route_id"),
+                user_billing_multiplier=(
+                    float(record["user_billing_multiplier"])
+                    if record.get("user_billing_multiplier") is not None
+                    else 1.0
+                ),
                 status=record.get("status") or "completed",
                 cache_ttl_minutes=record.get("cache_ttl_minutes"),
                 use_tiered_pricing=record.get("use_tiered_pricing", True),
@@ -1074,6 +1235,8 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
         insert_results = prepared_results[len(update_params_list) :]
 
         batch_finalized_at = datetime.now(timezone.utc)
+        existing_model_group_ids: dict[str, bool] = {}
+        existing_model_group_route_ids: dict[str, bool] = {}
 
         # 1. 处理需要更新的记录
         for i, (record, request_id, params) in enumerate(update_params_list):
@@ -1081,6 +1244,13 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 usage_params, total_cost, exc = update_results[i]
                 if exc:
                     raise exc
+
+                _clear_stale_usage_model_group_references(
+                    db,
+                    usage_params,
+                    existing_model_group_ids=existing_model_group_ids,
+                    existing_model_group_route_ids=existing_model_group_route_ids,
+                )
 
                 # existing_usage 已在构建阶段验证存在
                 existing_usage = existing_usages[request_id]
@@ -1155,6 +1325,13 @@ class UsageRecordingMixin(UsageBillingIntegrationMixin):
                 usage_params, total_cost, exc = insert_results[i]
                 if exc:
                     raise exc
+
+                _clear_stale_usage_model_group_references(
+                    db,
+                    usage_params,
+                    existing_model_group_ids=existing_model_group_ids,
+                    existing_model_group_route_ids=existing_model_group_route_ids,
+                )
 
                 user = params.user
                 api_key = params.api_key
