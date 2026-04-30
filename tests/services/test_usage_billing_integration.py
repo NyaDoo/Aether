@@ -403,6 +403,104 @@ async def test_prepare_usage_record_preserves_stream_1h_ttl_when_final_delta_has
 
 
 @pytest.mark.asyncio
+async def test_prepare_usage_record_preserves_stream_5m_ttl_when_final_delta_has_only_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        lambda **kwargs: {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0},
+    )
+
+    params = _build_params(
+        db,
+        provider_api_key_id=None,
+        cache_creation_input_tokens=258,
+        is_stream=True,
+        response_body={
+            "chunks": [
+                {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 6,
+                            "output_tokens": 1,
+                            "cache_creation_input_tokens": 258,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 258,
+                                "ephemeral_1h_input_tokens": 0,
+                            },
+                        }
+                    },
+                },
+                {
+                    "type": "message_delta",
+                    "usage": {
+                        "input_tokens": 6,
+                        "output_tokens": 150,
+                        "cache_creation_input_tokens": 258,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+            ]
+        },
+    )
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_creation_input_tokens") == 258
+    assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 5
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_defaults_stream_total_only_cache_creation_ttl_to_5m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        lambda **kwargs: {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0},
+    )
+
+    params = _build_params(
+        db,
+        cache_creation_input_tokens=258,
+        is_stream=True,
+        response_body={
+            "chunks": [
+                {
+                    "type": "message_delta",
+                    "usage": {
+                        "input_tokens": 6,
+                        "output_tokens": 150,
+                        "cache_creation_input_tokens": 258,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+            ]
+        },
+    )
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_creation_input_tokens") == 258
+    assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 5
+
+
+@pytest.mark.asyncio
 async def test_prepare_usage_record_defaults_cache_creation_ttl_to_5m_without_snapshot_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
