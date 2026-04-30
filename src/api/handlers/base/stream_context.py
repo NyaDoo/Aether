@@ -299,6 +299,7 @@ class StreamContext:
         output_tokens: int | None = None,
         cached_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
+        cache_ttl_minutes: int | None = None,
     ) -> None:
         """
         更新 Token 使用统计
@@ -324,6 +325,7 @@ class StreamContext:
             output_tokens: 输出 tokens 数量
             cached_tokens: 缓存命中 tokens 数量
             cache_creation_tokens: 缓存创建 tokens 数量
+            cache_ttl_minutes: 缓存 TTL 分钟数
         """
         if input_tokens is not None and (input_tokens > 0 or self.input_tokens == 0):
             self.input_tokens = input_tokens
@@ -335,6 +337,8 @@ class StreamContext:
             cache_creation_tokens > 0 or self.cache_creation_tokens == 0
         ):
             self.cache_creation_tokens = cache_creation_tokens
+        if cache_ttl_minutes is not None:
+            self.cache_ttl_minutes = cache_ttl_minutes
 
     def mark_failed(
         self,

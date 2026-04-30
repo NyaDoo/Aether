@@ -44,7 +44,11 @@ from src.core.exceptions import (
     ProviderTimeoutException,
 )
 from src.core.logger import logger
-from src.core.usage_tokens import extract_cache_creation_tokens, extract_cache_read_tokens
+from src.core.usage_tokens import (
+    extract_cache_creation_tokens,
+    extract_cache_read_tokens,
+    extract_cache_ttl_minutes,
+)
 from src.models.database import Provider, ProviderEndpoint
 from src.services.provider.behavior import get_provider_behavior
 from src.utils.perf import PerfRecorder
@@ -211,6 +215,7 @@ class StreamProcessor:
                 output_tokens=usage.get("output_tokens"),
                 cached_tokens=usage.get("cache_read_tokens"),
                 cache_creation_tokens=usage.get("cache_creation_tokens"),
+                cache_ttl_minutes=usage.get("cache_ttl_minutes"),
             )
 
         # Provider completion detection (Gemini doesn't emit response.completed).
@@ -339,6 +344,7 @@ class StreamProcessor:
             new_output = usage.get("output_tokens") or usage.get("completion_tokens") or 0
             new_cached = extract_cache_read_tokens(usage)
             new_cache_creation = extract_cache_creation_tokens(usage)
+            cache_ttl_minutes = extract_cache_ttl_minutes(usage)
 
             if new_input > ctx.input_tokens:
                 ctx.input_tokens = new_input
@@ -350,6 +356,8 @@ class StreamProcessor:
                 ctx.cached_tokens = new_cached
             if new_cache_creation > ctx.cache_creation_tokens:
                 ctx.cache_creation_tokens = new_cache_creation
+            if cache_ttl_minutes is not None:
+                ctx.cache_ttl_minutes = cache_ttl_minutes
 
             if any([new_input, new_output, new_cached, new_cache_creation]):
                 ctx.final_usage = usage

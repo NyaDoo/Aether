@@ -3,7 +3,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from src.core.usage_tokens import extract_cache_creation_tokens_detail, extract_cache_read_tokens
+from src.core.usage_tokens import (
+    extract_cache_creation_tokens_detail,
+    extract_cache_read_tokens,
+    extract_cache_ttl_minutes,
+)
 
 
 def build_upstream_usage_snapshot(
@@ -69,6 +73,7 @@ def extract_usage_metrics_from_snapshot(snapshot: Any) -> dict[str, int | None] 
             return None
 
         last_metrics: dict[str, int | None] | None = None
+        last_cache_ttl_minutes: int | None = None
         for event in events:
             if not isinstance(event, dict):
                 continue
@@ -77,6 +82,11 @@ def extract_usage_metrics_from_snapshot(snapshot: Any) -> dict[str, int | None] 
                 continue
             metrics = _extract_metrics_from_usage_dict(usage, api_family=api_family)
             if metrics is not None:
+                if metrics.get("cache_ttl_minutes") is not None:
+                    last_cache_ttl_minutes = int(metrics["cache_ttl_minutes"] or 0)
+                elif last_cache_ttl_minutes is not None:
+                    metrics = dict(metrics)
+                    metrics["cache_ttl_minutes"] = last_cache_ttl_minutes
                 last_metrics = metrics
 
         return last_metrics
@@ -165,11 +175,7 @@ def _extract_metrics_from_usage_dict(
     )
     cache_read_tokens = extract_cache_read_tokens(usage)
 
-    cache_ttl_minutes: int | None = None
-    if cache_creation_1h > 0:
-        cache_ttl_minutes = 60
-    elif cache_creation_total > 0:
-        cache_ttl_minutes = 5
+    cache_ttl_minutes = extract_cache_ttl_minutes(usage)
 
     return {
         "input_tokens": input_tokens,

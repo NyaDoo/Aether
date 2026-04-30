@@ -165,6 +165,7 @@ def _build_params(
     cache_ttl_minutes: int | None = None,
     provider_api_key_id: str | None = "pak-test",
     response_body: Any = None,
+    is_stream: bool = False,
 ) -> UsageRecordParams:
     return UsageRecordParams(
         db=db,
@@ -182,7 +183,7 @@ def _build_params(
         endpoint_kind="chat",
         endpoint_api_format="claude:chat",
         has_format_conversion=False,
-        is_stream=False,
+        is_stream=is_stream,
         response_time_ms=123,
         first_byte_time_ms=None,
         status_code=200,
@@ -285,6 +286,119 @@ async def test_prepare_usage_record_infers_ttl_from_upstream_snapshot(
     await _TestUsageBillingIntegration._prepare_usage_record(params)
 
     assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 60
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_preserves_stream_1h_ttl_from_earlier_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        lambda **kwargs: {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0},
+    )
+
+    params = _build_params(
+        db,
+        provider_api_key_id=None,
+        cache_creation_input_tokens=62226,
+        response_body={
+            "chunks": [
+                {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 6,
+                            "output_tokens": 1,
+                            "cache_creation_input_tokens": 62226,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 0,
+                                "ephemeral_1h_input_tokens": 62226,
+                            },
+                        }
+                    },
+                },
+                {
+                    "type": "message_delta",
+                    "usage": {
+                        "input_tokens": 6,
+                        "output_tokens": 150,
+                        "cache_creation_input_tokens": 62226,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+            ]
+        },
+    )
+    params.is_stream = True
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 60
+
+
+@pytest.mark.asyncio
+async def test_prepare_usage_record_preserves_stream_1h_ttl_when_final_delta_has_only_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = MagicMock()
+
+    monkeypatch.setattr("src.services.billing.service.BillingService", _DummyBillingService)
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.sanitize_request_metadata",
+        lambda metadata: metadata,
+    )
+    monkeypatch.setattr(
+        "src.services.usage._billing_integration.build_usage_params",
+        lambda **kwargs: {"total_cost_usd": 0.0, "actual_total_cost_usd": 0.0},
+    )
+
+    params = _build_params(
+        db,
+        provider_api_key_id=None,
+        cache_creation_input_tokens=62226,
+        is_stream=True,
+        response_body={
+            "chunks": [
+                {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 6,
+                            "output_tokens": 1,
+                            "cache_creation_input_tokens": 62226,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 0,
+                                "ephemeral_1h_input_tokens": 62226,
+                            },
+                        }
+                    },
+                },
+                {
+                    "type": "message_delta",
+                    "usage": {
+                        "input_tokens": 6,
+                        "output_tokens": 150,
+                        "cache_creation_input_tokens": 62226,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+            ]
+        },
+    )
+    await _TestUsageBillingIntegration._prepare_usage_record(params)
+
+    assert _DummyBillingService.last_dimensions is not None
+    assert _DummyBillingService.last_dimensions.get("cache_creation_input_tokens") == 62226
     assert _DummyBillingService.last_dimensions.get("cache_ttl_minutes") == 60
 
 

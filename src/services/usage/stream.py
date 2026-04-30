@@ -386,6 +386,7 @@ class StreamUsageTracker:
             or chunk.output_tokens
             or chunk.cache_creation_tokens
             or chunk.cache_read_tokens
+            or chunk.cache_ttl_minutes is not None
         ):
             usage = {
                 "input_tokens": chunk.input_tokens or self.stream_stats.input_tokens,
@@ -395,6 +396,9 @@ class StreamUsageTracker:
                 "cache_read_input_tokens": chunk.cache_read_tokens
                 or self.stream_stats.cache_read_tokens,
             }
+            cache_ttl_minutes = chunk.cache_ttl_minutes or self.stream_stats.cache_ttl_minutes
+            if cache_ttl_minutes is not None:
+                usage["cache_ttl_minutes"] = cache_ttl_minutes
 
         # 更新响应 ID
         if chunk.response_id and not self.complete_response.get("id"):
@@ -579,7 +583,12 @@ class StreamUsageTracker:
                     total, t5m, t1h = extract_cache_creation_tokens_detail(usage)
                     if total:
                         self.cache_creation_input_tokens = total
-                        self.cache_ttl_minutes = 60 if t1h > 0 else 5
+                        if usage.get("cache_ttl_minutes") is not None:
+                            self.cache_ttl_minutes = int(usage["cache_ttl_minutes"])
+                        elif t1h > 0:
+                            self.cache_ttl_minutes = 60
+                        elif t5m > 0:
+                            self.cache_ttl_minutes = 5
 
         finally:
             # 流结束后记录使用量
@@ -1080,6 +1089,8 @@ class EnhancedStreamUsageTracker(StreamUsageTracker):
                         self.cache_creation_input_tokens = usage["cache_creation_input_tokens"]
                     if "cache_read_input_tokens" in usage:
                         self.cache_read_input_tokens = usage["cache_read_input_tokens"]
+                    if usage.get("cache_ttl_minutes") is not None:
+                        self.cache_ttl_minutes = int(usage["cache_ttl_minutes"])
 
         finally:
             # 流结束后记录使用量
