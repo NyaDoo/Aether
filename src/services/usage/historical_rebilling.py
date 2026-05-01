@@ -28,16 +28,19 @@ from src.services.wallet import WalletDailyUsageLedgerService, WalletService
 class HistoricalUsageRebillingService:
     """升级后一次性的历史 Usage 重算维护任务。"""
 
-    TARGET_VERSION = "2026-03-31-usage-billing-recalc-v2"
+    TARGET_VERSION = "2026-05-02-claude-1h-usage-billing-recalc"
     STATE_KEY = "historical_usage_rebilling_state"
     ENABLED_KEY = "historical_usage_rebilling_enabled"
+    HISTORY_DAYS_KEY = "historical_usage_rebilling_history_days"
     USAGE_BATCH_SIZE_KEY = "historical_usage_rebilling_usage_batch_size"
     LEDGER_BATCH_DAYS_KEY = "historical_usage_rebilling_ledger_batch_days"
     PAUSE_MS_KEY = "historical_usage_rebilling_pause_ms"
 
+    DEFAULT_HISTORY_DAYS = 40
     DEFAULT_USAGE_BATCH_SIZE = 100
     DEFAULT_LEDGER_BATCH_DAYS = 30
     DEFAULT_PAUSE_MS = 100
+    FORCE_1H_CACHE_ENDPOINT_FORMATS = frozenset({"claude:chat", "claude:cli"})
 
     @classmethod
     async def run_once_in_background(cls) -> None:
@@ -75,11 +78,16 @@ class HistoricalUsageRebillingService:
                 return True
 
             if not state or state.get("version") != cls.TARGET_VERSION:
-                state = cls._build_initial_state()
+                history_days = cls._get_history_days(db)
+                state = cls._build_initial_state(history_days=history_days)
                 cls._save_state(db, state)
                 logger.info(
-                    "初始化历史计费重算维护任务: version={}, cutoff={}",
+                    (
+                        "初始化历史计费重算维护任务: "
+                        "version={}, window_start={}, cutoff={}"
+                    ),
                     cls.TARGET_VERSION,
+                    state.get("window_start_created_at"),
                     state.get("cutoff_created_at"),
                 )
                 return False
@@ -116,12 +124,29 @@ class HistoricalUsageRebillingService:
             db.close()
 
     @classmethod
-    def _build_initial_state(cls) -> dict[str, Any]:
+    def _get_history_days(cls, db: Session) -> int:
+        try:
+            history_days = int(
+                SystemConfigService.get_config(
+                    db, cls.HISTORY_DAYS_KEY, cls.DEFAULT_HISTORY_DAYS
+                )
+                or cls.DEFAULT_HISTORY_DAYS
+            )
+        except Exception:
+            history_days = cls.DEFAULT_HISTORY_DAYS
+        return max(1, history_days)
+
+    @classmethod
+    def _build_initial_state(cls, history_days: int | None = None) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
+        days = max(1, int(history_days or cls.DEFAULT_HISTORY_DAYS))
+        window_start = now - timedelta(days=days)
         return {
             "version": cls.TARGET_VERSION,
             "status": "running",
             "phase": "usage_reprice",
+            "history_days": days,
+            "window_start_created_at": window_start.isoformat(),
             "cutoff_created_at": now.isoformat(),
             "usage_cursor": None,
             "ledger_current_date": None,
@@ -180,6 +205,11 @@ class HistoricalUsageRebillingService:
         if cutoff_created_at is None:
             cutoff_created_at = datetime.now(timezone.utc)
             state["cutoff_created_at"] = cutoff_created_at.isoformat()
+        window_start_created_at = cls._parse_datetime(state.get("window_start_created_at"))
+        if window_start_created_at is None:
+            history_days = int(state.get("history_days") or cls.DEFAULT_HISTORY_DAYS)
+            window_start_created_at = cutoff_created_at - timedelta(days=max(1, history_days))
+            state["window_start_created_at"] = window_start_created_at.isoformat()
 
         batch_size = int(
             SystemConfigService.get_config(
@@ -194,6 +224,7 @@ class HistoricalUsageRebillingService:
             db.query(Usage)
             .filter(
                 Usage.billing_status == "settled",
+                Usage.created_at >= window_start_created_at,
                 Usage.created_at < cutoff_created_at,
             )
             .order_by(Usage.created_at.asc(), Usage.id.asc())
@@ -211,7 +242,12 @@ class HistoricalUsageRebillingService:
 
         rows = query.limit(batch_size).all()
         if not rows:
-            cls._prepare_ledger_phase(db, state, cutoff_created_at=cutoff_created_at)
+            cls._prepare_ledger_phase(
+                db,
+                state,
+                window_start_created_at=window_start_created_at,
+                cutoff_created_at=cutoff_created_at,
+            )
             return False
 
         processed = 0
@@ -237,7 +273,10 @@ class HistoricalUsageRebillingService:
         state["usage_batch_count"] = int(state.get("usage_batch_count") or 0) + 1
         db.flush()
         logger.info(
-            "历史计费重算批次完成: processed={}, updated={}, skipped={}, phase=usage_reprice",
+            (
+                "历史计费重算批次完成: "
+                "processed={}, updated={}, skipped={}, phase=usage_reprice"
+            ),
             processed,
             updated,
             skipped,
@@ -250,6 +289,7 @@ class HistoricalUsageRebillingService:
         db: Session,
         state: dict[str, Any],
         *,
+        window_start_created_at: datetime,
         cutoff_created_at: datetime,
     ) -> None:
         tz = WalletDailyUsageLedgerService.get_timezone()
@@ -261,6 +301,7 @@ class HistoricalUsageRebillingService:
                 Usage.billing_status == "settled",
                 Usage.wallet_id.isnot(None),
                 Usage.finalized_at.isnot(None),
+                Usage.created_at >= window_start_created_at,
                 Usage.created_at < cutoff_created_at,
             )
             .order_by(Usage.finalized_at.asc())
@@ -275,7 +316,7 @@ class HistoricalUsageRebillingService:
 
         earliest_finalized_at = cls._ensure_datetime(rows[0][0])
         start_date = earliest_finalized_at.astimezone(tz).date()
-        end_date = cutoff_local_date - timedelta(days=1)
+        end_date = cutoff_local_date
 
         if start_date > end_date:
             state["phase"] = "completed"
@@ -416,7 +457,9 @@ class HistoricalUsageRebillingService:
         actual_rate_multiplier = cls._get_usage_rate_multiplier(usage)
         is_free_tier = cls._usage_is_free_tier(usage)
         actual_request_cost = (
-            Decimal("0") if is_free_tier else to_money_decimal(base_request_cost * actual_rate_multiplier)
+            Decimal("0")
+            if is_free_tier
+            else to_money_decimal(base_request_cost * actual_rate_multiplier)
         )
         actual_total_cost = actual_request_cost
 
@@ -517,6 +560,9 @@ class HistoricalUsageRebillingService:
             has_cache_tokens=has_cache_tokens,
             explicit_cache_ttl_minutes=getattr(usage, "cache_ttl_minutes", None),
         )
+        force_1h_cache_pricing = cls._should_force_1h_cache_pricing(usage)
+        if force_1h_cache_pricing:
+            effective_cache_ttl_minutes = 60
 
         billing = BillingService(db)
         total_input_context = input_tokens_for_billing + cache_creation_tokens + cache_read_tokens
@@ -664,6 +710,8 @@ class HistoricalUsageRebillingService:
         metadata["billing_updated_at"] = datetime.now(timezone.utc).isoformat()
         metadata["billing_recalc_version"] = cls.TARGET_VERSION
         metadata["billing_recalc_pricing_source"] = "latest_model_pricing"
+        if force_1h_cache_pricing:
+            metadata["billing_recalc_cache_ttl_policy"] = "force_1h_for_claude_endpoint"
         sanitized_metadata = sanitize_request_metadata(metadata)
 
         return {
@@ -679,7 +727,9 @@ class HistoricalUsageRebillingService:
             ),
             "cache_creation_input_tokens": cache_creation_tokens,
             "cache_read_input_tokens": cache_read_tokens,
-            "cache_ttl_minutes": effective_cache_ttl_minutes if effective_cache_ttl_minutes is not None else 5,
+            "cache_ttl_minutes": (
+                effective_cache_ttl_minutes if effective_cache_ttl_minutes is not None else 5
+            ),
             "input_cost_usd": input_cost,
             "output_cost_usd": output_cost,
             "cache_cost_usd": cache_cost,
@@ -713,6 +763,8 @@ class HistoricalUsageRebillingService:
         ttl_1h_tokens: int,
     ) -> int | None:
         _ = (db, ttl_5m_tokens, ttl_1h_tokens)
+        if cls._should_force_1h_cache_pricing(usage):
+            return 60
         return infer_cache_ttl_minutes(
             snapshot=cls._build_usage_snapshot(usage),
             has_cache_tokens=has_cache_tokens,
@@ -726,6 +778,35 @@ class HistoricalUsageRebillingService:
                 continue
             try:
                 return normalize_signature_key(str(candidate))
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def _should_force_1h_cache_pricing(cls, usage: Usage) -> bool:
+        endpoint_key = cls._resolve_endpoint_api_format(usage)
+        return endpoint_key in cls.FORCE_1H_CACHE_ENDPOINT_FORMATS
+
+    @classmethod
+    def _resolve_endpoint_api_format(cls, usage: Usage) -> str | None:
+        candidates: list[str] = []
+        endpoint_api_format = getattr(usage, "endpoint_api_format", None)
+        if endpoint_api_format:
+            candidates.append(str(endpoint_api_format))
+
+        provider_api_family = getattr(usage, "provider_api_family", None)
+        provider_endpoint_kind = getattr(usage, "provider_endpoint_kind", None)
+        if provider_api_family and provider_endpoint_kind:
+            candidates.append(f"{provider_api_family}:{provider_endpoint_kind}")
+
+        if not candidates and not bool(getattr(usage, "has_format_conversion", False)):
+            api_format = getattr(usage, "api_format", None)
+            if api_format:
+                candidates.append(str(api_format))
+
+        for candidate in candidates:
+            try:
+                return normalize_signature_key(candidate)
             except Exception:
                 continue
         return None
@@ -764,7 +845,9 @@ class HistoricalUsageRebillingService:
 
     @classmethod
     def _build_usage_snapshot(cls, usage: Usage) -> dict[str, Any] | None:
-        api_family = getattr(usage, "provider_api_family", None) or getattr(usage, "api_family", None)
+        api_family = getattr(usage, "provider_api_family", None) or getattr(
+            usage, "api_family", None
+        )
         response_body = usage.get_response_body()
         built_snapshot = build_upstream_usage_snapshot(
             response_body,
