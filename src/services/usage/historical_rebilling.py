@@ -28,7 +28,7 @@ from src.services.wallet import WalletDailyUsageLedgerService, WalletService
 class HistoricalUsageRebillingService:
     """升级后一次性的历史 Usage 重算维护任务。"""
 
-    TARGET_VERSION = "2026-05-02-claude-1h-usage-billing-recalc"
+    TARGET_VERSION = "2026-05-05-claude-1h-usage-token-repair"
     STATE_KEY = "historical_usage_rebilling_state"
     ENABLED_KEY = "historical_usage_rebilling_enabled"
     HISTORY_DAYS_KEY = "historical_usage_rebilling_history_days"
@@ -526,25 +526,51 @@ class HistoricalUsageRebillingService:
         usage_snapshot = cls._build_usage_snapshot(usage)
         usage_metrics = extract_usage_metrics_from_snapshot(usage_snapshot)
 
-        raw_input_tokens = (
+        persisted_raw_input_tokens = cls._get_usage_raw_input_tokens(
+            usage,
+            billing_api_format=billing_api_format,
+        )
+        persisted_output_tokens = cls._to_int(usage.output_tokens)
+        persisted_cache_creation_tokens = cls._to_int(usage.cache_creation_input_tokens)
+        persisted_cache_read_tokens = cls._to_int(usage.cache_read_input_tokens)
+
+        snapshot_input_tokens = (
             cls._to_int(usage_metrics.get("input_tokens"))
             if isinstance(usage_metrics, dict)
-            else cls._get_usage_raw_input_tokens(usage)
+            else 0
+        )
+        snapshot_cache_creation_tokens = (
+            cls._to_int(usage_metrics.get("cache_creation_input_tokens"))
+            if isinstance(usage_metrics, dict)
+            else 0
+        )
+        snapshot_cache_read_tokens = (
+            cls._to_int(usage_metrics.get("cache_read_input_tokens"))
+            if isinstance(usage_metrics, dict)
+            else 0
+        )
+
+        snapshot_has_cache_tokens = bool(
+            snapshot_cache_creation_tokens > 0 or snapshot_cache_read_tokens > 0
+        )
+        raw_input_tokens = (
+            snapshot_input_tokens
+            if snapshot_has_cache_tokens and snapshot_input_tokens > 0
+            else persisted_raw_input_tokens
         )
         output_tokens = (
             cls._to_int(usage_metrics.get("output_tokens"))
             if isinstance(usage_metrics, dict)
-            else cls._to_int(usage.output_tokens)
+            and cls._to_int(usage_metrics.get("output_tokens")) > 0
+            else persisted_output_tokens
         )
-        cache_creation_tokens = (
-            cls._to_int(usage_metrics.get("cache_creation_input_tokens"))
-            if isinstance(usage_metrics, dict)
-            else cls._to_int(usage.cache_creation_input_tokens)
+        cache_creation_tokens = max(
+            persisted_cache_creation_tokens,
+            snapshot_cache_creation_tokens,
         )
-        cache_read_tokens = (
-            cls._to_int(usage_metrics.get("cache_read_input_tokens"))
-            if isinstance(usage_metrics, dict)
-            else cls._to_int(usage.cache_read_input_tokens)
+        cache_read_tokens = max(
+            persisted_cache_read_tokens,
+            snapshot_cache_read_tokens,
         )
         input_tokens_for_billing = normalize_input_tokens_for_billing(
             billing_api_format,
@@ -812,11 +838,16 @@ class HistoricalUsageRebillingService:
         return None
 
     @classmethod
-    def _get_usage_raw_input_tokens(cls, usage: Usage) -> int:
-        input_context_tokens = usage.input_context_tokens
-        if input_context_tokens is not None:
-            return cls._to_int(input_context_tokens)
-        return cls._to_int(usage.input_tokens) + cls._to_int(usage.cache_read_input_tokens)
+    def _get_usage_raw_input_tokens(cls, usage: Usage, *, billing_api_format: str | None) -> int:
+        input_tokens = cls._to_int(usage.input_tokens)
+        cache_read_tokens = cls._to_int(usage.cache_read_input_tokens)
+        try:
+            family = str(normalize_signature_key(str(billing_api_format)).split(":", 1)[0])
+        except Exception:
+            family = ""
+        if family == "claude":
+            return input_tokens
+        return input_tokens + cache_read_tokens
 
     @staticmethod
     def _copy_metadata(usage: Usage) -> dict[str, Any]:

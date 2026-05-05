@@ -73,6 +73,8 @@ def extract_usage_metrics_from_snapshot(snapshot: Any) -> dict[str, int | None] 
             return None
 
         last_metrics: dict[str, int | None] | None = None
+        last_cache_creation_tokens: int | None = None
+        last_cache_read_tokens: int | None = None
         last_cache_ttl_minutes: int | None = None
         for event in events:
             if not isinstance(event, dict):
@@ -82,10 +84,20 @@ def extract_usage_metrics_from_snapshot(snapshot: Any) -> dict[str, int | None] 
                 continue
             metrics = _extract_metrics_from_usage_dict(usage, api_family=api_family)
             if metrics is not None:
+                metrics = dict(metrics)
+                cache_creation_tokens = int(metrics.get("cache_creation_input_tokens") or 0)
+                cache_read_tokens = int(metrics.get("cache_read_input_tokens") or 0)
+                if cache_creation_tokens > 0:
+                    last_cache_creation_tokens = cache_creation_tokens
+                elif last_cache_creation_tokens is not None:
+                    metrics["cache_creation_input_tokens"] = last_cache_creation_tokens
+                if cache_read_tokens > 0:
+                    last_cache_read_tokens = cache_read_tokens
+                elif last_cache_read_tokens is not None:
+                    metrics["cache_read_input_tokens"] = last_cache_read_tokens
                 if metrics.get("cache_ttl_minutes") is not None:
                     last_cache_ttl_minutes = int(metrics["cache_ttl_minutes"] or 0)
                 elif last_cache_ttl_minutes is not None:
-                    metrics = dict(metrics)
                     metrics["cache_ttl_minutes"] = last_cache_ttl_minutes
                 last_metrics = metrics
 
@@ -159,7 +171,9 @@ def _extract_metrics_from_usage_dict(
             or usage.get("output_tokens")
             or 0
         )
-        cache_read_tokens = int(usage.get("cachedContentTokenCount") or usage.get("cached_tokens") or 0)
+        cache_read_tokens = int(
+            usage.get("cachedContentTokenCount") or usage.get("cached_tokens") or 0
+        )
         return {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -170,8 +184,8 @@ def _extract_metrics_from_usage_dict(
 
     input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
-    cache_creation_total, cache_creation_5m, cache_creation_1h = extract_cache_creation_tokens_detail(
-        usage
+    cache_creation_total, cache_creation_5m, cache_creation_1h = (
+        extract_cache_creation_tokens_detail(usage)
     )
     cache_read_tokens = extract_cache_read_tokens(usage)
 
