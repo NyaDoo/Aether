@@ -2470,12 +2470,12 @@ class ProviderAPIKey(ExportMixin, Base):
     circuit_breaker_by_format = Column(JSON, nullable=True, default=dict)
 
     # 使用统计
-    request_count = Column(Integer, default=0)  # 请求次数
+    request_count = Column(BigInteger, default=0)  # 请求次数
     total_tokens = Column(BigInteger, default=0, nullable=False)  # 累计 Token 数
     total_cost_usd = Column(Numeric(20, 8), default=0.0, nullable=False)  # 累计成本
-    success_count = Column(Integer, default=0)  # 成功次数
-    error_count = Column(Integer, default=0)  # 错误次数
-    total_response_time_ms = Column(Integer, default=0)  # 总响应时间（用于计算平均值）
+    success_count = Column(BigInteger, default=0)  # 成功次数
+    error_count = Column(BigInteger, default=0)  # 错误次数
+    total_response_time_ms = Column(BigInteger, default=0)  # 总响应时间（用于计算平均值）
     last_used_at = Column(DateTime(timezone=True), nullable=True)  # 最后使用时间
     last_error_at = Column(DateTime(timezone=True), nullable=True)  # 最后错误时间
     last_error_msg = Column(Text, nullable=True)  # 最后错误信息
