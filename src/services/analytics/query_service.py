@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import math
 from typing import Any, Literal
 
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import and_, case, func, or_, text
 from sqlalchemy.orm import Query, Session
 
 from src.core.enums import ErrorCategory, UserRole
@@ -175,7 +175,78 @@ def _bucket_end(start: datetime, granularity: str) -> datetime:
     return start + timedelta(days=1)
 
 
+def _validated_timezone_name(params: TimeRangeParams) -> str | None:
+    if not params.timezone:
+        return None
+
+    from zoneinfo import ZoneInfo
+
+    try:
+        ZoneInfo(params.timezone)
+        return params.timezone
+    except Exception:
+        return None
+
+
+def _postgres_local_timestamp_expr(params: TimeRangeParams) -> Any:
+    timezone_name = _validated_timezone_name(params)
+    if timezone_name:
+        return func.timezone(timezone_name, Usage.created_at)
+
+    utc_timestamp = func.timezone("UTC", Usage.created_at)
+    if params.tz_offset_minutes:
+        return utc_timestamp + text(f"INTERVAL '{int(params.tz_offset_minutes)} minutes'")
+    return utc_timestamp
+
+
+def _postgres_bucket_expression(
+    params: TimeRangeParams,
+    *,
+    granularity: Literal["hour", "day", "week", "month"] | None = None,
+) -> Any:
+    return func.date_trunc(granularity or params.granularity, _postgres_local_timestamp_expr(params))
+
+
+def _coerce_bucket_start(value: Any, params: TimeRangeParams) -> datetime | None:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    if isinstance(value, date) and not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time())
+
+    if not isinstance(value, datetime):
+        return None
+
+    tzinfo = _bucket_tz(params)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=tzinfo)
+    return value.astimezone(tzinfo)
+
+
+def _to_nullable_percentile(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(round(float(value)))
+
+
 class AnalyticsQueryService:
+    @staticmethod
+    def _db_dialect_name(db: Session) -> str:
+        bind = getattr(db, "bind", None)
+        if bind is None and hasattr(db, "get_bind"):
+            try:
+                bind = db.get_bind()
+            except Exception:
+                bind = None
+        dialect = getattr(bind, "dialect", None)
+        return str(getattr(dialect, "name", "") or "")
+
     @staticmethod
     def _failed_request_clause() -> Any:
         return or_(
@@ -655,28 +726,9 @@ class AnalyticsQueryService:
             },
         }
 
-    @classmethod
-    def timeseries(
-        cls,
-        db: Session,
-        current_user: User,
-        *,
-        time_range: TimeRangeParams,
-        scope_kind: ScopeKind,
-        scope_user_id: str | None,
-        scope_api_key_id: str | None,
-        filters: AnalyticsFilters,
-    ) -> dict[str, Any]:
-        query = cls.build_usage_query(
-            db,
-            current_user,
-            time_range=time_range,
-            scope_kind=scope_kind,
-            scope_user_id=scope_user_id,
-            scope_api_key_id=scope_api_key_id,
-            filters=filters,
-        )
-        rows = query.with_entities(
+    @staticmethod
+    def _timeseries_usage_columns() -> list[Any]:
+        return [
             Usage.created_at,
             Usage.model,
             Usage.target_model,
@@ -703,8 +755,14 @@ class AnalyticsQueryService:
             Usage.actual_cache_cost_usd,
             Usage.response_time_ms,
             Usage.first_byte_time_ms,
-        ).all()
+        ]
 
+    @classmethod
+    def _timeseries_from_usage_rows(
+        cls,
+        rows: list[Any],
+        time_range: TimeRangeParams,
+    ) -> dict[str, Any]:
         buckets: dict[str, dict[str, Any]] = {}
         for row in rows:
             created_at = row.created_at
@@ -789,8 +847,12 @@ class AnalyticsQueryService:
             first_byte_count = bucket.pop("_first_byte_count")
             first_byte_sum = bucket.pop("_first_byte_sum")
             models_used = bucket.pop("_models_used")
-            bucket["avg_response_time_ms"] = _round2(response_sum / response_count) if response_count else 0.0
-            bucket["avg_first_byte_time_ms"] = _round2(first_byte_sum / first_byte_count) if first_byte_count else 0.0
+            bucket["avg_response_time_ms"] = (
+                _round2(response_sum / response_count) if response_count else 0.0
+            )
+            bucket["avg_first_byte_time_ms"] = (
+                _round2(first_byte_sum / first_byte_count) if first_byte_count else 0.0
+            )
             bucket["cache_hit_rate"] = _cache_hit_rate(
                 int(bucket["input_context_tokens"]),
                 int(bucket["cache_read_input_tokens"]),
@@ -798,6 +860,51 @@ class AnalyticsQueryService:
             bucket["models_used_count"] = len(models_used)
             items.append(bucket)
         return {"buckets": items}
+
+    @classmethod
+    def timeseries(
+        cls,
+        db: Session,
+        current_user: User,
+        *,
+        time_range: TimeRangeParams,
+        scope_kind: ScopeKind,
+        scope_user_id: str | None,
+        scope_api_key_id: str | None,
+        filters: AnalyticsFilters,
+    ) -> dict[str, Any]:
+        query = cls.build_usage_query(
+            db,
+            current_user,
+            time_range=time_range,
+            scope_kind=scope_kind,
+            scope_user_id=scope_user_id,
+            scope_api_key_id=scope_api_key_id,
+            filters=filters,
+        )
+        if cls._db_dialect_name(db) == "postgresql":
+            bucket_expr = _postgres_bucket_expression(time_range).label("bucket_start")
+            rows = (
+                query.with_entities(bucket_expr, *cls._summary_columns())
+                .group_by(bucket_expr)
+                .order_by(bucket_expr.asc())
+                .all()
+            )
+            items = []
+            for row in rows:
+                bucket_start = _coerce_bucket_start(row.bucket_start, time_range)
+                if bucket_start is None:
+                    continue
+                bucket = {
+                    "bucket_start": bucket_start.isoformat(),
+                    "bucket_end": _bucket_end(bucket_start, time_range.granularity).isoformat(),
+                    **cls._serialize_summary_row(row),
+                }
+                items.append(bucket)
+            return {"buckets": items}
+
+        rows = query.with_entities(*cls._timeseries_usage_columns()).all()
+        return cls._timeseries_from_usage_rows(rows, time_range)
 
     @classmethod
     def breakdown(
@@ -1405,6 +1512,7 @@ class AnalyticsQueryService:
             key_column = Usage.api_key_id
             label_column = Usage.api_key_name
 
+        order_metric = cls._breakdown_metric_expression(metric)
         rows = (
             query.with_entities(
                 key_column.label("entity_id"),
@@ -1413,6 +1521,8 @@ class AnalyticsQueryService:
             )
             .filter(key_column.isnot(None))
             .group_by(key_column)
+            .order_by(order_metric.desc())
+            .limit(limit)
             .all()
         )
 
@@ -1423,9 +1533,8 @@ class AnalyticsQueryService:
             item["label"] = row.entity_label or row.entity_id
             items.append(item)
 
-        items.sort(key=lambda item: item[metric], reverse=True)
         ranked = []
-        for index, item in enumerate(items[:limit], start=1):
+        for index, item in enumerate(items, start=1):
             ranked.append(
                 {
                     "rank": index,
@@ -1446,40 +1555,12 @@ class AnalyticsQueryService:
         }
 
     @classmethod
-    def performance(
+    def _performance_from_usage_rows(
         cls,
-        db: Session,
-        current_user: User,
-        *,
+        rows: list[Any],
         time_range: TimeRangeParams,
-        scope_kind: ScopeKind,
-        scope_user_id: str | None,
-        scope_api_key_id: str | None,
-        filters: AnalyticsFilters,
+        current_user: User,
     ) -> dict[str, Any]:
-        query = cls.build_usage_query(
-            db,
-            current_user,
-            time_range=time_range,
-            scope_kind=scope_kind,
-            scope_user_id=scope_user_id,
-            scope_api_key_id=scope_api_key_id,
-            filters=filters,
-            include_non_terminal=False,
-            include_pending_providers=False,
-        )
-
-        rows = query.with_entities(
-            Usage.created_at,
-            Usage.provider_name,
-            Usage.error_category,
-            Usage.status,
-            Usage.status_code,
-            Usage.error_message,
-            Usage.response_time_ms,
-            Usage.first_byte_time_ms,
-        ).all()
-
         response_values: list[float] = []
         ttfb_values: list[float] = []
         distribution: dict[str, int] = defaultdict(int)
@@ -1500,12 +1581,16 @@ class AnalyticsQueryService:
             bucket_local = _bucket_start(row.created_at, time_range)
             bucket_key = bucket_local.date().isoformat()
             if row.response_time_ms is not None:
-                percentiles_by_bucket[bucket_key]["response"].append(_to_float(row.response_time_ms))
+                percentiles_by_bucket[bucket_key]["response"].append(
+                    _to_float(row.response_time_ms)
+                )
             if row.first_byte_time_ms is not None:
-                percentiles_by_bucket[bucket_key]["ttfb"].append(_to_float(row.first_byte_time_ms))
+                percentiles_by_bucket[bucket_key]["ttfb"].append(
+                    _to_float(row.first_byte_time_ms)
+                )
 
             if cls._is_failed_usage_row(row):
-                category = row.error_category or "unknown"
+                category = row.error_category or ErrorCategory.UNKNOWN.value
                 distribution[category] += 1
                 trend[bucket_key] += 1
 
@@ -1602,7 +1687,11 @@ class AnalyticsQueryService:
         return {
             "latency": {
                 "response_time_ms": {
-                    "avg": _round2(sum(response_values) / len(response_values)) if response_values else 0.0,
+                    "avg": (
+                        _round2(sum(response_values) / len(response_values))
+                        if response_values
+                        else 0.0
+                    ),
                     "p50": _percentile(response_values, 0.50),
                     "p90": _percentile(response_values, 0.90),
                     "p99": _percentile(response_values, 0.99),
@@ -1623,6 +1712,262 @@ class AnalyticsQueryService:
             },
             "provider_health": provider_health,
         }
+
+    @classmethod
+    def _postgres_latency_summary(cls, query: Query[Any]) -> dict[str, Any]:
+        response_row = (
+            query.with_entities(
+                func.avg(Usage.response_time_ms).label("avg"),
+                func.percentile_cont(0.5).within_group(Usage.response_time_ms).label("p50"),
+                func.percentile_cont(0.9).within_group(Usage.response_time_ms).label("p90"),
+                func.percentile_cont(0.99).within_group(Usage.response_time_ms).label("p99"),
+            )
+            .filter(Usage.response_time_ms.isnot(None))
+            .first()
+        )
+        ttfb_row = (
+            query.with_entities(
+                func.avg(Usage.first_byte_time_ms).label("avg"),
+                func.percentile_cont(0.5).within_group(Usage.first_byte_time_ms).label("p50"),
+                func.percentile_cont(0.9).within_group(Usage.first_byte_time_ms).label("p90"),
+                func.percentile_cont(0.99).within_group(Usage.first_byte_time_ms).label("p99"),
+            )
+            .filter(Usage.first_byte_time_ms.isnot(None))
+            .first()
+        )
+
+        return {
+            "response_time_ms": {
+                "avg": _round2(_to_float(getattr(response_row, "avg", 0))),
+                "p50": _to_nullable_percentile(getattr(response_row, "p50", None)),
+                "p90": _to_nullable_percentile(getattr(response_row, "p90", None)),
+                "p99": _to_nullable_percentile(getattr(response_row, "p99", None)),
+            },
+            "first_byte_time_ms": {
+                "avg": _round2(_to_float(getattr(ttfb_row, "avg", 0))),
+                "p50": _to_nullable_percentile(getattr(ttfb_row, "p50", None)),
+                "p90": _to_nullable_percentile(getattr(ttfb_row, "p90", None)),
+                "p99": _to_nullable_percentile(getattr(ttfb_row, "p99", None)),
+            },
+        }
+
+    @classmethod
+    def _postgres_performance(
+        cls,
+        query: Query[Any],
+        time_range: TimeRangeParams,
+        current_user: User,
+    ) -> dict[str, Any]:
+        latency = cls._postgres_latency_summary(query)
+
+        total_row = (
+            query.with_entities(
+                func.count(Usage.id).label("requests_total"),
+                func.coalesce(
+                    func.sum(case((cls._failed_request_clause(), 1), else_=0)),
+                    0,
+                ).label("requests_error"),
+            )
+            .first()
+        )
+        requests_total = _to_int(getattr(total_row, "requests_total", 0))
+        requests_error = _to_int(getattr(total_row, "requests_error", 0))
+
+        bucket_expr = _postgres_bucket_expression(time_range).label("bucket_start")
+        response_percentile_rows = (
+            query.with_entities(
+                bucket_expr,
+                func.percentile_cont(0.5).within_group(Usage.response_time_ms).label("p50"),
+                func.percentile_cont(0.9).within_group(Usage.response_time_ms).label("p90"),
+                func.percentile_cont(0.99).within_group(Usage.response_time_ms).label("p99"),
+            )
+            .filter(Usage.response_time_ms.isnot(None))
+            .group_by(bucket_expr)
+            .all()
+        )
+        ttfb_percentile_rows = (
+            query.with_entities(
+                bucket_expr,
+                func.percentile_cont(0.5).within_group(Usage.first_byte_time_ms).label("p50"),
+                func.percentile_cont(0.9).within_group(Usage.first_byte_time_ms).label("p90"),
+                func.percentile_cont(0.99).within_group(Usage.first_byte_time_ms).label("p99"),
+            )
+            .filter(Usage.first_byte_time_ms.isnot(None))
+            .group_by(bucket_expr)
+            .all()
+        )
+        response_by_date: dict[str, Any] = {}
+        for row in response_percentile_rows:
+            bucket_start = _coerce_bucket_start(row.bucket_start, time_range)
+            if bucket_start is not None:
+                response_by_date[bucket_start.date().isoformat()] = row
+
+        ttfb_by_date: dict[str, Any] = {}
+        for row in ttfb_percentile_rows:
+            bucket_start = _coerce_bucket_start(row.bucket_start, time_range)
+            if bucket_start is not None:
+                ttfb_by_date[bucket_start.date().isoformat()] = row
+
+        percentiles = []
+        for date_key in sorted(response_by_date.keys() | ttfb_by_date.keys()):
+            row = response_by_date.get(date_key)
+            ttfb_row = ttfb_by_date.get(date_key)
+            percentiles.append(
+                {
+                    "date": date_key,
+                    "p50_response_time_ms": _to_nullable_percentile(getattr(row, "p50", None)),
+                    "p90_response_time_ms": _to_nullable_percentile(getattr(row, "p90", None)),
+                    "p99_response_time_ms": _to_nullable_percentile(getattr(row, "p99", None)),
+                    "p50_first_byte_time_ms": _to_nullable_percentile(
+                        getattr(ttfb_row, "p50", None)
+                    ),
+                    "p90_first_byte_time_ms": _to_nullable_percentile(
+                        getattr(ttfb_row, "p90", None)
+                    ),
+                    "p99_first_byte_time_ms": _to_nullable_percentile(
+                        getattr(ttfb_row, "p99", None)
+                    ),
+                }
+            )
+
+        category_expr = func.coalesce(Usage.error_category, ErrorCategory.UNKNOWN.value)
+        distribution_rows = (
+            query.with_entities(
+                category_expr.label("category"),
+                func.count(Usage.id).label("count"),
+            )
+            .filter(cls._failed_request_clause())
+            .group_by(category_expr)
+            .order_by(func.count(Usage.id).desc())
+            .all()
+        )
+        distribution_items = [
+            {
+                "category": str(row.category or ErrorCategory.UNKNOWN.value),
+                "label": _error_category_display_label(row.category),
+                "count": _to_int(row.count),
+            }
+            for row in distribution_rows
+        ]
+
+        trend_rows = (
+            query.with_entities(
+                bucket_expr,
+                func.count(Usage.id).label("count"),
+            )
+            .filter(cls._failed_request_clause())
+            .group_by(bucket_expr)
+            .order_by(bucket_expr.asc())
+            .all()
+        )
+        trend_items = []
+        for row in trend_rows:
+            bucket_start = _coerce_bucket_start(row.bucket_start, time_range)
+            if bucket_start is None:
+                continue
+            trend_items.append(
+                {"date": bucket_start.date().isoformat(), "total": _to_int(row.count)}
+            )
+
+        provider_health = []
+        if current_user.role == UserRole.ADMIN:
+            provider_expr = func.coalesce(Usage.provider_name, "unknown")
+            provider_rows = (
+                query.with_entities(
+                    provider_expr.label("provider_name"),
+                    func.count(Usage.id).label("requests_total"),
+                    func.coalesce(
+                        func.sum(case((cls._successful_request_clause(), 1), else_=0)),
+                        0,
+                    ).label("requests_success"),
+                    func.coalesce(
+                        func.sum(case((cls._failed_request_clause(), 1), else_=0)),
+                        0,
+                    ).label("requests_error"),
+                    func.avg(Usage.response_time_ms).label("avg_response_time_ms"),
+                    func.avg(Usage.first_byte_time_ms).label("avg_first_byte_time_ms"),
+                )
+                .group_by(provider_expr)
+                .order_by(func.count(Usage.id).desc())
+                .all()
+            )
+            for row in provider_rows:
+                provider_requests_total = _to_int(row.requests_total)
+                provider_requests_success = _to_int(row.requests_success)
+                provider_requests_error = _to_int(row.requests_error)
+                provider_health.append(
+                    {
+                        "provider_name": str(row.provider_name or "unknown"),
+                        "requests_total": provider_requests_total,
+                        "success_rate": (
+                            _round2(provider_requests_success / provider_requests_total * 100)
+                            if provider_requests_total > 0
+                            else 0.0
+                        ),
+                        "error_rate": (
+                            _round2(provider_requests_error / provider_requests_total * 100)
+                            if provider_requests_total > 0
+                            else 0.0
+                        ),
+                        "avg_response_time_ms": _round2(
+                            _to_float(row.avg_response_time_ms)
+                        ),
+                        "avg_first_byte_time_ms": _round2(
+                            _to_float(row.avg_first_byte_time_ms)
+                        ),
+                    }
+                )
+
+        return {
+            "latency": latency,
+            "percentiles": percentiles,
+            "errors": {
+                "total": requests_error,
+                "rate": _round2(requests_error / requests_total * 100) if requests_total else 0.0,
+                "categories": distribution_items,
+                "trend": trend_items,
+            },
+            "provider_health": provider_health,
+        }
+
+    @classmethod
+    def performance(
+        cls,
+        db: Session,
+        current_user: User,
+        *,
+        time_range: TimeRangeParams,
+        scope_kind: ScopeKind,
+        scope_user_id: str | None,
+        scope_api_key_id: str | None,
+        filters: AnalyticsFilters,
+    ) -> dict[str, Any]:
+        query = cls.build_usage_query(
+            db,
+            current_user,
+            time_range=time_range,
+            scope_kind=scope_kind,
+            scope_user_id=scope_user_id,
+            scope_api_key_id=scope_api_key_id,
+            filters=filters,
+            include_non_terminal=False,
+            include_pending_providers=False,
+        )
+
+        if cls._db_dialect_name(db) == "postgresql":
+            return cls._postgres_performance(query, time_range, current_user)
+
+        rows = query.with_entities(
+            Usage.created_at,
+            Usage.provider_name,
+            Usage.error_category,
+            Usage.status,
+            Usage.status_code,
+            Usage.error_message,
+            Usage.response_time_ms,
+            Usage.first_byte_time_ms,
+        ).all()
+        return cls._performance_from_usage_rows(rows, time_range, current_user)
 
     @staticmethod
     def _serialize_summary_row(row: Any) -> dict[str, Any]:

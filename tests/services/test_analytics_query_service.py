@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
 
-from sqlalchemy.dialects import sqlite
+from sqlalchemy.dialects import postgresql, sqlite
 
 from src.core.enums import ErrorCategory, UserRole
 from src.services.analytics.query_service import (
@@ -12,6 +12,7 @@ from src.services.analytics.query_service import (
     DELETED_USER_FILTER,
     AnalyticsFilters,
     AnalyticsQueryService,
+    _postgres_bucket_expression,
 )
 from src.services.system.time_range import TimeRangeParams
 
@@ -118,8 +119,35 @@ class _FakePerformanceQuery:
     def with_entities(self, *_args: object, **_kwargs: object) -> "_FakePerformanceQuery":
         return self
 
+    def filter(self, *_args: object, **_kwargs: object) -> "_FakePerformanceQuery":
+        return self
+
     def all(self) -> list[Any]:
         return self._rows
+
+
+class _FakePostgresPerformanceQuery:
+    def __init__(self, *, first_results: list[Any], all_results: list[list[Any]]) -> None:
+        self._first_results = first_results
+        self._all_results = all_results
+
+    def with_entities(self, *_args: object, **_kwargs: object) -> "_FakePostgresPerformanceQuery":
+        return self
+
+    def filter(self, *_args: object, **_kwargs: object) -> "_FakePostgresPerformanceQuery":
+        return self
+
+    def group_by(self, *_args: object, **_kwargs: object) -> "_FakePostgresPerformanceQuery":
+        return self
+
+    def order_by(self, *_args: object, **_kwargs: object) -> "_FakePostgresPerformanceQuery":
+        return self
+
+    def first(self) -> Any:
+        return self._first_results.pop(0)
+
+    def all(self) -> list[Any]:
+        return self._all_results.pop(0)
 
 
 class _FakeFilterOptionsQuery:
@@ -626,6 +654,137 @@ def test_summary_columns_treat_legacy_error_fields_as_failures() -> None:
     )
 
 
+def test_postgres_bucket_expression_uses_date_trunc_and_timezone() -> None:
+    params = TimeRangeParams(
+        start_date=date(2026, 3, 19),
+        end_date=date(2026, 3, 19),
+        granularity="hour",
+        timezone="Asia/Shanghai",
+    )
+
+    compiled = str(
+        _postgres_bucket_expression(params).compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "date_trunc('hour', timezone('Asia/Shanghai', usage.created_at))" in compiled
+
+
+def test_timeseries_sqlite_path_groups_rows_without_postgres_aggregation(monkeypatch) -> None:
+    rows = [
+        SimpleNamespace(
+            created_at=datetime(2026, 3, 19, 1, 10, 0, tzinfo=timezone.utc),
+            model="model-a",
+            target_model=None,
+            status="completed",
+            status_code=200,
+            error_message=None,
+            is_stream=False,
+            has_format_conversion=False,
+            input_tokens=100,
+            output_tokens=40,
+            input_output_total_tokens=140,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            input_context_tokens=100,
+            total_tokens=140,
+            input_cost_usd=0,
+            output_cost_usd=0,
+            cache_creation_cost_usd=0,
+            cache_read_cost_usd=0,
+            cache_cost_usd=0,
+            request_cost_usd=0,
+            total_cost_usd=1.5,
+            actual_total_cost_usd=0,
+            actual_cache_cost_usd=0,
+            response_time_ms=1000,
+            first_byte_time_ms=200,
+        ),
+        SimpleNamespace(
+            created_at=datetime(2026, 3, 19, 1, 30, 0, tzinfo=timezone.utc),
+            model="model-b",
+            target_model=None,
+            status="failed",
+            status_code=500,
+            error_message="boom",
+            is_stream=False,
+            has_format_conversion=False,
+            input_tokens=20,
+            output_tokens=0,
+            input_output_total_tokens=20,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            input_context_tokens=20,
+            total_tokens=20,
+            input_cost_usd=0,
+            output_cost_usd=0,
+            cache_creation_cost_usd=0,
+            cache_read_cost_usd=0,
+            cache_cost_usd=0,
+            request_cost_usd=0,
+            total_cost_usd=0.25,
+            actual_total_cost_usd=0,
+            actual_cache_cost_usd=0,
+            response_time_ms=2000,
+            first_byte_time_ms=400,
+        ),
+    ]
+    monkeypatch.setattr(
+        AnalyticsQueryService,
+        "build_usage_query",
+        lambda *_args, **_kwargs: _FakePerformanceQuery(rows),
+    )
+
+    result = AnalyticsQueryService.timeseries(
+        SimpleNamespace(bind=SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))),
+        SimpleNamespace(id="user-1", role=UserRole.USER),
+        time_range=TimeRangeParams(
+            start_date=date(2026, 3, 19),
+            end_date=date(2026, 3, 19),
+            granularity="hour",
+            timezone="UTC",
+        ),
+        scope_kind="me",
+        scope_user_id=None,
+        scope_api_key_id=None,
+        filters=_empty_filters(),
+    )
+
+    assert result["buckets"] == [
+        {
+            "bucket_start": "2026-03-19T01:00:00+00:00",
+            "bucket_end": "2026-03-19T02:00:00+00:00",
+            "requests_total": 2,
+            "requests_success": 1,
+            "requests_error": 1,
+            "requests_stream": 0,
+            "input_tokens": 120,
+            "output_tokens": 40,
+            "input_output_total_tokens": 160,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_context_tokens": 120,
+            "total_tokens": 160,
+            "input_cost_usd": 0.0,
+            "output_cost_usd": 0.0,
+            "cache_creation_cost_usd": 0.0,
+            "cache_read_cost_usd": 0.0,
+            "cache_cost_usd": 0.0,
+            "request_cost_usd": 0.0,
+            "total_cost_usd": 1.75,
+            "actual_total_cost_usd": 0.0,
+            "actual_cache_cost_usd": 0.0,
+            "format_conversion_count": 0,
+            "avg_response_time_ms": 1500.0,
+            "avg_first_byte_time_ms": 300.0,
+            "cache_hit_rate": 0.0,
+            "models_used_count": 2,
+        }
+    ]
+
+
 def test_filter_options_includes_failed_when_only_legacy_error_fields_exist(monkeypatch) -> None:
     fake_query = _FakeFilterOptionsQuery(
         raw_status_rows=[("completed",)],
@@ -998,4 +1157,67 @@ def test_performance_counts_legacy_error_fields_in_provider_health(monkeypatch) 
             "avg_response_time_ms": 1050.0,
             "avg_first_byte_time_ms": 265.0,
         }
+    ]
+
+
+def test_postgres_performance_percentiles_include_ttfb_only_buckets() -> None:
+    query = _FakePostgresPerformanceQuery(
+        first_results=[
+            SimpleNamespace(avg=1000, p50=1000, p90=1000, p99=1000),
+            SimpleNamespace(avg=250, p50=250, p90=250, p99=250),
+            SimpleNamespace(requests_total=2, requests_error=0),
+        ],
+        all_results=[
+            [
+                SimpleNamespace(
+                    bucket_start=datetime(2026, 3, 19, 0, 0, 0),
+                    p50=1000,
+                    p90=1100,
+                    p99=1200,
+                ),
+            ],
+            [
+                SimpleNamespace(
+                    bucket_start=datetime(2026, 3, 20, 0, 0, 0),
+                    p50=200,
+                    p90=250,
+                    p99=300,
+                ),
+            ],
+            [],
+            [],
+            [],
+        ],
+    )
+
+    result = AnalyticsQueryService._postgres_performance(
+        cast(Any, query),
+        TimeRangeParams(
+            start_date=date(2026, 3, 19),
+            end_date=date(2026, 3, 20),
+            granularity="day",
+            timezone="UTC",
+        ),
+        SimpleNamespace(id="user-1", role=UserRole.USER),
+    )
+
+    assert result["percentiles"] == [
+        {
+            "date": "2026-03-19",
+            "p50_response_time_ms": 1000,
+            "p90_response_time_ms": 1100,
+            "p99_response_time_ms": 1200,
+            "p50_first_byte_time_ms": None,
+            "p90_first_byte_time_ms": None,
+            "p99_first_byte_time_ms": None,
+        },
+        {
+            "date": "2026-03-20",
+            "p50_response_time_ms": None,
+            "p90_response_time_ms": None,
+            "p99_response_time_ms": None,
+            "p50_first_byte_time_ms": 200,
+            "p90_first_byte_time_ms": 250,
+            "p99_first_byte_time_ms": 300,
+        },
     ]
