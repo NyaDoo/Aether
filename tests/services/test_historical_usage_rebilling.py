@@ -358,3 +358,215 @@ def test_build_token_payload_recovers_stream_cache_tokens_from_earlier_event(
     assert payload["input_tokens"] == 3
     assert payload["cache_creation_input_tokens"] == 32760
     assert payload["cache_read_input_tokens"] == 61777
+
+
+def test_build_token_payload_uses_stream_snapshot_even_when_flag_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeSnapshot:
+        status = "complete"
+        cost_breakdown = {
+            "input_cost": 0.00704,
+            "output_cost": 0.016775,
+            "cache_creation_cost": 0.0,
+            "cache_read_cost": 0.014046,
+            "request_cost": 0.0,
+        }
+        total_cost = 0.037861
+        resolved_variables = {
+            "input_price_per_1m": 5.0,
+            "output_price_per_1m": 25.0,
+            "cache_creation_price_per_1m": 10.0,
+            "cache_read_price_per_1m": 0.5,
+            "price_per_request": 0.0,
+        }
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "status": self.status,
+                "cost_breakdown": self.cost_breakdown,
+                "resolved_variables": self.resolved_variables,
+                "total_cost": self.total_cost,
+            }
+
+    class FakeBillingService:
+        def __init__(self, _db: object) -> None:
+            pass
+
+        def calculate(self, **kwargs: object) -> SimpleNamespace:
+            captured.update(kwargs)
+            return SimpleNamespace(snapshot=FakeSnapshot())
+
+    monkeypatch.setattr(historical_rebilling_module, "BillingService", FakeBillingService)
+
+    usage = SimpleNamespace(
+        provider_id="provider-1",
+        model="claude-opus-4-7",
+        endpoint_api_format="claude:chat",
+        api_format="claude:chat",
+        provider_api_family="claude",
+        provider_endpoint_kind="chat",
+        api_family="claude",
+        has_format_conversion=False,
+        input_context_tokens=29500,
+        input_tokens=29500,
+        output_tokens=671,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=28092,
+        cache_ttl_minutes=60,
+        status_code=200,
+        error_message=None,
+        request_metadata={
+            "billing_recalc_version": "2026-05-05-claude-1h-usage-token-repair",
+        },
+        rate_multiplier=1,
+        user_billing_multiplier=1,
+        total_cost_usd=0,
+        actual_total_cost_usd=0,
+        is_stream=False,
+        provider_api_key_id=None,
+        get_response_body=lambda: {
+            "chunks": [
+                {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 1408,
+                            "output_tokens": 8,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 28092,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": 0,
+                                "ephemeral_1h_input_tokens": 0,
+                            },
+                        }
+                    },
+                },
+                {
+                    "type": "message_delta",
+                    "usage": {
+                        "input_tokens": 1408,
+                        "output_tokens": 671,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 28092,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 0,
+                            "ephemeral_1h_input_tokens": 0,
+                        },
+                    },
+                },
+            ],
+            "metadata": {"stream": True, "response_time_ms": 9521},
+        },
+        get_client_response_body=lambda: None,
+    )
+
+    payload = HistoricalUsageRebillingService._build_token_payload(
+        MagicMock(),
+        usage,  # type: ignore[arg-type]
+        "chat",
+    )
+
+    assert payload is not None
+    dims = captured["dimensions"]  # type: ignore[assignment]
+    assert dims["input_tokens"] == 1408  # type: ignore[index]
+    assert dims["output_tokens"] == 671  # type: ignore[index]
+    assert dims["cache_read_input_tokens"] == 28092  # type: ignore[index]
+    assert dims["total_input_context"] == 29500  # type: ignore[index]
+    assert payload["input_tokens"] == 1408
+    assert payload["input_context_tokens"] == 29500
+    assert payload["input_output_total_tokens"] == 2079
+    assert payload["total_tokens"] == 30171
+
+
+def test_build_token_payload_repairs_prior_claude_cache_read_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeSnapshot:
+        status = "complete"
+        cost_breakdown = {
+            "input_cost": 0.004845,
+            "output_cost": 0.023675,
+            "cache_creation_cost": 0.0,
+            "cache_read_cost": 0.0129985,
+            "request_cost": 0.0,
+        }
+        total_cost = 0.0415185
+        resolved_variables = {
+            "input_price_per_1m": 5.0,
+            "output_price_per_1m": 25.0,
+            "cache_creation_price_per_1m": 10.0,
+            "cache_read_price_per_1m": 0.5,
+            "price_per_request": 0.0,
+        }
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "status": self.status,
+                "cost_breakdown": self.cost_breakdown,
+                "resolved_variables": self.resolved_variables,
+                "total_cost": self.total_cost,
+            }
+
+    class FakeBillingService:
+        def __init__(self, _db: object) -> None:
+            pass
+
+        def calculate(self, **kwargs: object) -> SimpleNamespace:
+            captured.update(kwargs)
+            return SimpleNamespace(snapshot=FakeSnapshot())
+
+    monkeypatch.setattr(historical_rebilling_module, "BillingService", FakeBillingService)
+
+    usage = SimpleNamespace(
+        provider_id="provider-1",
+        model="claude-sonnet",
+        endpoint_api_format="claude:chat",
+        api_format="claude:chat",
+        provider_api_family="claude",
+        provider_endpoint_kind="chat",
+        api_family="claude",
+        has_format_conversion=False,
+        input_context_tokens=52963,
+        input_tokens=26966,
+        output_tokens=947,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=25997,
+        cache_ttl_minutes=60,
+        status_code=200,
+        error_message=None,
+        request_metadata={
+            "billing_recalc_version": "2026-05-02-claude-1h-usage-billing-recalc",
+            "billing_recalc_cache_ttl_policy": "force_1h_for_claude_endpoint",
+        },
+        rate_multiplier=1,
+        user_billing_multiplier=1,
+        total_cost_usd=0,
+        actual_total_cost_usd=0,
+        is_stream=False,
+        provider_api_key_id=None,
+        get_response_body=lambda: None,
+        get_client_response_body=lambda: None,
+    )
+
+    payload = HistoricalUsageRebillingService._build_token_payload(
+        MagicMock(),
+        usage,  # type: ignore[arg-type]
+        "chat",
+    )
+
+    assert payload is not None
+    dims = captured["dimensions"]  # type: ignore[assignment]
+    assert dims["input_tokens"] == 969  # type: ignore[index]
+    assert dims["cache_read_input_tokens"] == 25997  # type: ignore[index]
+    assert payload["input_tokens"] == 969
+    assert payload["input_context_tokens"] == 26966
+    assert payload["cache_read_input_tokens"] == 25997
+    assert (
+        payload["request_metadata"]["billing_recalc_token_repair"]
+        == "claude_cache_read_overlap"
+    )

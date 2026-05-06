@@ -28,7 +28,7 @@ from src.services.wallet import WalletDailyUsageLedgerService, WalletService
 class HistoricalUsageRebillingService:
     """升级后一次性的历史 Usage 重算维护任务。"""
 
-    TARGET_VERSION = "2026-05-05-claude-1h-usage-token-repair"
+    TARGET_VERSION = "2026-05-06-claude-cache-overlap-token-repair"
     STATE_KEY = "historical_usage_rebilling_state"
     ENABLED_KEY = "historical_usage_rebilling_enabled"
     HISTORY_DAYS_KEY = "historical_usage_rebilling_history_days"
@@ -41,6 +41,12 @@ class HistoricalUsageRebillingService:
     DEFAULT_LEDGER_BATCH_DAYS = 30
     DEFAULT_PAUSE_MS = 100
     FORCE_1H_CACHE_ENDPOINT_FORMATS = frozenset({"claude:chat", "claude:cli"})
+    CACHE_OVERLAP_REPAIR_SOURCE_VERSIONS = frozenset(
+        {
+            "2026-05-02-claude-1h-usage-billing-recalc",
+            "2026-05-05-claude-1h-usage-token-repair",
+        }
+    )
 
     @classmethod
     async def run_once_in_background(cls) -> None:
@@ -523,6 +529,7 @@ class HistoricalUsageRebillingService:
             return None
 
         billing_api_format = cls._resolve_billing_api_format(usage)
+        metadata = cls._copy_metadata(usage)
         usage_snapshot = cls._build_usage_snapshot(usage)
         usage_metrics = extract_usage_metrics_from_snapshot(usage_snapshot)
 
@@ -572,11 +579,28 @@ class HistoricalUsageRebillingService:
             persisted_cache_read_tokens,
             snapshot_cache_read_tokens,
         )
-        input_tokens_for_billing = normalize_input_tokens_for_billing(
-            billing_api_format,
-            raw_input_tokens,
-            cache_read_tokens,
+        snapshot_input_includes_cache_read = bool(
+            usage_metrics.get("input_tokens_include_cache_read")
+            if isinstance(usage_metrics, dict)
+            else False
         )
+        if snapshot_input_includes_cache_read and cache_read_tokens > 0:
+            input_tokens_for_billing = max(raw_input_tokens - cache_read_tokens, 0)
+        else:
+            input_tokens_for_billing = normalize_input_tokens_for_billing(
+                billing_api_format,
+                raw_input_tokens,
+                cache_read_tokens,
+            )
+        repaired_cache_overlap = cls._should_repair_claude_cache_read_overlap(
+            usage=usage,
+            metadata=metadata,
+            usage_metrics=usage_metrics,
+            input_tokens_for_billing=input_tokens_for_billing,
+            cache_read_tokens=cache_read_tokens,
+        )
+        if repaired_cache_overlap:
+            input_tokens_for_billing = max(input_tokens_for_billing - cache_read_tokens, 0)
 
         is_failed_request = cls._to_int(usage.status_code) >= 400 or bool(usage.error_message)
         request_count = 0 if is_failed_request else 1
@@ -731,13 +755,14 @@ class HistoricalUsageRebillingService:
             "total_cost": float(total_cost),
         }
 
-        metadata = cls._copy_metadata(usage)
         metadata["billing_snapshot"] = billing_snapshot_payload
         metadata["billing_updated_at"] = datetime.now(timezone.utc).isoformat()
         metadata["billing_recalc_version"] = cls.TARGET_VERSION
         metadata["billing_recalc_pricing_source"] = "latest_model_pricing"
         if force_1h_cache_pricing:
             metadata["billing_recalc_cache_ttl_policy"] = "force_1h_for_claude_endpoint"
+        if repaired_cache_overlap:
+            metadata["billing_recalc_token_repair"] = "claude_cache_read_overlap"
         sanitized_metadata = sanitize_request_metadata(metadata)
 
         return {
@@ -812,6 +837,32 @@ class HistoricalUsageRebillingService:
     def _should_force_1h_cache_pricing(cls, usage: Usage) -> bool:
         endpoint_key = cls._resolve_endpoint_api_format(usage)
         return endpoint_key in cls.FORCE_1H_CACHE_ENDPOINT_FORMATS
+
+    @classmethod
+    def _should_repair_claude_cache_read_overlap(
+        cls,
+        *,
+        usage: Usage,
+        metadata: dict[str, Any],
+        usage_metrics: dict[str, Any] | None,
+        input_tokens_for_billing: int,
+        cache_read_tokens: int,
+    ) -> bool:
+        if isinstance(usage_metrics, dict):
+            return False
+        if cache_read_tokens <= 0 or input_tokens_for_billing <= cache_read_tokens:
+            return False
+        if cls._resolve_endpoint_api_format(usage) not in cls.FORCE_1H_CACHE_ENDPOINT_FORMATS:
+            return False
+
+        recalc_version = str(metadata.get("billing_recalc_version") or "")
+        if recalc_version in cls.CACHE_OVERLAP_REPAIR_SOURCE_VERSIONS:
+            return True
+
+        return (
+            metadata.get("billing_recalc_cache_ttl_policy")
+            == "force_1h_for_claude_endpoint"
+        )
 
     @classmethod
     def _resolve_endpoint_api_format(cls, usage: Usage) -> str | None:

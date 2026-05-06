@@ -21,11 +21,15 @@ def build_upstream_usage_snapshot(
 
     normalized_family = (api_family or "").strip().lower() or None
 
-    if is_stream:
-        chunks = response_body.get("chunks")
-        if not isinstance(chunks, list) or not chunks:
-            return None
+    chunks = response_body.get("chunks")
+    metadata = response_body.get("metadata")
+    looks_like_stream = (
+        is_stream
+        or isinstance(chunks, list)
+        or (isinstance(metadata, dict) and metadata.get("stream") is True)
+    )
 
+    if looks_like_stream and isinstance(chunks, list) and chunks:
         usage_events: list[dict[str, Any]] = []
         for chunk in chunks:
             if not isinstance(chunk, dict):
@@ -34,14 +38,15 @@ def build_upstream_usage_snapshot(
             if event is not None:
                 usage_events.append(event)
 
-        if not usage_events:
-            return None
+        if usage_events:
+            return {
+                "snapshot_type": "parsed_stream_usage_events",
+                "api_family": normalized_family,
+                "events": usage_events,
+            }
 
-        return {
-            "snapshot_type": "parsed_stream_usage_events",
-            "api_family": normalized_family,
-            "events": usage_events,
-        }
+    if is_stream or (isinstance(metadata, dict) and metadata.get("stream") is True):
+        return None
 
     raw_usage = _extract_raw_usage_object(response_body)
     if raw_usage is None:
@@ -54,7 +59,7 @@ def build_upstream_usage_snapshot(
     }
 
 
-def extract_usage_metrics_from_snapshot(snapshot: Any) -> dict[str, int | None] | None:
+def extract_usage_metrics_from_snapshot(snapshot: Any) -> dict[str, int | bool | None] | None:
     if not isinstance(snapshot, dict):
         return None
 
@@ -72,7 +77,7 @@ def extract_usage_metrics_from_snapshot(snapshot: Any) -> dict[str, int | None] 
         if not isinstance(events, list):
             return None
 
-        last_metrics: dict[str, int | None] | None = None
+        last_metrics: dict[str, int | bool | None] | None = None
         last_cache_creation_tokens: int | None = None
         last_cache_read_tokens: int | None = None
         last_cache_ttl_minutes: int | None = None
@@ -157,7 +162,7 @@ def _extract_metrics_from_usage_dict(
     usage: dict[str, Any],
     *,
     api_family: str | None,
-) -> dict[str, int | None] | None:
+) -> dict[str, int | bool | None] | None:
     if api_family == "gemini" or "usageMetadata" in usage:
         input_tokens = int(
             usage.get("promptTokenCount")
@@ -180,6 +185,7 @@ def _extract_metrics_from_usage_dict(
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": cache_read_tokens,
             "cache_ttl_minutes": None,
+            "input_tokens_include_cache_read": cache_read_tokens > 0,
         }
 
     input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
@@ -190,6 +196,13 @@ def _extract_metrics_from_usage_dict(
     cache_read_tokens = extract_cache_read_tokens(usage)
 
     cache_ttl_minutes = extract_cache_ttl_minutes(usage)
+    input_tokens_include_cache_read = cache_read_tokens > 0 and (
+        api_family == "openai"
+        or "prompt_tokens" in usage
+        or "prompt_tokens_details" in usage
+        or "input_tokens_details" in usage
+        or "cached_tokens" in usage
+    )
 
     return {
         "input_tokens": input_tokens,
@@ -197,4 +210,5 @@ def _extract_metrics_from_usage_dict(
         "cache_creation_input_tokens": cache_creation_total,
         "cache_read_input_tokens": cache_read_tokens,
         "cache_ttl_minutes": cache_ttl_minutes,
+        "input_tokens_include_cache_read": input_tokens_include_cache_read,
     }
