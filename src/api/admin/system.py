@@ -125,148 +125,24 @@ async def check_update() -> Any:
     """
     检查系统更新
 
-    从 GitHub Tags 获取最新版本并与当前版本对比。
-    更新内容从 annotated tag 的 message 中获取。
-
     **返回字段**:
     - `current_version`: 当前版本号
     - `latest_version`: 最新版本号
     - `has_update`: 是否有更新可用
-    - `release_url`: 最新版本的 GitHub 页面链接
+    - `release_url`: 最新版本页面链接
     - `release_notes`: 更新日志 (Markdown 格式，来自 tag message)
     - `published_at`: 发布时间 (ISO 8601 格式)
     """
-    import httpx
-
-    from src.clients.http_client import HTTPClientPool
-
     current_version = _get_current_version()
-    github_repo = "Aethersailor/Aether"
-    github_tags_url = f"https://api.github.com/repos/{github_repo}/tags"
-
-    def _make_empty_response(error: str | None = None) -> None:
-        return {
-            "current_version": current_version,
-            "latest_version": None,
-            "has_update": False,
-            "release_url": None,
-            "release_notes": None,
-            "published_at": None,
-            "error": error,
-        }
-
-    try:
-        async with HTTPClientPool.get_temp_client(
-            timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
-        ) as client:
-            # 获取 tags 列表
-            response = await client.get(
-                github_tags_url,
-                headers={
-                    "Accept": "application/vnd.github.v3+json",
-                    "User-Agent": f"Aether/{current_version}",
-                },
-                params={"per_page": 20},
-            )
-
-            if response.status_code != 200:
-                return _make_empty_response(f"GitHub API 返回错误: {response.status_code}")
-
-            tags = response.json()
-            if not tags:
-                return _make_empty_response()
-
-            # 筛选版本号格式的 tags 并排序
-            valid_tags = []
-            for tag in tags:
-                tag_name = tag.get("name", "")
-                if tag_name.startswith("v") or (tag_name and tag_name[0].isdigit()):
-                    valid_tags.append((tag, _parse_version(tag_name)))
-
-            if not valid_tags:
-                return _make_empty_response()
-
-            # 按版本号排序，取最大的
-            valid_tags.sort(key=lambda x: x[1], reverse=True)
-            latest_tag_info = valid_tags[0][0]
-            latest_tag_name = latest_tag_info.get("name", "")
-            latest_version = latest_tag_name.lstrip("v")
-
-            current_tuple = _parse_version(current_version)
-            latest_tuple = _parse_version(latest_version)
-            has_update = latest_tuple > current_tuple
-
-            # 获取 tag 的详细信息（包含 message 和时间）
-            release_notes = None
-            published_at = None
-
-            # 获取 tag 对应的 commit sha
-            tag_commit_sha = latest_tag_info.get("commit", {}).get("sha")
-            if tag_commit_sha:
-                # 尝试获取 annotated tag 的信息
-                tag_ref_url = (
-                    f"https://api.github.com/repos/{github_repo}/git/refs/tags/{latest_tag_name}"
-                )
-                ref_response = await client.get(
-                    tag_ref_url,
-                    headers={
-                        "Accept": "application/vnd.github.v3+json",
-                        "User-Agent": f"Aether/{current_version}",
-                    },
-                )
-
-                if ref_response.status_code == 200:
-                    ref_data = ref_response.json()
-                    # 检查是否是 annotated tag（type 为 "tag"）
-                    if ref_data.get("object", {}).get("type") == "tag":
-                        tag_object_url = ref_data.get("object", {}).get("url")
-                        if tag_object_url:
-                            tag_obj_response = await client.get(
-                                tag_object_url,
-                                headers={
-                                    "Accept": "application/vnd.github.v3+json",
-                                    "User-Agent": f"Aether/{current_version}",
-                                },
-                            )
-                            if tag_obj_response.status_code == 200:
-                                tag_obj_data = tag_obj_response.json()
-                                release_notes = tag_obj_data.get("message")
-                                # 获取 tagger 的时间
-                                tagger = tag_obj_data.get("tagger", {})
-                                published_at = tagger.get("date")
-
-                # 如果没有获取到时间，从 commit 获取
-                if not published_at:
-                    commit_url = (
-                        f"https://api.github.com/repos/{github_repo}/commits/{tag_commit_sha}"
-                    )
-                    commit_response = await client.get(
-                        commit_url,
-                        headers={
-                            "Accept": "application/vnd.github.v3+json",
-                            "User-Agent": f"Aether/{current_version}",
-                        },
-                    )
-                    if commit_response.status_code == 200:
-                        commit_data = commit_response.json()
-                        published_at = (
-                            commit_data.get("commit", {}).get("committer", {}).get("date")
-                        )
-
-            return {
-                "current_version": current_version,
-                "latest_version": latest_version,
-                "has_update": has_update,
-                "release_url": f"https://github.com/{github_repo}/releases/tag/{latest_tag_name}",
-                "release_notes": release_notes,
-                "published_at": published_at,
-                "error": None,
-            }
-
-    except httpx.TimeoutException:
-        return _make_empty_response("检查更新超时")
-    except Exception as e:
-        return _make_empty_response(f"检查更新失败: {str(e)}")
+    return {
+        "current_version": current_version,
+        "latest_version": None,
+        "has_update": False,
+        "release_url": None,
+        "release_notes": None,
+        "published_at": None,
+        "error": None,
+    }
 
 
 pipeline = get_pipeline()

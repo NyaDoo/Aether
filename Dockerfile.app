@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # 运行镜像：从 base 提取产物到精简运行时
 # 构建命令: docker build -f Dockerfile.app -t aether-app:latest .
-# 用于 GitHub Actions CI（官方源）
+# 用于 CI（官方源）
 
 FROM aether-base:latest AS builder
 WORKDIR /app
@@ -37,8 +37,8 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin/gunicorn /usr/local/bin/
 COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/
 COPY --from=builder /usr/local/bin/alembic /usr/local/bin/
-# Hub 预编译二进制（构建时从 GitHub Release 下载）
-# GITHUB_TOKEN 可选：未认证 API 限流 60 次/小时，认证后 5000 次/小时
+# Hub 预编译二进制（构建时下载）
+# 访问令牌可选：用于提高 API 限额
 RUN set -eux; \
     auth_header=""; \
     if [ -n "${GITHUB_TOKEN:-}" ]; then \

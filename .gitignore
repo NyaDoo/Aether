@@ -144,6 +144,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local license signing material
+license_private_key.pem
+
 # Spyder project settings
 .spyderproject
 .spyproject

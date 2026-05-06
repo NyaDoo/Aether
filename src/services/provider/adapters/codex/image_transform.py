@@ -16,8 +16,7 @@ This module wraps that套壳:
                          base64 image.
 
 **协议对齐参考**：实测 Codex 反代当前协议 (2026-04-23) 与 Rust 分支老版本不同，
-以 sub2api (Go) 最新实现为准：
-https://github.com/Wei-Shaw/sub2api/commit/eea6f38881896ed8f78a8b340ee3a5b6223dbe74
+以 sub2api (Go) 对应实现为准。
 
 关键不变式（不要改）：
 - 外层 ``model`` = ``OPENAI_IMAGE_ROUTING_MODEL``（Codex 内部路由模型）

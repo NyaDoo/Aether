@@ -1,7 +1,9 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useLicenseStore } from '@/stores/license'
 import { useModuleStore } from '@/stores/modules'
+import apiClient from '@/api/client'
 import { importWithRetry } from '@/utils/importRetry'
 import { log } from '@/utils/logger'
 import {
@@ -299,9 +301,14 @@ const router = createRouter({
 
 router.beforeEach(async (to, from, next) => {
   const authStore = useAuthStore()
+  const licenseStore = useLicenseStore()
   const moduleStore = useModuleStore()
 
   try {
+    await licenseStore.fetchStatus()
+    if (licenseStore.isDemoLocked && !apiClient.getToken()?.startsWith('demo-access-token')) {
+      apiClient.clearAuth()
+    }
     const isAuthenticated = await ensureUserLoaded(authStore)
 
     // 首页重定向

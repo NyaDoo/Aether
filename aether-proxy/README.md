@@ -16,15 +16,7 @@ docker compose up -d
 
 ### 下载预编译二进制
 
-<!-- DOWNLOAD_TABLE_START -->
-| Platform | Download |
-|----------|----------|
-| Linux x86_64 | [aether-proxy-linux-amd64.tar.gz](https://github.com/NyaDoo/Aether/releases/download/proxy-v0.2.6/aether-proxy-linux-amd64.tar.gz) |
-| Linux ARM64 | [aether-proxy-linux-arm64.tar.gz](https://github.com/NyaDoo/Aether/releases/download/proxy-v0.2.6/aether-proxy-linux-arm64.tar.gz) |
-| macOS x86_64 | [aether-proxy-macos-amd64.tar.gz](https://github.com/NyaDoo/Aether/releases/download/proxy-v0.2.6/aether-proxy-macos-amd64.tar.gz) |
-| macOS ARM64 | [aether-proxy-macos-arm64.tar.gz](https://github.com/NyaDoo/Aether/releases/download/proxy-v0.2.6/aether-proxy-macos-arm64.tar.gz) |
-| Windows x86_64 | [aether-proxy-windows-amd64.zip](https://github.com/NyaDoo/Aether/releases/download/proxy-v0.2.6/aether-proxy-windows-amd64.zip) |
-<!-- DOWNLOAD_TABLE_END -->
+请使用随版本发布的安装包，选择与系统架构匹配的二进制文件后解压运行。
 
 ## 快速开始
 
@@ -143,10 +135,10 @@ node_name = "jp-proxy-02"
 
 ## 发布新版本
 
-推送 `proxy-v*` 格式的 tag，GitHub Actions 会自动：
-- 编译所有平台二进制并发布到 Releases
-- 构建 Docker 镜像并推送到 GHCR 和 Docker Hub
-- 更新 README 中的下载链接表格
+推送 `proxy-v*` 格式的 tag 后，发布流程会自动：
+- 编译所有平台二进制
+- 构建 Docker 镜像
+- 更新 README 中的下载说明
 
 ```bash
 git tag proxy-v0.2.0

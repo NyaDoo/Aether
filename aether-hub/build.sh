@@ -2,7 +2,7 @@
 # aether-hub 构建脚本
 #
 # 支持两种模式:
-# 1) binary 模式（默认）: 构建多架构二进制并可上传 GitHub Release
+# 1) binary 模式（默认）: 构建多架构二进制并可上传发布产物
 # 2) image 模式: 构建并推送/加载 Docker 镜像（推荐生产发布用）
 #
 # 示例:
@@ -48,7 +48,7 @@ usage() {
 
 binary 模式（默认）:
   amd64|arm64              仅构建指定架构（可重复）
-  --upload <hub-vX.Y.Z>    上传到 GitHub Release（需要 gh CLI）
+  --upload <hub-vX.Y.Z>    上传发布产物（需要 gh CLI）
 
 image 模式:
   --image                  启用镜像模式
@@ -121,7 +121,7 @@ build_binary() {
     fi
 
     if ! command -v cross >/dev/null 2>&1; then
-        echo "❌ 需要安装 cross: cargo install cross --git https://github.com/cross-rs/cross"
+        echo "❌ 需要安装 cross"
         exit 1
     fi
 
@@ -170,11 +170,11 @@ build_binary() {
             exit 1
         fi
         if ! command -v gh >/dev/null 2>&1; then
-            echo "❌ 需要安装 GitHub CLI: brew install gh"
+            echo "❌ 需要安装 gh CLI"
             exit 1
         fi
 
-        echo "📦 上传到 GitHub Release: $UPLOAD_TAG"
+        echo "📦 上传发布产物: $UPLOAD_TAG"
         cd "$PROJECT_DIR"
 
         if ! git rev-parse "$UPLOAD_TAG" >/dev/null 2>&1; then

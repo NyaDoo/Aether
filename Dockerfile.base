@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # 构建镜像：编译环境 + 预编译的依赖
-# 用于 GitHub Actions CI 构建（不使用国内镜像源）
+# 用于 CI 构建（不使用国内镜像源）
 # 构建命令: docker build -f Dockerfile.base -t aether-base:latest .
 # 只在 pyproject.toml 或 frontend/package*.json 变化时需要重建
 FROM python:3.13-slim

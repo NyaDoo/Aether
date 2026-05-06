@@ -23,6 +23,7 @@ from src.api.announcements import router as announcement_router
 # API路由
 from src.api.auth import router as auth_router
 from src.api.internal import router as internal_router
+from src.api.license import router as license_router
 from src.api.monitoring import router as monitoring_router
 from src.api.payment import router as payment_router
 from src.api.public import router as public_router
@@ -37,6 +38,7 @@ from src.core.exceptions import ExceptionHandlers, ProxyException
 from src.core.logger import logger
 from src.core.modules import get_module_registry
 from src.database import init_db
+from src.middleware.license_middleware import LicenseMiddleware
 from src.middleware.plugin_middleware import PluginMiddleware
 from src.plugins.manager import get_plugin_manager
 
@@ -774,6 +776,7 @@ app.add_exception_handler(HTTPException, ExceptionHandlers.handle_http_exception
 
 # 添加插件中间件（包含认证、审计、速率限制等功能）
 app.add_middleware(PluginMiddleware)
+app.add_middleware(LicenseMiddleware)
 
 # CORS配置 - 使用环境变量配置允许的域名
 # 生产环境必须通过 CORS_ORIGINS 环境变量显式指定允许的域名
@@ -797,6 +800,7 @@ else:
     )
 
 # 注册路由
+app.include_router(license_router)  # 许可证状态与激活
 app.include_router(auth_router)  # 认证相关
 app.include_router(admin_router)  # 管理员端点
 app.include_router(me_router)  # 用户个人端点

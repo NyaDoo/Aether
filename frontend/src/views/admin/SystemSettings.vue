@@ -21,6 +21,8 @@
             @update:site-subtitle="systemConfig.site_subtitle = $event"
           />
 
+          <LicenseSection id="section-license" />
+
           <!-- 配置导出/导入 -->
           <ConfigManagementSection
             id="section-config-mgmt"
@@ -217,6 +219,7 @@ import { useScheduledTasks } from './system-settings/composables/useScheduledTas
 
 // Section components
 import SiteInfoSection from './system-settings/SiteInfoSection.vue'
+import LicenseSection from './system-settings/LicenseSection.vue'
 import ConfigManagementSection from './system-settings/ConfigManagementSection.vue'
 import UserDataSection from './system-settings/UserDataSection.vue'
 import DataManagementSection from './system-settings/DataManagementSection.vue'
@@ -237,6 +240,7 @@ const proxyNodesStore = useProxyNodesStore()
 // TOC 目录导航
 const tocItems = [
   { id: 'section-site-info', label: '站点信息' },
+  { id: 'section-license', label: '许可证授权' },
   { id: 'section-config-mgmt', label: '配置管理' },
   { id: 'section-user-data', label: '用户数据管理' },
   { id: 'section-data-mgmt', label: '数据管理' },

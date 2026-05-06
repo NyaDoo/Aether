@@ -310,8 +310,7 @@ class ImageAdapterBase(HandlerAdapterBase):
     ) -> dict[str, Any]:
         """构建图像端点的测试 body。
 
-        **Codex 反代协议约束**（与 sub2api 最新实现严格对齐，不要擅改）：
-        https://github.com/Wei-Shaw/sub2api/commit/eea6f38881896ed8f78a8b340ee3a5b6223dbe74
+        **Codex 反代协议约束**（与 sub2api 对应实现严格对齐，不要擅改）：
 
         - outer ``model`` = ``OPENAI_IMAGE_ROUTING_MODEL``（Codex 内部路由模型）
         - ``tool.model`` = 管理员配置的真实图像模型

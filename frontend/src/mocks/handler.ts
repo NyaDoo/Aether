@@ -1380,7 +1380,36 @@ const MOCK_CAPABILITIES = [
  * Mock API 路由处理器
  */
 const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<AxiosResponse<unknown>>> = {
+  'GET /api/public/site-info': async () => {
+    await delay(50)
+    return createMockResponse({ site_name: 'Aether', site_subtitle: 'AI Gateway' })
+  },
+
   // ========== 认证相关 ==========
+  'GET /api/auth/registration-settings': async () => {
+    await delay(50)
+    return createMockResponse({
+      enable_registration: false,
+      require_email_verification: false,
+      email_configured: false,
+      password_policy_level: 'weak',
+    })
+  },
+
+  'GET /api/auth/settings': async () => {
+    await delay(50)
+    return createMockResponse({
+      local_enabled: true,
+      ldap_enabled: false,
+      ldap_exclusive: false,
+    })
+  },
+
+  'GET /api/oauth/providers': async () => {
+    await delay(50)
+    return createMockResponse([])
+  },
+
   'POST /api/auth/login': async (config) => {
     await delay()
     const body = JSON.parse(config.data || '{}')

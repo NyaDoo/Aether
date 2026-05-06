@@ -1,6 +1,6 @@
 //! Self-upgrade for aether-proxy.
 //!
-//! Downloads a release from GitHub, verifies SHA256 checksum, and atomically
+//! Downloads a release, verifies SHA256 checksum, and atomically
 //! replaces the running binary.  Restarts the systemd service if active.
 
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 const GITHUB_REPO: &str = "fawney19/Aether";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ── GitHub API types ─────────────────────────────────────────────────────────
+// ── Release API types ────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
 struct GithubRelease {
@@ -39,7 +39,7 @@ fn detect_platform() -> &'static str {
     }
 }
 
-// ── GitHub HTTP client ───────────────────────────────────────────────────────
+// ── Release HTTP client ──────────────────────────────────────────────────────
 
 fn build_github_client() -> anyhow::Result<reqwest::Client> {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -110,10 +110,9 @@ async fn fetch_release(
     }
 }
 
-// ── Download via GitHub release direct links ─────────────────────────────────
+// ── Download via release direct links ────────────────────────────────────────
 
-/// Download a release asset via the public direct download URL:
-/// `https://github.com/{repo}/releases/download/{tag}/{filename}`
+/// Download a release asset via the public direct download URL.
 async fn download_release_file(
     client: &reqwest::Client,
     tag: &str,
@@ -397,7 +396,7 @@ async fn execute_upgrade(
     Ok(())
 }
 
-/// `aether-proxy upgrade [version]` -- self-upgrade from GitHub releases.
+/// `aether-proxy upgrade [version]` -- self-upgrade from published releases.
 pub async fn cmd_upgrade(version: Option<String>) -> anyhow::Result<()> {
     execute_upgrade(version.as_deref(), false, RestartMode::BestEffort).await
 }

@@ -63,11 +63,6 @@ tls = [
     "curl_cffi>=0.7.0",   # 可选：用于上游请求的真实 TLS 指纹伪装 (Chrome/Firefox)
 ]
 
-[project.urls]
-Homepage = "https://github.com/fawney19/Aether"
-Repository = "https://github.com/fawney19/Aether.git"
-Issues = "https://github.com/fawney19/Aether/issues"
-
 [project.scripts]
 aether = "src.main:main"
 

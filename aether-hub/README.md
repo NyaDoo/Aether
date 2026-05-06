@@ -11,12 +11,12 @@ cd /path/to/Aether
 ./deploy.sh --hub-tag hub-v0.1.0
 ```
 
-不指定 `--hub-tag` 时，`./deploy.sh` 会自动解析最新 `hub-v*` release，并在构建 app 镜像时从 GitHub Release 下载对应架构的 Hub 二进制。
+不指定 `--hub-tag` 时，`./deploy.sh` 会自动解析最新 `hub-v*` 版本，并在构建 app 镜像时下载对应架构的 Hub 二进制。
 
 ## build.sh 模式说明
 
 - 默认是 `binary` 模式（`cross` 构建二进制）。
-- `--upload <hub-vX.Y.Z>` 会把构建产物上传到 GitHub Release。
+- `--upload <hub-vX.Y.Z>` 会把构建产物上传到发布版本。
 - 加 `--image` 后进入镜像模式（`docker buildx`，可选）。
 
 常用参数：
@@ -35,4 +35,4 @@ cd /path/to/Aether
 
 ## 与部署脚本关系
 
-- `./deploy.sh`: 本地构建部署（会本地构建 app/base，并在构建 app 时从 GitHub Release 下载 Hub，可用 `--hub-tag` 固定版本）。
+- `./deploy.sh`: 本地构建部署（会本地构建 app/base，并在构建 app 时下载 Hub，可用 `--hub-tag` 固定版本）。

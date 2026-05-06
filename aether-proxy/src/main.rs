@@ -42,7 +42,7 @@ fn build_command() -> clap::Command {
         .subcommand(clap::Command::new("uninstall").about("Uninstall the systemd service"))
         .subcommand(
             clap::Command::new("upgrade")
-                .about("Self-upgrade from GitHub releases")
+                .about("Self-upgrade from published releases")
                 .arg(clap::Arg::new("version").help("Target version (e.g. 0.2.0)")),
         )
         .subcommand_negates_reqs(true)

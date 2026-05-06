@@ -20,7 +20,7 @@ ARG HUB_RELEASE_REPO=fawney19/Aether
 ARG HUB_TAG
 ARG TARGETARCH
 ARG GITHUB_TOKEN
-# GitHub 下载镜像前缀，国内构建时传入可用的镜像加速地址
+# 下载镜像前缀，国内构建时传入可用的镜像加速地址
 # 用法: --build-arg GITHUB_MIRROR=https://ghfast.top
 #   或: --build-arg GITHUB_MIRROR=https://gh-proxy.com
 #   或: --build-arg GITHUB_MIRROR=https://mirror.ghproxy.com
@@ -51,7 +51,7 @@ COPY --from=builder /usr/local/bin/alembic /usr/local/bin/
 
 # Hub 预编译二进制
 # 国内构建: --build-arg GITHUB_MIRROR=https://ghfast.top 即可走镜像下载
-# GITHUB_TOKEN 可选：未认证 API 限流 60 次/小时，认证后 5000 次/小时
+# 访问令牌可选：用于提高 API 限额
 RUN set -eux; \
     arch="${TARGETARCH:-}"; \
     if [ -z "$arch" ]; then \

@@ -1,7 +1,7 @@
 import axios, { getAdapter } from 'axios'
 import type { AxiosInstance, AxiosRequestConfig, AxiosResponse, InternalAxiosRequestConfig, AxiosAdapter } from 'axios'
 import { NETWORK_CONFIG, AUTH_CONFIG } from '@/config/constants'
-import { isDemoMode } from '@/config/demo'
+import { isDemoMode, setLicenseDemoMode } from '@/config/demo'
 import { handleMockRequest, setMockUserToken } from '@/mocks'
 import { getClientDeviceId } from '@/utils/deviceId'
 import { CrossTabRefreshCoordinator } from '@/utils/crossTabRefresh'
@@ -33,6 +33,10 @@ function isAuthRequest(url?: string): boolean {
   return url?.includes('/auth/login') || url?.includes('/auth/refresh') || url?.includes('/auth/logout') || false
 }
 
+function isLicenseEndpoint(url?: string): boolean {
+  return url?.startsWith('/api/license/') || false
+}
+
 /**
  * 判断 403 错误是否表示用户账号级别的问题（需要清除认证并跳转）
  */
@@ -51,7 +55,7 @@ function isAccountLevelForbidden(status: number, errorDetail: string): boolean {
  */
 function createDemoAdapter(defaultAdapter: AxiosAdapter) {
   return async (config: InternalAxiosRequestConfig): Promise<AxiosResponse> => {
-    if (isDemoMode()) {
+    if (isDemoMode() && !isLicenseEndpoint(config.url)) {
       try {
         const mockResponse = await handleMockRequest({
           method: config.method?.toUpperCase(),
@@ -193,6 +197,10 @@ class ApiClient {
     if (status === 403) {
       const rawDetail = (error.response?.data as Record<string, unknown>)?.detail
       const errorDetail = typeof rawDetail === 'string' ? rawDetail : ''
+      if (errorDetail === 'license_required') {
+        setLicenseDemoMode(true, 'license_required')
+        return Promise.reject(error)
+      }
       if (isAccountLevelForbidden(status, errorDetail)) {
         log.info('User account issue detected, clearing auth', { errorDetail })
         this.clearAuth()

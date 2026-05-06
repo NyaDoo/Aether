@@ -5,7 +5,7 @@
 #   部署/更新:     ./deploy.sh                    (自动检测所有变化)
 #   指定 Hub 版本: ./deploy.sh --hub-tag hub-v0.1.0
 #   更新 Hub:      ./deploy.sh --update-hub
-#   GitHub 镜像:   ./deploy.sh --mirror https://ghfast.top
+#   下载镜像:      ./deploy.sh --mirror https://ghfast.top
 #   强制重建:      ./deploy.sh --rebuild-base
 #   强制全部重建:  ./deploy.sh --force
 
@@ -34,7 +34,7 @@ HASH_FILE=".deps-hash"
 CODE_HASH_FILE=".code-hash"
 MIGRATION_HASH_FILE=".migration-hash"
 
-# Hub release 配置
+# Hub 版本配置
 GITHUB_REPO="fawney19/Aether"
 HUB_TAG_STATE_FILE=".hub-tag"
 
@@ -43,9 +43,9 @@ usage() {
 Usage: ./deploy.sh [options]
 
 Options:
-  --hub-tag <hub-vX.Y.Z>  指定 Hub Release tag（例如 hub-v0.1.0）
+  --hub-tag <hub-vX.Y.Z>  指定 Hub 版本 tag（例如 hub-v0.1.0）
   --update-hub            强制刷新 Hub 版本标记（下次构建会重新下载）
-  --mirror <url>          GitHub 下载镜像（例如 https://ghfast.top）
+  --mirror <url>          下载镜像（例如 https://ghfast.top）
   --rebuild-base, -r      仅重建 base 镜像
   --force, -f             强制重建全部（hub/base/app）并重启
   -h, --help              显示帮助
@@ -149,8 +149,8 @@ calc_code_hash() {
     } | md5sum | cut -d' ' -f1
 }
 
-# 获取最新 hub release tag
-# 支持 GITHUB_TOKEN 环境变量以避免未认证 API 限流（60 次/小时 -> 5000 次/小时）
+# 获取最新 hub tag
+# 支持访问令牌环境变量以提高 API 限额
 get_latest_hub_tag() {
     local auth_args=()
     if [ -n "${GITHUB_TOKEN:-}" ]; then
@@ -407,7 +407,7 @@ else
     echo ">>> Dependencies unchanged."
 fi
 
-# 解析/检查 Hub 版本（构建时由 Dockerfile 从 GitHub Release 下载）
+# 解析/检查 Hub 版本（构建时由 Dockerfile 下载）
 if ensure_hub_tag "$HUB_TAG"; then
     HUB_UPDATED=true
     NEED_RESTART=true

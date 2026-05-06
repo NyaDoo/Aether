@@ -13,8 +13,8 @@ function getGitVersion(): string {
 
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => ({
-  // GitHub Pages 部署时使用仓库名作为 base
-  base: process.env.GITHUB_PAGES === 'true' ? '/Aether/' : '/',
+  // 静态页面部署时使用项目名作为 base
+  base: process.env.STATIC_PAGES === 'true' ? '/Aether/' : '/',
   plugins: [vue()],
   define: {
     __APP_VERSION__: JSON.stringify(getGitVersion()),
