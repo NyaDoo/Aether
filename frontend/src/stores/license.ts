@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { licenseApi, type LicenseStatus } from '@/api/license'
+import { licenseApi, type LicenseMachineBinding, type LicenseStatus } from '@/api/license'
 import { setLicenseDemoMode } from '@/config/demo'
 
 export const useLicenseStore = defineStore('license', () => {
@@ -8,6 +8,7 @@ export const useLicenseStore = defineStore('license', () => {
   const loading = ref(false)
   const loaded = ref(false)
   const error = ref<string | null>(null)
+  const machineBinding = ref<LicenseMachineBinding | null>(null)
 
   const isLicensed = computed(() => status.value?.licensed === true)
   const isDemoLocked = computed(() => status.value?.demo_mode !== false)
@@ -16,7 +17,7 @@ export const useLicenseStore = defineStore('license', () => {
     status.value = nextStatus
     loaded.value = true
     error.value = null
-    setLicenseDemoMode(nextStatus.demo_mode, nextStatus.reason)
+    setLicenseDemoMode(nextStatus.demo_mode, null)
   }
 
   async function fetchStatus(force = false): Promise<LicenseStatus | null> {
@@ -51,14 +52,38 @@ export const useLicenseStore = defineStore('license', () => {
     }
   }
 
+  async function deactivate(): Promise<LicenseStatus> {
+    loading.value = true
+    try {
+      const nextStatus = await licenseApi.deactivate()
+      applyStatus(nextStatus)
+      return nextStatus
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function fetchMachineBinding(force = false): Promise<LicenseMachineBinding | null> {
+    if (machineBinding.value && !force) return machineBinding.value
+    try {
+      machineBinding.value = await licenseApi.getMachineBinding()
+      return machineBinding.value
+    } catch {
+      return null
+    }
+  }
+
   return {
     status,
     loading,
     loaded,
     error,
+    machineBinding,
     isLicensed,
     isDemoLocked,
     fetchStatus,
     activate,
+    deactivate,
+    fetchMachineBinding,
   }
 })

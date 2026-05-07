@@ -12,9 +12,9 @@
           </p>
         </div>
         <div>
-          <Label class="text-xs text-muted-foreground">版本</Label>
+          <Label class="text-xs text-muted-foreground">授权范围</Label>
           <p class="mt-1 text-sm font-medium">
-            {{ licenseStore.status?.edition || '-' }}
+            {{ licenseStore.status?.licensed ? '全部功能' : '-' }}
           </p>
         </div>
         <div>
@@ -26,10 +26,33 @@
       </div>
 
       <div
-        v-if="licenseStore.status?.reason"
-        class="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300"
+        v-if="licenseStore.status"
+        class="rounded-lg border px-3 py-2 text-sm"
+        :class="licenseStore.status.licensed
+          ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+          : 'border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300'"
       >
-        {{ reasonText }}
+        {{ licenseStore.status.licensed ? '许可证状态有效。' : '许可证状态无效。' }}
+      </div>
+
+      <div class="grid gap-4 md:grid-cols-2">
+        <div>
+          <Label class="text-xs text-muted-foreground">机器指纹</Label>
+          <button
+            type="button"
+            class="mt-2 block max-w-full break-all text-left font-mono text-xs text-foreground underline-offset-4 hover:text-primary hover:underline disabled:pointer-events-none disabled:opacity-60"
+            :disabled="machineFingerprint === '-'"
+            @click="handleCopyMachineFingerprint"
+          >
+            {{ machineFingerprint }}
+          </button>
+        </div>
+        <div>
+          <Label class="text-xs text-muted-foreground">当前时间</Label>
+          <p class="mt-1 text-sm font-medium">
+            {{ currentTimeLabel }}
+          </p>
+        </div>
       </div>
 
       <div>
@@ -46,17 +69,17 @@
           placeholder="{ &quot;license_id&quot;: &quot;lic_xxx&quot;, ... }"
         />
         <p class="mt-2 text-xs text-muted-foreground">
-          粘贴签名后的许可证 JSON。激活成功后页面会刷新，并使用完整系统模式重新登录。
+          粘贴签名后的许可证 JSON。
         </p>
       </div>
 
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-3">
         <Button
           size="sm"
           :disabled="licenseStore.loading || !licenseInput.trim()"
           @click="handleActivate"
         >
-          {{ licenseStore.loading ? '激活中...' : '激活许可证' }}
+          {{ licenseStore.loading ? '激活中...' : '激活 / 修改许可证' }}
         </Button>
         <Button
           variant="outline"
@@ -66,13 +89,21 @@
         >
           刷新状态
         </Button>
+        <Button
+          variant="destructive"
+          size="sm"
+          :disabled="licenseStore.loading || !licenseStore.status?.can_deactivate"
+          @click="handleDeactivate"
+        >
+          取消关联许可证
+        </Button>
       </div>
     </div>
   </CardSection>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import Button from '@/components/ui/button.vue'
 import Label from '@/components/ui/label.vue'
 import Textarea from '@/components/ui/textarea.vue'
@@ -84,28 +115,26 @@ import apiClient from '@/api/client'
 const licenseStore = useLicenseStore()
 const { success: showSuccess, error: showError } = useToast()
 const licenseInput = ref('')
+const currentTime = ref(new Date())
+let currentTimeTimer: number | undefined
+
+onMounted(() => {
+  void licenseStore.fetchMachineBinding()
+  currentTimeTimer = window.setInterval(() => {
+    currentTime.value = new Date()
+  }, 1000)
+})
+
+onUnmounted(() => {
+  if (currentTimeTimer !== undefined) {
+    window.clearInterval(currentTimeTimer)
+  }
+})
 
 const statusLabel = computed(() => {
   const status = licenseStore.status
   if (!status) return '加载中'
-  if (status.licensed) return '已授权'
-  if (status.mode === 'expired') return '已过期'
-  if (status.mode === 'invalid') return '无效'
-  return '未授权'
-})
-
-const reasonText = computed(() => {
-  const reason = licenseStore.status?.reason
-  const map: Record<string, string> = {
-    license_missing: '当前实例未激活许可证，已自动进入演示模式。',
-    license_public_key_missing: '未配置许可证公钥，无法校验许可证。',
-    license_signature_missing: '许可证缺少签名。',
-    license_signature_invalid: '许可证签名无效。',
-    license_expired: '许可证已过期。',
-    instance_mismatch: '许可证绑定的实例与当前实例不匹配。',
-    license_datetime_invalid: '许可证时间格式无效。',
-  }
-  return reason ? (map[reason] || reason) : ''
+  return status.licensed ? '有效' : '无效'
 })
 
 const formattedExpiresAt = computed(() => {
@@ -118,14 +147,44 @@ const formattedExpiresAt = computed(() => {
   }
 })
 
+const machineFingerprint = computed(() => {
+  return (
+    licenseStore.status?.machine_fingerprint ||
+    licenseStore.machineBinding?.fingerprint ||
+    '-'
+  )
+})
+
+const currentTimeLabel = computed(() => currentTime.value.toLocaleString('zh-CN'))
+
+async function handleCopyMachineFingerprint() {
+  try {
+    await navigator.clipboard.writeText(machineFingerprint.value)
+    showSuccess('机器指纹已复制')
+  } catch {
+    showError('复制机器指纹失败')
+  }
+}
+
 async function handleActivate() {
   try {
     await licenseStore.activate(licenseInput.value)
     showSuccess('许可证激活成功，正在刷新页面...')
     apiClient.clearAuth()
     setTimeout(() => window.location.reload(), 700)
-  } catch (err) {
-    showError(err instanceof Error ? err.message : '许可证激活失败')
+  } catch {
+    showError('许可证激活失败')
+  }
+}
+
+async function handleDeactivate() {
+  try {
+    await licenseStore.deactivate()
+    showSuccess('许可证关联已取消，正在刷新页面...')
+    apiClient.clearAuth()
+    setTimeout(() => window.location.reload(), 700)
+  } catch {
+    showError('取消关联失败')
   }
 }
 </script>

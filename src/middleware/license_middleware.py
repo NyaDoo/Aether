@@ -50,7 +50,11 @@ class LicenseMiddleware:
                 "message": "当前实例未授权，仅允许演示模式",
                 "license": status.model_dump() if status is not None else None,
             },
-            headers={"x-aether-license-mode": status.mode if status is not None else "invalid"},
+            headers={
+                "x-aether-license-mode": (
+                    "licensed" if status is not None and status.licensed else "unlicensed"
+                )
+            },
         )
         await response(scope, receive, send)
 
@@ -67,7 +71,8 @@ class LicenseMiddleware:
 
         exact_allowed = {
             "/api/license/status": {"GET"},
-            "/api/license/activate": {"POST"},
+            "/api/license/machine": {"GET"},
+            "/api/license/activate": {"POST", "DELETE"},
             "/api/auth/settings": {"GET"},
             "/api/auth/registration-settings": {"GET"},
             "/api/public/site-info": {"GET"},

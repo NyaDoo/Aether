@@ -23,6 +23,11 @@ async def get_license_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     return LicenseService.get_status(db).model_dump()
 
 
+@router.get("/machine")
+async def get_license_machine_binding() -> dict[str, Any]:
+    return LicenseService.get_machine_binding()
+
+
 @router.post("/activate")
 async def activate_license(
     request: LicenseActivateRequest,
@@ -31,5 +36,16 @@ async def activate_license(
     try:
         status = LicenseService.activate(db, request.license)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        detail = "license_update_unavailable" if str(exc) == "license_env_managed" else "license_invalid"
+        raise HTTPException(status_code=400, detail=detail) from exc
+    return status.model_dump()
+
+
+@router.delete("/activate")
+async def deactivate_license(db: Session = Depends(get_db)) -> dict[str, Any]:
+    try:
+        status = LicenseService.deactivate(db)
+    except ValueError as exc:
+        detail = "license_update_unavailable" if str(exc) == "license_env_managed" else "license_update_failed"
+        raise HTTPException(status_code=400, detail=detail) from exc
     return status.model_dump()

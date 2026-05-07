@@ -1376,6 +1376,806 @@ const MOCK_CAPABILITIES = [
   { name: 'context_1m', display_name: '1M上下文', description: '支持1M上下文窗口', match_mode: 'compatible', short_name: '1M' }
 ]
 
+function parseMockBody<T = unknown>(config: AxiosRequestConfig, fallback: T): T {
+  if (config.data == null || config.data === '') return fallback
+  if (typeof config.data !== 'string') return config.data as T
+  try {
+    return JSON.parse(config.data) as T
+  } catch {
+    return fallback
+  }
+}
+
+function getMockSearchParams(config: AxiosRequestConfig): URLSearchParams {
+  const query = config.url?.split('?')[1] || ''
+  const params = new URLSearchParams(query)
+  const extraParams = config.params
+  if (extraParams && typeof extraParams === 'object') {
+    if (extraParams instanceof URLSearchParams) {
+      extraParams.forEach((value, key) => params.set(key, value))
+    } else {
+      for (const [key, value] of Object.entries(extraParams as Record<string, unknown>)) {
+        if (value == null) continue
+        if (Array.isArray(value)) {
+          params.set(key, value.join(','))
+        } else {
+          params.set(key, String(value))
+        }
+      }
+    }
+  }
+  return params
+}
+
+function getMockNumberParam(params: URLSearchParams, key: string, fallback: number): number {
+  const raw = params.get(key)
+  if (raw == null || raw === '') return fallback
+  const value = Number(raw)
+  return Number.isFinite(value) ? value : fallback
+}
+
+function paginateMockItems<T>(
+  items: T[],
+  config: AxiosRequestConfig,
+  defaults: { limit?: number; offset?: number } = {},
+) {
+  const params = getMockSearchParams(config)
+  const limit = Math.max(1, getMockNumberParam(params, 'limit', defaults.limit ?? 50))
+  const offset = Math.max(0, getMockNumberParam(params, 'offset', defaults.offset ?? 0))
+  return {
+    items: items.slice(offset, offset + limit),
+    total: items.length,
+    limit,
+    offset,
+  }
+}
+
+const MOCK_MODULE_STATUS: Record<string, Record<string, unknown>> = {
+  oauth: {
+    name: 'oauth',
+    available: true,
+    enabled: false,
+    active: false,
+    config_validated: true,
+    config_error: null,
+    display_name: 'OAuth 登录',
+    description: '第三方 OAuth 登录集成',
+    category: 'auth',
+    admin_route: null,
+    admin_menu_icon: null,
+    admin_menu_group: 'auth',
+    admin_menu_order: 10,
+    health: 'unknown',
+  },
+  ldap: {
+    name: 'ldap',
+    available: true,
+    enabled: false,
+    active: false,
+    config_validated: true,
+    config_error: null,
+    display_name: 'LDAP 登录',
+    description: '企业 LDAP/AD 目录登录集成',
+    category: 'auth',
+    admin_route: null,
+    admin_menu_icon: null,
+    admin_menu_group: 'auth',
+    admin_menu_order: 20,
+    health: 'unknown',
+  },
+  proxy_nodes: {
+    name: 'proxy_nodes',
+    available: true,
+    enabled: true,
+    active: true,
+    config_validated: true,
+    config_error: null,
+    display_name: '代理节点',
+    description: '管理 aether-proxy 节点和手动代理',
+    category: 'integration',
+    admin_route: '/admin/proxy-nodes',
+    admin_menu_icon: 'Network',
+    admin_menu_group: 'network',
+    admin_menu_order: 30,
+    health: 'healthy',
+  },
+  management_tokens: {
+    name: 'management_tokens',
+    available: true,
+    enabled: true,
+    active: true,
+    config_validated: true,
+    config_error: null,
+    display_name: '管理令牌',
+    description: '用于自动化脚本的受控管理令牌',
+    category: 'security',
+    admin_route: null,
+    admin_menu_icon: 'KeyRound',
+    admin_menu_group: 'security',
+    admin_menu_order: 40,
+    health: 'healthy',
+  },
+  notification_email: {
+    name: 'notification_email',
+    available: true,
+    enabled: false,
+    active: false,
+    config_validated: true,
+    config_error: null,
+    display_name: '邮件通知',
+    description: '系统邮件、通知模板与发送配置',
+    category: 'integration',
+    admin_route: null,
+    admin_menu_icon: 'Mail',
+    admin_menu_group: 'notification',
+    admin_menu_order: 50,
+    health: 'unknown',
+  },
+}
+
+function getMockAdminWallets(status?: string | null) {
+  const userWallets = MOCK_ALL_USERS.map((user, index) => {
+    const unlimited = user.unlimited === true
+    const balance = unlimited ? 0 : Number((36.5 + index * 18.25).toFixed(2))
+    const rechargeBalance = unlimited ? 0 : Number((balance * 0.72).toFixed(2))
+    const giftBalance = unlimited ? 0 : Number((balance - rechargeBalance).toFixed(2))
+    return {
+      id: `wallet-${user.id}`,
+      user_id: user.id,
+      api_key_id: null,
+      owner_type: 'user',
+      owner_name: user.username,
+      owner_email: user.email,
+      balance,
+      recharge_balance: rechargeBalance,
+      gift_balance: giftBalance,
+      refundable_balance: rechargeBalance,
+      currency: 'USD',
+      status: user.is_active ? 'active' : 'disabled',
+      limit_mode: unlimited ? 'unlimited' : 'finite',
+      unlimited,
+      total_recharged: unlimited ? 0 : Number((balance + 120).toFixed(2)),
+      total_consumed: Number((index * 17.42 + 8.35).toFixed(2)),
+      total_refunded: 0,
+      total_adjusted: 0,
+      created_at: user.created_at,
+      updated_at: new Date().toISOString(),
+    }
+  })
+
+  const apiKeyWallets = MOCK_ADMIN_API_KEYS.api_keys.map((key, index) => {
+    const balance = Number((28 + index * 33.4).toFixed(2))
+    return {
+      id: `wallet-${key.id}`,
+      user_id: null,
+      api_key_id: key.id,
+      owner_type: 'api_key',
+      owner_name: key.name,
+      owner_email: key.user_email ?? null,
+      balance,
+      recharge_balance: balance,
+      gift_balance: 0,
+      refundable_balance: balance,
+      currency: 'USD',
+      status: key.is_active ? 'active' : 'disabled',
+      limit_mode: 'finite',
+      unlimited: false,
+      total_recharged: Number((balance + 75).toFixed(2)),
+      total_consumed: Number((key.total_cost_usd ?? 0).toFixed(2)),
+      total_refunded: 0,
+      total_adjusted: 0,
+      created_at: key.created_at,
+      updated_at: new Date().toISOString(),
+    }
+  })
+
+  const wallets = [...userWallets, ...apiKeyWallets]
+  return status ? wallets.filter(wallet => wallet.status === status) : wallets
+}
+
+function getMockWalletById(walletId: string) {
+  return getMockAdminWallets().find(wallet => wallet.id === walletId) ?? null
+}
+
+function buildMockLedgerItems() {
+  const wallets = getMockAdminWallets()
+  return wallets.slice(0, 6).map((wallet, index) => ({
+    id: `ledger-demo-${index + 1}`,
+    wallet_id: wallet.id,
+    owner_type: wallet.owner_type,
+    owner_name: wallet.owner_name,
+    owner_email: wallet.owner_email,
+    wallet_status: wallet.status,
+    category: index % 2 === 0 ? 'recharge' : 'adjust',
+    reason_code: index % 2 === 0 ? 'manual_recharge' : 'admin_adjust',
+    amount: index % 2 === 0 ? 20 + index * 5 : -3.5,
+    balance_before: Number(Math.max(0, wallet.balance - 20).toFixed(4)),
+    balance_after: Number(wallet.balance.toFixed(4)),
+    recharge_balance_before: Number(Math.max(0, wallet.recharge_balance - 20).toFixed(4)),
+    recharge_balance_after: Number(wallet.recharge_balance.toFixed(4)),
+    gift_balance_before: Number(wallet.gift_balance.toFixed(4)),
+    gift_balance_after: Number(wallet.gift_balance.toFixed(4)),
+    link_type: index % 2 === 0 ? 'payment_order' : null,
+    link_id: index % 2 === 0 ? `pay-demo-${index + 1}` : null,
+    operator_id: MOCK_ADMIN_USER.id,
+    operator_name: MOCK_ADMIN_USER.username,
+    operator_email: MOCK_ADMIN_USER.email,
+    description: index % 2 === 0 ? '演示模式充值入账' : '演示模式手动调账',
+    created_at: new Date(Date.now() - index * 3600 * 1000).toISOString(),
+  }))
+}
+
+const MOCK_PAYMENT_ORDERS = [
+  {
+    id: 'pay-demo-1',
+    order_no: 'PAY-DEMO-0001',
+    wallet_id: 'wallet-demo-user-uuid-0002',
+    user_id: 'demo-user-uuid-0002',
+    amount_usd: 20,
+    pay_amount: 20,
+    pay_currency: 'USD',
+    exchange_rate: 1,
+    refunded_amount_usd: 0,
+    refundable_amount_usd: 20,
+    payment_method: 'manual',
+    order_type: 'topup',
+    gateway_order_id: 'gw-demo-1',
+    gateway_response: { demo_mode: true },
+    status: 'paid',
+    created_at: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
+    paid_at: new Date(Date.now() - 2.5 * 3600 * 1000).toISOString(),
+    credited_at: new Date(Date.now() - 2.5 * 3600 * 1000).toISOString(),
+    expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+  },
+  {
+    id: 'pay-demo-2',
+    order_no: 'PAY-DEMO-0002',
+    wallet_id: 'wallet-demo-user-uuid-0003',
+    user_id: 'demo-user-uuid-0003',
+    amount_usd: 50,
+    pay_amount: null,
+    pay_currency: null,
+    exchange_rate: null,
+    refunded_amount_usd: 0,
+    refundable_amount_usd: 0,
+    payment_method: 'manual_review',
+    order_type: 'topup',
+    gateway_order_id: null,
+    gateway_response: { demo_mode: true },
+    status: 'pending_approval',
+    created_at: new Date(Date.now() - 1.5 * 3600 * 1000).toISOString(),
+    paid_at: null,
+    credited_at: null,
+    expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+  },
+]
+
+const MOCK_PAYMENT_CALLBACKS = [
+  {
+    id: 'callback-demo-1',
+    payment_order_id: 'pay-demo-1',
+    payment_method: 'manual',
+    callback_key: 'manual:PAY-DEMO-0001',
+    order_no: 'PAY-DEMO-0001',
+    gateway_order_id: 'gw-demo-1',
+    payload_hash: 'demo-hash-1',
+    signature_valid: true,
+    status: 'processed',
+    payload: { demo_mode: true },
+    error_message: null,
+    created_at: new Date(Date.now() - 2.5 * 3600 * 1000).toISOString(),
+    processed_at: new Date(Date.now() - 2.5 * 3600 * 1000).toISOString(),
+  },
+]
+
+const MOCK_SUBSCRIPTION_PRODUCTS = [
+  {
+    id: 'sub-prod-team',
+    code: 'team',
+    name: '团队版',
+    description: '演示模式订阅产品',
+    user_group_id: 'group-internal-demo',
+    user_group_name: '内部研发',
+    plan_level: 10,
+    overage_policy: 'use_wallet_balance',
+    is_active: true,
+    active_subscription_count: 1,
+    variant_count: 2,
+    variants: [
+      {
+        id: 'sub-plan-team-basic',
+        product_id: 'sub-prod-team',
+        code: 'basic',
+        name: '基础版',
+        description: null,
+        monthly_price_usd: 29,
+        monthly_quota_usd: 50,
+        variant_rank: 10,
+        term_discounts_json: [{ months: 1, discount_factor: 1 }, { months: 12, discount_factor: 0.85 }],
+        is_active: true,
+        is_default_variant: true,
+        active_subscription_count: 1,
+        created_at: '2024-01-01T00:00:00Z',
+        updated_at: new Date().toISOString(),
+      },
+      {
+        id: 'sub-plan-team-pro',
+        product_id: 'sub-prod-team',
+        code: 'pro',
+        name: '专业版',
+        description: null,
+        monthly_price_usd: 99,
+        monthly_quota_usd: 220,
+        variant_rank: 20,
+        term_discounts_json: [{ months: 1, discount_factor: 1 }, { months: 12, discount_factor: 0.8 }],
+        is_active: true,
+        is_default_variant: false,
+        active_subscription_count: 0,
+        created_at: '2024-01-01T00:00:00Z',
+        updated_at: new Date().toISOString(),
+      },
+    ],
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: new Date().toISOString(),
+  },
+]
+
+const MOCK_USER_SUBSCRIPTIONS = [
+  {
+    id: 'sub-demo-user-2',
+    user_id: 'demo-user-uuid-0002',
+    username: 'Demo User',
+    email: 'user@demo.aether.io',
+    product_id: 'sub-prod-team',
+    product_code: 'team',
+    product_name: '团队版',
+    plan_id: 'sub-plan-team-basic',
+    plan_code: 'basic',
+    plan_name: '基础版',
+    variant_id: 'sub-plan-team-basic',
+    variant_code: 'basic',
+    variant_name: '基础版',
+    variant_rank: 10,
+    user_group_id: 'group-internal-demo',
+    user_group_name: '内部研发',
+    status: 'active',
+    end_reason: null,
+    purchased_months: 1,
+    discount_factor: 1,
+    monthly_price_usd_snapshot: 29,
+    total_price_usd: 29,
+    started_at: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString(),
+    ends_at: new Date(Date.now() + 25 * 24 * 3600 * 1000).toISOString(),
+    current_cycle_start: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString(),
+    current_cycle_end: new Date(Date.now() + 25 * 24 * 3600 * 1000).toISOString(),
+    cycle_quota_usd: 50,
+    cycle_used_usd: 12.45,
+    remaining_quota_usd: 37.55,
+    cancel_at_period_end: false,
+    canceled_at: null,
+    ended_at: null,
+    upgraded_from_subscription_id: null,
+    created_at: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString(),
+    updated_at: new Date().toISOString(),
+  },
+]
+
+function getMockSubscriptionOrders() {
+  return [
+    {
+      ...MOCK_PAYMENT_ORDERS[0],
+      id: 'sub-order-demo-1',
+      order_no: 'SUB-DEMO-0001',
+      subscription_id: 'sub-demo-user-2',
+      order_type: 'subscription_initial',
+      username: 'Demo User',
+      email: 'user@demo.aether.io',
+      subscription_status: 'active',
+      product_id: 'sub-prod-team',
+      product_name: '团队版',
+      plan_id: 'sub-plan-team-basic',
+      plan_name: '基础版',
+      variant_name: '基础版',
+      purchased_months: 1,
+      upgraded_from_subscription_id: null,
+    },
+    {
+      ...MOCK_PAYMENT_ORDERS[1],
+      id: 'sub-order-demo-2',
+      order_no: 'SUB-DEMO-0002',
+      subscription_id: null,
+      order_type: 'subscription_initial',
+      username: 'Alice Wang',
+      email: 'alice@example.com',
+      subscription_status: 'pending_payment',
+      product_id: 'sub-prod-team',
+      product_name: '团队版',
+      plan_id: 'sub-plan-team-pro',
+      plan_name: '专业版',
+      variant_name: '专业版',
+      purchased_months: 1,
+      upgraded_from_subscription_id: null,
+    },
+  ]
+}
+
+const MOCK_ASYNC_TASKS = [
+  {
+    id: 'video-task-demo-1',
+    external_task_id: 'ext-video-demo-1',
+    user_id: 'demo-user-uuid-0002',
+    username: 'Demo User',
+    task_type: 'video',
+    model: 'veo-3.1-generate-preview',
+    prompt: 'A calm product demo scene for Aether Gateway',
+    status: 'completed',
+    progress_percent: 100,
+    progress_message: '已完成',
+    provider_id: 'provider-004',
+    provider_name: 'IKunCode',
+    duration_seconds: 8,
+    resolution: '1080p',
+    aspect_ratio: '16:9',
+    video_url: 'https://example.com/demo-video.mp4',
+    error_code: null,
+    error_message: null,
+    poll_count: 4,
+    max_poll_count: 60,
+    created_at: new Date(Date.now() - 4 * 3600 * 1000).toISOString(),
+    completed_at: new Date(Date.now() - 3.8 * 3600 * 1000).toISOString(),
+    submitted_at: new Date(Date.now() - 4 * 3600 * 1000).toISOString(),
+  },
+  {
+    id: 'video-task-demo-2',
+    external_task_id: 'ext-video-demo-2',
+    user_id: 'demo-user-uuid-0003',
+    username: 'Alice Wang',
+    task_type: 'video',
+    model: 'veo-3.1-generate-preview',
+    prompt: 'Dashboard animation with soft lighting',
+    status: 'processing',
+    progress_percent: 62,
+    progress_message: '正在生成视频',
+    provider_id: 'provider-004',
+    provider_name: 'IKunCode',
+    duration_seconds: 6,
+    resolution: '720p',
+    aspect_ratio: '9:16',
+    video_url: null,
+    error_code: null,
+    error_message: null,
+    poll_count: 9,
+    max_poll_count: 60,
+    created_at: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
+    completed_at: null,
+    submitted_at: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
+  },
+]
+
+function buildMockAsyncTaskDetail(task: Record<string, unknown>) {
+  return {
+    ...task,
+    api_key_id: 'key-provider-004-1',
+    endpoint_id: 'ep-provider-004-1',
+    key_id: 'key-provider-004-1',
+    client_api_format: 'gemini:chat',
+    provider_api_format: 'gemini:chat',
+    format_converted: false,
+    original_request_body: { prompt: task.prompt, model: task.model },
+    converted_request_body: { prompt: task.prompt, model: task.model },
+    size: null,
+    video_urls: task.video_url ? [task.video_url] : null,
+    thumbnail_url: null,
+    video_size_bytes: task.video_url ? 18_000_000 : null,
+    video_duration_seconds: task.duration_seconds,
+    video_expires_at: task.video_url ? new Date(Date.now() + 24 * 3600 * 1000).toISOString() : null,
+    stored_video_path: null,
+    storage_provider: null,
+    retry_count: 0,
+    max_retries: 2,
+    poll_interval_seconds: 10,
+    next_poll_at: task.status === 'processing' ? new Date(Date.now() + 10_000).toISOString() : null,
+    updated_at: new Date().toISOString(),
+    endpoint: {
+      id: 'ep-provider-004-1',
+      base_url: 'https://generativelanguage.googleapis.com',
+      api_format: 'gemini:chat',
+    },
+    request_metadata: {
+      candidate_keys: [
+        {
+          index: 0,
+          provider_id: 'provider-004',
+          provider_name: 'IKunCode',
+          endpoint_id: 'ep-provider-004-1',
+          key_id: 'key-provider-004-1',
+          key_name: 'Primary Key',
+          auth_type: 'api_key',
+          has_billing_rule: true,
+          priority: 1,
+          selected: true,
+        },
+      ],
+      selected_key_id: 'key-provider-004-1',
+      selected_endpoint_id: 'ep-provider-004-1',
+      client_ip: '127.0.0.1',
+      user_agent: 'Aether Demo',
+      request_id: `req-${task.id}`,
+    },
+  }
+}
+
+const MOCK_PROXY_NODES = [
+  {
+    id: 'proxy-node-demo-1',
+    name: '上海演示节点',
+    ip: '203.0.113.10',
+    port: 18080,
+    region: 'CN-East',
+    status: 'online',
+    is_manual: true,
+    tunnel_mode: false,
+    tunnel_connected: false,
+    tunnel_connected_at: null,
+    proxy_url: 'http://203.0.113.10:18080',
+    proxy_username: 'demo',
+    proxy_password: '********',
+    hardware_info: null,
+    estimated_max_concurrency: 200,
+    remote_config: null,
+    config_version: 1,
+    registered_by: MOCK_ADMIN_USER.id,
+    last_heartbeat_at: new Date().toISOString(),
+    heartbeat_interval: 30,
+    active_connections: 12,
+    total_requests: 4280,
+    avg_latency_ms: 86,
+    failed_requests: 12,
+    dns_failures: 1,
+    stream_errors: 2,
+    proxy_metadata: { demo_mode: true },
+    created_at: '2024-12-01T00:00:00Z',
+    updated_at: new Date().toISOString(),
+  },
+]
+
+const MOCK_ARCHITECTURES = [
+  {
+    architecture_id: 'generic',
+    display_name: '通用 Provider',
+    description: '演示模式通用余额查询架构',
+    credentials_schema: {
+      type: 'object',
+      properties: {
+        api_key: { type: 'string', title: 'API Key' },
+      },
+    },
+    supported_auth_types: [
+      {
+        type: 'api_key',
+        display_name: 'API Key',
+        credentials_schema: {
+          type: 'object',
+          properties: {
+            api_key: { type: 'string', title: 'API Key' },
+          },
+        },
+      },
+    ],
+    supported_actions: [
+      {
+        type: 'query_balance',
+        display_name: '余额查询',
+        description: '查询 Provider 余额',
+        config_schema: { type: 'object', properties: {} },
+      },
+      {
+        type: 'checkin',
+        display_name: '签到',
+        description: '执行每日签到',
+        config_schema: { type: 'object', properties: {} },
+      },
+    ],
+    default_connector: 'api_key',
+  },
+]
+
+function buildMockProviderBalance(providerId: string) {
+  const providerIndex = Math.max(0, MOCK_PROVIDERS.findIndex(provider => provider.id === providerId))
+  const available = Number((100 - providerIndex * 6.75).toFixed(2))
+  return {
+    status: 'success',
+    action_type: 'query_balance',
+    data: {
+      total_granted: 100,
+      total_used: Number((100 - available).toFixed(2)),
+      total_available: available,
+      expires_at: null,
+      currency: 'USD',
+      extra: {
+        checkin_success: null,
+        checkin_message: '演示模式无需签到',
+      },
+    },
+    message: '演示模式余额',
+    executed_at: new Date().toISOString(),
+    response_time_ms: 120,
+    cache_ttl_seconds: 60,
+  }
+}
+
+const MOCK_CACHE_AFFINITIES = [
+  {
+    affinity_key: 'key-uuid-001',
+    user_api_key_name: '开发环境',
+    user_api_key_prefix: 'sk-ae********x7f9',
+    is_standalone: false,
+    user_id: 'demo-user-uuid-0002',
+    username: 'Demo User',
+    email: 'user@demo.aether.io',
+    provider_id: 'provider-002',
+    provider_name: 'OpenClaudeCode',
+    endpoint_id: 'ep-002',
+    endpoint_url: 'https://api.openai.com',
+    key_id: 'ekey-003',
+    key_name: 'OpenAI OAuth',
+    key_prefix: 'sk-oai********ghi3',
+    rate_multipliers: null,
+    global_model_id: 'gm-006',
+    model_name: 'gpt-5.1',
+    model_display_name: 'GPT-5.1',
+    api_format: 'openai:chat',
+    created_at: Math.floor(Date.now() / 1000) - 300,
+    expire_at: Math.floor(Date.now() / 1000) + 600,
+    request_count: 12,
+  },
+]
+
+function getMockCacheStats() {
+  return {
+    scheduler: 'cache_aware',
+    cache_reservation_ratio: 0.3,
+    affinity_stats: {
+      storage_type: 'demo',
+      total_affinities: MOCK_CACHE_AFFINITIES.length,
+      active_affinities: MOCK_CACHE_AFFINITIES.length,
+      cache_hits: 128,
+      cache_misses: 34,
+      cache_hit_rate: 0.79,
+      cache_invalidations: 4,
+      provider_switches: 9,
+      key_switches: 17,
+      config: { default_ttl: 300 },
+    },
+  }
+}
+
+function getMockCacheConfig() {
+  return {
+    cache_ttl_seconds: 300,
+    cache_reservation_ratio: 0.3,
+    dynamic_reservation: {
+      enabled: true,
+      config: {
+        probe_phase_requests: 3,
+        probe_reservation: 0.15,
+        stable_min_reservation: 0.15,
+        stable_max_reservation: 0.5,
+        low_load_threshold: 0.25,
+        high_load_threshold: 0.8,
+        success_count_for_full_confidence: 10,
+        cooldown_hours_for_full_confidence: 24,
+      },
+      description: {},
+    },
+    description: {
+      cache_ttl: '缓存亲和性 TTL',
+      cache_reservation_ratio: '缓存预留比例',
+      dynamic_reservation: '动态预留策略',
+    },
+  }
+}
+
+function getMockModelMappingStats() {
+  return {
+    available: true,
+    ttl_seconds: 300,
+    total_keys: 3,
+    breakdown: {
+      model_by_id: 1,
+      model_by_provider_global: 1,
+      global_model_by_id: 1,
+      global_model_by_name: 0,
+      global_model_resolve: 0,
+    },
+    mappings: [
+      {
+        mapping_name: 'gpt-5.1',
+        global_model_name: 'gpt-5.1',
+        global_model_display_name: 'GPT-5.1',
+        providers: ['OpenClaudeCode', 'DuckCoding'],
+        ttl: 260,
+      },
+    ],
+    provider_model_mappings: [
+      {
+        provider_id: 'provider-002',
+        provider_name: 'OpenClaudeCode',
+        global_model_id: 'gm-006',
+        global_model_name: 'gpt-5.1',
+        global_model_display_name: 'GPT-5.1',
+        provider_model_name: 'gpt-5.1',
+        aliases: ['gpt5'],
+        ttl: 260,
+        hit_count: 42,
+      },
+    ],
+    unmapped: [],
+  }
+}
+
+const MOCK_REDIS_CACHE_CATEGORIES = {
+  available: true,
+  categories: [
+    {
+      key: 'model_mapping',
+      name: '模型映射',
+      pattern: 'model:*',
+      description: '模型解析与 Provider 映射缓存',
+      count: 3,
+    },
+    {
+      key: 'provider',
+      name: 'Provider',
+      pattern: 'provider:*',
+      description: 'Provider 摘要缓存',
+      count: 0,
+    },
+  ],
+  total_keys: 3,
+}
+
+function getMockPoolOverview() {
+  return {
+    items: MOCK_PROVIDERS.map(provider => ({
+      provider_id: provider.id,
+      provider_name: provider.name,
+      provider_type: provider.provider_type || 'custom',
+      total_keys: provider.total_keys,
+      active_keys: provider.active_keys,
+      cooldown_count: provider.unhealthy_endpoints,
+      pool_enabled: Boolean((provider.pool_advanced as Record<string, unknown> | null | undefined)?.enabled),
+    })),
+  }
+}
+
+const MOCK_POOL_SCHEDULING_PRESETS = [
+  {
+    name: 'account_status',
+    label: '账号状态',
+    description: '根据账号状态过滤可调度 Key',
+    providers: ['codex', 'claude_code'],
+    modes: [
+      { value: 'both', label: '全部' },
+      { value: 'free_only', label: 'Free' },
+      { value: 'team_only', label: 'Team' },
+    ],
+    default_mode: 'both',
+    mutex_group: 'account_status',
+    evidence_hint: '演示模式使用静态状态',
+  },
+  {
+    name: 'healthy_only',
+    label: '健康优先',
+    description: '优先选择健康分较高的 Key',
+    providers: ['custom', 'codex', 'claude_code'],
+    modes: null,
+    default_mode: null,
+    mutex_group: null,
+    evidence_hint: null,
+  },
+]
+
 /**
  * Mock API 路由处理器
  */
