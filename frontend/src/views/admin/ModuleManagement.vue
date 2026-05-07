@@ -145,7 +145,7 @@
           <div class="mt-5 pt-4 border-t border-border/50 flex items-center justify-between">
             <div class="flex items-center gap-3">
               <Switch
-                :model-value="module.enabled"
+                :model-value="Boolean(module.enabled)"
                 :disabled="!module.available || !module.config_validated || toggling[module.name]"
                 @update:model-value="(val: boolean) => toggleModule(module.name, val)"
               />

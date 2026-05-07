@@ -1605,7 +1605,102 @@ function buildMockLedgerItems() {
   }))
 }
 
-const MOCK_PAYMENT_ORDERS = [
+function buildMockRefundItems() {
+  const wallet = getMockAdminWallets().find(item => item.owner_type === 'user' && item.status === 'active')
+  if (!wallet) return []
+  const now = new Date().toISOString()
+  return [
+    {
+      id: 'refund-demo-1',
+      wallet_id: wallet.id,
+      owner_type: wallet.owner_type,
+      owner_name: wallet.owner_name,
+      owner_email: wallet.owner_email,
+      wallet_status: wallet.status,
+      refund_no: 'RF-DEMO-0001',
+      payment_order_id: 'pay-demo-1',
+      source_type: 'payment_order',
+      source_id: 'pay-demo-1',
+      refund_mode: 'manual',
+      amount_usd: 5,
+      status: 'pending_approval',
+      reason: '演示模式退款申请',
+      failure_reason: null,
+      gateway_refund_id: null,
+      payout_method: null,
+      payout_reference: null,
+      payout_proof: null,
+      created_at: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+      updated_at: now,
+      processed_at: null,
+      completed_at: null,
+    },
+  ]
+}
+
+interface MockPaymentOrder {
+  id: string
+  order_no: string
+  wallet_id: string
+  user_id: string | null
+  subscription_id?: string | null
+  amount_usd: number
+  pay_amount: number | null
+  pay_currency: string | null
+  exchange_rate: number | null
+  refunded_amount_usd: number
+  refundable_amount_usd: number
+  payment_method: string
+  order_type?: string | null
+  gateway_order_id: string | null
+  gateway_response: Record<string, unknown> | null
+  status: string
+  created_at: string
+  paid_at: string | null
+  credited_at: string | null
+  expires_at: string | null
+}
+
+interface MockSubscriptionOrder extends MockPaymentOrder {
+  username: string | null
+  email: string | null
+  subscription_status: string | null
+  product_id: string | null
+  product_name: string | null
+  plan_id: string | null
+  plan_name: string | null
+  variant_name: string | null
+  purchased_months: number | null
+  upgraded_from_subscription_id: string | null
+}
+
+interface MockRefundRequest {
+  id: string
+  refund_no: string
+  wallet_id?: string
+  owner_type?: string
+  owner_name?: string | null
+  owner_email?: string | null
+  wallet_status?: string
+  payment_order_id: string | null
+  source_type: string
+  source_id: string | null
+  refund_mode: string
+  amount_usd: number
+  status: string
+  reason: string | null
+  failure_reason: string | null
+  gateway_refund_id: string | null
+  payout_method: string | null
+  payout_reference: string | null
+  payout_proof: Record<string, unknown> | null
+  created_at: string
+  updated_at: string
+  processed_at: string | null
+  completed_at: string | null
+}
+
+const MOCK_PAYMENT_ORDERS: MockPaymentOrder[] = [
   {
     id: 'pay-demo-1',
     order_no: 'PAY-DEMO-0001',
@@ -1681,6 +1776,17 @@ const MOCK_SUBSCRIPTION_PRODUCTS = [
     is_active: true,
     active_subscription_count: 1,
     variant_count: 2,
+    available_model_names: [
+      'claude-haiku-4-5',
+      'claude-opus-4-5',
+      'claude-sonnet-4-5',
+      'gemini-3-pro-image-preview',
+      'gemini-3-pro-preview',
+      'gpt-5.1',
+      'gpt-5.1-codex',
+      'gpt-5.1-codex-max',
+      'gpt-5.1-codex-mini',
+    ],
     variants: [
       {
         id: 'sub-plan-team-basic',
@@ -1760,43 +1866,386 @@ const MOCK_USER_SUBSCRIPTIONS = [
   },
 ]
 
+const MOCK_SUBSCRIPTION_ORDERS: MockSubscriptionOrder[] = [
+  {
+    ...MOCK_PAYMENT_ORDERS[0],
+    id: 'sub-order-demo-1',
+    order_no: 'SUB-DEMO-0001',
+    subscription_id: 'sub-demo-user-2',
+    order_type: 'subscription_initial',
+    username: 'Demo User',
+    email: 'user@demo.aether.io',
+    subscription_status: 'active',
+    product_id: 'sub-prod-team',
+    product_name: '团队版',
+    plan_id: 'sub-plan-team-basic',
+    plan_name: '基础版',
+    variant_name: '基础版',
+    purchased_months: 1,
+    upgraded_from_subscription_id: null,
+  },
+  {
+    ...MOCK_PAYMENT_ORDERS[1],
+    id: 'sub-order-demo-2',
+    order_no: 'SUB-DEMO-0002',
+    wallet_id: 'wallet-demo-user-uuid-0002',
+    user_id: 'demo-user-uuid-0002',
+    subscription_id: 'sub-demo-pending-2',
+    order_type: 'subscription_upgrade',
+    username: 'Demo User',
+    email: 'user@demo.aether.io',
+    subscription_status: 'pending_payment',
+    product_id: 'sub-prod-team',
+    product_name: '团队版',
+    plan_id: 'sub-plan-team-pro',
+    plan_name: '专业版',
+    variant_name: '专业版',
+    purchased_months: 1,
+    upgraded_from_subscription_id: 'sub-demo-user-2',
+  },
+]
+
+const MOCK_USER_REFUNDS: MockRefundRequest[] = [
+  {
+    id: 'refund-demo-user-1',
+    refund_no: 'RF-DEMO-U-0001',
+    wallet_id: 'wallet-demo-user-uuid-0002',
+    payment_order_id: 'pay-demo-1',
+    source_type: 'payment_order',
+    source_id: 'pay-demo-1',
+    refund_mode: 'offline_payout',
+    amount_usd: 5,
+    status: 'pending_approval',
+    reason: '演示模式退款申请',
+    failure_reason: null,
+    gateway_refund_id: null,
+    payout_method: null,
+    payout_reference: null,
+    payout_proof: null,
+    created_at: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+    updated_at: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+    processed_at: null,
+    completed_at: null,
+  },
+]
+
 function getMockSubscriptionOrders() {
+  return [...MOCK_SUBSCRIPTION_ORDERS]
+}
+
+function getCurrentMockUserId() {
+  return getCurrentUser().id || 'demo-user-uuid-0002'
+}
+
+function getCurrentMockUserWallet() {
+  return getMockAdminWallets().find(wallet => wallet.user_id === getCurrentMockUserId()) ?? null
+}
+
+function getCurrentWalletSummary() {
+  const adminWallet = getCurrentMockUserWallet()
+  const profileBilling = getCurrentProfile().billing
+  const wallet = adminWallet ?? {
+    id: profileBilling.id,
+    balance: Number(profileBilling.balance ?? 0),
+    recharge_balance: Number(profileBilling.recharge_balance ?? 0),
+    gift_balance: Number(profileBilling.gift_balance ?? 0),
+    refundable_balance: Number(profileBilling.refundable_balance ?? 0),
+    currency: profileBilling.currency ?? 'USD',
+    status: profileBilling.status ?? 'active',
+    limit_mode: profileBilling.limit_mode ?? 'finite',
+    unlimited: Boolean(profileBilling.unlimited),
+    total_recharged: Number(profileBilling.total_recharged ?? 0),
+    total_consumed: Number(profileBilling.total_consumed ?? 0),
+    total_refunded: Number(profileBilling.total_refunded ?? 0),
+    total_adjusted: Number(profileBilling.total_adjusted ?? 0),
+    updated_at: profileBilling.updated_at ?? new Date().toISOString(),
+  }
+
+  return {
+    id: wallet.id,
+    balance: Number(wallet.balance ?? 0),
+    recharge_balance: Number(wallet.recharge_balance ?? 0),
+    gift_balance: Number(wallet.gift_balance ?? 0),
+    refundable_balance: Number(wallet.refundable_balance ?? 0),
+    currency: wallet.currency ?? 'USD',
+    status: wallet.status ?? 'active',
+    limit_mode: wallet.limit_mode === 'unlimited' ? 'unlimited' : 'finite',
+    unlimited: Boolean(wallet.unlimited),
+    total_recharged: Number(wallet.total_recharged ?? 0),
+    total_consumed: Number(wallet.total_consumed ?? 0),
+    total_refunded: Number(wallet.total_refunded ?? 0),
+    total_adjusted: Number(wallet.total_adjusted ?? 0),
+    updated_at: wallet.updated_at ?? new Date().toISOString(),
+  }
+}
+
+function buildMockWalletBalanceResponse() {
+  const wallet = getCurrentWalletSummary()
+  const pendingRefundCount = MOCK_USER_REFUNDS.filter(refund =>
+    refund.wallet_id === wallet.id && ['pending_approval', 'approved', 'processing'].includes(refund.status),
+  ).length
+  return {
+    wallet,
+    unlimited: wallet.unlimited,
+    limit_mode: wallet.limit_mode,
+    balance: wallet.balance,
+    recharge_balance: wallet.recharge_balance,
+    gift_balance: wallet.gift_balance,
+    refundable_balance: wallet.refundable_balance,
+    currency: wallet.currency,
+    pending_refund_count: pendingRefundCount,
+  }
+}
+
+function buildMockDailyUsageRecord(index = 0, isToday = false) {
+  const date = new Date(Date.now() - index * 24 * 3600 * 1000)
+  const inputTokens = 180_000 + index * 32_000
+  const outputTokens = 46_000 + index * 9_500
+  const totalCost = roundNumber(1.28 + index * 0.42, 4)
+  return {
+    id: isToday ? 'daily-demo-today' : `daily-demo-${index}`,
+    date: date.toISOString().slice(0, 10),
+    timezone: 'Asia/Shanghai',
+    total_cost: totalCost,
+    total_requests: 24 + index * 7,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_creation_tokens: 12_000 + index * 1_800,
+    cache_read_tokens: 38_000 + index * 4_500,
+    first_finalized_at: new Date(date.getTime() + 8 * 3600 * 1000).toISOString(),
+    last_finalized_at: new Date(date.getTime() + 18 * 3600 * 1000).toISOString(),
+    aggregated_at: new Date(date.getTime() + 23 * 3600 * 1000).toISOString(),
+    is_today: isToday,
+  }
+}
+
+function buildMockUserWalletTransactions() {
+  const wallet = getCurrentWalletSummary()
+  const now = Date.now()
   return [
     {
-      ...MOCK_PAYMENT_ORDERS[0],
-      id: 'sub-order-demo-1',
-      order_no: 'SUB-DEMO-0001',
-      subscription_id: 'sub-demo-user-2',
-      order_type: 'subscription_initial',
-      username: 'Demo User',
-      email: 'user@demo.aether.io',
-      subscription_status: 'active',
-      product_id: 'sub-prod-team',
-      product_name: '团队版',
-      plan_id: 'sub-plan-team-basic',
-      plan_name: '基础版',
-      variant_name: '基础版',
-      purchased_months: 1,
-      upgraded_from_subscription_id: null,
+      id: 'user-ledger-demo-1',
+      category: 'recharge',
+      reason_code: 'topup_gateway',
+      amount: 20,
+      balance_before: roundNumber(wallet.balance - 20, 4),
+      balance_after: wallet.balance,
+      recharge_balance_before: roundNumber(wallet.recharge_balance - 20, 4),
+      recharge_balance_after: wallet.recharge_balance,
+      gift_balance_before: wallet.gift_balance,
+      gift_balance_after: wallet.gift_balance,
+      link_type: 'payment_order',
+      link_id: 'pay-demo-1',
+      operator_id: null,
+      operator_name: null,
+      operator_email: null,
+      description: '演示模式充值入账',
+      created_at: new Date(now - 2.5 * 3600 * 1000).toISOString(),
     },
     {
-      ...MOCK_PAYMENT_ORDERS[1],
-      id: 'sub-order-demo-2',
-      order_no: 'SUB-DEMO-0002',
-      subscription_id: null,
-      order_type: 'subscription_initial',
-      username: 'Alice Wang',
-      email: 'alice@example.com',
-      subscription_status: 'pending_payment',
-      product_id: 'sub-prod-team',
-      product_name: '团队版',
-      plan_id: 'sub-plan-team-pro',
-      plan_name: '专业版',
-      variant_name: '专业版',
-      purchased_months: 1,
-      upgraded_from_subscription_id: null,
+      id: 'user-ledger-demo-2',
+      category: 'gift',
+      reason_code: 'gift_campaign',
+      amount: 8,
+      balance_before: roundNumber(wallet.balance - 28, 4),
+      balance_after: roundNumber(wallet.balance - 20, 4),
+      recharge_balance_before: roundNumber(wallet.recharge_balance - 20, 4),
+      recharge_balance_after: roundNumber(wallet.recharge_balance - 20, 4),
+      gift_balance_before: roundNumber(wallet.gift_balance - 8, 4),
+      gift_balance_after: wallet.gift_balance,
+      link_type: 'campaign',
+      link_id: 'campaign-demo-spring',
+      operator_id: MOCK_ADMIN_USER.id,
+      operator_name: MOCK_ADMIN_USER.username,
+      operator_email: MOCK_ADMIN_USER.email,
+      description: '演示模式活动赠款',
+      created_at: new Date(now - 1.5 * 24 * 3600 * 1000).toISOString(),
     },
   ]
+}
+
+function buildMockWalletFlowResponse(config: AxiosRequestConfig) {
+  const todayEntry = buildMockDailyUsageRecord(0, true)
+  const items = [
+    ...buildMockUserWalletTransactions().map(item => ({ type: 'transaction' as const, data: item })),
+    ...[1, 2, 3].map(index => ({ type: 'daily_usage' as const, data: buildMockDailyUsageRecord(index) })),
+  ].sort((left, right) => {
+    const leftTime = left.type === 'transaction'
+      ? new Date(left.data.created_at).getTime()
+      : new Date(`${left.data.date}T00:00:00Z`).getTime()
+    const rightTime = right.type === 'transaction'
+      ? new Date(right.data.created_at).getTime()
+      : new Date(`${right.data.date}T00:00:00Z`).getTime()
+    return rightTime - leftTime
+  })
+
+  return {
+    ...buildMockWalletBalanceResponse(),
+    today_entry: todayEntry,
+    ...paginateMockItems(items, config, { limit: 50, offset: 0 }),
+  }
+}
+
+function buildMockPaymentInstructions(order: MockPaymentOrder | MockSubscriptionOrder) {
+  const gatewayResponse = order.gateway_response && typeof order.gateway_response === 'object'
+    ? order.gateway_response
+    : {}
+  return gatewayResponse
+}
+
+function createMockPaymentOrder(
+  payload: { amount_usd?: number; payment_method?: string },
+  orderType: string,
+  extra: Partial<MockPaymentOrder> = {},
+): MockPaymentOrder {
+  const now = new Date().toISOString()
+  const amount = Number(payload.amount_usd || 0)
+  const paymentMethod = payload.payment_method || 'alipay'
+  const orderNoPrefix = orderType === 'topup' ? 'PAY-DEMO' : 'SUB-DEMO'
+  const idPrefix = orderType === 'topup' ? 'pay-demo' : 'sub-order-demo'
+  const status = paymentMethod === 'manual_review' ? 'pending_approval' : 'pending'
+  return {
+    id: `${idPrefix}-${Date.now()}`,
+    order_no: `${orderNoPrefix}-${Date.now()}`,
+    wallet_id: getCurrentWalletSummary().id,
+    user_id: getCurrentMockUserId(),
+    subscription_id: null,
+    amount_usd: roundNumber(amount, 4),
+    pay_amount: paymentMethod === 'manual_review' ? null : roundNumber(amount, 4),
+    pay_currency: paymentMethod === 'manual_review' ? null : 'USD',
+    exchange_rate: paymentMethod === 'manual_review' ? null : 1,
+    refunded_amount_usd: 0,
+    refundable_amount_usd: 0,
+    payment_method: paymentMethod,
+    order_type: orderType,
+    gateway_order_id: paymentMethod === 'manual_review' ? null : `gw-demo-${Date.now()}`,
+    gateway_response: {
+      demo_mode: true,
+      gateway: paymentMethod,
+      display_name: paymentMethod === 'wechat' ? '微信支付' : paymentMethod === 'alipay' ? '支付宝' : '人工充值',
+      payment_url: paymentMethod === 'manual_review' ? undefined : `https://demo.aether.local/pay/${Date.now()}`,
+      expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+      instructions: paymentMethod === 'manual_review' ? '演示模式人工审核订单' : '演示模式支付链接',
+    },
+    status,
+    created_at: now,
+    paid_at: null,
+    credited_at: null,
+    expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    ...extra,
+  }
+}
+
+function findMockSubscriptionPlan(planId: string | null | undefined) {
+  if (!planId) return null
+  for (const product of MOCK_SUBSCRIPTION_PRODUCTS) {
+    const variant = product.variants.find(item => item.id === planId)
+    if (variant) return { product, variant }
+  }
+  return null
+}
+
+function getMockDiscountFactor(variant: { term_discounts_json: { months: number; discount_factor: number }[] }, months: number) {
+  return [...variant.term_discounts_json]
+    .sort((a, b) => a.months - b.months)
+    .reduce((factor, item) => (item.months <= months ? item.discount_factor : factor), 1)
+}
+
+function buildMockPendingSubscription(planId: string, purchasedMonths: number, upgradedFromSubscriptionId: string | null = null) {
+  const plan = findMockSubscriptionPlan(planId)
+  if (!plan) return null
+  const now = new Date()
+  const months = Math.max(1, Number(purchasedMonths || 1))
+  const discountFactor = getMockDiscountFactor(plan.variant, months)
+  const totalPrice = roundNumber(plan.variant.monthly_price_usd * months * discountFactor, 4)
+  return {
+    ...MOCK_USER_SUBSCRIPTIONS[0],
+    id: `sub-demo-pending-${Date.now()}`,
+    user_id: getCurrentMockUserId(),
+    username: getCurrentUser().username,
+    email: getCurrentUser().email,
+    product_id: plan.product.id,
+    product_code: plan.product.code,
+    product_name: plan.product.name,
+    plan_id: plan.variant.id,
+    plan_code: plan.variant.code,
+    plan_name: plan.variant.name,
+    variant_id: plan.variant.id,
+    variant_code: plan.variant.code,
+    variant_name: plan.variant.name,
+    variant_rank: plan.variant.variant_rank,
+    user_group_id: plan.product.user_group_id,
+    user_group_name: plan.product.user_group_name,
+    status: 'pending_payment',
+    purchased_months: months,
+    discount_factor: discountFactor,
+    monthly_price_usd_snapshot: plan.variant.monthly_price_usd,
+    total_price_usd: totalPrice,
+    started_at: now.toISOString(),
+    ends_at: new Date(now.getTime() + months * 30 * 24 * 3600 * 1000).toISOString(),
+    current_cycle_start: now.toISOString(),
+    current_cycle_end: new Date(now.getTime() + 30 * 24 * 3600 * 1000).toISOString(),
+    cycle_quota_usd: plan.variant.monthly_quota_usd,
+    cycle_used_usd: 0,
+    remaining_quota_usd: plan.variant.monthly_quota_usd,
+    upgraded_from_subscription_id: upgradedFromSubscriptionId,
+    created_at: now.toISOString(),
+    updated_at: now.toISOString(),
+  }
+}
+
+function createMockSubscriptionCheckout(
+  payload: { plan_id?: string; new_plan_id?: string; purchased_months?: number; payment_method?: string },
+  mode: 'purchase' | 'upgrade',
+  currentSubscriptionId: string | null = null,
+) {
+  const planId = payload.plan_id || payload.new_plan_id
+  const months = Math.max(1, Number(payload.purchased_months || 1))
+  const subscription = buildMockPendingSubscription(
+    planId || '',
+    months,
+    mode === 'upgrade' ? currentSubscriptionId : null,
+  )
+  if (!subscription) {
+    throw { response: createMockResponse({ detail: '订阅计划不存在' }, 404) }
+  }
+
+  const currentSubscription = currentSubscriptionId
+    ? MOCK_USER_SUBSCRIPTIONS.find(item => item.id === currentSubscriptionId)
+    : null
+  const orderType = mode === 'upgrade'
+    ? currentSubscription?.plan_id === subscription.plan_id
+      ? 'subscription_renewal'
+      : 'subscription_upgrade'
+    : 'subscription_initial'
+  const order = createMockPaymentOrder(
+    {
+      amount_usd: subscription.total_price_usd,
+      payment_method: payload.payment_method,
+    },
+    orderType,
+    { subscription_id: subscription.id },
+  ) as MockSubscriptionOrder
+  Object.assign(order, {
+    username: subscription.username,
+    email: subscription.email,
+    subscription_status: subscription.status,
+    product_id: subscription.product_id,
+    product_name: subscription.product_name,
+    plan_id: subscription.plan_id,
+    plan_name: subscription.plan_name,
+    variant_name: subscription.variant_name,
+    purchased_months: subscription.purchased_months,
+    upgraded_from_subscription_id: subscription.upgraded_from_subscription_id,
+  })
+  MOCK_SUBSCRIPTION_ORDERS.unshift(order)
+
+  return {
+    subscription,
+    payable_amount_usd: subscription.total_price_usd,
+    order,
+    payment_instructions: buildMockPaymentInstructions(order),
+  }
 }
 
 const MOCK_ASYNC_TASKS = [
@@ -2381,6 +2830,146 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse({ message: '已更新', model_capability_settings: {} })
   },
 
+  // ========== User: Wallet ==========
+  'GET /api/wallet/balance': async () => {
+    await delay()
+    return createMockResponse(buildMockWalletBalanceResponse())
+  },
+
+  'GET /api/wallet/transactions': async (config) => {
+    await delay()
+    return createMockResponse({
+      ...buildMockWalletBalanceResponse(),
+      ...paginateMockItems(buildMockUserWalletTransactions(), config, { limit: 50, offset: 0 }),
+    })
+  },
+
+  'GET /api/wallet/flow': async (config) => {
+    await delay()
+    return createMockResponse(buildMockWalletFlowResponse(config))
+  },
+
+  'GET /api/wallet/today-cost': async () => {
+    await delay(50)
+    return createMockResponse(buildMockDailyUsageRecord(0, true))
+  },
+
+  'GET /api/wallet/recharge': async (config) => {
+    await delay()
+    const orders = MOCK_PAYMENT_ORDERS
+      .filter(order => order.user_id === getCurrentMockUserId() && order.order_type === 'topup')
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+    return createMockResponse(paginateMockItems(orders, config, { limit: 50, offset: 0 }))
+  },
+
+  'POST /api/wallet/recharge': async (config) => {
+    await delay()
+    const body = parseMockBody<{ amount_usd?: number; payment_method?: string }>(config, {})
+    const order = createMockPaymentOrder(body, 'topup')
+    MOCK_PAYMENT_ORDERS.unshift(order)
+    return createMockResponse({
+      order,
+      payment_instructions: buildMockPaymentInstructions(order),
+    })
+  },
+
+  'GET /api/wallet/refunds': async (config) => {
+    await delay()
+    const currentWalletId = getCurrentWalletSummary().id
+    const refunds = [...MOCK_USER_REFUNDS]
+      .filter(refund => refund.wallet_id === currentWalletId)
+      .sort((left, right) =>
+        new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
+      )
+    return createMockResponse(paginateMockItems(refunds, config, { limit: 50, offset: 0 }))
+  },
+
+  'POST /api/wallet/refunds': async (config) => {
+    await delay()
+    const body = parseMockBody<{
+      amount_usd?: number
+      payment_order_id?: string
+      source_type?: string
+      source_id?: string
+      refund_mode?: string
+      reason?: string
+    }>(config, {})
+    const now = new Date().toISOString()
+    const paymentOrder = body.payment_order_id
+      ? MOCK_PAYMENT_ORDERS.find(order => order.id === body.payment_order_id)
+      : null
+    const refund: MockRefundRequest = {
+      id: `refund-demo-${Date.now()}`,
+      refund_no: `RF-DEMO-${Date.now()}`,
+      wallet_id: getCurrentWalletSummary().id,
+      payment_order_id: paymentOrder?.id ?? body.payment_order_id ?? null,
+      source_type: paymentOrder ? 'payment_order' : body.source_type || 'wallet_balance',
+      source_id: paymentOrder?.id ?? body.source_id ?? null,
+      refund_mode: body.refund_mode || (paymentOrder ? 'offline_payout' : 'offline_payout'),
+      amount_usd: roundNumber(Number(body.amount_usd || 0), 4),
+      status: 'pending_approval',
+      reason: body.reason || null,
+      failure_reason: null,
+      gateway_refund_id: null,
+      payout_method: null,
+      payout_reference: null,
+      payout_proof: null,
+      created_at: now,
+      updated_at: now,
+      processed_at: null,
+      completed_at: null,
+    }
+    MOCK_USER_REFUNDS.unshift(refund)
+    return createMockResponse(refund)
+  },
+
+  // ========== User: Subscriptions ==========
+  'GET /api/subscriptions/dashboard': async () => {
+    await delay()
+    const currentSubscription = MOCK_USER_SUBSCRIPTIONS.find(subscription =>
+      subscription.user_id === getCurrentMockUserId() && subscription.status === 'active',
+    ) ?? null
+    return createMockResponse({ current_subscription: currentSubscription })
+  },
+
+  'GET /api/subscriptions/plans': async () => {
+    await delay()
+    const plans = MOCK_SUBSCRIPTION_PRODUCTS.flatMap(product =>
+      product.variants.map(variant => ({
+        ...variant,
+        plan_level: product.plan_level,
+        overage_policy: product.overage_policy,
+      })),
+    )
+    return createMockResponse({ plans, total: plans.length })
+  },
+
+  'GET /api/subscriptions/products': async () => {
+    await delay()
+    return createMockResponse({
+      products: MOCK_SUBSCRIPTION_PRODUCTS,
+      total: MOCK_SUBSCRIPTION_PRODUCTS.length,
+    })
+  },
+
+  'GET /api/subscriptions/orders': async (config) => {
+    await delay()
+    const orders = getMockSubscriptionOrders()
+      .filter(order => order.user_id === getCurrentMockUserId())
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+    return createMockResponse(paginateMockItems(orders, config, { limit: 50, offset: 0 }))
+  },
+
+  'POST /api/subscriptions/purchase': async (config) => {
+    await delay()
+    const body = parseMockBody<{
+      plan_id?: string
+      purchased_months?: number
+      payment_method?: string
+    }>(config, {})
+    return createMockResponse(createMockSubscriptionCheckout(body, 'purchase'))
+  },
+
   // ========== 公告 ==========
   'GET /api/announcements': async () => {
     await delay()
@@ -2603,10 +3192,42 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   },
 
   // ========== Admin: Providers ==========
-  'GET /api/admin/providers/summary': async () => {
+  'GET /api/admin/providers/summary': async (config) => {
     await delay()
     requireAdmin()
-    return createMockResponse(MOCK_PROVIDERS)
+    const params = getMockSearchParams(config)
+    const page = Math.max(1, getMockNumberParam(params, 'page', 1))
+    const pageSize = Math.max(1, getMockNumberParam(params, 'page_size', 20))
+    const search = (params.get('search') || '').trim().toLowerCase()
+    const status = params.get('status')
+    const apiFormat = params.get('api_format')
+    const modelId = params.get('model_id')
+
+    let items = MOCK_PROVIDERS
+    if (search) {
+      items = items.filter(provider =>
+        `${provider.name} ${provider.description || ''} ${provider.website || ''}`.toLowerCase().includes(search),
+      )
+    }
+    if (status === 'active') {
+      items = items.filter(provider => provider.is_active)
+    } else if (status === 'inactive') {
+      items = items.filter(provider => !provider.is_active)
+    }
+    if (apiFormat && apiFormat !== 'all') {
+      items = items.filter(provider => (provider.api_formats || []).includes(apiFormat))
+    }
+    if (modelId && modelId !== 'all') {
+      items = items.filter(provider => (provider.global_model_ids || []).includes(modelId))
+    }
+
+    const start = (page - 1) * pageSize
+    return createMockResponse({
+      total: items.length,
+      page,
+      page_size: pageSize,
+      items: items.slice(start, start + pageSize),
+    })
   },
 
   'GET /api/admin/providers': async () => {
@@ -2620,6 +3241,21 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     requireAdmin()
     const body = JSON.parse(config.data || '{}')
     return createMockResponse({ ...body, id: `provider-demo-${Date.now()}`, created_at: new Date().toISOString() })
+  },
+
+  'GET /api/admin/provider-ops/architectures': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(MOCK_ARCHITECTURES)
+  },
+
+  'POST /api/admin/provider-ops/batch/balance': async (config) => {
+    await delay()
+    requireAdmin()
+    const providerIds = parseMockBody<string[] | undefined>(config, undefined) || MOCK_PROVIDERS.map(provider => provider.id)
+    return createMockResponse(Object.fromEntries(
+      providerIds.map(providerId => [providerId, buildMockProviderBalance(providerId)]),
+    ))
   },
 
   // ========== Admin: Endpoints ==========
@@ -3121,6 +3757,251 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse(generateCacheHitAnalysisData(hours))
   },
 
+  // ========== Admin: Modules ==========
+  'GET /api/admin/modules/status': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(MOCK_MODULE_STATUS)
+  },
+
+  // ========== Admin: Wallets ==========
+  'GET /api/admin/wallets': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    const wallets = getMockAdminWallets(params.get('status'))
+    return createMockResponse(paginateMockItems(wallets, config, { limit: 50, offset: 0 }))
+  },
+
+  'GET /api/admin/wallets/ledger': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    let items = buildMockLedgerItems()
+    const category = params.get('category')
+    const reasonCode = params.get('reason_code')
+    const ownerType = params.get('owner_type')
+    if (category) items = items.filter(item => item.category === category)
+    if (reasonCode) items = items.filter(item => item.reason_code === reasonCode)
+    if (ownerType) items = items.filter(item => item.owner_type === ownerType)
+    return createMockResponse(paginateMockItems(items, config, { limit: 50, offset: 0 }))
+  },
+
+  'GET /api/admin/wallets/refund-requests': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    let items = buildMockRefundItems()
+    const status = params.get('status')
+    const ownerType = params.get('owner_type')
+    if (status) items = items.filter(item => item.status === status)
+    if (ownerType) items = items.filter(item => item.owner_type === ownerType)
+    return createMockResponse(paginateMockItems(items, config, { limit: 50, offset: 0 }))
+  },
+
+  // ========== Admin: Payments ==========
+  'GET /api/admin/payments/orders': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    let items = MOCK_PAYMENT_ORDERS
+    const status = params.get('status')
+    const paymentMethod = params.get('payment_method')
+    if (status) items = items.filter(item => item.status === status)
+    if (paymentMethod) items = items.filter(item => item.payment_method === paymentMethod)
+    return createMockResponse(paginateMockItems(items, config, { limit: 50, offset: 0 }))
+  },
+
+  'GET /api/admin/payments/callbacks': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    const paymentMethod = params.get('payment_method')
+    const items = paymentMethod
+      ? MOCK_PAYMENT_CALLBACKS.filter(item => item.payment_method === paymentMethod)
+      : MOCK_PAYMENT_CALLBACKS
+    return createMockResponse(paginateMockItems(items, config, { limit: 50, offset: 0 }))
+  },
+
+  // ========== Admin: Subscriptions ==========
+  'GET /api/admin/subscriptions/products': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({
+      products: MOCK_SUBSCRIPTION_PRODUCTS,
+      total: MOCK_SUBSCRIPTION_PRODUCTS.length,
+    })
+  },
+
+  'GET /api/admin/subscriptions': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    let subscriptions = MOCK_USER_SUBSCRIPTIONS
+    const status = params.get('status')
+    const userId = params.get('user_id')
+    const planId = params.get('plan_id')
+    const productId = params.get('product_id')
+    if (status) subscriptions = subscriptions.filter(item => item.status === status)
+    if (userId) subscriptions = subscriptions.filter(item => item.user_id === userId)
+    if (planId) subscriptions = subscriptions.filter(item => item.plan_id === planId)
+    if (productId) subscriptions = subscriptions.filter(item => item.product_id === productId)
+    return createMockResponse({ subscriptions, total: subscriptions.length })
+  },
+
+  'GET /api/admin/subscriptions/orders': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    let orders = getMockSubscriptionOrders()
+    const status = params.get('status')
+    const paymentMethod = params.get('payment_method')
+    const userId = params.get('user_id')
+    if (status) orders = orders.filter(order => order.status === status)
+    if (paymentMethod) orders = orders.filter(order => order.payment_method === paymentMethod)
+    if (userId) orders = orders.filter(order => order.user_id === userId)
+    return createMockResponse({ orders, total: orders.length })
+  },
+
+  'GET /api/admin/subscriptions/callbacks': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    const paymentMethod = params.get('payment_method')
+    const items = paymentMethod
+      ? MOCK_PAYMENT_CALLBACKS.filter(item => item.payment_method === paymentMethod)
+      : MOCK_PAYMENT_CALLBACKS
+    return createMockResponse(paginateMockItems(items, config, { limit: 50, offset: 0 }))
+  },
+
+  // ========== Admin: Async Tasks ==========
+  'GET /api/admin/video-tasks': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    const page = Math.max(1, getMockNumberParam(params, 'page', 1))
+    const pageSize = Math.max(1, getMockNumberParam(params, 'page_size', 20))
+    const status = params.get('status')
+    const model = (params.get('model') || '').trim().toLowerCase()
+    let items = MOCK_ASYNC_TASKS
+    if (status) items = items.filter(task => task.status === status)
+    if (model) items = items.filter(task => String(task.model).toLowerCase().includes(model))
+    const start = (page - 1) * pageSize
+    return createMockResponse({
+      items: items.slice(start, start + pageSize),
+      total: items.length,
+      page,
+      page_size: pageSize,
+      pages: Math.max(1, Math.ceil(items.length / pageSize)),
+    })
+  },
+
+  'GET /api/admin/video-tasks/stats': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({
+      total: MOCK_ASYNC_TASKS.length,
+      by_status: MOCK_ASYNC_TASKS.reduce<Record<string, number>>((acc, task) => {
+        acc[task.status] = (acc[task.status] || 0) + 1
+        return acc
+      }, {
+        pending: 0,
+        submitted: 0,
+        queued: 0,
+        processing: 0,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+      }),
+      by_model: MOCK_ASYNC_TASKS.reduce<Record<string, number>>((acc, task) => {
+        acc[task.model] = (acc[task.model] || 0) + 1
+        return acc
+      }, {}),
+      today_count: MOCK_ASYNC_TASKS.length,
+      active_users: new Set(MOCK_ASYNC_TASKS.map(task => task.user_id)).size,
+      processing_count: MOCK_ASYNC_TASKS.filter(task => task.status === 'processing').length,
+    })
+  },
+
+  // ========== Admin: Cache Monitoring ==========
+  'GET /api/admin/monitoring/cache/stats': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({ status: 'ok', data: getMockCacheStats() })
+  },
+
+  'GET /api/admin/monitoring/cache/config': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({ status: 'ok', data: getMockCacheConfig() })
+  },
+
+  'GET /api/admin/monitoring/cache/affinities': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    const keyword = (params.get('keyword') || '').trim().toLowerCase()
+    const items = keyword
+      ? MOCK_CACHE_AFFINITIES.filter(item =>
+        Object.values(item).some(value => String(value ?? '').toLowerCase().includes(keyword)),
+      )
+      : MOCK_CACHE_AFFINITIES
+    const page = paginateMockItems(items, config, { limit: 100, offset: 0 })
+    return createMockResponse({
+      status: 'ok',
+      data: {
+        ...page,
+        meta: {
+          count: page.total,
+          limit: page.limit,
+          offset: page.offset,
+        },
+        matched_user_id: null,
+      },
+    })
+  },
+
+  'GET /api/admin/monitoring/cache/redis-keys': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({ status: 'ok', data: MOCK_REDIS_CACHE_CATEGORIES })
+  },
+
+  'GET /api/admin/monitoring/cache/model-mapping/stats': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({ status: 'ok', data: getMockModelMappingStats() })
+  },
+
+  // ========== Admin: Pool / Proxy ==========
+  'GET /api/admin/pool/overview': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(getMockPoolOverview())
+  },
+
+  'GET /api/admin/pool/scheduling-presets': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(MOCK_POOL_SCHEDULING_PRESETS)
+  },
+
+  'GET /api/admin/proxy-nodes': async (config) => {
+    await delay()
+    requireAdmin()
+    const params = getMockSearchParams(config)
+    const status = params.get('status')
+    const skip = Math.max(0, getMockNumberParam(params, 'skip', 0))
+    const limit = Math.max(1, getMockNumberParam(params, 'limit', 100))
+    const items = status ? MOCK_PROXY_NODES.filter(node => node.status === status) : MOCK_PROXY_NODES
+    return createMockResponse({
+      items: items.slice(skip, skip + limit),
+      total: items.length,
+      skip,
+      limit,
+    })
+  },
+
   // ========== Admin: System ==========
   'GET /api/admin/system/configs': async () => {
     await delay()
@@ -3131,6 +4012,26 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   'GET /api/admin/system/api-formats': async () => {
     await delay()
     return createMockResponse(MOCK_API_FORMATS)
+  },
+
+  'GET /api/admin/system/version': async () => {
+    await delay(50)
+    requireAdmin()
+    return createMockResponse({ version: 'demo-mode' })
+  },
+
+  'GET /api/admin/system/check-update': async () => {
+    await delay(50)
+    requireAdmin()
+    return createMockResponse({
+      current_version: 'demo-mode',
+      latest_version: null,
+      has_update: false,
+      release_url: null,
+      release_notes: null,
+      published_at: null,
+      error: null,
+    })
   },
 
   'GET /api/admin/system/stats': async () => {
@@ -3555,6 +4456,680 @@ function generateMockModelsForProvider(providerId: string) {
 }
 
 // ========== 注册动态路由 ==========
+
+registerDynamicRoute('GET', '/api/wallet/recharge/:orderId', async (_config, params) => {
+  await delay()
+  const order = MOCK_PAYMENT_ORDERS.find(item =>
+    item.user_id === getCurrentMockUserId() &&
+    item.order_type === 'topup' &&
+    (item.id === params.orderId || item.order_no === params.orderId),
+  )
+  if (!order) {
+    throw { response: createMockResponse({ detail: '充值订单不存在' }, 404) }
+  }
+  return createMockResponse({ order })
+})
+
+registerDynamicRoute('POST', '/api/wallet/recharge/:orderId/cancel', async (_config, params) => {
+  await delay()
+  const order = MOCK_PAYMENT_ORDERS.find(item =>
+    item.user_id === getCurrentMockUserId() &&
+    item.order_type === 'topup' &&
+    item.id === params.orderId,
+  )
+  if (!order) {
+    throw { response: createMockResponse({ detail: '充值订单不存在' }, 404) }
+  }
+  if (!['pending', 'pending_approval'].includes(order.status)) {
+    throw { response: createMockResponse({ detail: '仅待支付充值订单支持取消' }, 400) }
+  }
+  order.status = 'expired'
+  order.expires_at = new Date().toISOString()
+  return createMockResponse({ order })
+})
+
+registerDynamicRoute('GET', '/api/wallet/refunds/:refundId', async (_config, params) => {
+  await delay()
+  const currentWalletId = getCurrentWalletSummary().id
+  const refund = MOCK_USER_REFUNDS.find(item =>
+    item.id === params.refundId && item.wallet_id === currentWalletId,
+  )
+  if (!refund) {
+    throw { response: createMockResponse({ detail: '退款申请不存在' }, 404) }
+  }
+  return createMockResponse(refund)
+})
+
+registerDynamicRoute('POST', '/api/subscriptions/orders/:orderId/cancel', async (_config, params) => {
+  await delay()
+  const order = MOCK_SUBSCRIPTION_ORDERS.find(item =>
+    item.user_id === getCurrentMockUserId() && item.id === params.orderId,
+  )
+  if (!order) {
+    throw { response: createMockResponse({ detail: '订阅订单不存在' }, 404) }
+  }
+  if (!['pending', 'pending_approval'].includes(order.status)) {
+    throw { response: createMockResponse({ detail: '仅待支付订阅订单支持取消' }, 400) }
+  }
+  order.status = 'expired'
+  order.expires_at = new Date().toISOString()
+  return createMockResponse({ order })
+})
+
+registerDynamicRoute('POST', '/api/subscriptions/:subscriptionId/upgrade', async (config, params) => {
+  await delay()
+  const currentSubscription = MOCK_USER_SUBSCRIPTIONS.find(subscription =>
+    subscription.id === params.subscriptionId &&
+    subscription.user_id === getCurrentMockUserId(),
+  )
+  if (!currentSubscription) {
+    throw { response: createMockResponse({ detail: '用户订阅不存在' }, 404) }
+  }
+  const body = parseMockBody<{
+    new_plan_id?: string
+    purchased_months?: number
+    payment_method?: string
+  }>(config, {})
+  return createMockResponse(createMockSubscriptionCheckout(body, 'upgrade', currentSubscription.id))
+})
+
+registerDynamicRoute('GET', '/api/admin/modules/status/:moduleName', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const moduleStatus = MOCK_MODULE_STATUS[params.moduleName]
+  if (!moduleStatus) {
+    throw { response: createMockResponse({ detail: '模块不存在' }, 404) }
+  }
+  return createMockResponse(moduleStatus)
+})
+
+registerDynamicRoute('PUT', '/api/admin/modules/status/:moduleName/enabled', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const moduleStatus = MOCK_MODULE_STATUS[params.moduleName]
+  if (!moduleStatus) {
+    throw { response: createMockResponse({ detail: '模块不存在' }, 404) }
+  }
+  const body = parseMockBody<{ enabled?: boolean }>(config, {})
+  moduleStatus.enabled = Boolean(body.enabled)
+  moduleStatus.active = Boolean(moduleStatus.available && moduleStatus.config_validated && moduleStatus.enabled)
+  moduleStatus.health = moduleStatus.active ? 'healthy' : 'unknown'
+  return createMockResponse(moduleStatus)
+})
+
+registerDynamicRoute('GET', '/api/admin/wallets/:walletId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const wallet = getMockWalletById(params.walletId)
+  if (!wallet) {
+    throw { response: createMockResponse({ detail: '钱包不存在' }, 404) }
+  }
+  return createMockResponse({ ...wallet, pending_refund_count: buildMockRefundItems().filter(item => item.wallet_id === wallet.id).length })
+})
+
+registerDynamicRoute('GET', '/api/admin/wallets/:walletId/transactions', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const wallet = getMockWalletById(params.walletId)
+  if (!wallet) {
+    throw { response: createMockResponse({ detail: '钱包不存在' }, 404) }
+  }
+  const items = buildMockLedgerItems().filter(item => item.wallet_id === wallet.id)
+  return createMockResponse({
+    wallet,
+    ...paginateMockItems(items, config, { limit: 50, offset: 0 }),
+  })
+})
+
+registerDynamicRoute('GET', '/api/admin/wallets/:walletId/refunds', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const wallet = getMockWalletById(params.walletId)
+  if (!wallet) {
+    throw { response: createMockResponse({ detail: '钱包不存在' }, 404) }
+  }
+  const items = buildMockRefundItems().filter(item => item.wallet_id === wallet.id)
+  return createMockResponse({
+    wallet,
+    ...paginateMockItems(items, config, { limit: 50, offset: 0 }),
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/wallets/:walletId/recharge', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const wallet = getMockWalletById(params.walletId)
+  if (!wallet) {
+    throw { response: createMockResponse({ detail: '钱包不存在' }, 404) }
+  }
+  const body = parseMockBody<{ amount_usd?: number; payment_method?: string }>(config, {})
+  const amount = Number(body.amount_usd || 0)
+  const updatedWallet = {
+    ...wallet,
+    balance: Number((wallet.balance + amount).toFixed(4)),
+    recharge_balance: Number((wallet.recharge_balance + amount).toFixed(4)),
+    refundable_balance: Number((wallet.refundable_balance + amount).toFixed(4)),
+    total_recharged: Number((wallet.total_recharged + amount).toFixed(4)),
+    updated_at: new Date().toISOString(),
+  }
+  return createMockResponse({
+    wallet: updatedWallet,
+    payment_order: {
+      id: `pay-demo-${Date.now()}`,
+      order_no: `PAY-DEMO-${Date.now()}`,
+      amount_usd: amount,
+      payment_method: body.payment_method || 'admin_manual',
+      status: 'paid',
+      created_at: new Date().toISOString(),
+      credited_at: new Date().toISOString(),
+    },
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/wallets/:walletId/adjust', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const wallet = getMockWalletById(params.walletId)
+  if (!wallet) {
+    throw { response: createMockResponse({ detail: '钱包不存在' }, 404) }
+  }
+  const body = parseMockBody<{ amount_usd?: number }>(config, {})
+  const amount = Number(body.amount_usd || 0)
+  const balanceAfter = Number((wallet.balance + amount).toFixed(4))
+  return createMockResponse({
+    wallet: {
+      ...wallet,
+      balance: balanceAfter,
+      updated_at: new Date().toISOString(),
+    },
+    transaction: {
+      id: `ledger-demo-${Date.now()}`,
+      wallet_id: wallet.id,
+      owner_type: wallet.owner_type,
+      owner_name: wallet.owner_name,
+      owner_email: wallet.owner_email,
+      wallet_status: wallet.status,
+      category: 'adjust',
+      reason_code: 'admin_adjust',
+      amount,
+      balance_before: wallet.balance,
+      balance_after: balanceAfter,
+      recharge_balance_before: wallet.recharge_balance,
+      recharge_balance_after: wallet.recharge_balance,
+      gift_balance_before: wallet.gift_balance,
+      gift_balance_after: wallet.gift_balance,
+      description: '演示模式调账',
+      created_at: new Date().toISOString(),
+    },
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/wallets/:walletId/refunds/:refundId/process', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const wallet = getMockWalletById(params.walletId)
+  const refund = buildMockRefundItems().find(item => item.id === params.refundId)
+  if (!wallet || !refund) {
+    throw { response: createMockResponse({ detail: '退款申请不存在' }, 404) }
+  }
+  const updatedRefund = { ...refund, status: 'processing', processed_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+  return createMockResponse({
+    wallet,
+    refund: updatedRefund,
+    transaction: buildMockLedgerItems()[0],
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/wallets/:walletId/refunds/:refundId/fail', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const wallet = getMockWalletById(params.walletId)
+  const refund = buildMockRefundItems().find(item => item.id === params.refundId)
+  if (!wallet || !refund) {
+    throw { response: createMockResponse({ detail: '退款申请不存在' }, 404) }
+  }
+  const body = parseMockBody<{ reason?: string }>(config, {})
+  return createMockResponse({
+    wallet,
+    refund: { ...refund, status: 'failed', failure_reason: body.reason || '演示模式驳回', updated_at: new Date().toISOString() },
+    transaction: null,
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/wallets/:walletId/refunds/:refundId/complete', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const refund = buildMockRefundItems().find(item => item.id === params.refundId)
+  if (!refund) {
+    throw { response: createMockResponse({ detail: '退款申请不存在' }, 404) }
+  }
+  const body = parseMockBody<Record<string, unknown>>(config, {})
+  return createMockResponse({
+    refund: {
+      ...refund,
+      status: 'completed',
+      gateway_refund_id: body.gateway_refund_id ? String(body.gateway_refund_id) : null,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    },
+  })
+})
+
+registerDynamicRoute('GET', '/api/admin/payments/orders/:orderId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const order = MOCK_PAYMENT_ORDERS.find(item => item.id === params.orderId || item.order_no === params.orderId)
+  if (!order) {
+    throw { response: createMockResponse({ detail: '订单不存在' }, 404) }
+  }
+  return createMockResponse({ order })
+})
+
+for (const action of ['expire', 'fail', 'credit', 'approve', 'reject']) {
+  registerDynamicRoute('POST', `/api/admin/payments/orders/:orderId/${action}`, async (_config, params) => {
+    await delay()
+    requireAdmin()
+    const order = MOCK_PAYMENT_ORDERS.find(item => item.id === params.orderId)
+    if (!order) {
+      throw { response: createMockResponse({ detail: '订单不存在' }, 404) }
+    }
+    const nextStatus = action === 'reject' || action === 'fail'
+      ? 'failed'
+      : action === 'expire'
+        ? 'expired'
+        : 'paid'
+    return createMockResponse({
+      order: {
+        ...order,
+        status: nextStatus,
+        paid_at: nextStatus === 'paid' ? new Date().toISOString() : order.paid_at,
+        credited_at: nextStatus === 'paid' ? new Date().toISOString() : order.credited_at,
+      },
+      credited: action === 'credit',
+      expired: action === 'expire',
+    })
+  })
+}
+
+registerDynamicRoute('GET', '/api/admin/subscriptions/users/:userId/current', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse(MOCK_USER_SUBSCRIPTIONS.find(item => item.user_id === params.userId) ?? null)
+})
+
+registerDynamicRoute('POST', '/api/admin/subscriptions/users/:userId', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const body = parseMockBody<{ plan_id?: string; purchased_months?: number }>(config, {})
+  const plan = MOCK_SUBSCRIPTION_PRODUCTS.flatMap(product => product.variants).find(variant => variant.id === body.plan_id)
+  const product = plan ? MOCK_SUBSCRIPTION_PRODUCTS.find(item => item.id === plan.product_id) : null
+  const user = MOCK_ALL_USERS.find(item => item.id === params.userId)
+  return createMockResponse({
+    ...MOCK_USER_SUBSCRIPTIONS[0],
+    id: `sub-demo-${Date.now()}`,
+    user_id: params.userId,
+    username: user?.username ?? null,
+    email: user?.email ?? null,
+    product_id: product?.id ?? null,
+    product_code: product?.code ?? null,
+    product_name: product?.name ?? null,
+    plan_id: plan?.id ?? String(body.plan_id || ''),
+    plan_code: plan?.code ?? null,
+    plan_name: plan?.name ?? null,
+    variant_id: plan?.id ?? null,
+    variant_code: plan?.code ?? null,
+    variant_name: plan?.name ?? null,
+    purchased_months: Number(body.purchased_months || 1),
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/subscriptions/orders/:orderId/approve', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const order = getMockSubscriptionOrders().find(item => item.id === params.orderId)
+  if (!order) {
+    throw { response: createMockResponse({ detail: '订阅订单不存在' }, 404) }
+  }
+  return createMockResponse({ order: { ...order, status: 'paid', paid_at: new Date().toISOString(), credited_at: new Date().toISOString() } })
+})
+
+registerDynamicRoute('POST', '/api/admin/subscriptions/orders/:orderId/reject', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const order = getMockSubscriptionOrders().find(item => item.id === params.orderId)
+  if (!order) {
+    throw { response: createMockResponse({ detail: '订阅订单不存在' }, 404) }
+  }
+  return createMockResponse({ order: { ...order, status: 'failed' } })
+})
+
+registerDynamicRoute('POST', '/api/admin/subscriptions/:subscriptionId/cancel', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const subscription = MOCK_USER_SUBSCRIPTIONS.find(item => item.id === params.subscriptionId)
+  if (!subscription) {
+    throw { response: createMockResponse({ detail: '订阅不存在' }, 404) }
+  }
+  return createMockResponse({
+    ...subscription,
+    status: 'canceled',
+    canceled_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/subscriptions/:subscriptionId/upgrade', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const subscription = MOCK_USER_SUBSCRIPTIONS.find(item => item.id === params.subscriptionId)
+  if (!subscription) {
+    throw { response: createMockResponse({ detail: '订阅不存在' }, 404) }
+  }
+  const body = parseMockBody<{ new_plan_id?: string; purchased_months?: number }>(config, {})
+  const plan = MOCK_SUBSCRIPTION_PRODUCTS.flatMap(product => product.variants).find(variant => variant.id === body.new_plan_id)
+  const product = plan ? MOCK_SUBSCRIPTION_PRODUCTS.find(item => item.id === plan.product_id) : null
+  return createMockResponse({
+    ...subscription,
+    product_id: product?.id ?? subscription.product_id,
+    product_code: product?.code ?? subscription.product_code,
+    product_name: product?.name ?? subscription.product_name,
+    plan_id: plan?.id ?? subscription.plan_id,
+    plan_code: plan?.code ?? subscription.plan_code,
+    plan_name: plan?.name ?? subscription.plan_name,
+    variant_id: plan?.id ?? subscription.variant_id,
+    variant_code: plan?.code ?? subscription.variant_code,
+    variant_name: plan?.name ?? subscription.variant_name,
+    purchased_months: Number(body.purchased_months || subscription.purchased_months),
+    updated_at: new Date().toISOString(),
+  })
+})
+
+registerDynamicRoute('GET', '/api/admin/video-tasks/:taskId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const task = MOCK_ASYNC_TASKS.find(item => item.id === params.taskId)
+  if (!task) {
+    throw { response: createMockResponse({ detail: '任务不存在' }, 404) }
+  }
+  return createMockResponse(buildMockAsyncTaskDetail(task))
+})
+
+registerDynamicRoute('POST', '/api/admin/video-tasks/:taskId/cancel', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ id: params.taskId, status: 'cancelled', message: '任务已取消（演示模式）' })
+})
+
+registerDynamicRoute('GET', '/api/admin/monitoring/cache/affinity/:userIdentifier', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const affinities = MOCK_CACHE_AFFINITIES.filter(item =>
+    item.user_id === params.userIdentifier ||
+    item.username === params.userIdentifier ||
+    item.email === params.userIdentifier ||
+    item.affinity_key === params.userIdentifier,
+  )
+  if (affinities.length === 0) {
+    return createMockResponse({ status: 'not_found', affinities: [] })
+  }
+  return createMockResponse({
+    status: 'ok',
+    user_info: {
+      user_id: affinities[0].user_id,
+      username: affinities[0].username,
+      email: affinities[0].email,
+    },
+    affinities,
+    total_endpoints: affinities.length,
+  })
+})
+
+for (const path of [
+  '/api/admin/monitoring/cache',
+  '/api/admin/monitoring/cache/users/:userIdentifier',
+  '/api/admin/monitoring/cache/providers/:providerId',
+  '/api/admin/monitoring/cache/redis-keys/:category',
+  '/api/admin/monitoring/cache/model-mapping',
+  '/api/admin/monitoring/cache/model-mapping/:modelName',
+  '/api/admin/monitoring/cache/model-mapping/provider/:providerId/:globalModelId',
+]) {
+  registerDynamicRoute('DELETE', path, async (_config, params) => {
+    await delay()
+    requireAdmin()
+    return createMockResponse({
+      status: 'ok',
+      message: '缓存已清除（演示模式）',
+      count: 1,
+      deleted_count: 1,
+      category: params.category,
+      provider_id: params.providerId,
+      model_name: params.modelName,
+    })
+  })
+}
+
+registerDynamicRoute('DELETE', '/api/admin/monitoring/cache/affinity/:affinityKey/:endpointId/:modelId/:apiFormat', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ status: 'ok', message: '缓存亲和性已清除（演示模式）', deleted_count: 1 })
+})
+
+registerDynamicRoute('GET', '/api/admin/provider-ops/architectures/:architectureId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  const architecture = MOCK_ARCHITECTURES.find(item => item.architecture_id === params.architectureId)
+  if (!architecture) {
+    throw { response: createMockResponse({ detail: '架构不存在' }, 404) }
+  }
+  return createMockResponse(architecture)
+})
+
+registerDynamicRoute('GET', '/api/admin/provider-ops/providers/:providerId/status', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({
+    provider_id: params.providerId,
+    is_configured: true,
+    architecture_id: 'generic',
+    connection_status: {
+      status: 'connected',
+      auth_type: 'api_key',
+      connected_at: new Date().toISOString(),
+      expires_at: null,
+      last_error: null,
+    },
+    enabled_actions: ['query_balance', 'checkin'],
+  })
+})
+
+registerDynamicRoute('GET', '/api/admin/provider-ops/providers/:providerId/config', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({
+    provider_id: params.providerId,
+    is_configured: true,
+    architecture_id: 'generic',
+    base_url: null,
+    connector: {
+      auth_type: 'api_key',
+      config: {},
+      credentials: { api_key: '********demo' },
+    },
+  })
+})
+
+registerDynamicRoute('GET', '/api/admin/provider-ops/providers/:providerId/balance', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse(buildMockProviderBalance(params.providerId))
+})
+
+registerDynamicRoute('POST', '/api/admin/provider-ops/providers/:providerId/balance', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse(buildMockProviderBalance(params.providerId))
+})
+
+registerDynamicRoute('POST', '/api/admin/provider-ops/providers/:providerId/checkin', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({
+    status: 'already_done',
+    action_type: 'checkin',
+    data: {
+      reward: null,
+      streak_days: null,
+      next_reward: null,
+      message: '演示模式无需签到',
+      extra: {},
+    },
+    message: '演示模式无需签到',
+    executed_at: new Date().toISOString(),
+    response_time_ms: 80,
+    cache_ttl_seconds: 60,
+    provider_id: params.providerId,
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/provider-ops/providers/:providerId/actions/:actionType', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  if (params.actionType === 'query_balance') {
+    return createMockResponse(buildMockProviderBalance(params.providerId))
+  }
+  return createMockResponse({
+    status: 'success',
+    action_type: params.actionType,
+    data: {},
+    message: '演示模式操作完成',
+    executed_at: new Date().toISOString(),
+    response_time_ms: 100,
+    cache_ttl_seconds: 60,
+  })
+})
+
+registerDynamicRoute('PUT', '/api/admin/provider-ops/providers/:providerId/config', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ success: true, message: '配置已保存（演示模式）' })
+})
+
+registerDynamicRoute('DELETE', '/api/admin/provider-ops/providers/:providerId/config', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ success: true, message: '配置已删除（演示模式）' })
+})
+
+registerDynamicRoute('POST', '/api/admin/provider-ops/providers/:providerId/connect', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ success: true, message: '已连接（演示模式）' })
+})
+
+registerDynamicRoute('POST', '/api/admin/provider-ops/providers/:providerId/disconnect', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ success: true, message: '已断开（演示模式）' })
+})
+
+registerDynamicRoute('POST', '/api/admin/provider-ops/providers/:providerId/verify', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ success: true, message: '验证通过（演示模式）', data: { username: 'demo' } })
+})
+
+registerDynamicRoute('POST', '/api/admin/proxy-nodes/manual', async (config) => {
+  await delay()
+  requireAdmin()
+  const body = parseMockBody<Record<string, unknown>>(config, {})
+  const node = {
+    ...MOCK_PROXY_NODES[0],
+    id: `proxy-node-demo-${Date.now()}`,
+    name: String(body.name || '新代理节点'),
+    proxy_url: String(body.proxy_url || 'http://127.0.0.1:8080'),
+    region: body.region ? String(body.region) : null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+  return createMockResponse({ node_id: node.id, node })
+})
+
+registerDynamicRoute('PATCH', '/api/admin/proxy-nodes/:nodeId', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const body = parseMockBody<Record<string, unknown>>(config, {})
+  const node = MOCK_PROXY_NODES.find(item => item.id === params.nodeId) || MOCK_PROXY_NODES[0]
+  return createMockResponse({
+    node_id: params.nodeId,
+    node: { ...node, ...body, id: params.nodeId, updated_at: new Date().toISOString() },
+  })
+})
+
+registerDynamicRoute('DELETE', '/api/admin/proxy-nodes/:nodeId', async (_config, params) => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ message: '代理节点已删除（演示模式）', node_id: params.nodeId, cleared_system_proxy: false })
+})
+
+registerDynamicRoute('POST', '/api/admin/proxy-nodes/:nodeId/test', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ success: true, latency_ms: 86, exit_ip: '203.0.113.10', error: null })
+})
+
+registerDynamicRoute('PUT', '/api/admin/proxy-nodes/:nodeId/config', async (config, params) => {
+  await delay()
+  requireAdmin()
+  const remoteConfig = parseMockBody<Record<string, unknown>>(config, {})
+  const node = MOCK_PROXY_NODES.find(item => item.id === params.nodeId) || MOCK_PROXY_NODES[0]
+  return createMockResponse({
+    node_id: params.nodeId,
+    config_version: Number(node.config_version || 1) + 1,
+    remote_config: remoteConfig,
+    node: {
+      ...node,
+      id: params.nodeId,
+      remote_config: remoteConfig,
+      config_version: Number(node.config_version || 1) + 1,
+      updated_at: new Date().toISOString(),
+    },
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/proxy-nodes/upgrade', async (config) => {
+  await delay()
+  requireAdmin()
+  const body = parseMockBody<{ version?: string }>(config, {})
+  return createMockResponse({
+    version: body.version || 'demo',
+    updated: MOCK_PROXY_NODES.length,
+    skipped: 0,
+    node_ids: MOCK_PROXY_NODES.map(node => node.id),
+  })
+})
+
+registerDynamicRoute('POST', '/api/admin/proxy-nodes/test-url', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({ success: true, latency_ms: 92, exit_ip: '203.0.113.10', error: null })
+})
+
+registerDynamicRoute('GET', '/api/admin/proxy-nodes/:nodeId/events', async () => {
+  await delay()
+  requireAdmin()
+  return createMockResponse({
+    items: [
+      {
+        id: 1,
+        event_type: 'connected',
+        detail: '演示节点连接正常',
+        created_at: new Date().toISOString(),
+      },
+    ],
+  })
+})
 
 // Provider 详情
 registerDynamicRoute('GET', '/api/admin/providers/:providerId/summary', async (_config, params) => {

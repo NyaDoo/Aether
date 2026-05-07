@@ -604,7 +604,7 @@
     <Dialog
       :model-value="showCancelConfirmDialog"
       size="md"
-      z-index="120"
+      :z-index="120"
       @update:model-value="handleCancelDialogUpdate"
     >
       <template #header>
