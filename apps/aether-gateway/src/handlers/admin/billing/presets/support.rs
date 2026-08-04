@@ -226,6 +226,45 @@ fn build_admin_billing_aether_core_collectors() -> Vec<crate::AdminBillingCollec
             priority: 0,
             is_enabled: true,
         },
+        // Doubao bills video generation by tokens, which reach pricing through
+        // the usage record's output_tokens. These collectors only add the
+        // optional duration/resolution dimensions for tiered price rules.
+        crate::AdminBillingCollectorWriteInput {
+            api_format: "DOUBAO:VIDEO".to_string(),
+            task_type: "video".to_string(),
+            dimension_name: "output_tokens".to_string(),
+            source_type: "response".to_string(),
+            source_path: Some("usage.completion_tokens".to_string()),
+            value_type: "int".to_string(),
+            transform_expression: None,
+            default_value: None,
+            priority: 10,
+            is_enabled: true,
+        },
+        crate::AdminBillingCollectorWriteInput {
+            api_format: "DOUBAO:VIDEO".to_string(),
+            task_type: "video".to_string(),
+            dimension_name: "video_resolution_key".to_string(),
+            source_type: "metadata".to_string(),
+            source_path: Some("task.resolution".to_string()),
+            value_type: "string".to_string(),
+            transform_expression: None,
+            default_value: None,
+            priority: 10,
+            is_enabled: true,
+        },
+        crate::AdminBillingCollectorWriteInput {
+            api_format: "DOUBAO:VIDEO".to_string(),
+            task_type: "video".to_string(),
+            dimension_name: "video_duration_seconds".to_string(),
+            source_type: "metadata".to_string(),
+            source_path: Some("task.duration_seconds".to_string()),
+            value_type: "int".to_string(),
+            transform_expression: None,
+            default_value: None,
+            priority: 10,
+            is_enabled: true,
+        },
     ]
 }
 

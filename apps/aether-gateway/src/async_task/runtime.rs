@@ -547,6 +547,10 @@ fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<Usage
         .and_then(|snapshot| snapshot.provider_name().map(str::to_string))
         .or_else(|| task.provider_id.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    // Doubao bills video generation by tokens rather than by duration, so the
+    // reported usage has to reach the billing pipeline like a chat completion.
+    let usage_tokens = LocalVideoTaskSnapshot::from_stored_task(task)
+        .and_then(|snapshot| snapshot.usage_tokens());
     let response_time_ms = task
         .submitted_at_unix_secs
         .zip(
@@ -584,6 +588,8 @@ fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<Usage
             response_time_ms,
             request_body: task.original_request_body.clone(),
             request_metadata: task.request_metadata.clone(),
+            output_tokens: usage_tokens.map(|(completion_tokens, _)| completion_tokens),
+            total_tokens: usage_tokens.map(|(_, total_tokens)| total_tokens),
             ..UsageEventData::default()
         },
     ))

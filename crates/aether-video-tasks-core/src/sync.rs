@@ -4,10 +4,10 @@ use uuid::Uuid;
 
 use crate::{
     context_text, context_u64, current_unix_timestamp_secs, generate_local_short_id,
-    request_body_text, GeminiVideoTaskSeed, LocalVideoTaskPersistence, LocalVideoTaskReadResponse,
-    LocalVideoTaskSeed, LocalVideoTaskSnapshot, LocalVideoTaskStatus, LocalVideoTaskSuccessPlan,
-    LocalVideoTaskTransport, OpenAiVideoTaskSeed, VideoTaskSyncReportMode,
-    VideoTaskTruthSourceMode,
+    request_body_text, DoubaoVideoTaskSeed, GeminiVideoTaskSeed, LocalVideoTaskPersistence,
+    LocalVideoTaskReadResponse, LocalVideoTaskSeed, LocalVideoTaskSnapshot, LocalVideoTaskStatus,
+    LocalVideoTaskSuccessPlan, LocalVideoTaskTransport, OpenAiVideoTaskSeed,
+    VideoTaskSyncReportMode, VideoTaskTruthSourceMode,
 };
 
 impl LocalVideoTaskSeed {
@@ -109,6 +109,61 @@ impl LocalVideoTaskSeed {
                     transport,
                 }))
             }
+            "doubao_video_create_sync_finalize" => {
+                let upstream_id = provider_body.get("id").and_then(Value::as_str)?.trim();
+                if upstream_id.is_empty() {
+                    return None;
+                }
+                let request_body = &persistence.original_request_body;
+                let prompt = crate::doubao_content_prompt(request_body)
+                    .map(|prompt| crate::doubao_prompt_text(&prompt))
+                    .filter(|prompt| !prompt.is_empty());
+
+                Some(Self::DoubaoCreate(DoubaoVideoTaskSeed {
+                    local_task_id: context_text(report_context, "local_task_id")
+                        .unwrap_or_else(generate_local_doubao_task_id),
+                    upstream_task_id: upstream_id.to_string(),
+                    created_at_unix_secs: provider_body
+                        .get("created_at")
+                        .and_then(Value::as_u64)
+                        .or_else(|| context_u64(report_context, "local_created_at"))
+                        .unwrap_or_else(current_unix_timestamp_secs),
+                    user_id: context_text(report_context, "user_id"),
+                    api_key_id: context_text(report_context, "api_key_id"),
+                    model: provider_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                        .or_else(|| context_text(report_context, "model"))
+                        .or_else(|| request_body_text(report_context, "model")),
+                    prompt,
+                    resolution: crate::doubao_string_parameter(
+                        request_body,
+                        "resolution",
+                        &["rs", "resolution"],
+                    ),
+                    ratio: crate::doubao_string_parameter(request_body, "ratio", &["rt", "ratio"]),
+                    duration_seconds: crate::doubao_u32_parameter(
+                        request_body,
+                        "duration",
+                        &["dur", "duration"],
+                    ),
+                    // Ark returns `queued` on create; the poller refines it from there.
+                    status: LocalVideoTaskStatus::Submitted,
+                    progress_percent: 0,
+                    completed_at_unix_secs: None,
+                    error_code: None,
+                    error_message: None,
+                    video_url: None,
+                    last_frame_url: None,
+                    completion_tokens: None,
+                    total_tokens: None,
+                    persistence,
+                    transport,
+                }))
+            }
             _ => None,
         }
     }
@@ -118,6 +173,7 @@ impl LocalVideoTaskSeed {
             Self::OpenAiCreate(_) => "openai_video_create_sync_success",
             Self::OpenAiRemix(_) => "openai_video_remix_sync_success",
             Self::GeminiCreate(_) => "gemini_video_create_sync_success",
+            Self::DoubaoCreate(_) => "doubao_video_create_sync_success",
         }
     }
 
@@ -139,6 +195,16 @@ impl LocalVideoTaskSeed {
                     Value::String(seed.local_short_id.clone()),
                 );
             }
+            Self::DoubaoCreate(seed) => {
+                report_context.insert(
+                    "local_task_id".to_string(),
+                    Value::String(seed.local_task_id.clone()),
+                );
+                report_context.insert(
+                    "local_created_at".to_string(),
+                    Value::Number(seed.created_at_unix_secs.into()),
+                );
+            }
         }
     }
 
@@ -146,8 +212,15 @@ impl LocalVideoTaskSeed {
         match self {
             Self::OpenAiCreate(seed) | Self::OpenAiRemix(seed) => seed.client_body_json(),
             Self::GeminiCreate(seed) => seed.client_body_json(),
+            Self::DoubaoCreate(seed) => seed.client_body_json(),
         }
     }
+}
+
+/// Ark task ids use a `cgt-` prefix; local ids keep that shape so clients that
+/// validate the id format keep working while the upstream id stays hidden.
+fn generate_local_doubao_task_id() -> String {
+    format!("cgt-{}", Uuid::new_v4().simple())
 }
 
 impl VideoTaskTruthSourceMode {
@@ -198,6 +271,7 @@ impl LocalVideoTaskSuccessPlan {
                 LocalVideoTaskSnapshot::OpenAi(seed.clone())
             }
             LocalVideoTaskSeed::GeminiCreate(seed) => LocalVideoTaskSnapshot::Gemini(seed.clone()),
+            LocalVideoTaskSeed::DoubaoCreate(seed) => LocalVideoTaskSnapshot::Doubao(seed.clone()),
         }
     }
 }
@@ -207,7 +281,7 @@ pub fn build_internal_finalize_video_plan(
     signature: &str,
     report_context: Option<&Value>,
 ) -> Option<ExecutionPlan> {
-    if !matches!(signature, "openai:video" | "gemini:video") {
+    if !matches!(signature, "openai:video" | "gemini:video" | "doubao:video") {
         return None;
     }
 
@@ -231,6 +305,7 @@ pub fn build_internal_finalize_video_plan(
         .or_else(|| match signature {
             "openai:video" => Some("sora-2".to_string()),
             "gemini:video" => Some("veo-3".to_string()),
+            "doubao:video" => Some("doubao-seedance-1-0-pro-250528".to_string()),
             _ => None,
         });
     let original_request_body = report_context
@@ -243,6 +318,9 @@ pub fn build_internal_finalize_video_plan(
             "https://internal.gateway.invalid/v1beta/models/{}:predictLongRunning",
             model_name.clone().unwrap_or_else(|| "veo-3".to_string())
         ),
+        "doubao:video" => {
+            "https://internal.gateway.invalid/api/v3/contents/generations/tasks".to_string()
+        }
         _ => return None,
     };
 
@@ -316,6 +394,17 @@ pub fn build_local_sync_finalize_read_response(
                 body_json: json!({}),
             })
         }
+        // Ark answers DELETE with an empty body; a 404 upstream still means the
+        // task is gone, which is the outcome the client asked for.
+        "doubao_video_delete_sync_finalize" => {
+            if upstream_status_code >= 400 && upstream_status_code != 404 {
+                return None;
+            }
+            Some(LocalVideoTaskReadResponse {
+                status_code: 200,
+                body_json: json!({}),
+            })
+        }
         _ => None,
     }
 }
@@ -327,6 +416,7 @@ pub fn resolve_local_sync_success_background_report_kind(
         "openai_video_delete_sync_finalize" => Some("openai_video_delete_sync_success"),
         "openai_video_cancel_sync_finalize" => Some("openai_video_cancel_sync_success"),
         "gemini_video_cancel_sync_finalize" => Some("gemini_video_cancel_sync_success"),
+        "doubao_video_delete_sync_finalize" => Some("doubao_video_delete_sync_success"),
         _ => None,
     }
 }
@@ -339,6 +429,8 @@ pub fn resolve_local_sync_error_background_report_kind(report_kind: &str) -> Opt
         "openai_video_delete_sync_finalize" => Some("openai_video_delete_sync_error"),
         "openai_video_cancel_sync_finalize" => Some("openai_video_cancel_sync_error"),
         "gemini_video_cancel_sync_finalize" => Some("gemini_video_cancel_sync_error"),
+        "doubao_video_create_sync_finalize" => Some("doubao_video_create_sync_error"),
+        "doubao_video_delete_sync_finalize" => Some("doubao_video_delete_sync_error"),
         _ => None,
     }
 }

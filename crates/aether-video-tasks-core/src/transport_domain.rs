@@ -15,6 +15,7 @@ impl LocalVideoTaskTransport {
         let upstream_base_url = match plan.provider_api_format.as_str() {
             "openai:video" => trim_openai_video_resource_root(&plan.url)?,
             "gemini:video" => plan.url.split("/v1beta/").next()?.to_string(),
+            "doubao:video" => trim_doubao_video_resource_root(&plan.url)?,
             _ => return None,
         };
         if upstream_base_url.is_empty() {
@@ -58,6 +59,17 @@ impl LocalVideoTaskTransport {
 fn trim_openai_video_resource_root(url: &str) -> Option<String> {
     let base = url.split_once('?').map(|(base, _)| base).unwrap_or(url);
     let (root, suffix) = base.rsplit_once("/videos")?;
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return None;
+    }
+    Some(root.to_string())
+}
+
+/// Recovers the provider base URL from an Ark task URL, keeping the API root
+/// (`/api/v3`) so later plans rebuild the same path.
+fn trim_doubao_video_resource_root(url: &str) -> Option<String> {
+    let base = url.split_once('?').map(|(base, _)| base).unwrap_or(url);
+    let (root, suffix) = base.rsplit_once("/contents/generations/tasks")?;
     if !suffix.is_empty() && !suffix.starts_with('/') {
         return None;
     }
