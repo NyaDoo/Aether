@@ -22,7 +22,8 @@ pub use body::{
 };
 pub use doubao::{map_doubao_stored_task_to_read_response, map_doubao_task_status};
 pub use doubao_body::{
-    doubao_content_prompt, doubao_prompt_text, doubao_string_parameter, doubao_u32_parameter,
+    doubao_content_has_video_input, doubao_content_prompt, doubao_prompt_text,
+    doubao_string_parameter, doubao_u32_parameter,
 };
 pub use follow_up::{
     build_video_follow_up_report_context, resolve_follow_up_auth, VideoFollowUpReportContextInput,
@@ -62,4 +63,4 @@ pub use types::{
     VideoTaskSyncReportMode, VideoTaskTruthSourceMode, DEFAULT_VIDEO_TASK_MAX_POLL_COUNT,
     DEFAULT_VIDEO_TASK_POLL_INTERVAL_SECONDS,
 };
-pub use util::non_empty_owned;
+pub use util::{derive_video_task_short_id, non_empty_owned};

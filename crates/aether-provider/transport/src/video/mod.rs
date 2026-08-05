@@ -612,12 +612,17 @@ mod tests {
         )
         .expect("body should build");
 
-        assert_eq!(body.get("model"), Some(&json!("doubao-seedance-2-0-260128")));
+        assert_eq!(
+            body.get("model"),
+            Some(&json!("doubao-seedance-2-0-260128"))
+        );
         // Unmodeled fields must survive verbatim so new Ark parameters keep working.
         assert_eq!(body.get("generate_audio"), Some(&json!(true)));
         assert_eq!(body.get("duration"), Some(&json!(11)));
         assert_eq!(
-            body.get("content").and_then(|value| value.as_array()).map(Vec::len),
+            body.get("content")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
             Some(2)
         );
     }

@@ -105,15 +105,19 @@ impl LocalVideoTaskSnapshot {
                     user_id: task.user_id.clone(),
                     api_key_id: task.api_key_id.clone(),
                     model: non_empty_owned(task.model.as_ref()),
-                    prompt: non_empty_owned(task.prompt.as_ref())
-                        .or_else(|| doubao_content_prompt(request_body).map(|prompt| doubao_prompt_text(&prompt))),
-                    resolution: non_empty_owned(task.resolution.as_ref())
-                        .or_else(|| doubao_string_parameter(request_body, "resolution", &["rs", "resolution"])),
-                    ratio: non_empty_owned(task.aspect_ratio.as_ref())
-                        .or_else(|| doubao_string_parameter(request_body, "ratio", &["rt", "ratio"])),
-                    duration_seconds: task
-                        .duration_seconds
-                        .or_else(|| doubao_u32_parameter(request_body, "duration", &["dur", "duration"])),
+                    prompt: non_empty_owned(task.prompt.as_ref()).or_else(|| {
+                        doubao_content_prompt(request_body)
+                            .map(|prompt| doubao_prompt_text(&prompt))
+                    }),
+                    resolution: non_empty_owned(task.resolution.as_ref()).or_else(|| {
+                        doubao_string_parameter(request_body, "resolution", &["rs", "resolution"])
+                    }),
+                    ratio: non_empty_owned(task.aspect_ratio.as_ref()).or_else(|| {
+                        doubao_string_parameter(request_body, "ratio", &["rt", "ratio"])
+                    }),
+                    duration_seconds: task.duration_seconds.or_else(|| {
+                        doubao_u32_parameter(request_body, "duration", &["dur", "duration"])
+                    }),
                     status: local_status_from_stored(task.status),
                     progress_percent: task.progress_percent,
                     completed_at_unix_secs: task.completed_at_unix_secs,

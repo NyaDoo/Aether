@@ -481,7 +481,8 @@ impl DoubaoVideoTaskSeed {
         };
         UpsertVideoTask {
             id: self.local_task_id.clone(),
-            short_id: None,
+            // The column is NOT NULL; Doubao has no short-id concept of its own.
+            short_id: Some(crate::derive_video_task_short_id(&self.local_task_id)),
             request_id: self.persistence.request_id.clone(),
             user_id: self.user_id.clone(),
             api_key_id: self.api_key_id.clone(),
@@ -656,11 +657,7 @@ mod tests {
     #[test]
     fn maps_running_status_to_processing() {
         let mut seed = sample_seed();
-        seed.apply_provider_body(
-            json!({"status": "running"})
-                .as_object()
-                .expect("object"),
-        );
+        seed.apply_provider_body(json!({"status": "running"}).as_object().expect("object"));
 
         assert_eq!(seed.status, LocalVideoTaskStatus::Processing);
         assert_eq!(seed.progress_percent, 50);
@@ -706,7 +703,10 @@ mod tests {
 
         assert_eq!(body["id"], "cgt-local-123");
         assert_eq!(body["status"], "succeeded");
-        assert_eq!(body["content"]["video_url"], "https://tos.example.com/v.mp4");
+        assert_eq!(
+            body["content"]["video_url"],
+            "https://tos.example.com/v.mp4"
+        );
         assert_eq!(body["usage"]["completion_tokens"], 1_000);
         assert_eq!(body["ratio"], "16:9");
         assert_eq!(body["duration"], 11);
@@ -812,6 +812,21 @@ mod tests {
             .as_ref()
             .and_then(|value| value.get("rust_local_snapshot"))
             .is_some());
+    }
+
+    #[test]
+    fn upsert_record_satisfies_the_short_id_column_constraint() {
+        // `video_tasks.short_id` is NOT NULL and capped at 16 characters; a
+        // missing or oversized value fails the insert at runtime only.
+        let seed = DoubaoVideoTaskSeed {
+            local_task_id: format!("cgt-{}", "a".repeat(32)),
+            ..sample_seed()
+        };
+
+        let short_id = seed.to_upsert_record().short_id.expect("short id required");
+
+        assert!(!short_id.is_empty());
+        assert!(short_id.len() <= 16, "short_id must fit the column");
     }
 
     #[test]

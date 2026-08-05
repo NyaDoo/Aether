@@ -444,6 +444,129 @@ mod tests {
         resolve_local_sync_error_background_report_kind,
         resolve_local_sync_success_background_report_kind,
     };
+    use crate::{LocalVideoTaskSeed, VideoTaskTruthSourceMode};
+
+    /// An Ark task-create response, as returned by the upstream on success.
+    fn doubao_create_provider_body() -> serde_json::Map<String, serde_json::Value> {
+        json!({
+            "id": "cgt-upstream-abc123",
+            "model": "doubao-seedance-2-0-260128",
+            "status": "queued",
+            "created_at": 1_768_294_532u64
+        })
+        .as_object()
+        .expect("object")
+        .clone()
+    }
+
+    fn doubao_create_plan(url: &str) -> aether_contracts::ExecutionPlan {
+        aether_contracts::ExecutionPlan {
+            request_id: "req-doubao-1".to_string(),
+            candidate_id: None,
+            provider_name: Some("ark".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: url.to_string(),
+            headers: Default::default(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: aether_contracts::RequestBody::from_json(json!({})),
+            stream: false,
+            client_api_format: "doubao:video".to_string(),
+            provider_api_format: "doubao:video".to_string(),
+            model_name: Some("doubao-seedance-2-0-260128".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
+
+    #[test]
+    fn builds_doubao_create_seed_from_finalize_report() {
+        let report_context = json!({
+            "request_id": "req-doubao-1",
+            "user_id": "user-1",
+            "api_key_id": "api-key-1",
+            "original_request_body": {
+                "model": "Doubao-Seedance-2.0",
+                "content": [{"type": "text", "text": "一只猫在窗台上打哈欠"}],
+                "ratio": "16:9",
+                "duration": 5
+            }
+        });
+
+        let seed = LocalVideoTaskSeed::from_sync_finalize(
+            "doubao_video_create_sync_finalize",
+            &doubao_create_provider_body(),
+            report_context.as_object().expect("object"),
+            &doubao_create_plan(
+                "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+            ),
+        )
+        .expect("doubao create finalize should produce a seed");
+
+        let LocalVideoTaskSeed::DoubaoCreate(seed) = seed else {
+            panic!("expected a doubao create seed");
+        };
+        assert_eq!(seed.upstream_task_id, "cgt-upstream-abc123");
+        assert!(seed.local_task_id.starts_with("cgt-"));
+        assert_eq!(seed.ratio.as_deref(), Some("16:9"));
+        assert_eq!(seed.duration_seconds, Some(5));
+        assert_eq!(seed.prompt.as_deref(), Some("一只猫在窗台上打哈欠"));
+        // The transport must be recoverable from the plan, otherwise the task
+        // silently never reaches the database. The recovered base is the
+        // operator-configured one, with the task resource path stripped.
+        assert_eq!(
+            seed.transport.upstream_base_url,
+            "https://ark.cn-beijing.volces.com/api"
+        );
+    }
+
+    #[test]
+    fn prepares_doubao_create_success_plan_when_rust_is_authoritative() {
+        let report_context = json!({ "request_id": "req-doubao-1" });
+        let plan = VideoTaskTruthSourceMode::RustAuthoritative
+            .prepare_sync_success(
+                "doubao_video_create_sync_finalize",
+                &doubao_create_provider_body(),
+                report_context.as_object().expect("object"),
+                &doubao_create_plan(
+                    "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+                ),
+            )
+            .expect("rust-authoritative mode should prepare a persistable plan");
+
+        assert_eq!(
+            plan.success_report_kind(),
+            "doubao_video_create_sync_success"
+        );
+        assert_eq!(
+            plan.report_mode(),
+            crate::VideoTaskSyncReportMode::Background
+        );
+        // Background mode is what carries the snapshot into the database.
+        assert!(matches!(
+            plan.to_snapshot(),
+            crate::LocalVideoTaskSnapshot::Doubao(_)
+        ));
+    }
+
+    #[test]
+    fn doubao_seed_is_dropped_when_the_plan_url_is_not_a_task_resource() {
+        // A malformed upstream URL must not yield a half-built task; catching it
+        // here is what keeps a broken endpoint from writing unusable rows.
+        let report_context = json!({ "request_id": "req-doubao-1" });
+        let seed = LocalVideoTaskSeed::from_sync_finalize(
+            "doubao_video_create_sync_finalize",
+            &doubao_create_provider_body(),
+            report_context.as_object().expect("object"),
+            &doubao_create_plan("https://ark.cn-beijing.volces.com/api/v3/chat/completions"),
+        );
+
+        assert!(seed.is_none());
+    }
 
     #[test]
     fn builds_local_sync_finalize_read_response_for_supported_video_finalize_kinds() {

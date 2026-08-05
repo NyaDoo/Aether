@@ -238,7 +238,8 @@ pub fn build_passthrough_path_url(
     path: &str,
     query: Option<&str>,
     blocked_keys: &[&str],
-) -> Option<String> {    let (trimmed_base_url, base_query) = split_base_url_query(upstream_base_url);
+) -> Option<String> {
+    let (trimmed_base_url, base_query) = split_base_url_query(upstream_base_url);
     let trimmed_base_url = trimmed_base_url.trim_end_matches('/');
     let trimmed_path = path.trim();
     if trimmed_base_url.is_empty() || trimmed_path.is_empty() {
@@ -897,18 +898,12 @@ mod tests {
                 None
             )
             .as_deref(),
-            Some(
-                "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-1"
-            )
+            Some("https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-1")
         );
         // The base is never rewritten, so a misconfigured root stays visible.
         assert_eq!(
-            doubao_video_tasks_upstream_url(
-                "https://ark.cn-beijing.volces.com/api/v3",
-                None,
-                None
-            )
-            .as_deref(),
+            doubao_video_tasks_upstream_url("https://ark.cn-beijing.volces.com/api/v3", None, None)
+                .as_deref(),
             Some("https://ark.cn-beijing.volces.com/api/v3/v3/contents/generations/tasks")
         );
         assert_eq!(doubao_video_tasks_upstream_url("", None, None), None);

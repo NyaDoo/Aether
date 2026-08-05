@@ -501,16 +501,15 @@ async fn maybe_execute_local_video_task_content_stream(
     // A download can be the first read after the task finished, so refresh the
     // task state before deciding whether the asset is available.
     let refresh_path = match route_family {
-        Some("doubao") => {
-            crate::video_tasks::extract_doubao_task_id_from_content_path(parts.uri.path()).map(
-                |task_id| {
-                    format!(
-                        "{}/{task_id}",
-                        aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH
-                    )
-                },
+        Some("doubao") => crate::video_tasks::extract_doubao_task_id_from_content_path(
+            parts.uri.path(),
+        )
+        .map(|task_id| {
+            format!(
+                "{}/{task_id}",
+                aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH
             )
-        }
+        }),
         _ => crate::video_tasks::extract_openai_task_id_from_content_path(parts.uri.path())
             .map(|task_id| format!("/v1/videos/{task_id}")),
     };

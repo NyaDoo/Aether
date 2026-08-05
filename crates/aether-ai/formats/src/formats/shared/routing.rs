@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn resolves_doubao_video_plan_kinds() {
-        use super::{DOUBAO_VIDEO_TASKS_PATH, DOUBAO_VIDEO_CONTENT_PLAN_KIND};
+        use super::{DOUBAO_VIDEO_CONTENT_PLAN_KIND, DOUBAO_VIDEO_TASKS_PATH};
         use crate::contracts::{
             DOUBAO_VIDEO_CREATE_SYNC_PLAN_KIND, DOUBAO_VIDEO_DELETE_SYNC_PLAN_KIND,
         };
@@ -1030,7 +1030,8 @@ mod tests {
     }
 
     #[test]
-    fn resolves_openai_image_sync_plan_kind() {        assert_eq!(
+    fn resolves_openai_image_sync_plan_kind() {
+        assert_eq!(
             resolve_execution_runtime_sync_plan_kind(
                 Some("ai_public"),
                 Some("openai"),

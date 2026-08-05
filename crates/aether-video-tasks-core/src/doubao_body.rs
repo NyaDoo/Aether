@@ -23,6 +23,25 @@ pub fn doubao_content_prompt(body: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Reports whether the request supplies a reference video.
+///
+/// Video-to-video generation is materially more expensive upstream than text or
+/// image driven generation, so billing prices it separately. Only `video_url`
+/// entries count: image and audio references stay on the default price table.
+pub fn doubao_content_has_video_input(body: &Value) -> bool {
+    body.as_object()
+        .and_then(|object| object.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("video_url"))
+            })
+        })
+}
+
 /// Reads a top-level string field, falling back to a `--flag value` prompt suffix.
 pub fn doubao_string_parameter(body: &Value, field: &str, flags: &[&str]) -> Option<String> {
     if let Some(value) = body
@@ -102,8 +121,38 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        doubao_content_prompt, doubao_prompt_text, doubao_string_parameter, doubao_u32_parameter,
+        doubao_content_has_video_input, doubao_content_prompt, doubao_prompt_text,
+        doubao_string_parameter, doubao_u32_parameter,
     };
+
+    #[test]
+    fn detects_a_reference_video_input() {
+        let with_video = json!({
+            "content": [
+                {"type": "text", "text": "clip"},
+                {"type": "image_url", "image_url": {"url": "https://e/a.jpg"}, "role": "reference_image"},
+                {"type": "video_url", "video_url": {"url": "https://e/a.mp4"}, "role": "reference_video"}
+            ]
+        });
+        assert!(doubao_content_has_video_input(&with_video));
+
+        // Image and audio references are not video-to-video generation.
+        let image_only = json!({
+            "content": [
+                {"type": "text", "text": "clip"},
+                {"type": "image_url", "image_url": {"url": "https://e/a.jpg"}},
+                {"type": "audio_url", "audio_url": {"url": "https://e/a.mp3"}}
+            ]
+        });
+        assert!(!doubao_content_has_video_input(&image_only));
+
+        assert!(!doubao_content_has_video_input(
+            &json!({"content": [{"type": "text", "text": "clip"}]})
+        ));
+        // Other surfaces have no `content` array at all.
+        assert!(!doubao_content_has_video_input(&json!({"prompt": "clip"})));
+        assert!(!doubao_content_has_video_input(&json!({})));
+    }
 
     fn top_level_body() -> serde_json::Value {
         json!({

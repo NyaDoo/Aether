@@ -1892,8 +1892,7 @@ async fn proxy_request_inner(
                     // The request did reach an upstream and was refused there, so
                     // report that instead of a generic "no execution path" miss.
                     .or_else(|| {
-                        local_execution_runtime_miss_context
-                            .all_candidates_failed_upstream_detail()
+                        local_execution_runtime_miss_context.all_candidates_failed_upstream_detail()
                     })
             })
             .flatten()

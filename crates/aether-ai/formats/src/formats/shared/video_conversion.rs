@@ -99,13 +99,13 @@ fn convert_seconds(seconds: &Value) -> Result<Value, FormatError> {
         Value::String(text) => text.trim().parse::<u64>().ok(),
         _ => None,
     };
-    parsed.map(Value::from).ok_or_else(|| {
-        FormatError::InvalidTargetField {
+    parsed
+        .map(Value::from)
+        .ok_or_else(|| FormatError::InvalidTargetField {
             format: TARGET_FORMAT.to_string(),
             field: "seconds".to_string(),
             reason: "Doubao duration must be a positive whole number of seconds".to_string(),
-        }
-    })
+        })
 }
 
 /// Converts Sora's single `input_reference` image into an Ark content entry.

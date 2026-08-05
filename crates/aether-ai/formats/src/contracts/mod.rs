@@ -33,7 +33,8 @@ pub use plan_kinds::{
 pub use report_kinds::{
     core_error_background_report_kind, core_error_default_client_api_format,
     core_success_background_report_kind, implicit_stream_success_report_kind,
-    implicit_sync_finalize_report_kind, CLAUDE_CHAT_STREAM_SUCCESS_REPORT_KIND,    CLAUDE_CHAT_SYNC_ERROR_REPORT_KIND, CLAUDE_CHAT_SYNC_FINALIZE_REPORT_KIND,
+    implicit_sync_finalize_report_kind, CLAUDE_CHAT_STREAM_SUCCESS_REPORT_KIND,
+    CLAUDE_CHAT_SYNC_ERROR_REPORT_KIND, CLAUDE_CHAT_SYNC_FINALIZE_REPORT_KIND,
     CLAUDE_CHAT_SYNC_SUCCESS_REPORT_KIND, CLAUDE_CLI_STREAM_SUCCESS_REPORT_KIND,
     CLAUDE_CLI_SYNC_ERROR_REPORT_KIND, CLAUDE_CLI_SYNC_FINALIZE_REPORT_KIND,
     CLAUDE_CLI_SYNC_SUCCESS_REPORT_KIND, CLAUDE_COUNT_TOKENS_SYNC_SUCCESS_REPORT_KIND,

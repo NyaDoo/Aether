@@ -445,7 +445,10 @@ mod tests {
             None
         );
         // Other surfaces must not be mistaken for Doubao paths.
-        assert_eq!(extract_doubao_task_id_from_path("/v1/videos/task_123"), None);
+        assert_eq!(
+            extract_doubao_task_id_from_path("/v1/videos/task_123"),
+            None
+        );
     }
 
     #[test]
