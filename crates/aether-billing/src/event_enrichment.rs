@@ -482,6 +482,24 @@ mod tests {
         }
     }
 
+    struct NameMatchingLookup {
+        expected_name: &'static str,
+        context: StoredBillingModelContext,
+    }
+
+    #[async_trait]
+    impl BillingModelContextLookup for NameMatchingLookup {
+        async fn find_billing_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, aether_data_contracts::DataLayerError>
+        {
+            Ok((model_name == self.expected_name).then(|| self.context.clone()))
+        }
+    }
+
     #[test]
     fn video_dimensions_read_from_the_dimensions_bag() {
         let data = UsageEventData {
@@ -563,6 +581,86 @@ mod tests {
         assert!(usage_event_dimension_string(&data, "video_resolution").is_none());
         assert!(usage_event_dimension_i64(&data, "video_duration_seconds").is_none());
         assert!(usage_event_dimension_bool(&data, "video_has_video_input").is_none());
+    }
+
+    #[tokio::test]
+    async fn video_billing_uses_configured_target_when_provider_reports_a_canonical_model() {
+        let configured_model = "Doubao-Seedance-2.0";
+        let lookup = NameMatchingLookup {
+            expected_name: configured_model,
+            context: StoredBillingModelContext::new(
+                "provider-doubao".to_string(),
+                Some("pay_as_you_go".to_string()),
+                Some("key-doubao".to_string()),
+                None,
+                None,
+                "global-model-doubao".to_string(),
+                configured_model.to_string(),
+                Some(json!({
+                    "billing": {
+                        "video": {
+                            "mode": "per_token",
+                            "token_prices_by_resolution": {
+                                "1080p": {
+                                    "input_price_per_1m": 0,
+                                    "output_price_per_1m": 15
+                                }
+                            }
+                        }
+                    }
+                })),
+                None,
+                Some(json!({
+                    "tiers": [{
+                        "up_to": null,
+                        "input_price_per_1m": 0,
+                        "output_price_per_1m": 0
+                    }]
+                })),
+                Some("model-doubao".to_string()),
+                Some(configured_model.to_string()),
+                None,
+                None,
+                None,
+            )
+            .expect("billing context should build"),
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-doubao-video",
+            UsageEventData {
+                provider_name: "Doubao".to_string(),
+                // Ark reports this canonical family in the terminal task body,
+                // while dispatch and pricing are configured under the public
+                // model name carried in `target_model`.
+                model: "doubao-seedance-2-0-260128".to_string(),
+                target_model: Some(configured_model.to_string()),
+                provider_id: Some("provider-doubao".to_string()),
+                provider_api_key_id: Some("key-doubao".to_string()),
+                request_type: Some("video".to_string()),
+                api_format: Some("doubao:video".to_string()),
+                endpoint_api_format: Some("doubao:video".to_string()),
+                input_tokens: Some(0),
+                output_tokens: Some(245_025),
+                total_tokens: Some(245_025),
+                status_code: Some(200),
+                request_metadata: Some(json!({
+                    "dimensions": {
+                        "video_resolution": "1080p",
+                        "video_duration_seconds": 5,
+                        "video_has_video_input": false
+                    }
+                })),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("video billing should resolve the configured target model");
+
+        assert_eq!(event.data.total_cost_usd, Some(3.675375));
+        assert_eq!(event.data.actual_total_cost_usd, Some(3.675375));
     }
 
     #[test]

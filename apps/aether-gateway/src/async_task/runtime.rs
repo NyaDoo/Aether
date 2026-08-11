@@ -721,17 +721,33 @@ pub(crate) async fn finalize_video_task_if_terminal(state: &AppState, task: &Sto
             "gateway video task finalize failed to enrich billing"
         );
     }
+    let billing_resolved = terminal_video_billing_is_resolved(&event);
+    if !billing_resolved {
+        warn!(
+            event_name = "video_task_finalize_billing_unresolved",
+            log_type = "event",
+            request_id = %short_request_id(task.request_id.as_str()),
+            provider_id = ?event.data.provider_id,
+            model = %event.data.model,
+            target_model = ?event.data.target_model,
+            input_tokens = ?event.data.input_tokens,
+            output_tokens = ?event.data.output_tokens,
+            "gateway left completed video usage pending because billing could not resolve a price"
+        );
+    }
     match build_upsert_usage_record_from_event(&event) {
         Ok(record) => match state.data.upsert_usage(record).await {
             Ok(Some(stored)) => {
-                if let Err(err) = settle_usage_if_needed(state.data.as_ref(), &stored).await {
-                    warn!(
-                        event_name = "video_task_finalize_settlement_failed",
-                        log_type = "event",
-                        request_id = %short_request_id(task.request_id.as_str()),
-                        error = %err,
-                        "gateway video task finalize failed to settle usage"
-                    );
+                if billing_resolved {
+                    if let Err(err) = settle_usage_if_needed(state.data.as_ref(), &stored).await {
+                        warn!(
+                            event_name = "video_task_finalize_settlement_failed",
+                            log_type = "event",
+                            request_id = %short_request_id(task.request_id.as_str()),
+                            error = %err,
+                            "gateway video task finalize failed to settle usage"
+                        );
+                    }
                 }
             }
             Ok(None) => {}
@@ -755,6 +771,11 @@ pub(crate) async fn finalize_video_task_if_terminal(state: &AppState, task: &Sto
             );
         }
     }
+}
+
+fn terminal_video_billing_is_resolved(event: &UsageEvent) -> bool {
+    !matches!(event.event_type, UsageEventType::Completed)
+        || (event.data.total_cost_usd.is_some() && event.data.actual_total_cost_usd.is_some())
 }
 
 /// Publishes the billing dimensions a finished video task priced by.
@@ -823,6 +844,22 @@ fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<Usage
         .and_then(|snapshot| snapshot.provider_model_name().map(str::to_string))
         .or_else(|| task.model.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    // Provider task responses may report a canonical model family that differs
+    // from the configured global/provider model used during dispatch. Keep the
+    // response-reported value as the observed model, but carry the dispatch
+    // model as `target_model` so billing can still resolve the exact pricing
+    // context (and fall back to the observed model when both names coincide).
+    let target_model = snapshot
+        .as_ref()
+        .and_then(|snapshot| match snapshot {
+            LocalVideoTaskSnapshot::OpenAi(seed) => seed.transport.model_name.as_deref(),
+            LocalVideoTaskSnapshot::Gemini(seed) => seed.transport.model_name.as_deref(),
+            LocalVideoTaskSnapshot::Doubao(seed) => seed.transport.model_name.as_deref(),
+        })
+        .or_else(|| task.model.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     // Doubao bills video generation by tokens rather than by duration, so the
     // reported usage has to reach the billing pipeline like a chat completion.
     let usage_tokens = snapshot.and_then(|snapshot| snapshot.usage_tokens());
@@ -850,6 +887,7 @@ fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<Usage
             api_key_name: task.api_key_name.clone(),
             provider_name,
             model: provider_model,
+            target_model,
             provider_id: task.provider_id.clone(),
             provider_endpoint_id: task.endpoint_id.clone(),
             provider_api_key_id: task.key_id.clone(),
@@ -886,7 +924,8 @@ mod tests {
         build_credential_unavailable_poll_update, build_failed_poll_update,
         build_successful_poll_update, build_video_task_billing_dimensions,
         build_video_task_terminal_usage_event, sanitize_poll_raw_response,
-        snapshot_with_runtime_transport, stored_task_to_upsert, VideoTaskRefreshError,
+        snapshot_with_runtime_transport, stored_task_to_upsert, terminal_video_billing_is_resolved,
+        VideoTaskRefreshError,
     };
     use crate::video_tasks::{
         LocalVideoTaskPersistence, LocalVideoTaskSnapshot, LocalVideoTaskStatus,
@@ -1280,7 +1319,7 @@ mod tests {
             updated_at_unix_secs: Some(30),
             user_id: task.user_id.clone(),
             api_key_id: task.api_key_id.clone(),
-            model: Some("doubao-provider-model".to_string()),
+            model: Some("doubao-provider-reported-model".to_string()),
             prompt: Some("hello".to_string()),
             resolution: Some("720p".to_string()),
             ratio: Some("16:9".to_string()),
@@ -1307,7 +1346,7 @@ mod tests {
                 format_converted: true,
             },
             transport: LocalVideoTaskTransport {
-                model_name: Some("doubao-provider-model".to_string()),
+                model_name: Some("doubao-configured-model".to_string()),
                 ..base_transport
             },
         });
@@ -1317,7 +1356,11 @@ mod tests {
 
         let event = build_video_task_terminal_usage_event(&task)
             .expect("completed task should produce a usage event");
-        assert_eq!(event.data.model, "doubao-provider-model");
+        assert_eq!(event.data.model, "doubao-provider-reported-model");
+        assert_eq!(
+            event.data.target_model.as_deref(),
+            Some("doubao-configured-model")
+        );
         assert_eq!(event.data.input_tokens, Some(20));
         assert_eq!(event.data.output_tokens, Some(80));
         assert_eq!(event.data.total_tokens, Some(100));
@@ -1325,6 +1368,22 @@ mod tests {
             event.data.endpoint_api_format.as_deref(),
             Some("doubao:video")
         );
+    }
+
+    #[test]
+    fn completed_video_billing_requires_resolved_costs_before_settlement() {
+        let mut event = build_video_task_terminal_usage_event(&{
+            let mut task = sample_sparse_stored_task();
+            task.status = VideoTaskStatus::Completed;
+            task
+        })
+        .expect("completed task should produce a usage event");
+
+        assert!(!terminal_video_billing_is_resolved(&event));
+
+        event.data.total_cost_usd = Some(0.0);
+        event.data.actual_total_cost_usd = Some(0.0);
+        assert!(terminal_video_billing_is_resolved(&event));
     }
 
     #[test]

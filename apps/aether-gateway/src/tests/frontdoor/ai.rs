@@ -1,8 +1,9 @@
 use super::{
-    hash_api_key, sample_models_candidate_row, unrestricted_models_snapshot,
-    InMemoryAuthApiKeySnapshotRepository, InMemoryMinimalCandidateSelectionReadRepository,
-    InMemoryVideoTaskRepository, StoredAuthApiKeySnapshot, UpsertVideoTask, VideoTaskLookupKey,
-    VideoTaskReadRepository, VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
+    hash_api_key, run_frontdoor_async_test, sample_models_candidate_row,
+    unrestricted_models_snapshot, InMemoryAuthApiKeySnapshotRepository,
+    InMemoryMinimalCandidateSelectionReadRepository, InMemoryVideoTaskRepository,
+    StoredAuthApiKeySnapshot, UpsertVideoTask, VideoTaskLookupKey, VideoTaskReadRepository,
+    VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
 };
 use crate::image_capabilities::openai_image_gateway_max_generation_count;
 use crate::tests::video::{simple_video_provider_catalog_repository, video_auth_repository};
@@ -11,12 +12,13 @@ use crate::tests::{
     to_bytes, AppState, Arc, Body, Json, Mutex, Request, Router, StatusCode, EXECUTION_PATH_HEADER,
     EXECUTION_PATH_LOCAL_AI_PUBLIC, EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS,
 };
+use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
 use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::candidate_selection::{
     MinimalCandidateSelectionReadRepository, StoredMinimalCandidateSelectionRow,
     StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
-    StoredRequestedModelCandidateRowsQuery,
+    StoredProviderModelMapping, StoredRequestedModelCandidateRowsQuery,
 };
 use aether_data_contracts::repository::global_models::{
     StoredAdminGlobalModel, UpdateAdminGlobalModelRecord,
@@ -253,6 +255,29 @@ fn sample_doubao_video_task(
     }
     task.request_metadata = None;
     task
+}
+
+fn sample_doubao_video_candidate_row() -> StoredMinimalCandidateSelectionRow {
+    let mut row = sample_models_candidate_row(
+        "provider-doubao-video-public-e2e",
+        "doubao",
+        "doubao:video",
+        "Doubao-Seedance-2.0",
+        10,
+    );
+    row.endpoint_api_family = Some("doubao".to_string());
+    row.endpoint_kind = Some("video".to_string());
+    row.global_model_supports_streaming = Some(false);
+    row.model_provider_model_name = "doubao-seedance-2-0-260128".to_string();
+    row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+        name: "doubao-seedance-2-0-260128".to_string(),
+        priority: 1,
+        api_formats: Some(vec!["doubao:video".to_string()]),
+        endpoint_ids: None,
+        operations: None,
+    }]);
+    row.model_supports_streaming = Some(false);
+    row
 }
 
 struct PendingMinimalCandidateSelectionReadRepository;
@@ -1621,6 +1646,219 @@ async fn gateway_lists_gemini_operations_without_hitting_fallback_probe() {
 
     gateway_handle.abort();
     fallback_probe_handle.abort();
+}
+
+#[test]
+fn gateway_creates_then_reads_native_doubao_video_task_through_public_route() {
+    run_frontdoor_async_test(
+        "gateway_creates_then_reads_native_doubao_video_task_through_public_route",
+        gateway_creates_then_reads_native_doubao_video_task_through_public_route_impl(),
+    );
+}
+
+async fn gateway_creates_then_reads_native_doubao_video_task_through_public_route_impl() {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SeenExecutionRuntimeRequest {
+        method: String,
+        url: String,
+        authorization: String,
+        model: Option<String>,
+    }
+
+    let seen_requests = Arc::new(Mutex::new(Vec::<SeenExecutionRuntimeRequest>::new()));
+    let seen_requests_clone = Arc::clone(&seen_requests);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |request: Request| {
+            let seen_requests_inner = Arc::clone(&seen_requests_clone);
+            async move {
+                let (_parts, body) = request.into_parts();
+                let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
+                let payload: serde_json::Value = serde_json::from_slice(&raw_body)
+                    .expect("execution runtime payload should parse");
+                let method = payload
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let url = payload
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let authorization = payload
+                    .get("headers")
+                    .and_then(|value| value.get("authorization"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let model = payload
+                    .get("body")
+                    .and_then(|value| value.get("json_body"))
+                    .and_then(|value| value.get("model"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                seen_requests_inner.lock().expect("mutex should lock").push(
+                    SeenExecutionRuntimeRequest {
+                        method: method.clone(),
+                        url,
+                        authorization,
+                        model,
+                    },
+                );
+
+                let provider_body = if method == "POST" {
+                    json!({
+                        "id": "cgt-upstream-public-e2e",
+                        "status": "queued",
+                        "model": "doubao-seedance-2-0-260128",
+                        "created_at": "1786437454",
+                        "updated_at": "1786437454",
+                        "resolution": "1080p",
+                        "ratio": "16:9",
+                        "duration": "5"
+                    })
+                } else {
+                    json!({
+                        "id": "cgt-upstream-public-e2e",
+                        "status": "running",
+                        "model": "doubao-seedance-2-0-260128",
+                        "created_at": "1786437454",
+                        "updated_at": "1786437455",
+                        "resolution": "1080p",
+                        "ratio": "16:9",
+                        "duration": "5"
+                    })
+                };
+
+                Json(json!({
+                    "request_id": "trace-doubao-public-e2e",
+                    "status_code": 200,
+                    "headers": {"content-type": "application/json"},
+                    "body": {"json_body": provider_body},
+                    "telemetry": {"elapsed_ms": 1}
+                }))
+            }
+        }),
+    );
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+
+    let auth_repository = video_auth_repository(
+        "sk-doubao-public-e2e",
+        "api-key-doubao-public-e2e",
+        "user-doubao-public-e2e",
+        "doubao",
+        "doubao:video",
+        "Doubao-Seedance-2.0",
+    );
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_doubao_video_candidate_row(),
+        ]));
+    let provider_catalog_repository = simple_video_provider_catalog_repository(
+        "provider-doubao-video-public-e2e",
+        "endpoint-provider-doubao-video-public-e2e",
+        "key-provider-doubao-video-public-e2e",
+        "doubao",
+        "doubao:video",
+        "https://ark.cn-beijing.volces.com/api",
+        "sk-upstream-doubao-public-e2e",
+    );
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_video_task_truth_source_mode(crate::VideoTaskTruthSourceMode::RustAuthoritative)
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+                auth_repository,
+                candidate_selection_repository,
+                provider_catalog_repository,
+                request_candidate_repository,
+                DEVELOPMENT_ENCRYPTION_KEY,
+            ),
+        );
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    let create_response = client
+        .post(format!("{gateway_url}/v3/contents/generations/tasks"))
+        .bearer_auth("sk-doubao-public-e2e")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": "Doubao-Seedance-2.0",
+                "content": [{"type": "text", "text": "a cat yawns by a sunny window"}],
+                "ratio": "16:9",
+                "resolution": "1080p",
+                "duration": 5
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("Doubao create request should succeed");
+    let create_status = create_response.status();
+    let create_text = create_response.text().await.expect("body should read");
+    assert_eq!(
+        create_status,
+        StatusCode::OK,
+        "unexpected Doubao create response: {create_text}"
+    );
+    let create_body: serde_json::Value =
+        serde_json::from_str(&create_text).expect("create body should parse");
+    let local_task_id = create_body["id"]
+        .as_str()
+        .expect("create response should include local task id")
+        .to_string();
+    assert!(local_task_id.starts_with("cgt-"));
+    assert_ne!(local_task_id, "cgt-upstream-public-e2e");
+    assert_eq!(create_body["status"], "queued");
+
+    let detail_response = client
+        .get(format!(
+            "{gateway_url}/v3/contents/generations/tasks/{local_task_id}"
+        ))
+        .bearer_auth("sk-doubao-public-e2e")
+        .send()
+        .await
+        .expect("Doubao detail request should succeed");
+    let detail_status = detail_response.status();
+    let detail_text = detail_response.text().await.expect("body should read");
+    assert_eq!(
+        detail_status,
+        StatusCode::OK,
+        "unexpected Doubao detail response: {detail_text}"
+    );
+    let detail_body: serde_json::Value =
+        serde_json::from_str(&detail_text).expect("detail body should parse");
+    assert_eq!(detail_body["id"], local_task_id);
+    assert_eq!(detail_body["status"], "running");
+    assert_eq!(detail_body["duration"], "5");
+
+    let seen_requests = seen_requests.lock().expect("mutex should lock").clone();
+    assert_eq!(
+        seen_requests.len(),
+        2,
+        "create and detail should each execute once"
+    );
+    assert_eq!(seen_requests[0].method, "POST");
+    assert!(seen_requests[0]
+        .url
+        .ends_with("/v3/contents/generations/tasks"));
+    assert_eq!(
+        seen_requests[0].model.as_deref(),
+        Some("doubao-seedance-2-0-260128")
+    );
+    assert_eq!(seen_requests[1].method, "GET");
+    assert!(seen_requests[1]
+        .url
+        .ends_with("/v3/contents/generations/tasks/cgt-upstream-public-e2e"));
+    assert!(seen_requests
+        .iter()
+        .all(|request| request.authorization == "Bearer sk-upstream-doubao-public-e2e"));
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
 }
 
 #[tokio::test]
