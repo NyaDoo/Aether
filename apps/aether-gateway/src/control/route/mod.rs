@@ -1,6 +1,7 @@
 use axum::http::Uri;
 
 use crate::ai_serving::{ApiOperation, ClientSurface};
+use crate::constants::TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER;
 use crate::headers::header_value_str;
 use crate::{AppState, GatewayError};
 
@@ -176,6 +177,26 @@ pub(crate) async fn resolve_control_route(
     headers: &http::HeaderMap,
     trace_id: &str,
 ) -> Result<Option<GatewayControlDecision>, GatewayError> {
+    // An affinity proof is minted for one concrete owner gateway.  A valid
+    // signature alone must not let a caller replay that identity proof on a
+    // different gateway instance; reject it before any trusted identity is
+    // extracted.  Admin forwarding proofs intentionally have no affinity
+    // target and are admitted by their dedicated operational-route guard.
+    if crate::control::verify_trusted_auth_forward_headers(headers, method, uri)
+        && header_value_str(headers, TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER).as_deref()
+            != Some(state.tunnel.local_instance_id())
+    {
+        return Err(GatewayError::Client {
+            status: http::StatusCode::UNAUTHORIZED,
+            message: "internal forwarding proof targets a different gateway instance".to_string(),
+        });
+    }
+    if crate::control::internal_forward_proof_is_replay(headers, method, uri) {
+        return Err(GatewayError::Client {
+            status: http::StatusCode::UNAUTHORIZED,
+            message: "replayed internal forwarding proof".to_string(),
+        });
+    }
     let Some(mut decision) = classify_control_route(method, uri, headers) else {
         return Ok(None);
     };
@@ -185,7 +206,7 @@ pub(crate) async fn resolve_control_route(
             crate::system_features::ModelDirectivePolicySnapshot::load(state).await;
     }
 
-    match resolve_control_decision_auth(state, headers, uri, trace_id, decision).await? {
+    match resolve_control_decision_auth(state, method, headers, uri, trace_id, decision).await? {
         ControlDecisionAuthResolution::Resolved(decision) => Ok(Some(decision)),
     }
 }
@@ -217,7 +238,7 @@ pub(crate) fn classify_control_route(
     let mut decision = classified.into_decision(normalized_path);
     if let Some(signature) = decision.auth_endpoint_signature.as_deref() {
         decision.gateway_credential_carrier =
-            resolve_gateway_credential_carrier(headers, uri, signature);
+            resolve_gateway_credential_carrier(headers, method, uri, signature);
     }
     if decision.route_family.as_deref() == Some("claude") {
         if let Some(carrier) = decision.gateway_credential_carrier {

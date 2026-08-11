@@ -120,6 +120,17 @@ pub fn ai_local_execution_contract_for_formats(
         return (ExecutionStrategy::LocalSameFormat, ConversionMode::None);
     }
 
+    // Video task projection performs the provider-response normalization in
+    // the task service, so the planner only converts the create request.
+    if aether_ai_formats::normalize_api_format_alias(client_api_format) == "openai:video"
+        && aether_ai_formats::normalize_api_format_alias(provider_api_format) == "doubao:video"
+    {
+        return (
+            ExecutionStrategy::LocalCrossFormat,
+            ConversionMode::RequestOnly,
+        );
+    }
+
     let conversion_mode =
         if aether_ai_formats::request_conversion_kind(client_api_format, provider_api_format)
             .is_some()

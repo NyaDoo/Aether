@@ -21,10 +21,32 @@ pub async fn read_data_backed_video_task_response(
     route_family: Option<&str>,
     request_path: &str,
 ) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
+    read_data_backed_video_task_response_inner(state, route_family, request_path, None).await
+}
+
+pub async fn read_data_backed_video_task_response_for_user(
+    state: &impl StoredVideoTaskReadSide,
+    route_family: Option<&str>,
+    request_path: &str,
+    user_id: &str,
+) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
+    let Some(user_id) = non_empty_user_id(user_id) else {
+        return Ok(None);
+    };
+    read_data_backed_video_task_response_inner(state, route_family, request_path, Some(user_id))
+        .await
+}
+
+async fn read_data_backed_video_task_response_inner(
+    state: &impl StoredVideoTaskReadSide,
+    route_family: Option<&str>,
+    request_path: &str,
+    user_id: Option<&str>,
+) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
     match route_family {
-        Some("openai") => read_openai_video_task_response(state, request_path).await,
-        Some("gemini") => read_gemini_video_task_response(state, request_path).await,
-        Some("doubao") => read_doubao_video_task_response(state, request_path).await,
+        Some("openai") => read_openai_video_task_response(state, request_path, user_id).await,
+        Some("gemini") => read_gemini_video_task_response(state, request_path, user_id).await,
+        Some("doubao") => read_doubao_video_task_response(state, request_path, user_id).await,
         _ => Ok(None),
     }
 }
@@ -32,6 +54,7 @@ pub async fn read_data_backed_video_task_response(
 async fn read_openai_video_task_response(
     state: &impl StoredVideoTaskReadSide,
     request_path: &str,
+    user_id: Option<&str>,
 ) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
     let Some(lookup) = resolve_video_task_read_lookup_key(Some("openai"), request_path) else {
         return Ok(None);
@@ -40,8 +63,16 @@ async fn read_openai_video_task_response(
     let Some(task) = state.find_stored_video_task(lookup).await? else {
         return Ok(None);
     };
+    if !task_belongs_to_user(&task, user_id) {
+        return Ok(None);
+    }
 
-    if !matches!(task.provider_api_format.as_deref(), Some("openai:video")) {
+    if !matches!(task.client_api_format.as_deref(), Some("openai:video"))
+        || !matches!(
+            task.provider_api_format.as_deref(),
+            Some("openai:video" | "doubao:video")
+        )
+    {
         return Ok(None);
     }
 
@@ -51,6 +82,7 @@ async fn read_openai_video_task_response(
 async fn read_gemini_video_task_response(
     state: &impl StoredVideoTaskReadSide,
     request_path: &str,
+    user_id: Option<&str>,
 ) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
     let Some(lookup) = resolve_video_task_read_lookup_key(Some("gemini"), request_path) else {
         return Ok(None);
@@ -59,8 +91,13 @@ async fn read_gemini_video_task_response(
     let Some(task) = state.find_stored_video_task(lookup).await? else {
         return Ok(None);
     };
+    if !task_belongs_to_user(&task, user_id) {
+        return Ok(None);
+    }
 
-    if !matches!(task.provider_api_format.as_deref(), Some("gemini:video")) {
+    if !matches!(task.client_api_format.as_deref(), Some("gemini:video"))
+        || !matches!(task.provider_api_format.as_deref(), Some("gemini:video"))
+    {
         return Ok(None);
     }
 
@@ -70,6 +107,7 @@ async fn read_gemini_video_task_response(
 async fn read_doubao_video_task_response(
     state: &impl StoredVideoTaskReadSide,
     request_path: &str,
+    user_id: Option<&str>,
 ) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
     let Some(lookup) = resolve_video_task_read_lookup_key(Some("doubao"), request_path) else {
         return Ok(None);
@@ -78,10 +116,29 @@ async fn read_doubao_video_task_response(
     let Some(task) = state.find_stored_video_task(lookup).await? else {
         return Ok(None);
     };
+    if !task_belongs_to_user(&task, user_id) {
+        return Ok(None);
+    }
 
-    if !matches!(task.provider_api_format.as_deref(), Some("doubao:video")) {
+    if !matches!(task.client_api_format.as_deref(), Some("doubao:video"))
+        || !matches!(task.provider_api_format.as_deref(), Some("doubao:video"))
+    {
         return Ok(None);
     }
 
     Ok(Some(map_doubao_stored_task_to_read_response(task)))
+}
+
+fn task_belongs_to_user(task: &StoredVideoTask, user_id: Option<&str>) -> bool {
+    // Only the private inner call made by the legacy internal/admin wrapper is
+    // unscoped. The public `_for_user` entry point cannot construct `None`.
+    let Some(user_id) = user_id else {
+        return true;
+    };
+    task.user_id.as_deref().map(str::trim) == Some(user_id)
+}
+
+fn non_empty_user_id(user_id: &str) -> Option<&str> {
+    let user_id = user_id.trim();
+    (!user_id.is_empty()).then_some(user_id)
 }

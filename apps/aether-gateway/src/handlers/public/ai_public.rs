@@ -207,7 +207,8 @@ async fn maybe_build_local_doubao_video_tasks_list_response(
 ) -> Option<Response<Body>> {
     if decision.route_family.as_deref() != Some("doubao")
         || decision.route_kind.as_deref() != Some("video")
-        || request_context.request_path != aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH
+        || request_context.request_path.trim_end_matches('/')
+            != aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH
     {
         return None;
     }
@@ -222,9 +223,10 @@ async fn maybe_build_local_doubao_video_tasks_list_response(
         .map(|auth_context| auth_context.user_id.trim())
         .filter(|value| !value.is_empty())
     else {
-        return Some(build_ai_public_error_response(
+        return Some(build_doubao_video_error_response(
             http::StatusCode::UNAUTHORIZED,
-            AI_PUBLIC_UNAUTHORIZED_DETAIL,
+            "Unauthorized",
+            "Authentication required",
         ));
     };
 
@@ -241,40 +243,118 @@ async fn maybe_build_local_doubao_video_tasks_list_response(
             ));
         }
     };
+    let now_unix_secs = aether_video_tasks_core::current_unix_timestamp_secs();
 
+    // Ark supports an explicit task-id filter. The shared repository filter is
+    // intentionally user-agnostic for this field, so resolve IDs one by one
+    // and apply the ownership/status/model predicates before pagination.
+    if !list_query.task_ids.is_empty() {
+        let mut matching = Vec::with_capacity(list_query.task_ids.len());
+        for task_id in &list_query.task_ids {
+            let task = match state.find_video_task_by_id(task_id).await {
+                Ok(task) => task,
+                Err(_) => {
+                    return Some(build_ai_public_error_response(
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "Video task list is temporarily unavailable",
+                    ));
+                }
+            };
+            let Some(task) = task else { continue };
+            if task.user_id.as_deref().map(str::trim) == Some(user_id)
+                && doubao_task_matches_list_query(&task, &list_query, now_unix_secs)
+            {
+                matching.push(task);
+            }
+        }
+        matching.sort_by(|left, right| {
+            right
+                .created_at_unix_ms
+                .cmp(&left.created_at_unix_ms)
+                .then_with(|| right.updated_at_unix_secs.cmp(&left.updated_at_unix_secs))
+        });
+        let total = matching.len() as u64;
+        let items = matching
+            .into_iter()
+            .skip(list_query.offset)
+            .take(list_query.page_size)
+            .map(|task| {
+                aether_video_tasks_core::map_doubao_stored_task_to_read_response_at(
+                    task,
+                    now_unix_secs,
+                )
+                .body_json
+            })
+            .collect::<Vec<_>>();
+        return Some(Json(json!({ "items": items, "total": total })).into_response());
+    }
+
+    // Status groups (`queued` and `failed`), request-side model matching, and
+    // the cancelled-task retention window cannot be expressed by the shared
+    // single-status repository filter. Scan the already owner/client-scoped
+    // rows first so both `items` and `total` use the exact same predicates.
+    const SCAN_PAGE_SIZE: usize = 500;
     let filter = VideoTaskQueryFilter {
         user_id: Some(user_id.to_string()),
-        status: list_query.status,
-        model_substring: list_query.model,
+        status: None,
+        model_exact: None,
+        model_substring: None,
         client_api_format: Some("doubao:video".to_string()),
+        exclude_deleted: true,
     };
-    let tasks = match state
-        .list_video_task_page(&filter, list_query.offset, list_query.page_size)
-        .await
-    {
-        Ok(tasks) => tasks,
-        Err(err) => {
-            return Some(build_ai_public_error_response(
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{err:?}"),
-            ));
+    let mut matching = Vec::new();
+    let mut scan_offset = 0usize;
+    loop {
+        let page = match state
+            .list_video_task_page(&filter, scan_offset, SCAN_PAGE_SIZE)
+            .await
+        {
+            Ok(page) => page,
+            Err(_) => {
+                return Some(build_ai_public_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Video task list is temporarily unavailable",
+                ));
+            }
+        };
+        let page_len = page.len();
+        matching.extend(
+            page.into_iter()
+                .filter(|task| doubao_task_matches_list_query(task, &list_query, now_unix_secs)),
+        );
+        if page_len < SCAN_PAGE_SIZE {
+            break;
         }
-    };
-
-    let items = tasks
+        let next_offset = scan_offset.saturating_add(SCAN_PAGE_SIZE);
+        if next_offset == scan_offset {
+            break;
+        }
+        scan_offset = next_offset;
+    }
+    matching.sort_by(|left, right| {
+        right
+            .created_at_unix_ms
+            .cmp(&left.created_at_unix_ms)
+            .then_with(|| right.updated_at_unix_secs.cmp(&left.updated_at_unix_secs))
+    });
+    let total = matching.len() as u64;
+    let items = matching
         .into_iter()
-        .filter(is_doubao_video_task)
+        .skip(list_query.offset)
+        .take(list_query.page_size)
         .map(|task| {
-            aether_video_tasks_core::map_doubao_stored_task_to_read_response(task).body_json
+            aether_video_tasks_core::map_doubao_stored_task_to_read_response_at(task, now_unix_secs)
+                .body_json
         })
         .collect::<Vec<_>>();
 
-    Some(Json(json!({ "items": items, "total": items.len() })).into_response())
+    Some(Json(json!({ "items": items, "total": total })).into_response())
 }
 
 struct DoubaoVideoTasksListQuery {
     status: Option<VideoTaskStatus>,
     model: Option<String>,
+    task_ids: Vec<String>,
     page_size: usize,
     offset: usize,
 }
@@ -285,28 +365,37 @@ fn parse_doubao_video_tasks_list_query(
 ) -> Result<DoubaoVideoTasksListQuery, &'static str> {
     const DEFAULT_PAGE_SIZE: usize = 10;
     const MAX_PAGE_SIZE: usize = 500;
+    const MAX_PAGE_NUM: usize = 500;
 
     let mut page_size = DEFAULT_PAGE_SIZE;
     let mut page_num = 1usize;
     let mut status = None;
     let mut model = None;
+    let mut task_ids = Vec::new();
 
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
             "page_size" => {
-                page_size = value
+                let parsed = value
                     .parse::<usize>()
                     .ok()
                     .filter(|value| *value > 0)
-                    .ok_or("page_size must be a positive integer")?
-                    .min(MAX_PAGE_SIZE);
+                    .ok_or("page_size must be a positive integer")?;
+                if parsed > MAX_PAGE_SIZE {
+                    return Err("page_size must be between 1 and 500");
+                }
+                page_size = parsed;
             }
             "page_num" => {
-                page_num = value
+                let parsed = value
                     .parse::<usize>()
                     .ok()
                     .filter(|value| *value > 0)
                     .ok_or("page_num must be a positive integer")?;
+                if parsed > MAX_PAGE_NUM {
+                    return Err("page_num must be between 1 and 500");
+                }
+                page_num = parsed;
             }
             "filter.status" => {
                 status = Some(
@@ -320,6 +409,20 @@ fn parse_doubao_video_tasks_list_query(
                     model = Some(value.to_string());
                 }
             }
+            "filter.task_ids" | "filter.task_id" => {
+                for task_id in value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    if !task_ids.iter().any(|existing| existing == task_id) {
+                        if task_ids.len() >= MAX_PAGE_SIZE {
+                            return Err("filter.task_ids contains too many task IDs");
+                        }
+                        task_ids.push(task_id.to_string());
+                    }
+                }
+            }
             // Unknown filters are ignored rather than rejected, so newer Ark
             // query parameters do not turn into gateway errors.
             _ => {}
@@ -329,6 +432,7 @@ fn parse_doubao_video_tasks_list_query(
     Ok(DoubaoVideoTasksListQuery {
         status,
         model,
+        task_ids,
         page_size,
         offset: (page_num - 1).saturating_mul(page_size),
     })
@@ -347,12 +451,62 @@ fn doubao_status_filter_to_stored_status(value: &str) -> Option<VideoTaskStatus>
 
 fn is_doubao_video_task(task: &StoredVideoTask) -> bool {
     matches!(
+        task.client_api_format.as_deref().map(str::trim),
+        Some("doubao:video")
+    ) && matches!(
         task.provider_api_format
             .as_deref()
             .or(task.client_api_format.as_deref())
             .map(str::trim),
         Some("doubao:video")
     )
+}
+
+fn doubao_task_matches_list_query(
+    task: &StoredVideoTask,
+    query: &DoubaoVideoTasksListQuery,
+    now_unix_secs: u64,
+) -> bool {
+    is_doubao_video_task(task)
+        && aether_video_tasks_core::doubao_stored_task_is_visible_at(task, now_unix_secs)
+        && query
+            .status
+            .is_none_or(|status| doubao_list_status_matches(task.status, status))
+        && query
+            .model
+            .as_deref()
+            .is_none_or(|model| doubao_task_requested_model(task) == Some(model))
+}
+
+fn doubao_list_status_matches(task_status: VideoTaskStatus, filter: VideoTaskStatus) -> bool {
+    match filter {
+        VideoTaskStatus::Queued => matches!(
+            task_status,
+            VideoTaskStatus::Pending | VideoTaskStatus::Submitted | VideoTaskStatus::Queued
+        ),
+        VideoTaskStatus::Failed => {
+            matches!(
+                task_status,
+                VideoTaskStatus::Failed | VideoTaskStatus::Expired
+            )
+        }
+        status => task_status == status,
+    }
+}
+
+fn doubao_task_requested_model(task: &StoredVideoTask) -> Option<&str> {
+    task.original_request_body
+        .as_ref()
+        .and_then(|body| body.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            task.model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn maybe_build_local_openai_request_validation_response(
@@ -1556,15 +1710,17 @@ async fn build_local_gemini_video_operations_list_response(
     let filter = VideoTaskQueryFilter {
         user_id: Some(user_id.to_string()),
         status: None,
+        model_exact: None,
         model_substring: None,
         client_api_format: Some("gemini:video".to_string()),
+        exclude_deleted: false,
     };
     let tasks = match state.list_video_task_page(&filter, 0, 100).await {
         Ok(tasks) => tasks,
-        Err(err) => {
+        Err(_) => {
             return build_ai_public_error_response(
                 http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{err:?}"),
+                "Video operation list is temporarily unavailable",
             );
         }
     };
@@ -1591,10 +1747,10 @@ async fn build_local_gemini_video_operation_detail_response(
                     GEMINI_VIDEO_TASK_NOT_FOUND_DETAIL,
                 );
             }
-            Err(err) => {
+            Err(_) => {
                 return build_ai_public_error_response(
                     http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{err:?}"),
+                    "Video task is temporarily unavailable",
                 );
             }
         };
@@ -1616,10 +1772,10 @@ async fn build_local_gemini_video_operation_cancel_response(
                     GEMINI_VIDEO_TASK_NOT_FOUND_DETAIL,
                 );
             }
-            Err(err) => {
+            Err(_) => {
                 return build_ai_public_error_response(
                     http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{err:?}"),
+                    "Video task is temporarily unavailable",
                 );
             }
         };
@@ -1638,9 +1794,9 @@ async fn build_local_gemini_video_operation_cancel_response(
             ),
         ),
         Err(CancelVideoTaskError::Response(response)) => response,
-        Err(CancelVideoTaskError::Gateway(err)) => build_ai_public_error_response(
+        Err(CancelVideoTaskError::Gateway(_)) => build_ai_public_error_response(
             http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{err:?}"),
+            "Video task cancellation is temporarily unavailable",
         ),
     }
 }
@@ -1800,16 +1956,120 @@ fn build_ai_public_error_response(
     (status, Json(json!({ "detail": detail.into() }))).into_response()
 }
 
+fn doubao_video_error_body(code: &str, message: &str) -> Value {
+    json!({
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    })
+}
+
+fn build_doubao_video_error_response(
+    status: http::StatusCode,
+    code: &str,
+    message: &str,
+) -> Response<Body> {
+    (status, Json(doubao_video_error_body(code, message))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        doubao_list_status_matches, doubao_video_error_body, parse_doubao_video_tasks_list_query,
         parse_openai_image_validation_input, validate_claude_count_tokens_request,
         validate_openai_image_n, OpenAiImageOperation, CLAUDE_COUNT_TOKENS_BODY_REQUIRED_DETAIL,
         CLAUDE_COUNT_TOKENS_INVALID_JSON_DETAIL, CLAUDE_COUNT_TOKENS_MESSAGES_REQUIRED_DETAIL,
         CLAUDE_COUNT_TOKENS_MODEL_REQUIRED_DETAIL,
     };
+    use aether_data_contracts::repository::video_tasks::VideoTaskStatus;
     use axum::body::Bytes;
     use serde_json::json;
+
+    #[test]
+    fn doubao_video_auth_errors_use_the_native_ark_envelope() {
+        assert_eq!(
+            doubao_video_error_body("Unauthorized", "Authentication required"),
+            json!({
+                "error": {
+                    "code": "Unauthorized",
+                    "message": "Authentication required"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn doubao_list_query_applies_page_number_to_offset() {
+        let query = parse_doubao_video_tasks_list_query(
+            "page_size=25&page_num=3&filter.status=cancelled&filter.model=seedance-1-5-pro",
+        )
+        .expect("valid Doubao list query should parse");
+
+        assert_eq!(query.page_size, 25);
+        assert_eq!(query.offset, 50);
+        assert_eq!(query.status, Some(VideoTaskStatus::Cancelled));
+        assert_eq!(query.model.as_deref(), Some("seedance-1-5-pro"));
+    }
+
+    #[test]
+    fn doubao_list_query_rejects_zero_page_number() {
+        assert_eq!(
+            parse_doubao_video_tasks_list_query("page_num=0").err(),
+            Some("page_num must be a positive integer")
+        );
+    }
+
+    #[test]
+    fn doubao_list_query_enforces_official_page_bounds() {
+        assert_eq!(
+            parse_doubao_video_tasks_list_query("page_num=501").err(),
+            Some("page_num must be between 1 and 500")
+        );
+        assert_eq!(
+            parse_doubao_video_tasks_list_query("page_size=501").err(),
+            Some("page_size must be between 1 and 500")
+        );
+    }
+
+    #[test]
+    fn doubao_list_query_accepts_and_deduplicates_task_ids() {
+        let query = parse_doubao_video_tasks_list_query(
+            "filter.task_ids=task-a,task-b&filter.task_ids=task-b&filter.task_id=task-c",
+        )
+        .expect("task-id filter should parse");
+        assert_eq!(
+            query.task_ids,
+            vec![
+                "task-a".to_string(),
+                "task-b".to_string(),
+                "task-c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn doubao_list_status_filters_match_ark_status_groups() {
+        for status in [
+            VideoTaskStatus::Pending,
+            VideoTaskStatus::Submitted,
+            VideoTaskStatus::Queued,
+        ] {
+            assert!(doubao_list_status_matches(status, VideoTaskStatus::Queued));
+        }
+        assert!(!doubao_list_status_matches(
+            VideoTaskStatus::Processing,
+            VideoTaskStatus::Queued
+        ));
+
+        for status in [VideoTaskStatus::Failed, VideoTaskStatus::Expired] {
+            assert!(doubao_list_status_matches(status, VideoTaskStatus::Failed));
+        }
+        assert!(!doubao_list_status_matches(
+            VideoTaskStatus::Cancelled,
+            VideoTaskStatus::Failed
+        ));
+    }
 
     #[test]
     fn count_tokens_validation_rejects_only_structurally_invalid_requests() {

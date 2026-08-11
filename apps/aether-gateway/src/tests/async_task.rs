@@ -9,9 +9,9 @@ use aether_data_contracts::repository::video_tasks::{
 };
 
 use super::{
-    any, build_router_with_state, build_state_with_execution_runtime_override, json, start_server,
-    to_bytes, AppState, Arc, Body, Bytes, HeaderValue, Json, Mutex, Request, Response, Router,
-    StatusCode,
+    any, build_router_with_state, build_state_with_execution_runtime_override, json,
+    signed_internal_admin_headers, start_server, to_bytes, AppState, Arc, Body, Bytes, HeaderValue,
+    Json, Mutex, Request, Response, Router, StatusCode, VideoTaskTruthSourceMode,
 };
 
 fn sample_video_task(
@@ -75,6 +75,71 @@ fn sample_video_task(
     }
 }
 
+fn openai_video_provider_catalog(base_url: &str) -> Arc<InMemoryProviderCatalogReadRepository> {
+    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            "OpenAI Video".to_string(),
+            Some("https://openai.com".to_string()),
+            "openai".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            Some(2),
+            None,
+            Some(20.0),
+            None,
+            None,
+        )],
+        vec![StoredProviderCatalogEndpoint::new(
+            "endpoint-1".to_string(),
+            "provider-1".to_string(),
+            "openai:video".to_string(),
+            Some("openai".to_string()),
+            Some("video".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            base_url.to_string(),
+            None,
+            None,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build")],
+        vec![StoredProviderCatalogKey::new(
+            "provider-key-1".to_string(),
+            "provider-1".to_string(),
+            "primary".to_string(),
+            "bearer".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["openai:video"])),
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "sk-upstream-openai-video")
+                .expect("api key should encrypt"),
+            None,
+            None,
+            Some(json!({"openai:video": 1})),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build")],
+    ))
+}
+
 #[tokio::test]
 async fn gateway_lists_video_tasks_via_internal_async_task_endpoint() {
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
@@ -119,10 +184,10 @@ async fn gateway_lists_video_tasks_via_internal_async_task_endpoint() {
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/async-tasks/video-tasks?status=completed&page=1&page_size=1";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks?status=completed&page=1&page_size=1"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("request should succeed");
@@ -176,10 +241,10 @@ async fn gateway_exposes_video_task_stats_via_internal_async_task_endpoint() {
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/async-tasks/video-tasks/stats";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/stats"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("request should succeed");
@@ -219,10 +284,10 @@ async fn gateway_reads_video_task_detail_via_internal_async_task_endpoint() {
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/async-tasks/video-tasks/task-1";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-1"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("request should succeed");
@@ -265,10 +330,10 @@ async fn gateway_redirects_direct_video_task_video_from_internal_async_task_endp
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("client should build");
+    let path = "/_gateway/async-tasks/video-tasks/task-redirect/video";
     let response = client
-        .get(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-redirect/video"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("request should succeed");
@@ -326,9 +391,10 @@ async fn gateway_proxies_gemini_video_task_video_from_internal_async_task_endpoi
     task.provider_id = Some("provider-gemini-video-1".to_string());
     task.endpoint_id = Some("endpoint-gemini-video-1".to_string());
     task.key_id = Some("key-gemini-video-1".to_string());
-    task.video_url = Some(format!(
+    let task_video_url = format!(
         "{upstream_url}/generativelanguage.googleapis.com/v1beta/files/video-task-123:download"
-    ));
+    );
+    task.video_url = Some(task_video_url.clone());
     repository
         .upsert(task)
         .await
@@ -410,36 +476,32 @@ async fn gateway_proxies_gemini_video_task_video_from_internal_async_task_endpoi
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-proxy/video"
-        ))
+    let path = "/_gateway/async-tasks/video-tasks/task-proxy/video";
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client should build");
+    let response = client
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    // The test server is HTTP on a loopback origin.  The production path only
+    // proxies Gemini media from the exact HTTPS Google origin, so this
+    // deliberately falls back to a redirect and must never attach the API key.
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(
         response
             .headers()
-            .get(http::header::CONTENT_TYPE)
+            .get(http::header::LOCATION)
             .and_then(|value| value.to_str().ok()),
-        Some("video/mp4")
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get(http::header::CONTENT_DISPOSITION)
-            .and_then(|value| value.to_str().ok()),
-        Some("inline; filename=\"video_task-proxy.mp4\"")
-    );
-    assert_eq!(
-        response.bytes().await.expect("body should read"),
-        Bytes::from_static(b"proxied-video-bytes")
+        Some(task_video_url.as_str())
     );
     assert_eq!(
         seen_api_key.lock().expect("mutex should lock").as_deref(),
-        Some("gemini-upstream-secret")
+        None
     );
 
     gateway_handle.abort();
@@ -564,21 +626,29 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint() {
         .expect("upsert should succeed");
 
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let provider_catalog_repository =
+        openai_video_provider_catalog("https://api.openai.example/v1");
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
-            .with_video_task_data_repository_for_tests(Arc::clone(&repository)),
+            .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_video_task_repository_and_provider_transport_for_tests(
+                    Arc::clone(&repository),
+                    provider_catalog_repository,
+                    DEVELOPMENT_ENCRYPTION_KEY,
+                ),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/async-tasks/video-tasks/task-openai-cancel/cancel";
     let response = reqwest::Client::new()
-        .post(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-openai-cancel/cancel"
-        ))
+        .post(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::POST, path))
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
             .json::<serde_json::Value>()
@@ -606,9 +676,12 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint() {
         "Bearer sk-upstream-openai-video"
     );
 
+    let detail_path = "/_gateway/async-tasks/video-tasks/task-openai-cancel";
     let detail = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-openai-cancel"
+        .get(format!("{gateway_url}{detail_path}"))
+        .headers(signed_internal_admin_headers(
+            http::Method::GET,
+            detail_path,
         ))
         .send()
         .await
@@ -726,22 +799,29 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint_with
         .await
         .expect("upsert should succeed");
 
+    let provider_catalog_repository = openai_video_provider_catalog(&upstream_api_root);
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway state should build")
-            .with_video_task_data_repository_for_tests(Arc::clone(&repository)),
+            .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_video_task_repository_and_provider_transport_for_tests(
+                    Arc::clone(&repository),
+                    provider_catalog_repository,
+                    DEVELOPMENT_ENCRYPTION_KEY,
+                ),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/async-tasks/video-tasks/task-openai-cancel-direct/cancel";
     let response = reqwest::Client::new()
-        .post(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-openai-cancel-direct/cancel"
-        ))
+        .post(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::POST, path))
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
             .json::<serde_json::Value>()
@@ -763,9 +843,12 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint_with
         })
     );
 
+    let detail_path = "/_gateway/async-tasks/video-tasks/task-openai-cancel-direct";
     let detail = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-openai-cancel-direct"
+        .get(format!("{gateway_url}{detail_path}"))
+        .headers(signed_internal_admin_headers(
+            http::Method::GET,
+            detail_path,
         ))
         .send()
         .await
@@ -805,10 +888,10 @@ async fn gateway_rejects_terminal_video_task_cancel_via_internal_async_task_endp
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/async-tasks/video-tasks/task-cancelled-already/cancel";
     let response = reqwest::Client::new()
-        .post(format!(
-            "{gateway_url}/_gateway/async-tasks/video-tasks/task-cancelled-already/cancel"
-        ))
+        .post(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::POST, path))
         .send()
         .await
         .expect("request should succeed");

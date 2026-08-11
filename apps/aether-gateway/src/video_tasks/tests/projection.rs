@@ -1,4 +1,6 @@
 use super::fixtures::*;
+use aether_contracts::EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER;
+use aether_video_tasks_core::DoubaoVideoTaskSeed;
 use serde_json::{json, Value};
 
 use super::{
@@ -124,7 +126,14 @@ fn rust_authoritative_service_builds_openai_content_stream_plan_from_direct_vide
         plan.url.as_str(),
         "https://cdn.example.com/ext-video-task-123.mp4"
     );
-    assert!(plan.headers.is_empty());
+    assert_eq!(plan.headers.len(), 1);
+    assert_eq!(
+        plan.headers
+            .get(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER)
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(!plan.headers.contains_key("authorization"));
 }
 
 #[test]
@@ -172,6 +181,112 @@ fn rust_authoritative_service_returns_processing_content_response_for_pending_op
         body_json,
         json!({"detail": "Video is still processing (status: processing)"})
     );
+}
+
+#[test]
+fn gateway_service_enforces_owner_and_cross_doubao_content_contract() {
+    let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
+    let mut persistence = sample_persistence("openai:video");
+    persistence.provider_api_format = "doubao:video".to_string();
+    persistence.format_converted = true;
+    let mut transport = sample_transport("https://ark.example.com/api", "openai:video");
+    transport.upstream_base_url = "https://ark.example.com/api".to_string();
+    transport.provider_name = Some("doubao".to_string());
+
+    service.record_snapshot(LocalVideoTaskSnapshot::Doubao(DoubaoVideoTaskSeed {
+        local_task_id: "task-cross-content-123".to_string(),
+        upstream_task_id: "cgt-upstream-content-123".to_string(),
+        created_at_unix_secs: 1_712_345_678,
+        updated_at_unix_secs: Some(1_712_345_688),
+        user_id: Some("user-123".to_string()),
+        api_key_id: Some("key-123".to_string()),
+        model: Some("doubao-seedance".to_string()),
+        prompt: Some("hello".to_string()),
+        resolution: Some("720p".to_string()),
+        ratio: Some("16:9".to_string()),
+        duration_seconds: Some(4),
+        seed: None,
+        frames: None,
+        frames_per_second: None,
+        status: LocalVideoTaskStatus::Completed,
+        progress_percent: 100,
+        completed_at_unix_secs: Some(1_712_345_688),
+        error_code: None,
+        error_message: None,
+        video_url: Some("https://cdn.example.com/video.mp4?X-Sig=video-secret".to_string()),
+        last_frame_url: Some("https://cdn.example.com/frame.jpg?X-Sig=frame-secret".to_string()),
+        completion_tokens: Some(100),
+        total_tokens: Some(120),
+        persistence,
+        transport,
+    }));
+
+    assert!(service
+        .prepare_openai_content_stream_action_for_user(
+            "/v1/videos/task-cross-content-123/content",
+            Some("variant=thumbnail"),
+            "trace-foreign",
+            "user-foreign",
+        )
+        .is_none());
+
+    let read = service
+        .read_response_for_user(
+            Some("openai"),
+            "/v1/videos/task-cross-content-123",
+            "user-123",
+        )
+        .expect("owner should read the projected task");
+    assert!(!read.body_json.to_string().contains("X-Sig="));
+    assert!(read.body_json.get("video_url").is_none());
+    assert!(read.body_json.get("content").is_none());
+
+    let thumbnail = service
+        .prepare_openai_content_stream_action_for_user(
+            "/v1/videos/task-cross-content-123/content",
+            Some("variant=thumbnail"),
+            "trace-owner",
+            "user-123",
+        )
+        .expect("owner should receive a content action");
+    let LocalVideoTaskContentAction::StreamPlan(plan) = thumbnail else {
+        panic!("thumbnail should stream");
+    };
+    assert_eq!(
+        plan.url,
+        "https://cdn.example.com/frame.jpg?X-Sig=frame-secret"
+    );
+    assert_eq!(plan.headers.len(), 1);
+    assert_eq!(
+        plan.headers
+            .get(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER)
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(!plan.headers.contains_key("authorization"));
+    assert_eq!(plan.client_api_format, "openai:video");
+    // The SSRF asset guard classifies both native and converted content plans
+    // by provider format, so this must never regress to the client format.
+    assert_eq!(plan.provider_api_format, "doubao:video");
+
+    let spritesheet = service
+        .prepare_openai_content_stream_action_for_user(
+            "/v1/videos/task-cross-content-123/content",
+            Some("variant=spritesheet"),
+            "trace-spritesheet",
+            "user-123",
+        )
+        .expect("unsupported variant should be an explicit action");
+    let LocalVideoTaskContentAction::Immediate {
+        status_code,
+        body_json,
+    } = spritesheet
+    else {
+        panic!("spritesheet should not stream");
+    };
+    assert_eq!(status_code, 400);
+    assert_eq!(body_json["error"]["code"], "unsupported_variant");
+    assert!(!body_json.to_string().contains("X-Sig="));
 }
 
 #[test]

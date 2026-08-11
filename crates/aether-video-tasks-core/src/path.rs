@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{LocalVideoTaskRegistryMutation, LocalVideoTaskStatus, VideoTaskTruthSourceMode};
 
 pub fn extract_openai_task_id_from_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let suffix = path.strip_prefix("/v1/videos/")?;
     if suffix.is_empty()
         || suffix.contains('/')
@@ -20,6 +21,7 @@ pub fn extract_openai_task_id_from_path(path: &str) -> Option<&str> {
 }
 
 pub fn extract_gemini_short_id_from_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let operations_index = path.find("/operations/")?;
     let suffix = &path[(operations_index + "/operations/".len())..];
     if suffix.is_empty() || suffix.contains('/') || suffix.ends_with(":cancel") {
@@ -29,6 +31,7 @@ pub fn extract_gemini_short_id_from_path(path: &str) -> Option<&str> {
 }
 
 pub fn extract_openai_task_id_from_cancel_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let suffix = path.strip_prefix("/v1/videos/")?;
     suffix
         .strip_suffix("/cancel")
@@ -36,6 +39,7 @@ pub fn extract_openai_task_id_from_cancel_path(path: &str) -> Option<&str> {
 }
 
 pub fn extract_openai_task_id_from_remix_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let suffix = path.strip_prefix("/v1/videos/")?;
     suffix
         .strip_suffix("/remix")
@@ -43,6 +47,7 @@ pub fn extract_openai_task_id_from_remix_path(path: &str) -> Option<&str> {
 }
 
 pub fn extract_openai_task_id_from_content_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let suffix = path.strip_prefix("/v1/videos/")?;
     suffix
         .strip_suffix("/content")
@@ -50,6 +55,7 @@ pub fn extract_openai_task_id_from_content_path(path: &str) -> Option<&str> {
 }
 
 pub fn extract_gemini_short_id_from_cancel_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let operations_index = path.find("/operations/")?;
     let suffix = &path[(operations_index + "/operations/".len())..];
     let short_id = suffix.strip_suffix(":cancel")?;
@@ -63,6 +69,7 @@ pub fn extract_gemini_short_id_from_cancel_path(path: &str) -> Option<&str> {
 pub const DOUBAO_VIDEO_TASKS_PATH: &str = "/v3/contents/generations/tasks";
 
 pub fn extract_doubao_task_id_from_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let suffix = path
         .strip_prefix(DOUBAO_VIDEO_TASKS_PATH)?
         .strip_prefix('/')?;
@@ -70,6 +77,7 @@ pub fn extract_doubao_task_id_from_path(path: &str) -> Option<&str> {
 }
 
 pub fn extract_doubao_task_id_from_content_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
     let suffix = path
         .strip_prefix(DOUBAO_VIDEO_TASKS_PATH)?
         .strip_prefix('/')?
@@ -187,7 +195,7 @@ pub fn build_local_sync_finalize_request_path(
                 "/v1beta/models/{model}/operations/{short_id}:cancel"
             ))
         }
-        "doubao_video_delete_sync_finalize" => {
+        "doubao_video_delete_sync_finalize" | "doubao_video_cancel_sync_finalize" => {
             let task_id =
                 report_context.and_then(|value| non_empty_context_str(value, "task_id"))?;
             Some(format!("{DOUBAO_VIDEO_TASKS_PATH}/{task_id}"))
@@ -228,6 +236,12 @@ pub fn resolve_local_video_registry_mutation(
         "doubao_video_delete_sync_finalize" => {
             let task_id = extract_doubao_task_id_from_path(request_path)?;
             Some(LocalVideoTaskRegistryMutation::DoubaoDeleted {
+                task_id: task_id.to_string(),
+            })
+        }
+        "doubao_video_cancel_sync_finalize" => {
+            let task_id = extract_doubao_task_id_from_path(request_path)?;
+            Some(LocalVideoTaskRegistryMutation::DoubaoCancelled {
                 task_id: task_id.to_string(),
             })
         }
@@ -303,6 +317,10 @@ mod tests {
         );
         assert_eq!(
             extract_openai_task_id_from_content_path("/v1/videos/task_123/content"),
+            Some("task_123")
+        );
+        assert_eq!(
+            extract_openai_task_id_from_path("/v1/videos/task_123/"),
             Some("task_123")
         );
         assert_eq!(
@@ -427,6 +445,12 @@ mod tests {
         assert_eq!(
             extract_doubao_task_id_from_content_path(
                 "/v3/contents/generations/tasks/cgt-123/content"
+            ),
+            Some("cgt-123")
+        );
+        assert_eq!(
+            extract_doubao_task_id_from_content_path(
+                "/v3/contents/generations/tasks/cgt-123/content/"
             ),
             Some("cgt-123")
         );

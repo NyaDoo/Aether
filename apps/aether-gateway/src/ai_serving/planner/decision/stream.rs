@@ -160,21 +160,36 @@ async fn maybe_build_local_video_task_content_stream_decision_payload(
         return Ok(None);
     }
 
+    let Some(user_id) = decision
+        .auth_context
+        .as_ref()
+        .map(|auth_context| auth_context.user_id.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
     let _ = state
-        .hydrate_video_task_for_route(route_family, parts.uri.path())
+        .hydrate_video_task_for_route_for_user(route_family, parts.uri.path(), user_id)
         .await?;
 
     let action = match route_family {
-        Some("doubao") => state.video_tasks.prepare_doubao_content_stream_action(
-            parts.uri.path(),
-            parts.uri.query(),
-            trace_id,
-        ),
-        _ => state.video_tasks.prepare_openai_content_stream_action(
-            parts.uri.path(),
-            parts.uri.query(),
-            trace_id,
-        ),
+        Some("doubao") => state
+            .video_tasks
+            .prepare_doubao_content_stream_action_for_user(
+                parts.uri.path(),
+                parts.uri.query(),
+                trace_id,
+                user_id,
+            ),
+        _ => state
+            .video_tasks
+            .prepare_openai_content_stream_action_for_user(
+                parts.uri.path(),
+                parts.uri.query(),
+                trace_id,
+                user_id,
+            ),
     };
     let Some(action) = action else {
         return Ok(None);

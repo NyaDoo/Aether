@@ -353,8 +353,15 @@ pub enum VideoTaskLookupKey<'a> {
 pub struct VideoTaskQueryFilter {
     pub user_id: Option<String>,
     pub status: Option<VideoTaskStatus>,
+    /// Exact model/endpoint identifier match. This is separate from the
+    /// legacy substring filter because provider list APIs (for example Ark)
+    /// define `filter.model` as an exact search.
+    pub model_exact: Option<String>,
     pub model_substring: Option<String>,
     pub client_api_format: Option<String>,
+    /// Hide terminal tombstones from provider-facing task lists while keeping
+    /// the default repository behavior unchanged for admin/audit queries.
+    pub exclude_deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

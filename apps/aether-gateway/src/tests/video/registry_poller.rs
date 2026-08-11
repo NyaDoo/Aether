@@ -11,7 +11,8 @@ use axum::{extract::Request, Json, Router};
 use serde_json::json;
 
 use super::{
-    build_state_with_execution_runtime_override, start_server, AppState, VideoTaskTruthSourceMode,
+    build_state_with_execution_runtime_override, simple_video_provider_catalog_repository,
+    start_server, AppState, VideoTaskTruthSourceMode,
 };
 
 fn sample_due_openai_task(upstream_base_url: &str) -> UpsertVideoTask {
@@ -168,9 +169,22 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
         .upsert(sample_due_openai_task("https://api.openai.example/v1"))
         .await
         .expect("task upsert should succeed");
+    let provider_catalog_repository = simple_video_provider_catalog_repository(
+        "provider-openai-video-local-1",
+        "endpoint-openai-video-local-1",
+        "key-openai-video-local-1",
+        "openai",
+        "openai:video",
+        "https://api.openai.example/v1",
+        "sk-upstream-openai-video",
+    );
 
     let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url)
-        .with_video_task_data_repository_for_tests(Arc::clone(&repository))
+        .with_video_task_repository_and_provider_transport_for_tests(
+            Arc::clone(&repository),
+            provider_catalog_repository,
+            aether_crypto::DEVELOPMENT_ENCRYPTION_KEY,
+        )
         .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
         .with_video_task_poller_config(std::time::Duration::from_millis(25), 8);
     let background_tasks = gateway_state.spawn_background_tasks();
@@ -274,10 +288,23 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
         .upsert(sample_due_openai_task(&upstream_api_root))
         .await
         .expect("task upsert should succeed");
+    let provider_catalog_repository = simple_video_provider_catalog_repository(
+        "provider-openai-video-local-1",
+        "endpoint-openai-video-local-1",
+        "key-openai-video-local-1",
+        "openai",
+        "openai:video",
+        &upstream_api_root,
+        "sk-upstream-openai-video",
+    );
 
     let gateway_state = AppState::new()
         .expect("gateway state should build")
-        .with_video_task_data_repository_for_tests(Arc::clone(&repository))
+        .with_video_task_repository_and_provider_transport_for_tests(
+            Arc::clone(&repository),
+            provider_catalog_repository,
+            aether_crypto::DEVELOPMENT_ENCRYPTION_KEY,
+        )
         .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
         .with_video_task_poller_config(std::time::Duration::from_millis(25), 8);
     let background_tasks = gateway_state.spawn_background_tasks();

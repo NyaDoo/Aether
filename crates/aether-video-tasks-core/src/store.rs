@@ -13,6 +13,9 @@ pub trait VideoTaskStore: std::fmt::Debug + Send + Sync {
     fn clone_openai(&self, task_id: &str) -> Option<OpenAiVideoTaskSeed>;
     fn clone_gemini(&self, short_id: &str) -> Option<GeminiVideoTaskSeed>;
     fn clone_doubao(&self, task_id: &str) -> Option<DoubaoVideoTaskSeed>;
+    fn clone_openai_snapshot(&self, task_id: &str) -> Option<LocalVideoTaskSnapshot>;
+    fn clone_gemini_snapshot(&self, short_id: &str) -> Option<LocalVideoTaskSnapshot>;
+    fn clone_doubao_snapshot(&self, task_id: &str) -> Option<LocalVideoTaskSnapshot>;
     fn list_active_snapshots(&self, limit: usize) -> Vec<LocalVideoTaskSnapshot>;
     fn apply_mutation(&self, mutation: LocalVideoTaskRegistryMutation);
     fn project_openai(&self, task_id: &str, provider_body: &Map<String, Value>) -> bool;

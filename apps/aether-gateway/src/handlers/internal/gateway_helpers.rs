@@ -1,4 +1,5 @@
 use crate::admin_api::build_internal_control_error_response;
+use crate::async_task::finalize_video_task_if_terminal;
 use crate::constants::{
     CONTROL_ACTION_HEADER, CONTROL_ACTION_PROXY_PUBLIC, CONTROL_EXECUTED_HEADER,
     CONTROL_EXECUTION_RUNTIME_CANDIDATE_KEY, EXECUTION_PATH_CONTROL_EXECUTE_STREAM,
@@ -281,8 +282,14 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
                 local_task_snapshot,
             } = outcome;
             if let Some(snapshot) = local_task_snapshot {
-                let _ = state.upsert_video_task_snapshot(&snapshot).await?;
+                let stored = state.upsert_video_task_snapshot(&snapshot).await?;
                 state.video_tasks.record_snapshot(snapshot);
+                if let Some(stored) = stored.as_ref() {
+                    // Cross-gateway finalize must settle the original create
+                    // request just like the direct execution path, including
+                    // the rare immediate-terminal create response.
+                    finalize_video_task_if_terminal(state, stored).await;
+                }
             }
             match report_mode {
                 crate::video_tasks::VideoTaskSyncReportMode::InlineSync => {
@@ -318,7 +325,14 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
                 .video_tasks
                 .snapshot_for_route(decision.route_family.as_deref(), request_path.as_str())
             {
-                let _ = state.upsert_video_task_snapshot(&snapshot).await?;
+                if let Some(stored) = state.upsert_video_task_snapshot(&snapshot).await? {
+                    if payload.report_kind.ends_with("_cancel_sync_finalize") {
+                        // The internal finalize trace is not the create
+                        // request. Drive cancellation billing from the stored
+                        // task, which retains the original request id.
+                        finalize_video_task_if_terminal(state, &stored).await;
+                    }
+                }
             }
         }
         if let Some(success_report_kind) =

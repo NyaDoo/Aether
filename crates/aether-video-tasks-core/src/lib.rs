@@ -20,7 +20,11 @@ mod util;
 pub use body::{
     context_text, context_u64, request_body_string, request_body_text, request_body_u32,
 };
-pub use doubao::{map_doubao_stored_task_to_read_response, map_doubao_task_status};
+pub use doubao::{
+    doubao_cancelled_task_is_visible_at, doubao_stored_task_is_visible_at,
+    map_doubao_stored_task_to_read_response, map_doubao_stored_task_to_read_response_at,
+    map_doubao_task_status, DOUBAO_CANCELLED_TASK_RETENTION_SECONDS,
+};
 pub use doubao_body::{
     doubao_content_has_video_input, doubao_content_prompt, doubao_prompt_text,
     doubao_string_parameter, doubao_u32_parameter,
@@ -40,7 +44,10 @@ pub use path::{
     resolve_video_task_hydration_lookup_key, resolve_video_task_read_lookup_key,
     resolve_video_task_report_lookup, VideoTaskReportLookup, DOUBAO_VIDEO_TASKS_PATH,
 };
-pub use read_side::{read_data_backed_video_task_response, StoredVideoTaskReadSide};
+pub use read_side::{
+    read_data_backed_video_task_response, read_data_backed_video_task_response_for_user,
+    StoredVideoTaskReadSide,
+};
 pub use service::VideoTaskService;
 pub use store::VideoTaskStore;
 pub use store_backend::{FileVideoTaskStore, InMemoryVideoTaskStore};

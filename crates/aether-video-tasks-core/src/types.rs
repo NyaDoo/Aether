@@ -82,6 +82,7 @@ pub enum LocalVideoTaskRegistryMutation {
     OpenAiCancelled { task_id: String },
     OpenAiDeleted { task_id: String },
     GeminiCancelled { short_id: String },
+    DoubaoCancelled { task_id: String },
     DoubaoDeleted { task_id: String },
 }
 
@@ -185,6 +186,10 @@ pub struct DoubaoVideoTaskSeed {
     pub local_task_id: String,
     pub upstream_task_id: String,
     pub created_at_unix_secs: u64,
+    /// Most recent provider-side update timestamp. Older persisted snapshots do
+    /// not contain this field, so deserialization must keep accepting them.
+    #[serde(default)]
+    pub updated_at_unix_secs: Option<u64>,
     pub user_id: Option<String>,
     pub api_key_id: Option<String>,
     pub model: Option<String>,
@@ -192,6 +197,17 @@ pub struct DoubaoVideoTaskSeed {
     pub resolution: Option<String>,
     pub ratio: Option<String>,
     pub duration_seconds: Option<u32>,
+    /// Provider-resolved random seed. Ark models this as a signed int32 and
+    /// may use negative sentinel values, so it must not be narrowed to u32.
+    #[serde(default)]
+    pub seed: Option<i32>,
+    /// Exact generated frame count. Ark returns either `frames` or `duration`,
+    /// never both, for a single task.
+    #[serde(default)]
+    pub frames: Option<i32>,
+    /// Provider-resolved frame rate, exposed as `framespersecond` to clients.
+    #[serde(default)]
+    pub frames_per_second: Option<i32>,
     pub status: LocalVideoTaskStatus,
     pub progress_percent: u16,
     pub completed_at_unix_secs: Option<u64>,

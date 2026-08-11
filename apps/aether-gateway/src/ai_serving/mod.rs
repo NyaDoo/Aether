@@ -132,12 +132,15 @@ pub(crate) fn build_provider_transport_request_url_for_request_body(
 pub(crate) async fn resolve_execution_runtime_auth_context(
     state: &AppState,
     decision: &GatewayControlDecision,
+    method: &http::Method,
     headers: &http::HeaderMap,
     uri: &Uri,
     trace_id: &str,
 ) -> Result<Option<crate::control::GatewayControlAuthContext>, GatewayError> {
-    crate::control::resolve_execution_runtime_auth_context(state, decision, headers, uri, trace_id)
-        .await
+    crate::control::resolve_execution_runtime_auth_context(
+        state, decision, method, headers, uri, trace_id,
+    )
+    .await
 }
 
 pub(crate) fn collect_control_headers(

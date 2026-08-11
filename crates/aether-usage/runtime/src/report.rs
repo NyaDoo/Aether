@@ -289,6 +289,8 @@ pub fn is_local_ai_sync_report_kind(report_kind: &str) -> bool {
             | "doubao_video_create_sync_error"
             | "doubao_video_delete_sync_success"
             | "doubao_video_delete_sync_error"
+            | "doubao_video_cancel_sync_success"
+            | "doubao_video_cancel_sync_error"
             | "gemini_files_store_mapping"
             | "gemini_files_delete_mapping"
     )

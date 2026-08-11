@@ -505,6 +505,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
         forwarded_for: String,
         forwarded_by: String,
         owner_instance_id: String,
+        proof_valid: bool,
     }
 
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
@@ -595,6 +596,11 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_string(),
+                    proof_valid: crate::control::verify_trusted_auth_forward_headers(
+                        &parts.headers,
+                        &parts.method,
+                        &parts.uri,
+                    ),
                 });
                 (
                     StatusCode::OK,
@@ -720,6 +726,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
     assert_eq!(owner_request.forwarded_for, "127.0.0.1");
     assert_eq!(owner_request.forwarded_by, "gateway-a");
     assert_eq!(owner_request.owner_instance_id, "gateway-b");
+    assert!(owner_request.proof_valid);
 
     gateway_handle.abort();
     owner_handle.abort();

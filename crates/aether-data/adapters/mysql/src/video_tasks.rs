@@ -554,6 +554,14 @@ fn push_filter<'args>(
         push_clause(builder, "status = ");
         builder.push_bind(status_to_database(status));
     }
+    if filter.exclude_deleted {
+        push_clause(builder, "status <> ");
+        builder.push_bind(status_to_database(VideoTaskStatus::Deleted));
+    }
+    if let Some(model_exact) = filter.model_exact.as_deref() {
+        push_clause(builder, "model = ");
+        builder.push_bind(model_exact.trim());
+    }
     if let Some(model_substring) = filter.model_substring.as_deref() {
         push_clause(builder, "LOWER(model) LIKE ");
         builder.push_bind(format!(

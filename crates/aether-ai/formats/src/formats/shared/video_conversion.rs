@@ -100,6 +100,7 @@ fn convert_seconds(seconds: &Value) -> Result<Value, FormatError> {
         _ => None,
     };
     parsed
+        .filter(|value| *value > 0)
         .map(Value::from)
         .ok_or_else(|| FormatError::InvalidTargetField {
             format: TARGET_FORMAT.to_string(),
@@ -248,6 +249,20 @@ mod tests {
             "seconds": "eight"
         }))
         .expect_err("non-numeric seconds should be rejected");
+
+        assert!(matches!(
+            error,
+            FormatError::InvalidTargetField { ref field, .. } if field == "seconds"
+        ));
+    }
+
+    #[test]
+    fn zero_seconds_is_rejected() {
+        let error = convert_openai_video_request_to_doubao(&json!({
+            "prompt": "a clip",
+            "seconds": 0
+        }))
+        .expect_err("zero duration should be rejected");
 
         assert!(matches!(
             error,

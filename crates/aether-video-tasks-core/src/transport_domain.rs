@@ -81,23 +81,31 @@ fn trim_doubao_video_resource_root(url: &str) -> Option<String> {
 
 impl LocalVideoTaskPersistence {
     pub fn from_report_context(report_context: &Map<String, Value>, plan: &ExecutionPlan) -> Self {
+        let client_api_format = context_text(report_context, "client_api_format")
+            .unwrap_or_else(|| plan.client_api_format.clone());
+        let provider_api_format = context_text(report_context, "provider_api_format")
+            .unwrap_or_else(|| plan.provider_api_format.clone());
+        let format_converted = report_context
+            .get("format_converted")
+            .or_else(|| report_context.get("needs_conversion"))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                !client_api_format
+                    .trim()
+                    .eq_ignore_ascii_case(provider_api_format.trim())
+            });
         Self {
             request_id: context_text(report_context, "request_id")
                 .unwrap_or_else(|| plan.request_id.clone()),
             username: context_text(report_context, "username"),
             api_key_name: context_text(report_context, "api_key_name"),
-            client_api_format: context_text(report_context, "client_api_format")
-                .unwrap_or_else(|| plan.client_api_format.clone()),
-            provider_api_format: context_text(report_context, "provider_api_format")
-                .unwrap_or_else(|| plan.provider_api_format.clone()),
+            client_api_format,
+            provider_api_format,
             original_request_body: report_context
                 .get("original_request_body")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new())),
-            format_converted: report_context
-                .get("format_converted")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            format_converted,
         }
     }
 

@@ -7047,6 +7047,7 @@ mod deferred_settlement_tests {
         // their usage, so none of them may be held open.
         for report_kind in [
             "doubao_video_delete_sync_success",
+            "doubao_video_cancel_sync_success",
             "openai_video_cancel_sync_success",
             "gemini_video_cancel_sync_success",
             "openai_chat_sync_success",

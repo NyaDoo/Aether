@@ -155,6 +155,7 @@ Aether Tunnel 是配套的正向代理节点，部署在海外 VPS 上，为墙�
 - `AETHER_RUNTIME_BACKEND=memory|redis`：运行时缓存/协调后端。SQLite 默认用 `memory`，不会连接 Redis
 - `AETHER_GATEWAY_AUTO_PREPARE_DATABASE`：常规启动前自动执行挂起的 schema migration 和 backfill；仓库自带的 `docker-compose.yml` 默认开启
 - `JWT_SECRET_KEY` / `ENCRYPTION_KEY`：认证和敏感数据加密所需密钥
+- `AETHER_GATEWAY_INTERNAL_FORWARD_SECRET`：多 Gateway 内部身份转发 HMAC 密钥；所有节点必须一致且至少 32 字节，未设置时复用安全的 `JWT_SECRET_KEY`。生产环境应配置独立随机密钥，并只通过 mTLS 或等效的受信加密内网传输内部管理员证明（管理员证明当前不绑定目标实例）
 - `API_KEY_PREFIX`：用户和管理员新建 API Key 时使用的前缀，默认 `sk`
 - `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_EMAIL`：首次启动时自举首个本地管理员；`install.sh` 会提示输入管理员密码
 - `CORS_ORIGINS` / `CORS_ALLOW_CREDENTIALS`：前端跨域来源控制；如果要跨域带登录 Cookie，`CORS_ORIGINS` 不能写 `*`

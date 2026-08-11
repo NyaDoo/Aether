@@ -352,6 +352,12 @@ fn ai_execution_strategy_for_formats(provider_api_format: &str, client_api_forma
 fn ai_conversion_mode_for_formats(provider_api_format: &str, client_api_format: &str) -> String {
     if provider_api_format == client_api_format {
         "none"
+    } else if aether_ai_formats::normalize_api_format_alias(provider_api_format) == "doubao:video"
+        && aether_ai_formats::normalize_api_format_alias(client_api_format) == "openai:video"
+    {
+        // The video task service projects Ark's response into the OpenAI task
+        // shape; only the create request is converted.
+        "request_only"
     } else {
         "bidirectional"
     }
@@ -700,6 +706,14 @@ mod tests {
             Some(json!({"model": "mapped"}))
         );
         assert_eq!(decision.report_kind.as_deref(), Some("report"));
+    }
+
+    #[test]
+    fn video_cross_format_decision_is_request_only() {
+        assert_eq!(
+            ai_conversion_mode_for_formats("doubao:video", "openai:video"),
+            "request_only"
+        );
     }
 
     #[test]

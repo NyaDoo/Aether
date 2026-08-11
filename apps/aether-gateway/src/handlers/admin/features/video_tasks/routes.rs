@@ -5,7 +5,9 @@ use crate::handlers::admin::shared::{
     attach_admin_audit_response, build_proxy_error_response, query_param_value,
 };
 use crate::GatewayError;
-use aether_data_contracts::repository::video_tasks::{VideoTaskQueryFilter, VideoTaskStatus};
+use aether_data_contracts::repository::video_tasks::{
+    StoredVideoTask, VideoTaskQueryFilter, VideoTaskStatus,
+};
 use axum::{
     body::Body,
     http,
@@ -52,8 +54,10 @@ pub(super) async fn maybe_build_local_admin_video_tasks_response(
         let filter = VideoTaskQueryFilter {
             user_id: query_param_value(request_context.query_string(), "user_id"),
             status,
+            model_exact: None,
             model_substring: query_param_value(request_context.query_string(), "model"),
             client_api_format: None,
+            exclude_deleted: false,
         };
         let page = query_param_value(request_context.query_string(), "page")
             .and_then(|value| value.parse::<usize>().ok())
@@ -96,8 +100,10 @@ pub(super) async fn maybe_build_local_admin_video_tasks_response(
         let filter = VideoTaskQueryFilter {
             user_id: None,
             status: None,
+            model_exact: None,
             model_substring: None,
             client_api_format: None,
+            exclude_deleted: false,
         };
         let stats = state
             .read_video_task_stats(&filter, current_admin_video_task_unix_secs())
@@ -295,7 +301,10 @@ pub(super) async fn maybe_build_local_admin_video_tasks_response(
                 "completed_at".to_string(),
                 json!(admin_video_task_timestamp(task.completed_at_unix_secs)),
             );
-            payload.insert("request_metadata".to_string(), json!(task.request_metadata));
+            payload.insert(
+                "request_metadata".to_string(),
+                json!(redacted_admin_video_task_request_metadata(&task)),
+            );
 
             return Ok(Some(attach_admin_audit_response(
                 Json(serde_json::Value::Object(payload)).into_response(),
@@ -350,4 +359,29 @@ pub(super) async fn maybe_build_local_admin_video_tasks_response(
     }
 
     Ok(None)
+}
+
+fn redacted_admin_video_task_request_metadata(task: &StoredVideoTask) -> Option<serde_json::Value> {
+    let mut metadata = match task.request_metadata.clone()? {
+        serde_json::Value::Object(metadata) => metadata,
+        _ => return None,
+    };
+
+    if metadata.contains_key("rust_local_snapshot") {
+        let snapshot = aether_video_tasks_core::LocalVideoTaskSnapshot::from_stored_task(task)
+            .map(|snapshot| snapshot.redacted_for_persistence())
+            .and_then(|snapshot| serde_json::to_value(snapshot).ok());
+        match snapshot {
+            Some(snapshot) => {
+                metadata.insert("rust_local_snapshot".to_string(), snapshot);
+            }
+            // A malformed legacy snapshot cannot be shown safely: it may be
+            // from a version that persisted provider or proxy credentials.
+            None => {
+                metadata.remove("rust_local_snapshot");
+            }
+        }
+    }
+
+    Some(serde_json::Value::Object(metadata))
 }

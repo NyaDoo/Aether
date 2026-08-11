@@ -163,7 +163,7 @@ async fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local
                 {"action":"drop","path":"store"}
             ])),
             Some(2),
-            Some("/custom/v1beta/models/veo-3-upstream:predictLongRunning".to_string()),
+            None,
             None,
             None,
             None,
@@ -438,7 +438,7 @@ async fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local
     assert_eq!(seen_execution_runtime_request.method, "POST");
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://generativelanguage.googleapis.com/custom/v1beta/models/veo-3-upstream:predictLongRunning?view=full"
+        "https://generativelanguage.googleapis.com/v1beta/models/veo-3-upstream:predictLongRunning?view=full"
     );
     assert_eq!(
         seen_execution_runtime_request.auth_header_value,

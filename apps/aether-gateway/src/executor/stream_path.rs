@@ -494,8 +494,29 @@ async fn maybe_execute_local_video_task_content_stream(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     }
 
+    let Some(user_id) = decision
+        .auth_context
+        .as_ref()
+        .map(|auth_context| auth_context.user_id.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        let body = if route_family == Some("doubao") {
+            serde_json::json!({
+                "error": {
+                    "code": "Unauthorized",
+                    "message": "Authentication required"
+                }
+            })
+        } else {
+            serde_json::json!({"detail": "Authentication required"})
+        };
+        return Ok(LocalExecutionRequestOutcome::Responded(
+            build_json_response(trace_id, decision, 401, &body)?,
+        ));
+    };
+
     let _ = state
-        .hydrate_video_task_for_route(route_family, parts.uri.path())
+        .hydrate_video_task_for_route_for_user(route_family, parts.uri.path(), user_id)
         .await?;
 
     // A download can be the first read after the task finished, so refresh the
@@ -514,29 +535,48 @@ async fn maybe_execute_local_video_task_content_stream(
             .map(|task_id| format!("/v1/videos/{task_id}")),
     };
     if let Some(refresh_path) = refresh_path {
-        if let Some(refresh_plan) =
-            state
-                .video_tasks
-                .prepare_read_refresh_sync_plan(route_family, &refresh_path, trace_id)
-        {
+        if let Some(refresh_plan) = state.video_tasks.prepare_read_refresh_sync_plan_for_user(
+            route_family,
+            &refresh_path,
+            user_id,
+            trace_id,
+        ) {
             state.execute_video_task_refresh_plan(&refresh_plan).await?;
         }
     }
 
     let action = match route_family {
-        Some("doubao") => state.video_tasks.prepare_doubao_content_stream_action(
-            parts.uri.path(),
-            parts.uri.query(),
-            trace_id,
-        ),
-        _ => state.video_tasks.prepare_openai_content_stream_action(
-            parts.uri.path(),
-            parts.uri.query(),
-            trace_id,
-        ),
+        Some("doubao") => state
+            .video_tasks
+            .prepare_doubao_content_stream_action_for_user(
+                parts.uri.path(),
+                parts.uri.query(),
+                trace_id,
+                user_id,
+            ),
+        _ => state
+            .video_tasks
+            .prepare_openai_content_stream_action_for_user(
+                parts.uri.path(),
+                parts.uri.query(),
+                trace_id,
+                user_id,
+            ),
     };
     let Some(action) = action else {
-        return Ok(LocalExecutionRequestOutcome::NoPath);
+        let body = if route_family == Some("doubao") {
+            serde_json::json!({
+                "error": {
+                    "code": "NotFound",
+                    "message": "The requested generation task was not found."
+                }
+            })
+        } else {
+            serde_json::json!({"detail": "Video task not found"})
+        };
+        return Ok(LocalExecutionRequestOutcome::Responded(
+            build_json_response(trace_id, decision, 404, &body)?,
+        ));
     };
 
     match action {

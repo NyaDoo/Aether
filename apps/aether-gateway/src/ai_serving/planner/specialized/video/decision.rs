@@ -44,8 +44,11 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
     } = attempt;
     let candidate = eligible.candidate;
     let transport = resolved.transport;
-    let (execution_strategy, conversion_mode) =
-        ai_local_execution_contract_for_formats(spec_metadata.api_format, spec_metadata.api_format);
+    let provider_api_format = eligible.provider_api_format.clone();
+    let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
+        spec_metadata.api_format,
+        provider_api_format.as_str(),
+    );
     let proxy = planner_state
         .app()
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&transport)
@@ -70,7 +73,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         model_id: Some(&candidate.model_id),
         global_model_id: Some(&candidate.global_model_id),
         global_model_name: Some(&candidate.global_model_name),
-        provider_api_format: spec_metadata.api_format,
+        provider_api_format: provider_api_format.as_str(),
         client_api_format: spec_metadata.api_format,
         mapped_model: Some(&resolved.mapped_model),
         candidate_group_id: eligible.orchestration.candidate_group_id.as_deref(),
@@ -93,7 +96,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         client_requested_stream: false,
         upstream_is_stream: false,
         has_envelope: false,
-        needs_conversion: false,
+        needs_conversion: provider_api_format != spec_metadata.api_format,
         extra_fields,
     });
     let report_context = append_local_failover_policy_to_value(report_context, &transport);
@@ -125,7 +128,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         provider_request_method: Some(parts.method.to_string()),
         auth_header: Some(auth_header),
         auth_value: Some(auth_value),
-        provider_api_format: spec_metadata.api_format.to_string(),
+        provider_api_format,
         client_api_format: spec_metadata.api_format.to_string(),
         model_name: input.requested_model.clone(),
         mapped_model,

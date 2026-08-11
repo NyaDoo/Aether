@@ -46,6 +46,10 @@ pub fn request_conversion_enabled_for_transport(
     if client_api_format == provider_api_format {
         return true;
     }
+    if is_openai_to_doubao_video_pair(client_api_format.as_str(), provider_api_format.as_str()) {
+        return transport.provider.enable_format_conversion
+            || endpoint_accepts_client_api_format(transport, client_api_format.as_str());
+    }
     let conversion_kind =
         request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str());
     if conversion_kind.is_none()
@@ -76,6 +80,13 @@ pub fn request_pair_allowed_for_transport(
     if client_api_format == provider_api_format {
         return true;
     }
+    if is_openai_to_doubao_video_pair(client_api_format.as_str(), provider_api_format.as_str()) {
+        return request_conversion_enabled_for_transport(
+            transport,
+            client_api_format.as_str(),
+            provider_api_format.as_str(),
+        );
+    }
     let conversion_kind =
         request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str());
     if conversion_kind.is_none()
@@ -99,6 +110,10 @@ pub fn request_pair_allowed_for_transport(
         client_api_format.as_str(),
         provider_api_format.as_str(),
     )
+}
+
+fn is_openai_to_doubao_video_pair(client_api_format: &str, provider_api_format: &str) -> bool {
+    client_api_format == "openai:video" && provider_api_format == "doubao:video"
 }
 
 fn same_data_format_transport_pair(client_api_format: &str, provider_api_format: &str) -> bool {
@@ -169,6 +184,18 @@ pub fn request_pair_transport_unsupported_reason(
     let client_api_format = normalize_api_format_alias(client_api_format);
     let provider_api_format = normalize_api_format_alias(provider_api_format);
 
+    if is_openai_to_doubao_video_pair(client_api_format.as_str(), provider_api_format.as_str()) {
+        return if request_conversion_enabled_for_transport(
+            transport,
+            client_api_format.as_str(),
+            provider_api_format.as_str(),
+        ) {
+            None
+        } else {
+            Some("format_conversion_disabled")
+        };
+    }
+
     if let Some(kind) =
         request_conversion_kind(client_api_format.as_str(), provider_api_format.as_str())
     {
@@ -234,6 +261,7 @@ fn request_direct_auth_for_provider_format(
         | "aliyun:multimodal_embedding"
         | "openai:rerank"
         | "jina:rerank" => resolve_local_openai_bearer_auth(transport),
+        "openai:video" | "doubao:video" => resolve_local_openai_bearer_auth(transport),
         "gemini:generate_content" | "gemini:embedding" => {
             if is_vertex_api_key_transport_context(transport) {
                 resolve_local_vertex_api_key_query_auth(transport)

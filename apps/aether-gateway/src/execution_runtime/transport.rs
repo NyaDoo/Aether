@@ -4,6 +4,7 @@ use std::error::Error as _;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -11,10 +12,10 @@ use std::time::{Duration, Instant};
 use aether_contracts::{
     ExecutionPlan, ExecutionResponseBodyMode, ExecutionResult, ExecutionTelemetry, ProxySnapshot,
     ResolvedTransportProfile, ResponseBody, EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER,
-    EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
-    EXECUTION_RESPONSE_BODY_MODE_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
-    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE,
-    TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+    EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
+    EXECUTION_REQUEST_HTTP1_ONLY_HEADER, EXECUTION_RESPONSE_BODY_MODE_HEADER,
+    TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_RUSTLS,
+    TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use aether_data::repository::proxy_nodes::ProxyNodeTrafficMutation;
 use aether_http::{apply_http_client_config, HttpClientConfig};
@@ -877,6 +878,15 @@ pub(crate) async fn execute_stream_plan_via_local_tunnel(
         return Ok(None);
     };
 
+    // A tunnel resolves and connects to the asset host on the remote node, so
+    // the gateway cannot bind that connection to the DNS answers it validated.
+    // Do not silently trade away the SSRF boundary for provider proxy affinity.
+    if is_direct_video_asset_stream_plan(plan) {
+        return Err(video_asset_transport_error(
+            "proxy and tunnel transports are not supported for video asset URLs",
+        ));
+    }
+
     if let Some(detail) = gateway_frontdoor_self_loop_guard_error(plan.url.as_str()) {
         return Err(ExecutionRuntimeTransportError::UpstreamRequest(detail));
     }
@@ -1167,6 +1177,271 @@ pub(crate) async fn send_request(
     send_request_inner(plan, body_bytes, true).await
 }
 
+/// Identifies video stream plans whose URL came from a provider task response
+/// instead of the configured provider API endpoint. The internal marker keeps
+/// native OpenAI `/videos/{id}/content` follow-ups on their configured
+/// transport while direct OpenAI and Ark asset URLs get DNS-pinned egress.
+fn is_direct_video_asset_stream_plan(plan: &ExecutionPlan) -> bool {
+    plan.stream
+        && plan.method.trim().eq_ignore_ascii_case("GET")
+        && matches!(
+            plan.provider_api_format
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "openai:video" | "doubao:video"
+        )
+        && plan.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER)
+                && value.trim() == "1"
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinnedVideoAssetTarget {
+    host: String,
+    addrs: Vec<SocketAddr>,
+}
+
+async fn send_direct_video_asset_request(
+    plan: &ExecutionPlan,
+    method: reqwest::Method,
+    headers: HeaderMap,
+    body_bytes: Vec<u8>,
+    total_timeout: Option<Duration>,
+    stream_first_byte_timeout: Option<Duration>,
+    transport_controls: ExecutionTransportControls,
+) -> Result<reqwest::Response, ExecutionRuntimeTransportError> {
+    validate_direct_video_asset_transport(plan, transport_controls)?;
+    let resolution_started_at = Instant::now();
+    let target = if let Some(timeout) = stream_first_byte_timeout {
+        tokio::time::timeout(
+            timeout,
+            resolve_public_video_asset_target(plan.url.as_str()),
+        )
+        .await
+        .map_err(|_| {
+            ExecutionRuntimeTransportError::UpstreamRequest(stream_first_byte_timeout_message(
+                timeout,
+            ))
+        })??
+    } else {
+        resolve_public_video_asset_target(plan.url.as_str()).await?
+    };
+    let client = build_pinned_video_asset_client(plan, &target, transport_controls)?;
+    let mut request = client
+        .request(method, &plan.url)
+        .headers(headers)
+        .body(body_bytes);
+    if let Some(timeout) = total_timeout {
+        request = request.timeout(timeout);
+    }
+    let remaining_first_byte_timeout = match stream_first_byte_timeout {
+        Some(timeout) => Some(
+            timeout
+                .checked_sub(resolution_started_at.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    ExecutionRuntimeTransportError::UpstreamRequest(
+                        stream_first_byte_timeout_message(timeout),
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let response = send_reqwest_request(request, remaining_first_byte_timeout).await?;
+    if response.status().is_redirection() {
+        return Err(video_asset_transport_error(
+            "video asset URL returned a redirect",
+        ));
+    }
+    Ok(response)
+}
+
+fn validate_direct_video_asset_transport(
+    plan: &ExecutionPlan,
+    transport_controls: ExecutionTransportControls,
+) -> Result<(), ExecutionRuntimeTransportError> {
+    // reqwest delegates target DNS to an HTTP/SOCKS proxy, while a tunnel
+    // delegates both DNS and the connection. Neither path can honor the
+    // gateway's validated address set, so an enabled snapshot fails closed.
+    if plan
+        .proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.enabled != Some(false))
+    {
+        return Err(video_asset_transport_error(
+            "proxy and tunnel transports are not supported for video asset URLs",
+        ));
+    }
+    if transport_profile_uses_browser_wreq(plan.transport_profile.as_ref()) {
+        return Err(video_asset_transport_error(
+            "browser transport cannot pin video asset DNS results",
+        ));
+    }
+    validate_reqwest_transport_profile(plan.transport_profile.as_ref())?;
+    if transport_controls.follow_redirects == Some(true) {
+        return Err(video_asset_transport_error(
+            "redirects are not supported for video asset URLs",
+        ));
+    }
+    if transport_controls.accept_invalid_certs {
+        return Err(video_asset_transport_error(
+            "invalid TLS certificates are not accepted for video asset URLs",
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_public_video_asset_target(
+    raw_url: &str,
+) -> Result<PinnedVideoAssetTarget, ExecutionRuntimeTransportError> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|_| video_asset_transport_error("video asset URL is invalid"))?;
+    if url.scheme() != "https" {
+        return Err(video_asset_transport_error(
+            "video asset URL must use HTTPS",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(video_asset_transport_error(
+            "video asset URL must not contain user information",
+        ));
+    }
+    let host = url
+        .host_str()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| video_asset_transport_error("video asset URL is missing a host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| video_asset_transport_error("video asset URL is missing a port"))?;
+
+    let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        validate_video_asset_resolved_addrs([SocketAddr::new(ip, port)])?
+    } else {
+        let resolved = tokio::net::lookup_host((host, port)).await.map_err(|err| {
+            video_asset_transport_error(format!("video asset DNS resolution failed: {err}"))
+        })?;
+        validate_video_asset_resolved_addrs(resolved)?
+    };
+
+    Ok(PinnedVideoAssetTarget {
+        host: host.to_string(),
+        addrs,
+    })
+}
+
+fn validate_video_asset_resolved_addrs(
+    resolved: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, ExecutionRuntimeTransportError> {
+    let mut addrs = Vec::new();
+    for addr in resolved {
+        // Reject the whole answer set when any A/AAAA result is unsafe. Merely
+        // filtering private answers would let an attacker steer connection
+        // selection by mixing public and private records.
+        if !video_asset_ip_is_public(addr.ip()) {
+            return Err(video_asset_transport_error(
+                "video asset URL resolves to a non-public address",
+            ));
+        }
+        addrs.push(addr);
+    }
+    if addrs.is_empty() {
+        return Err(video_asset_transport_error(
+            "video asset DNS resolution returned no addresses",
+        ));
+    }
+    addrs.sort_unstable();
+    addrs.dedup();
+    Ok(addrs)
+}
+
+fn video_asset_ip_is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => video_asset_ipv4_is_public(ip),
+        IpAddr::V6(ip) => video_asset_ipv6_is_public(ip),
+    }
+}
+
+fn video_asset_ipv4_is_public(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(octets[0] == 0
+        || octets[0] == 10
+        || octets[0] == 127
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 192 && octets[1] == 168)
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 224)
+}
+
+fn video_asset_ipv6_is_public(ip: Ipv6Addr) -> bool {
+    if let Some(ipv4) = ip.to_ipv4_mapped() {
+        return video_asset_ipv4_is_public(ipv4);
+    }
+    let segments = ip.segments();
+    let first = segments[0];
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || first == 0 // IPv4-compatible and other reserved ::/16 forms
+        || (first & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+        || (first & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        || (first & 0xffc0) == 0xfec0 // fec0::/10 deprecated site-local
+        || (first & 0xff00) == 0xff00 // ff00::/8 multicast
+        || (first == 0x0064 && segments[1] == 0xff9b) // NAT64 translation prefixes
+        || (first == 0x0100 && segments[1..4] == [0, 0, 0]) // discard-only 100::/64
+        || (first == 0x2001 && segments[1] <= 0x01ff) // IETF special-purpose /23
+        || (first == 0x2001 && segments[1] == 0x0db8) // documentation 2001:db8::/32
+        || first == 0x2002 // 6to4 can encode a private IPv4 target
+        || first == 0x3fff // documentation 3fff::/20 (conservative /16)
+        || first == 0x5f00) // segment-routing local-use block
+}
+
+fn build_pinned_video_asset_client(
+    plan: &ExecutionPlan,
+    target: &PinnedVideoAssetTarget,
+    transport_controls: ExecutionTransportControls,
+) -> Result<reqwest::Client, ExecutionRuntimeTransportError> {
+    let mut builder = reqwest::Client::builder()
+        // A redirect introduces a new hostname and therefore a new DNS trust
+        // decision. Asset plans intentionally do not follow them.
+        .redirect(Policy::none())
+        // Ambient process proxies would perform their own DNS lookup and make
+        // reqwest's per-host address override ineffective.
+        .no_proxy()
+        .resolve_to_addrs(&target.host, &target.addrs);
+    if transport_controls.http1_only
+        || transport_profile_http1_only(plan.transport_profile.as_ref())
+    {
+        builder = builder.http1_only();
+    }
+    let mut builder = apply_http_client_config(
+        builder,
+        &HttpClientConfig {
+            connect_timeout_ms: plan
+                .timeouts
+                .as_ref()
+                .and_then(|timeouts| timeouts.connect_ms),
+            ..HttpClientConfig::default()
+        },
+    );
+    builder = apply_transport_profile(builder, plan.transport_profile.as_ref());
+    builder
+        .build()
+        .map_err(ExecutionRuntimeTransportError::ClientBuild)
+}
+
+fn video_asset_transport_error(detail: impl Into<String>) -> ExecutionRuntimeTransportError {
+    ExecutionRuntimeTransportError::UpstreamRequest(detail.into())
+}
+
 async fn send_request_inner(
     plan: &ExecutionPlan,
     body_bytes: Vec<u8>,
@@ -1194,6 +1469,20 @@ async fn send_request_inner(
         "direct_request_prepare",
         prepare_started_at.elapsed().as_millis() as u64,
     );
+
+    if is_direct_video_asset_stream_plan(plan) {
+        return send_direct_video_asset_request(
+            plan,
+            method,
+            headers,
+            body_bytes,
+            total_timeout,
+            stream_first_byte_timeout,
+            transport_controls,
+        )
+        .await
+        .map(DirectHttpResponse::Reqwest);
+    }
 
     if transport_profile_uses_browser_wreq(plan.transport_profile.as_ref()) {
         return send_via_browser_wreq_transport(
@@ -4100,9 +4389,10 @@ mod tests {
 
     use aether_contracts::{
         ExecutionPlan, ExecutionResponseBodyMode, ExecutionTimeouts, ProxySnapshot, RequestBody,
-        ResolvedTransportProfile, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
-        EXECUTION_REQUEST_HTTP1_ONLY_HEADER, EXECUTION_RESPONSE_BODY_MODE_HEADER,
-        TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_AUTO,
+        ResolvedTransportProfile, EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER,
+        EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
+        EXECUTION_RESPONSE_BODY_MODE_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
+        TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_AUTO,
         TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
     };
     use aether_data::repository::proxy_nodes::{
@@ -4121,13 +4411,16 @@ mod tests {
 
     use super::{
         append_upstream_response_body_chunk_with_limit, build_browser_wreq_client, build_client,
-        build_direct_tunnel_request_meta, build_execution_response_body, build_request_headers,
+        build_direct_tunnel_request_meta, build_execution_response_body,
+        build_pinned_video_asset_client, build_request_headers,
         decode_response_body_bytes_with_limit, execute_sync_plan, execution_response_body_mode,
-        record_manual_proxy_request_failure, record_manual_proxy_request_outcome,
-        record_manual_proxy_request_success, record_manual_proxy_stream_error,
-        resolve_execution_transport_controls, resolve_non_stream_total_timeout,
-        resolve_stream_first_byte_timeout, response_body_is_json, DirectSyncExecutionRuntime,
-        ExecutionRuntimeTransportError, ExecutionTransportControls, UpstreamResponseBodyPhase,
+        is_direct_video_asset_stream_plan, record_manual_proxy_request_failure,
+        record_manual_proxy_request_outcome, record_manual_proxy_request_success,
+        record_manual_proxy_stream_error, resolve_execution_transport_controls,
+        resolve_non_stream_total_timeout, resolve_stream_first_byte_timeout, response_body_is_json,
+        validate_direct_video_asset_transport, validate_video_asset_resolved_addrs,
+        video_asset_ip_is_public, DirectSyncExecutionRuntime, ExecutionRuntimeTransportError,
+        ExecutionTransportControls, PinnedVideoAssetTarget, UpstreamResponseBodyPhase,
     };
     use crate::constants::{
         EXECUTION_RUNTIME_LOOP_GUARD_HEADER, EXECUTION_RUNTIME_LOOP_GUARD_VIA_TOKEN,
@@ -4140,6 +4433,196 @@ mod tests {
     use crate::AppState;
 
     const LOCAL_HTTP_SUCCESS_TIMEOUT_MS: u64 = 15_000;
+
+    fn direct_video_asset_plan(url: &str, provider_api_format: &str) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "video-asset-test".to_string(),
+            candidate_id: None,
+            provider_name: Some("doubao".to_string()),
+            provider_id: "provider-video-asset".to_string(),
+            endpoint_id: "endpoint-video-asset".to_string(),
+            key_id: "key-video-asset".to_string(),
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: BTreeMap::from([(
+                EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER.to_string(),
+                "1".to_string(),
+            )]),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody {
+                json_body: None,
+                body_bytes_b64: None,
+                body_ref: None,
+            },
+            stream: true,
+            client_api_format: "doubao:video".to_string(),
+            provider_api_format: provider_api_format.to_string(),
+            model_name: Some("doubao-seedance".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
+
+    #[test]
+    fn direct_video_asset_guard_requires_internal_marker() {
+        let plan = direct_video_asset_plan("https://cdn.example.com/video.mp4", "doubao:video");
+        assert!(is_direct_video_asset_stream_plan(&plan));
+
+        let openai_asset =
+            direct_video_asset_plan("https://cdn.example.com/video.mp4", "openai:video");
+        assert!(is_direct_video_asset_stream_plan(&openai_asset));
+
+        let mut refresh = plan.clone();
+        refresh.stream = false;
+        assert!(!is_direct_video_asset_stream_plan(&refresh));
+
+        let mut configured_api_follow_up = openai_asset;
+        configured_api_follow_up.url =
+            "https://api.openai.com/v1/videos/upstream-id/content".to_string();
+        configured_api_follow_up
+            .headers
+            .remove(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER);
+        configured_api_follow_up.headers.insert(
+            "authorization".to_string(),
+            "Bearer provider-sk".to_string(),
+        );
+        assert!(!is_direct_video_asset_stream_plan(
+            &configured_api_follow_up
+        ));
+
+        let mut unrelated = plan;
+        unrelated.provider_api_format = "openai:chat".to_string();
+        assert!(!is_direct_video_asset_stream_plan(&unrelated));
+    }
+
+    #[test]
+    fn video_asset_dns_guard_rejects_mixed_public_and_private_answers() {
+        let error = validate_video_asset_resolved_addrs([
+            "8.8.8.8:443".parse().expect("public address should parse"),
+            "127.0.0.1:443"
+                .parse()
+                .expect("private address should parse"),
+        ])
+        .expect_err("one private answer must reject the complete DNS response");
+
+        assert!(error.to_string().contains("non-public address"));
+    }
+
+    #[test]
+    fn video_asset_ip_guard_rejects_private_reserved_and_translation_ranges() {
+        for ip in [
+            "0.1.2.3",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "2002:7f00:1::",
+        ] {
+            assert!(
+                !video_asset_ip_is_public(ip.parse().expect("IP should parse")),
+                "{ip}"
+            );
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                video_asset_ip_is_public(ip.parse().expect("IP should parse")),
+                "{ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_asset_transport_fails_closed_for_proxy_redirect_browser_and_invalid_tls() {
+        let mut plan = direct_video_asset_plan("https://cdn.example.com/video.mp4", "openai:video");
+        plan.proxy = Some(ProxySnapshot {
+            enabled: Some(true),
+            url: Some("http://proxy.example:8080".to_string()),
+            ..ProxySnapshot::default()
+        });
+        assert!(validate_direct_video_asset_transport(
+            &plan,
+            ExecutionTransportControls::default()
+        )
+        .expect_err("enabled proxy must fail closed")
+        .to_string()
+        .contains("proxy and tunnel"));
+
+        plan.proxy = None;
+        assert!(validate_direct_video_asset_transport(
+            &plan,
+            ExecutionTransportControls {
+                follow_redirects: Some(true),
+                ..ExecutionTransportControls::default()
+            }
+        )
+        .expect_err("redirect opt-in must fail closed")
+        .to_string()
+        .contains("redirects"));
+
+        plan.transport_profile = Some(ResolvedTransportProfile {
+            backend: TRANSPORT_BACKEND_BROWSER_WREQ.to_string(),
+            ..ResolvedTransportProfile::default()
+        });
+        assert!(validate_direct_video_asset_transport(
+            &plan,
+            ExecutionTransportControls::default()
+        )
+        .expect_err("browser DNS cannot be pinned")
+        .to_string()
+        .contains("cannot pin"));
+
+        plan.transport_profile = None;
+        assert!(validate_direct_video_asset_transport(
+            &plan,
+            ExecutionTransportControls {
+                accept_invalid_certs: true,
+                ..ExecutionTransportControls::default()
+            }
+        )
+        .expect_err("invalid TLS certificates must fail closed")
+        .to_string()
+        .contains("invalid TLS"));
+    }
+
+    #[test]
+    fn builds_fresh_video_asset_client_with_validated_address_set() {
+        let plan = direct_video_asset_plan("https://cdn.example.com/video.mp4", "openai:video");
+        let target = PinnedVideoAssetTarget {
+            host: "cdn.example.com".to_string(),
+            addrs: vec!["8.8.8.8:443".parse().expect("address should parse")],
+        };
+
+        build_pinned_video_asset_client(&plan, &target, ExecutionTransportControls::default())
+            .expect("pinned direct client should build");
+    }
+
+    #[tokio::test]
+    async fn direct_openai_asset_request_rejects_private_literal_before_connecting() {
+        let result = DirectSyncExecutionRuntime::new()
+            .execute_stream(&direct_video_asset_plan(
+                "https://127.0.0.1/video.mp4",
+                "openai:video",
+            ))
+            .await;
+        let Err(error) = result else {
+            panic!("private literal must be rejected before a request is sent");
+        };
+
+        assert!(error.to_string().contains("non-public address"));
+    }
 
     #[test]
     fn upstream_error_url_sanitization_removes_secrets_everywhere() {
@@ -4166,6 +4649,10 @@ mod tests {
         let headers = BTreeMap::from([
             ("authorization".to_string(), "Bearer upstream".to_string()),
             ("x-aether-grok-runtime".to_string(), "1".to_string()),
+            (
+                EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER.to_string(),
+                "1".to_string(),
+            ),
             ("x-aether-future-control".to_string(), "private".to_string()),
         ]);
 
@@ -4179,6 +4666,7 @@ mod tests {
             Some("Bearer upstream")
         );
         assert!(!materialized.contains_key("x-aether-grok-runtime"));
+        assert!(!materialized.contains_key(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER));
         assert!(!materialized.contains_key("x-aether-future-control"));
     }
 

@@ -322,13 +322,50 @@ async fn maybe_build_local_video_task_read_response(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     }
 
-    let _ = state
-        .hydrate_video_task_for_route(decision.route_family.as_deref(), parts.uri.path())
-        .await?;
-
-    let refresh_plan = state.video_tasks.prepare_read_refresh_sync_plan(
+    // Let unrelated GET routes continue through normal routing. Only a
+    // syntactically recognized task lookup is an authenticated local surface;
+    // otherwise an absent auth header must not turn an unknown video path into
+    // a misleading 401 response.
+    if crate::video_tasks::resolve_video_task_read_lookup_key(
         decision.route_family.as_deref(),
         parts.uri.path(),
+    )
+    .is_none()
+    {
+        return Ok(LocalExecutionRequestOutcome::NoPath);
+    }
+
+    let Some(user_id) = decision
+        .auth_context
+        .as_ref()
+        .map(|auth_context| auth_context.user_id.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        let body = if decision.route_family.as_deref() == Some("doubao") {
+            serde_json::json!({
+                "error": {
+                    "code": "Unauthorized",
+                    "message": "Authentication required"
+                }
+            })
+        } else {
+            serde_json::json!({"detail": "Authentication required"})
+        };
+        return build_video_task_json_outcome(trace_id, decision, 401, body);
+    };
+
+    let _ = state
+        .hydrate_video_task_for_route_for_user(
+            decision.route_family.as_deref(),
+            parts.uri.path(),
+            user_id,
+        )
+        .await?;
+
+    let refresh_plan = state.video_tasks.prepare_read_refresh_sync_plan_for_user(
+        decision.route_family.as_deref(),
+        parts.uri.path(),
+        user_id,
         trace_id,
     );
 
@@ -336,9 +373,11 @@ async fn maybe_build_local_video_task_read_response(
         state.execute_video_task_refresh_plan(&refresh_plan).await?;
     }
 
-    let read_response = state
-        .video_tasks
-        .read_response(decision.route_family.as_deref(), parts.uri.path());
+    let read_response = state.video_tasks.read_response_for_user(
+        decision.route_family.as_deref(),
+        parts.uri.path(),
+        user_id,
+    );
     let read_response = match read_response {
         Some(read_response) => Some(read_response),
         None => {
@@ -346,12 +385,13 @@ async fn maybe_build_local_video_task_read_response(
                 .read_data_backed_video_task_response(
                     decision.route_family.as_deref(),
                     parts.uri.path(),
+                    user_id,
                 )
                 .await?
         }
     };
     let Some(read_response) = read_response else {
-        return Ok(LocalExecutionRequestOutcome::NoPath);
+        return build_video_task_not_found_outcome(trace_id, decision);
     };
 
     let body_bytes = serde_json::to_vec(&read_response.body_json)
@@ -391,26 +431,47 @@ async fn maybe_execute_local_video_task_follow_up_sync(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     }
 
-    let _ = state
-        .hydrate_video_task_for_route(decision.route_family.as_deref(), parts.uri.path())
-        .await?;
-
     let auth_context = resolve_execution_runtime_auth_context(
         state,
         decision,
+        &parts.method,
         &parts.headers,
         &parts.uri,
         trace_id,
     )
     .await?;
-    let Some(follow_up) = state.video_tasks.prepare_follow_up_sync_plan(
+    let Some(user_id) = auth_context
+        .as_ref()
+        .map(|value| value.user_id.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        let body = if decision.route_family.as_deref() == Some("doubao") {
+            serde_json::json!({
+                "error": {
+                    "code": "Unauthorized",
+                    "message": "Authentication required"
+                }
+            })
+        } else {
+            serde_json::json!({"detail": "Authentication required"})
+        };
+        return build_video_task_json_outcome(trace_id, decision, 401, body);
+    };
+    let _ = state
+        .hydrate_video_task_for_route_for_user(
+            decision.route_family.as_deref(),
+            parts.uri.path(),
+            user_id,
+        )
+        .await?;
+    let Some(follow_up) = state.video_tasks.prepare_follow_up_sync_plan_for_user(
         plan_kind,
         parts.uri.path(),
         Some(body_json),
         auth_context.as_ref(),
         trace_id,
     ) else {
-        return Ok(LocalExecutionRequestOutcome::NoPath);
+        return build_video_task_not_found_outcome(trace_id, decision);
     };
 
     execute_sync_plan_and_reports_with_transfer_tracker(
@@ -427,4 +488,43 @@ async fn maybe_execute_local_video_task_follow_up_sync(
         transfer_tracker,
     )
     .await
+}
+
+fn build_video_task_not_found_outcome(
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+) -> Result<LocalExecutionRequestOutcome, GatewayError> {
+    let body = if decision.route_family.as_deref() == Some("doubao") {
+        serde_json::json!({
+            "error": {
+                "code": "NotFound",
+                "message": "The requested generation task was not found."
+            }
+        })
+    } else {
+        serde_json::json!({"detail": "Video task not found"})
+    };
+    build_video_task_json_outcome(trace_id, decision, 404, body)
+}
+
+fn build_video_task_json_outcome(
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    status_code: u16,
+    body_json: serde_json::Value,
+) -> Result<LocalExecutionRequestOutcome, GatewayError> {
+    let body_bytes =
+        serde_json::to_vec(&body_json).map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let mut headers = BTreeMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), body_bytes.len().to_string());
+    Ok(LocalExecutionRequestOutcome::Responded(
+        build_client_response_from_parts(
+            status_code,
+            &headers,
+            Body::from(body_bytes),
+            trace_id,
+            Some(decision),
+        )?,
+    ))
 }

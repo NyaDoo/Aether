@@ -155,23 +155,27 @@ canonical status and projects it back per surface.
 | `Processing` | `processing` | `done: false` | `running` |
 | `Completed` | `completed` | `done: true` with `response` | `succeeded` |
 | `Failed` / `Expired` | `failed` | `done: true` with `error` | `failed` |
-| `Cancelled` | 404 | 404 | 404 |
+| `Cancelled` | 404 | 404 | `cancelled` |
 | `Deleted` | 404 | 404 | 404 |
 
 Doubao notes:
 
 - Ark reports no progress percentage; it is derived from the status (0/50/100).
-- Ark has no separate cancel verb — `DELETE` retires a task in any state, so a
-  cancelled task reads back as `404` rather than as a status value.
+- Ark has no separate cancel verb — `DELETE` cancels an in-flight task and
+  removes a finished one. Cancelled tasks remain queryable for the provider's
+  retention window; explicitly deleted tasks read back as `404`.
 - The generated asset lives at `content.video_url` and its URL is signed and
-  short-lived, which is why the gateway proxies downloads instead of handing the
-  URL to clients.
+  short-lived. Native Doubao GET/list keeps that field for compatibility; the
+  OpenAI projection suppresses it and serves bytes only through its authenticated
+  content route.
 
 ## OpenAI Video to Doubao Video Request Conversion
 
-One-way only. Ark requests can carry reference video/audio, multiple images and
-`generate_audio`; OpenAI Video cannot express any of those, so the reverse
-direction is not implemented rather than failing on most real requests.
+One-way and opt-in per provider. Set the provider's format-conversion switch (or
+an endpoint acceptance rule) before routing an OpenAI video request to a
+`doubao:video` endpoint. Ark requests can carry reference video/audio, multiple
+images and `generate_audio`; OpenAI Video cannot express those, so the reverse
+direction is rejected rather than silently losing data.
 
 | OpenAI Video field | Doubao field | Status |
 | --- | --- | --- |

@@ -610,9 +610,15 @@ pub(crate) fn resolve_video_price_per_second(
         VIDEO_PER_SECOND_DEFAULT_KEY,
         resolution,
         has_video_input,
-        |entry| entry.as_f64().filter(|price| *price > 0.0),
+        |entry| finite_nonnegative_price(entry).filter(|price| *price > 0.0),
     )
     .unwrap_or(0.0)
+}
+
+fn finite_nonnegative_price(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .filter(|price| price.is_finite() && *price >= 0.0)
 }
 
 /// Token rates for one video request, keyed by resolution and input kind.
@@ -627,21 +633,31 @@ impl VideoTokenPrices {
         // A bare number prices output tokens only: video models bill almost
         // entirely on generated tokens, and that is the shorthand operators
         // reach for.
-        if let Some(output_price_per_1m) = entry.as_f64() {
+        if entry.is_number() {
+            let output_price_per_1m = finite_nonnegative_price(entry)?;
             return Some(Self {
                 input_price_per_1m: 0.0,
                 output_price_per_1m,
             });
         }
         let entry = entry.as_object()?;
-        let read = |keys: &[&str]| -> f64 {
-            keys.iter()
-                .find_map(|key| entry.get(*key).and_then(Value::as_f64))
-                .unwrap_or(0.0)
+        let read = |keys: &[&str]| -> Option<f64> {
+            let mut selected = None;
+            for key in keys {
+                let Some(value) = entry.get(*key) else {
+                    continue;
+                };
+                // Reject the whole row when any recognized alias is malformed.
+                // Silently turning a negative rate into zero could undercharge,
+                // while accepting it could turn settlement into a credit.
+                let price = finite_nonnegative_price(value)?;
+                selected.get_or_insert(price);
+            }
+            Some(selected.unwrap_or(0.0))
         };
         let prices = Self {
-            input_price_per_1m: read(&["input_price_per_1m", "input", "prompt"]),
-            output_price_per_1m: read(&["output_price_per_1m", "output", "completion"]),
+            input_price_per_1m: read(&["input_price_per_1m", "input", "prompt"])?,
+            output_price_per_1m: read(&["output_price_per_1m", "output", "completion"])?,
         };
         (prices.input_price_per_1m > 0.0 || prices.output_price_per_1m > 0.0).then_some(prices)
     }
@@ -954,6 +970,72 @@ mod video_pricing_tests {
         let state = video_pricing_state(Some(&config));
         assert_eq!(state.mode, VideoBillingMode::PerToken);
         assert!(state.per_token_by_resolution_enabled);
+    }
+
+    #[test]
+    fn video_token_prices_reject_negative_rates() {
+        for entry in [
+            json!(-1.0),
+            json!({ "output_price_per_1m": -1.0 }),
+            json!({ "input": -1.0, "output": 15.0 }),
+            json!({ "input": 3.0, "completion": -1.0 }),
+        ] {
+            assert_eq!(
+                VideoTokenPrices::from_entry(&entry),
+                None,
+                "negative rate must invalidate the whole token-price entry: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_token_prices_reject_non_finite_rates() {
+        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // `serde_json` represents non-finite floats as null. Exercise both
+            // the shorthand and object forms because either can arrive after
+            // programmatic construction of a pricing config.
+            let value = Value::from(non_finite);
+            assert_eq!(VideoTokenPrices::from_entry(&value), None);
+            assert_eq!(
+                VideoTokenPrices::from_entry(&json!({
+                    "input_price_per_1m": 3.0,
+                    "output_price_per_1m": value,
+                })),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_video_token_row_falls_back_to_a_valid_default() {
+        let config = json!({
+            "mode": "per_token",
+            "token_prices_by_resolution": {
+                "720p": { "input": 3.0, "output": -15.0 }
+            },
+            "token_price_default": { "input": 2.0, "output": 10.0 }
+        });
+
+        assert_eq!(
+            resolve_video_token_prices(Some(&config), Some("720p"), false),
+            Some(VideoTokenPrices {
+                input_price_per_1m: 2.0,
+                output_price_per_1m: 10.0,
+            })
+        );
+    }
+
+    #[test]
+    fn per_second_video_prices_reject_non_finite_values() {
+        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let config = json!({
+                "price_per_second_default": Value::from(non_finite),
+            });
+            assert_eq!(
+                resolve_video_price_per_second(Some(&config), Some("720p"), false),
+                0.0
+            );
+        }
     }
 
     #[test]

@@ -169,7 +169,8 @@ pub use vertex::{
     is_vertex_transport_context, uses_vertex_api_key_query_auth,
 };
 pub use video::{
-    build_video_create_headers, build_video_create_request_body, build_video_create_upstream_url,
+    build_video_create_headers, build_video_create_request_body,
+    build_video_create_request_body_for_client, build_video_create_upstream_url,
     reconstruct_local_video_task_snapshot, resolve_local_video_task_transport,
     resolve_video_create_auth, video_create_transport_unsupported_reason,
     ProviderVideoCreateFamily, ProviderVideoCreateHeadersInput, VideoTaskTransportSnapshotLookup,

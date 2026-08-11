@@ -30,6 +30,9 @@ pub(super) use super::state::{AppState, FrontdoorCorsConfig};
 pub(super) use super::usage::UsageRuntimeConfig;
 
 pub(super) async fn start_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let app = app.layer(axum::middleware::from_fn(
+        sign_legacy_test_admin_forward_headers,
+    ));
     let listener = crate::test_support::bind_loopback_listener()
         .await
         .expect("listener should bind");
@@ -48,6 +51,7 @@ pub(super) async fn start_server(app: Router) -> (String, tokio::task::JoinHandl
 pub(super) async fn send_request(app: Router, mut request: Request) -> Response {
     use tower::ServiceExt;
 
+    sign_legacy_test_admin_forward_request(&mut request);
     request
         .extensions_mut()
         .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
@@ -57,6 +61,57 @@ pub(super) async fn send_request(app: Router, mut request: Request) -> Response 
     app.oneshot(request)
         .await
         .expect("router request should complete")
+}
+
+pub(super) fn signed_internal_admin_headers(
+    method: http::Method,
+    uri_text: &str,
+) -> http::HeaderMap {
+    let uri: http::Uri = uri_text.parse().expect("internal admin URI should parse");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static(TRUSTED_ADMIN_USER_ID_HEADER),
+        HeaderValue::from_static("internal-ops-admin"),
+    );
+    headers.insert(
+        HeaderName::from_static(TRUSTED_ADMIN_USER_ROLE_HEADER),
+        HeaderValue::from_static("admin"),
+    );
+    headers.insert(
+        HeaderName::from_static(TRUSTED_ADMIN_SESSION_ID_HEADER),
+        HeaderValue::from_static("internal-ops-session"),
+    );
+    crate::control::sign_trusted_admin_forward_headers(&mut headers, &method, &uri)
+        .expect("internal admin headers should sign");
+    headers
+}
+
+// The older integration suite used raw trusted-admin headers as a shortcut for
+// an internal forwarding hop. Upgrade only that exact legacy test marker into
+// the same HMAC proof a real internal producer must create. Production request
+// handling has no marker-only compatibility path.
+async fn sign_legacy_test_admin_forward_headers(
+    mut request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    sign_legacy_test_admin_forward_request(&mut request);
+    next.run(request).await
+}
+
+fn sign_legacy_test_admin_forward_request(request: &mut Request) {
+    let has_legacy_marker = request
+        .headers()
+        .get(GATEWAY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("rust-phase3b");
+    if !has_legacy_marker || !request.headers().contains_key(TRUSTED_ADMIN_USER_ID_HEADER) {
+        return;
+    }
+
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let _ =
+        crate::control::sign_trusted_admin_forward_headers(request.headers_mut(), &method, &uri);
 }
 
 pub(super) fn build_router_with_execution_runtime_override(

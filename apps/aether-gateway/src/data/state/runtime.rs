@@ -43,7 +43,9 @@ use aether_data_contracts::repository::usage::{
     UsageDailyHeatmapQuery,
 };
 use aether_runtime_state::RuntimeQueueStore;
-use aether_video_tasks_core::read_data_backed_video_task_response;
+use aether_video_tasks_core::{
+    read_data_backed_video_task_response, read_data_backed_video_task_response_for_user,
+};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
@@ -2650,6 +2652,16 @@ impl GatewayDataState {
         request_path: &str,
     ) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
         read_data_backed_video_task_response(self, route_family, request_path).await
+    }
+
+    pub(crate) async fn read_video_task_response_for_user(
+        &self,
+        route_family: Option<&str>,
+        request_path: &str,
+        user_id: &str,
+    ) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
+        read_data_backed_video_task_response_for_user(self, route_family, request_path, user_id)
+            .await
     }
 
     pub(crate) async fn find_background_task_run(

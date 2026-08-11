@@ -933,8 +933,10 @@ fn has_video_task_filter(
 ) -> bool {
     filter.user_id.is_some()
         || filter.status.is_some()
+        || filter.model_exact.is_some()
         || filter.model_substring.is_some()
         || filter.client_api_format.is_some()
+        || filter.exclude_deleted
         || created_since_unix_secs.is_some()
 }
 
@@ -966,6 +968,14 @@ fn push_video_task_filter<'args>(
     if let Some(status) = filter.status {
         push_sql_clause(builder, &mut has_where, "status = ");
         builder.push_bind(map_status_for_database(status));
+    }
+    if filter.exclude_deleted {
+        push_sql_clause(builder, &mut has_where, "status <> ");
+        builder.push_bind(map_status_for_database(VideoTaskStatus::Deleted));
+    }
+    if let Some(model_exact) = filter.model_exact.as_deref() {
+        push_sql_clause(builder, &mut has_where, "model = ");
+        builder.push_bind(model_exact.trim());
     }
     if let Some(model_substring) = filter.model_substring.as_deref() {
         push_sql_clause(builder, &mut has_where, "model ILIKE ");

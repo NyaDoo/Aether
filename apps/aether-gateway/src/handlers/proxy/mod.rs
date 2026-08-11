@@ -37,9 +37,11 @@ use crate::constants::{
     TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
 };
 use crate::control::{
-    allows_control_execute_emergency, management_token_permission_keys_from_value,
-    maybe_execute_via_control, request_model_local_rejection, should_buffer_request_for_local_auth,
-    trusted_auth_local_rejection, GatewayControlDecision, GatewayPublicRequestContext,
+    allows_control_execute_emergency, is_internal_forward_identity_header,
+    management_token_permission_keys_from_value, maybe_execute_via_control,
+    request_model_local_rejection, should_buffer_request_for_local_auth,
+    sign_trusted_auth_forward_headers, trusted_auth_local_rejection, GatewayControlDecision,
+    GatewayPublicRequestContext,
 };
 use crate::executor::{
     beautify_local_execution_client_error_message, build_local_execution_runtime_miss_context,
@@ -513,6 +515,11 @@ async fn maybe_forward_public_request_to_tunnel_owner(
         if should_skip_request_header(name.as_str()) || name == http::header::HOST {
             continue;
         }
+        // Never relay caller-controlled identity or proof material. The sending
+        // gateway rebuilds this complete header set and signs it below.
+        if is_internal_forward_identity_header(name) {
+            continue;
+        }
         if should_strip_forwarded_provider_credential_header(Some(decision), name) {
             continue;
         }
@@ -536,22 +543,51 @@ async fn maybe_forward_public_request_to_tunnel_owner(
     if !parts.headers.contains_key(TRACE_ID_HEADER) {
         upstream_request = upstream_request.header(TRACE_ID_HEADER, &request_context.trace_id);
     }
-    upstream_request = upstream_request
-        .header(GATEWAY_HEADER, "rust-phase3b-affinity")
-        .header(
-            TUNNEL_AFFINITY_FORWARDED_BY_HEADER,
-            state.tunnel.local_instance_id(),
-        )
-        .header(
-            TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
-            owner.gateway_instance_id.as_str(),
-        )
-        .header(TRUSTED_AUTH_USER_ID_HEADER, &auth_context.user_id)
-        .header(TRUSTED_AUTH_API_KEY_ID_HEADER, &auth_context.api_key_id)
-        .header(TRUSTED_AUTH_ACCESS_ALLOWED_HEADER, "true");
+    let mut internal_forward_headers = http::HeaderMap::new();
+    insert_internal_forward_header(
+        &mut internal_forward_headers,
+        GATEWAY_HEADER,
+        "rust-phase3b-affinity",
+    )?;
+    insert_internal_forward_header(
+        &mut internal_forward_headers,
+        TUNNEL_AFFINITY_FORWARDED_BY_HEADER,
+        state.tunnel.local_instance_id(),
+    )?;
+    insert_internal_forward_header(
+        &mut internal_forward_headers,
+        TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
+        owner.gateway_instance_id.as_str(),
+    )?;
+    insert_internal_forward_header(
+        &mut internal_forward_headers,
+        TRUSTED_AUTH_USER_ID_HEADER,
+        &auth_context.user_id,
+    )?;
+    insert_internal_forward_header(
+        &mut internal_forward_headers,
+        TRUSTED_AUTH_API_KEY_ID_HEADER,
+        &auth_context.api_key_id,
+    )?;
+    insert_internal_forward_header(
+        &mut internal_forward_headers,
+        TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
+        "true",
+    )?;
     if let Some(balance_remaining) = auth_context.balance_remaining {
-        upstream_request =
-            upstream_request.header(TRUSTED_AUTH_BALANCE_HEADER, balance_remaining.to_string());
+        insert_internal_forward_header(
+            &mut internal_forward_headers,
+            TRUSTED_AUTH_BALANCE_HEADER,
+            &balance_remaining.to_string(),
+        )?;
+    }
+    sign_trusted_auth_forward_headers(&mut internal_forward_headers, &parts.method, &parts.uri)
+        .map_err(|message| GatewayError::UpstreamUnavailable {
+            trace_id: request_context.trace_id.clone(),
+            message: format!("owner gateway identity proof unavailable: {message}"),
+        })?;
+    for (name, value) in &internal_forward_headers {
+        upstream_request = upstream_request.header(name, value);
     }
 
     let upstream_response = crate::tunnel::send_owner_forward_request(
@@ -578,6 +614,18 @@ async fn maybe_forward_public_request_to_tunnel_owner(
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
     Ok(Some(response))
+}
+
+fn insert_internal_forward_header(
+    headers: &mut http::HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<(), GatewayError> {
+    headers.insert(
+        HeaderName::from_static(name),
+        HeaderValue::from_str(value).map_err(|err| GatewayError::Internal(err.to_string()))?,
+    );
+    Ok(())
 }
 
 fn routing_overlay_allows_affinity_target(

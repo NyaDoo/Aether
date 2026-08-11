@@ -26,9 +26,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
-use crate::constants::TRACE_ID_HEADER;
+use crate::constants::{CONTROL_EXECUTE_FALLBACK_HEADER, TRACE_ID_HEADER};
 
-use super::{build_router_with_state, build_state_with_execution_runtime_override, start_server};
+use super::{
+    build_router_with_state, build_state_with_execution_runtime_override,
+    simple_video_provider_catalog_repository, start_server, video_auth_repository,
+    VideoTaskTruthSourceMode,
+};
 
 #[tokio::test]
 async fn gateway_executes_openai_video_create_via_local_decision_gate_with_local_planning_only() {
@@ -168,7 +172,7 @@ async fn gateway_executes_openai_video_create_via_local_decision_gate_with_local
                 {"action":"drop","path":"store"}
             ])),
             Some(2),
-            Some("/custom/v1/videos".to_string()),
+            None,
             None,
             None,
             None,
@@ -437,8 +441,14 @@ async fn gateway_executes_openai_video_create_via_local_decision_gate_with_local
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.expect("body should parse");
+    let response_status = response.status();
+    let response_text = response.text().await.expect("body should read");
+    assert_eq!(
+        response_status,
+        StatusCode::OK,
+        "unexpected remix response: {response_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&response_text).expect("body should parse");
     assert_eq!(body.get("object"), Some(&json!("video")));
     assert_eq!(body.get("status"), Some(&json!("queued")));
     assert_eq!(body.get("prompt"), Some(&json!("hello local video")));
@@ -451,7 +461,7 @@ async fn gateway_executes_openai_video_create_via_local_decision_gate_with_local
     assert_eq!(seen_execution_runtime_request.method, "POST");
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://api.openai.example/custom/v1/videos"
+        "https://api.openai.example/videos"
     );
     assert_eq!(
         seen_execution_runtime_request.authorization,
@@ -740,12 +750,33 @@ async fn gateway_executes_openai_video_remix_via_data_backed_local_follow_up_wit
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let auth_repository = video_auth_repository(
+        "client-openai-video-remix-local-key",
+        "key-openai-video-remix-local-123",
+        "user-openai-video-remix-local-123",
+        "openai",
+        "openai:video",
+        "sora-2",
+    );
+    let provider_catalog_repository = simple_video_provider_catalog_repository(
+        "provider-openai-video-local-1",
+        "endpoint-openai-video-local-1",
+        "key-openai-video-local-1",
+        "openai",
+        "openai:video",
+        "https://api.openai.example/v1",
+        "sk-upstream-openai-video",
+    );
     let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
         .with_data_state_for_tests(
-        crate::data::GatewayDataState::with_video_task_and_request_candidate_repository_for_tests(
+        crate::data::GatewayDataState::with_video_task_provider_transport_and_request_candidate_repository_for_tests(
             repository,
+            provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
-        ),
+            DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .with_auth_api_key_reader(auth_repository),
     );
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -753,14 +784,22 @@ async fn gateway_executes_openai_video_remix_via_data_backed_local_follow_up_wit
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/videos/task-local-123/remix"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .bearer_auth("client-openai-video-remix-local-key")
+        .header(CONTROL_EXECUTE_FALLBACK_HEADER, "true")
         .header(TRACE_ID_HEADER, "trace-openai-video-remix-local-123")
         .body("{\"prompt\":\"remix this\",\"model\":\"sora-2\"}")
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.expect("body should parse");
+    let response_status = response.status();
+    let response_text = response.text().await.expect("body should read");
+    assert_eq!(
+        response_status,
+        StatusCode::OK,
+        "unexpected remix response: {response_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&response_text).expect("body should parse");
     assert_eq!(body.get("object"), Some(&json!("video")));
     assert_eq!(body.get("status"), Some(&json!("queued")));
     assert_eq!(body.get("prompt"), Some(&json!("remix this")));

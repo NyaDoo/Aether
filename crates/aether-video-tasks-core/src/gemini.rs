@@ -344,7 +344,8 @@ impl GeminiVideoTaskSeed {
             video_url: gemini_metadata_video_url(&self.metadata),
             request_metadata: Some(json!({
                 "rust_owner": "async_task",
-                "rust_local_snapshot": LocalVideoTaskSnapshot::Gemini(self.clone()),
+                "rust_local_snapshot": LocalVideoTaskSnapshot::Gemini(self.clone())
+                    .redacted_for_persistence(),
             })),
         }
     }
