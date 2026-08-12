@@ -1898,11 +1898,38 @@ fn gemini_video_operation_name(task: &StoredVideoTask) -> String {
 }
 
 fn gemini_operation_model(task: &StoredVideoTask) -> String {
-    task.model
-        .as_deref()
+    task.request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("global_model_name"))
+        .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(|| {
+            task.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("rust_local_snapshot"))
+                .and_then(|value| {
+                    serde_json::from_value::<aether_video_tasks_core::LocalVideoTaskSnapshot>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .and_then(|snapshot| match snapshot {
+                    aether_video_tasks_core::LocalVideoTaskSnapshot::Gemini(seed) => {
+                        seed.persistence.global_model_name
+                    }
+                    _ => None,
+                })
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            task.model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
         .or_else(|| {
             task.external_task_id.as_deref().and_then(|external_id| {
                 let parts = external_id.split('/').collect::<Vec<_>>();
@@ -1976,13 +2003,13 @@ fn build_doubao_video_error_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        doubao_list_status_matches, doubao_video_error_body, parse_doubao_video_tasks_list_query,
-        parse_openai_image_validation_input, validate_claude_count_tokens_request,
-        validate_openai_image_n, OpenAiImageOperation, CLAUDE_COUNT_TOKENS_BODY_REQUIRED_DETAIL,
-        CLAUDE_COUNT_TOKENS_INVALID_JSON_DETAIL, CLAUDE_COUNT_TOKENS_MESSAGES_REQUIRED_DETAIL,
-        CLAUDE_COUNT_TOKENS_MODEL_REQUIRED_DETAIL,
+        doubao_list_status_matches, doubao_video_error_body, gemini_operation_model,
+        parse_doubao_video_tasks_list_query, parse_openai_image_validation_input,
+        validate_claude_count_tokens_request, validate_openai_image_n, OpenAiImageOperation,
+        CLAUDE_COUNT_TOKENS_BODY_REQUIRED_DETAIL, CLAUDE_COUNT_TOKENS_INVALID_JSON_DETAIL,
+        CLAUDE_COUNT_TOKENS_MESSAGES_REQUIRED_DETAIL, CLAUDE_COUNT_TOKENS_MODEL_REQUIRED_DETAIL,
     };
-    use aether_data_contracts::repository::video_tasks::VideoTaskStatus;
+    use aether_data_contracts::repository::video_tasks::{StoredVideoTask, VideoTaskStatus};
     use axum::body::Bytes;
     use serde_json::json;
 
@@ -1996,6 +2023,55 @@ mod tests {
                     "message": "Authentication required"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn gemini_operation_projection_prefers_global_model_identity() {
+        let task = StoredVideoTask {
+            id: "task-gemini-model-identity".to_string(),
+            short_id: Some("short-gemini-model-identity".to_string()),
+            request_id: "request-gemini-model-identity".to_string(),
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("key-1".to_string()),
+            username: None,
+            api_key_name: None,
+            external_task_id: Some("operations/upstream-op".to_string()),
+            provider_id: Some("provider-1".to_string()),
+            endpoint_id: Some("endpoint-1".to_string()),
+            key_id: Some("key-1".to_string()),
+            client_api_format: Some("gemini:video".to_string()),
+            provider_api_format: Some("gemini:video".to_string()),
+            format_converted: false,
+            model: Some("veo-provider-version".to_string()),
+            prompt: None,
+            original_request_body: Some(json!({"model": "veo-requested"})),
+            duration_seconds: None,
+            resolution: None,
+            aspect_ratio: None,
+            size: None,
+            status: VideoTaskStatus::Processing,
+            progress_percent: 50,
+            progress_message: None,
+            retry_count: 0,
+            poll_interval_seconds: 10,
+            next_poll_at_unix_secs: None,
+            poll_count: 1,
+            max_poll_count: 360,
+            created_at_unix_ms: 1,
+            submitted_at_unix_secs: Some(1),
+            completed_at_unix_secs: None,
+            updated_at_unix_secs: 2,
+            error_code: None,
+            error_message: None,
+            video_url: None,
+            request_metadata: Some(json!({"global_model_name": "Veo Global"})),
+        };
+
+        assert_eq!(gemini_operation_model(&task), "Veo Global");
+        assert_eq!(
+            super::gemini_video_operation_name(&task),
+            "models/Veo Global/operations/short-gemini-model-identity"
         );
     }
 

@@ -163,15 +163,24 @@ impl LocalVideoTaskSeed {
                     updated_at_unix_secs: None,
                     user_id: context_text(report_context, "user_id"),
                     api_key_id: context_text(report_context, "api_key_id"),
-                    model: provider_body
+                    // Keep the Aether/client identity stable. The provider's
+                    // echoed model is captured separately as observed_model
+                    // by `apply_provider_body` and must never replace this.
+                    model: context_text(report_context, "global_model_name")
+                        .or_else(|| context_text(report_context, "model"))
+                        .or_else(|| request_body_text(report_context, "model"))
+                        .or_else(|| context_text(report_context, "mapped_model"))
+                        .or_else(|| {
+                            plan.model_name
+                                .clone()
+                                .filter(|value| !value.trim().is_empty())
+                        }),
+                    observed_model: provider_body
                         .get("model")
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        .map(ToOwned::to_owned)
-                        .or_else(|| context_text(report_context, "mapped_model"))
-                        .or_else(|| context_text(report_context, "model"))
-                        .or_else(|| request_body_text(report_context, "model")),
+                        .map(ToOwned::to_owned),
                     prompt,
                     resolution: crate::doubao_string_parameter(
                         request_body,
@@ -681,7 +690,8 @@ mod tests {
         assert_eq!(seed.persistence.client_api_format, "openai:video");
         assert_eq!(seed.persistence.provider_api_format, "doubao:video");
         assert!(seed.persistence.format_converted);
-        assert_eq!(seed.model.as_deref(), Some("doubao-provider-model"));
+        assert_eq!(seed.model.as_deref(), Some("sora-compatible-alias"));
+        assert_eq!(seed.observed_model, None);
         assert!(!seed.local_task_id.starts_with("cgt-"));
 
         let record = snapshot.to_upsert_record();

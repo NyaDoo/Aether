@@ -11,6 +11,10 @@ pub struct VideoFollowUpReportContextInput<'a> {
     pub key_id: &'a str,
     pub provider_name: Option<&'a str>,
     pub model_name: Option<&'a str>,
+    pub global_model_name: Option<&'a str>,
+    pub mapped_model: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub global_model_id: Option<&'a str>,
     pub client_api_format: &'a str,
     pub provider_api_format: &'a str,
 }
@@ -26,6 +30,10 @@ pub fn build_video_follow_up_report_context(input: VideoFollowUpReportContextInp
         key_id,
         provider_name,
         model_name,
+        global_model_name,
+        mapped_model,
+        model_id,
+        global_model_id,
         client_api_format,
         provider_api_format,
     } = input;
@@ -66,6 +74,30 @@ pub fn build_video_follow_up_report_context(input: VideoFollowUpReportContextInp
     }
     if let Some(model_name) = model_name.filter(|value| !value.is_empty()) {
         context.insert("model".to_string(), Value::String(model_name.to_string()));
+    }
+    if let Some(value) = global_model_name.filter(|value| !value.trim().is_empty()) {
+        context.insert(
+            "global_model_name".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
+    if let Some(value) = mapped_model.filter(|value| !value.trim().is_empty()) {
+        context.insert(
+            "mapped_model".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
+    if let Some(value) = model_id.filter(|value| !value.trim().is_empty()) {
+        context.insert(
+            "model_id".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
+    if let Some(value) = global_model_id.filter(|value| !value.trim().is_empty()) {
+        context.insert(
+            "global_model_id".to_string(),
+            Value::String(value.trim().to_string()),
+        );
     }
     Value::Object(context)
 }
@@ -118,6 +150,10 @@ mod tests {
             key_id: "transport_key_123",
             provider_name: Some("provider-name"),
             model_name: Some("model-name"),
+            global_model_name: None,
+            mapped_model: None,
+            model_id: None,
+            global_model_id: None,
             client_api_format: "openai:video",
             provider_api_format: "openai:video",
         });

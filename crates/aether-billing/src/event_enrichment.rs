@@ -349,8 +349,20 @@ fn apply_billing_computation(
     pricing: &BillingModelPricingSnapshot,
     computation: BillingComputation,
 ) -> Result<(), DataLayerError> {
-    event.data.total_cost_usd = Some(computation.cost_result.cost);
-    event.data.actual_total_cost_usd = Some(computation.actual_total_cost);
+    // A zero-valued computation is not necessarily a zero-priced request.  The
+    // billing service intentionally returns a numeric zero for `NoRule` and
+    // `Incomplete` so callers can inspect the calculation snapshot, but putting
+    // that value in the usage event makes the settlement layer mistake an
+    // unresolved price for a legitimate free tier.  Only a complete formula is
+    // allowed to publish monetary fields; unresolved computations remain
+    // pending and are retriable.
+    if computation.cost_result.status == BillingSnapshotStatus::Complete {
+        event.data.total_cost_usd = Some(computation.cost_result.cost);
+        event.data.actual_total_cost_usd = Some(computation.actual_total_cost);
+    } else {
+        event.data.total_cost_usd = None;
+        event.data.actual_total_cost_usd = None;
+    }
     merge_billing_snapshot_metadata(&mut event.data.request_metadata, pricing, &computation)
 }
 
@@ -374,6 +386,19 @@ fn merge_billing_snapshot_metadata(
         _ => Map::new(),
     };
     metadata.insert("billing_snapshot".to_string(), billing_snapshot);
+    // Keep a small, indexed-friendly status mirror alongside the full snapshot.
+    // The usage adapters already copy this key into the settlement snapshot, and
+    // the settlement guard uses it without having to parse the complete pricing
+    // payload.  This is deliberately written for *all* outcomes, including
+    // no_rule/incomplete, so an unresolved zero can never look settled.
+    metadata.insert(
+        "billing_snapshot_schema_version".to_string(),
+        Value::from(snapshot.schema_version.clone()),
+    );
+    metadata.insert(
+        "billing_snapshot_status".to_string(),
+        Value::from(snapshot.status.as_str()),
+    );
     metadata.insert(
         "settlement_snapshot_schema_version".to_string(),
         Value::from(SETTLEMENT_SNAPSHOT_SCHEMA_VERSION),
@@ -1565,6 +1590,72 @@ mod tests {
                 .and_then(|value| value.get("status"))
                 .and_then(Value::as_str),
             Some("complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_no_rule_does_not_publish_zero_cost_as_settleable() {
+        // The context exists, but it has no token/request/video pricing.  This
+        // exercises the same `NoRule` path used when a mapped video model has
+        // not been configured in the billing catalog yet.
+        let context = StoredBillingModelContext::new(
+            "provider-1".to_string(),
+            Some("pay_as_you_go".to_string()),
+            Some("key-1".to_string()),
+            None,
+            None,
+            "global-video-1".to_string(),
+            "Doubao-Seedance-2.0".to_string(),
+            None,
+            None,
+            Some(json!({"tiers": []})),
+            Some("mapped-video-1".to_string()),
+            Some("mapped-video-1".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("billing context should build");
+        let lookup = NameMatchingLookup {
+            expected_name: "mapped-video-1",
+            context,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-billing-no-rule-video-1",
+            UsageEventData {
+                provider_name: "Doubao".to_string(),
+                model: "Doubao-Seedance-2.0".to_string(),
+                target_model: Some("mapped-video-1".to_string()),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("video".to_string()),
+                api_format: Some("doubao:video".to_string()),
+                endpoint_api_format: Some("doubao:video".to_string()),
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                status_code: Some(200),
+                request_metadata: Some(json!({
+                    "dimensions": {
+                        "video_resolution": "1080p",
+                        "video_duration_seconds": 5
+                    }
+                })),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("unresolved billing should be represented, not fail enrichment");
+
+        assert_eq!(event.data.total_cost_usd, None);
+        assert_eq!(event.data.actual_total_cost_usd, None);
+        let metadata = event.data.request_metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["billing_snapshot_status"], json!("no_rule"));
+        assert_eq!(
+            metadata.pointer("/billing_snapshot/status"),
+            Some(&json!("no_rule"))
         );
     }
 }

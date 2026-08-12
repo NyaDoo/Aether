@@ -83,9 +83,33 @@ fn build_gemini_pending_body(task: StoredVideoTask) -> Value {
 }
 
 fn stored_task_operation_name(task: &StoredVideoTask) -> String {
-    let model = task.model.clone().unwrap_or_else(|| "unknown".to_string());
+    let model = stored_global_model_name(task)
+        .or_else(|| task.model.clone())
+        .unwrap_or_else(|| "unknown".to_string());
     let short_id = task.short_id.clone().unwrap_or_else(|| task.id.clone());
     format!("models/{model}/operations/{short_id}")
+}
+
+fn stored_global_model_name(task: &StoredVideoTask) -> Option<String> {
+    task.request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("global_model_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            task.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("rust_local_snapshot"))
+                .and_then(|value| {
+                    serde_json::from_value::<LocalVideoTaskSnapshot>(value.clone()).ok()
+                })
+                .and_then(|snapshot| match snapshot {
+                    LocalVideoTaskSnapshot::Gemini(seed) => seed.persistence.global_model_name,
+                    _ => None,
+                })
+        })
 }
 
 impl GeminiVideoTaskSeed {
@@ -243,6 +267,10 @@ impl GeminiVideoTaskSeed {
                     key_id: &self.transport.key_id,
                     provider_name: self.transport.provider_name.as_deref(),
                     model_name: Some(self.model.as_str()),
+                    global_model_name: self.persistence.global_model_name.as_deref(),
+                    mapped_model: self.persistence.mapped_model.as_deref(),
+                    model_id: self.persistence.model_id.as_deref(),
+                    global_model_id: self.persistence.global_model_id.as_deref(),
                     client_api_format: "gemini:video",
                     provider_api_format: "gemini:video",
                 },
@@ -251,7 +279,13 @@ impl GeminiVideoTaskSeed {
     }
 
     pub fn client_body_json(&self) -> Value {
-        let operation_name = format!("models/{}/operations/{}", self.model, self.local_short_id);
+        let public_model = self
+            .persistence
+            .global_model_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(self.model.as_str());
+        let operation_name = format!("models/{}/operations/{}", public_model, self.local_short_id);
         match self.status {
             LocalVideoTaskStatus::Completed => json!({
                 "name": operation_name,
@@ -342,22 +376,41 @@ impl GeminiVideoTaskSeed {
             error_code: self.error_code.clone(),
             error_message: self.error_message.clone(),
             video_url: gemini_metadata_video_url(&self.metadata),
-            request_metadata: Some(json!({
-                "rust_owner": "async_task",
-                "rust_local_snapshot": LocalVideoTaskSnapshot::Gemini(self.clone())
-                    .redacted_for_persistence(),
-            })),
+            request_metadata: Some({
+                let mut metadata = Map::new();
+                metadata.insert(
+                    "rust_owner".to_string(),
+                    Value::String("async_task".to_string()),
+                );
+                metadata.insert(
+                    "rust_local_snapshot".to_string(),
+                    serde_json::to_value(
+                        LocalVideoTaskSnapshot::Gemini(self.clone()).redacted_for_persistence(),
+                    )
+                    .expect("video snapshot should serialize"),
+                );
+                self.persistence.append_identity_metadata(&mut metadata);
+                Value::Object(metadata)
+            }),
         }
     }
 
     fn resolve_operation_path(&self) -> Option<String> {
         if self.upstream_operation_name.starts_with("models/") {
             Some(self.upstream_operation_name.clone())
-        } else if self.upstream_operation_name.starts_with("operations/") && !self.model.is_empty()
-        {
+        } else if self.upstream_operation_name.starts_with("operations/") {
+            let provider_model = self
+                .persistence
+                .mapped_model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(self.model.as_str());
+            if provider_model.is_empty() {
+                return None;
+            }
             Some(format!(
                 "models/{}/{}",
-                self.model, self.upstream_operation_name
+                provider_model, self.upstream_operation_name
             ))
         } else {
             None

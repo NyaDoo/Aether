@@ -5,7 +5,9 @@ use aether_contracts::{ExecutionErrorKind, ExecutionResult};
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, UpsertVideoTask, VideoTaskStatus,
 };
-use aether_usage_runtime::{build_upsert_usage_record_from_event, settle_usage_if_needed};
+use aether_usage_runtime::{
+    billing_snapshot_status, build_upsert_usage_record_from_event, settle_usage_if_needed,
+};
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -378,8 +380,8 @@ fn build_successful_poll_update(
     record.provider_api_format = task.provider_api_format.clone();
     record.format_converted = task.format_converted;
     // The indexed model column intentionally keeps Ark's request-side model or
-    // endpoint ID for exact list filtering. The provider-resolved response
-    // model remains in the persisted local snapshot.
+    // endpoint ID for exact list filtering. Global, mapped, and observed model
+    // identities remain in explicit persisted metadata/snapshot fields.
     record.model = task.model.clone().or(record.model);
     record.prompt = record.prompt.or_else(|| task.prompt.clone());
     record.original_request_body = task
@@ -775,7 +777,16 @@ pub(crate) async fn finalize_video_task_if_terminal(state: &AppState, task: &Sto
 
 fn terminal_video_billing_is_resolved(event: &UsageEvent) -> bool {
     !matches!(event.event_type, UsageEventType::Completed)
-        || (event.data.total_cost_usd.is_some() && event.data.actual_total_cost_usd.is_some())
+        || (event
+            .data
+            .total_cost_usd
+            .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+            && event
+                .data
+                .actual_total_cost_usd
+                .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+            && billing_snapshot_status(event.data.request_metadata.as_ref())
+                .is_some_and(|status| status.eq_ignore_ascii_case("complete")))
 }
 
 /// Publishes the billing dimensions a finished video task priced by.
@@ -817,8 +828,107 @@ fn build_video_task_billing_dimensions(task: &StoredVideoTask) -> Value {
         Value::from(has_video_input),
     );
 
+    // Keep the three model identities separate all the way to billing and
+    // usage diagnostics. `model` is the stable client/global identity,
+    // `mapped_model` is the selected provider target, and `observed_model` is
+    // merely what the provider echoed on its latest poll. In particular, an
+    // Ark version string must never replace the catalog identity used to find
+    // a price rule. Read the first two values only from persistence; the
+    // transport's `model_name` is an upstream request detail, not a public
+    // identity source.
+    // Flat identity keys are also valid when a task row has no decodable local
+    // snapshot (for example, a deliberately minimal DB-only fixture). Seed
+    // snapshots refine these values, but must not be the only recovery path.
+    for key in [
+        "global_model_name",
+        "mapped_model",
+        "observed_model",
+        "model_id",
+        "global_model_id",
+    ] {
+        if let Some(value) = stored_video_metadata_string(task, key) {
+            metadata.insert(key.to_string(), Value::String(value));
+        }
+    }
+    if let Some(snapshot) = LocalVideoTaskSnapshot::from_stored_task(task) {
+        let persistence = match &snapshot {
+            LocalVideoTaskSnapshot::OpenAi(seed) => (
+                seed.persistence.global_model_name.clone(),
+                seed.persistence.mapped_model.clone(),
+                seed.persistence.model_id.clone(),
+                seed.persistence.global_model_id.clone(),
+            ),
+            LocalVideoTaskSnapshot::Gemini(seed) => (
+                seed.persistence.global_model_name.clone(),
+                seed.persistence.mapped_model.clone(),
+                seed.persistence.model_id.clone(),
+                seed.persistence.global_model_id.clone(),
+            ),
+            LocalVideoTaskSnapshot::Doubao(seed) => (
+                seed.persistence.global_model_name.clone(),
+                seed.persistence.mapped_model.clone(),
+                seed.persistence.model_id.clone(),
+                seed.persistence.global_model_id.clone(),
+            ),
+        };
+        let (public_model, mapped_model, model_id, global_model_id) = persistence;
+        if let Some(value) = public_model
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| !metadata.contains_key("global_model_name"))
+        {
+            metadata.insert(
+                "global_model_name".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        if let Some(value) = mapped_model
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| !metadata.contains_key("mapped_model"))
+        {
+            metadata.insert(
+                "mapped_model".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        let observed_model = snapshot.observed_model_name().map(str::to_string);
+        if let Some(value) = observed_model.filter(|_| !metadata.contains_key("observed_model")) {
+            metadata.insert("observed_model".to_string(), Value::String(value));
+        }
+        if let Some(value) = model_id.filter(|_| !metadata.contains_key("model_id")) {
+            metadata.insert("model_id".to_string(), Value::String(value));
+        }
+        if let Some(value) = global_model_id.filter(|_| !metadata.contains_key("global_model_id")) {
+            metadata.insert("global_model_id".to_string(), Value::String(value));
+        }
+    }
+
     metadata.insert("dimensions".to_string(), Value::Object(dimensions));
     Value::Object(metadata)
+}
+
+fn non_empty_task_string(value: Option<&String>) -> Option<String> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_video_model_name(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn stored_video_metadata_string(task: &StoredVideoTask, key: &str) -> Option<String> {
+    task.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<UsageEvent> {
@@ -839,27 +949,51 @@ fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<Usage
         .and_then(|snapshot| snapshot.provider_name().map(str::to_string))
         .or_else(|| task.provider_id.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    let provider_model = snapshot
+    // Usage identity is read directly from persistence. Snapshot convenience
+    // methods intentionally have transport fallbacks for legacy read paths,
+    // but `transport.model_name` must never become a public model or billing
+    // target in a terminal usage event.
+    let (global_model, mapped_model, observed_model, model_id, global_model_id) = snapshot
         .as_ref()
-        .and_then(|snapshot| snapshot.provider_model_name().map(str::to_string))
-        .or_else(|| task.model.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    // Provider task responses may report a canonical model family that differs
-    // from the configured global/provider model used during dispatch. Keep the
-    // response-reported value as the observed model, but carry the dispatch
-    // model as `target_model` so billing can still resolve the exact pricing
-    // context (and fall back to the observed model when both names coincide).
-    let target_model = snapshot
-        .as_ref()
-        .and_then(|snapshot| match snapshot {
-            LocalVideoTaskSnapshot::OpenAi(seed) => seed.transport.model_name.as_deref(),
-            LocalVideoTaskSnapshot::Gemini(seed) => seed.transport.model_name.as_deref(),
-            LocalVideoTaskSnapshot::Doubao(seed) => seed.transport.model_name.as_deref(),
+        .map(|snapshot| match snapshot {
+            LocalVideoTaskSnapshot::OpenAi(seed) => (
+                seed.persistence.global_model_name.clone(),
+                seed.persistence.mapped_model.clone(),
+                None,
+                seed.persistence.model_id.clone(),
+                seed.persistence.global_model_id.clone(),
+            ),
+            LocalVideoTaskSnapshot::Gemini(seed) => (
+                seed.persistence.global_model_name.clone(),
+                seed.persistence.mapped_model.clone(),
+                None,
+                seed.persistence.model_id.clone(),
+                seed.persistence.global_model_id.clone(),
+            ),
+            LocalVideoTaskSnapshot::Doubao(seed) => (
+                seed.persistence.global_model_name.clone(),
+                seed.persistence.mapped_model.clone(),
+                seed.observed_model.clone(),
+                seed.persistence.model_id.clone(),
+                seed.persistence.global_model_id.clone(),
+            ),
         })
-        .or_else(|| task.model.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .unwrap_or_default();
+    let global_model = normalize_video_model_name(global_model)
+        .or_else(|| stored_video_metadata_string(task, "global_model_name"))
+        .or_else(|| non_empty_task_string(task.model.as_ref()))
+        .unwrap_or_else(|| "unknown".to_string());
+    // Do not use the provider-observed version as a pricing key. If a task was
+    // created before mapping metadata was available, the raw request model is
+    // the safest fallback and remains auditable in the event metadata.
+    let target_model = normalize_video_model_name(mapped_model)
+        .or_else(|| stored_video_metadata_string(task, "mapped_model"))
+        .or_else(|| non_empty_task_string(task.model.as_ref()));
+    let observed_model =
+        observed_model.or_else(|| stored_video_metadata_string(task, "observed_model"));
+    let model_id = model_id.or_else(|| stored_video_metadata_string(task, "model_id"));
+    let global_model_id =
+        global_model_id.or_else(|| stored_video_metadata_string(task, "global_model_id"));
     // Doubao bills video generation by tokens rather than by duration, so the
     // reported usage has to reach the billing pipeline like a chat completion.
     let usage_tokens = snapshot.and_then(|snapshot| snapshot.usage_tokens());
@@ -886,8 +1020,10 @@ fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<Usage
             username: task.username.clone(),
             api_key_name: task.api_key_name.clone(),
             provider_name,
-            model: provider_model,
+            model: global_model,
             target_model,
+            model_id,
+            global_model_id,
             provider_id: task.provider_id.clone(),
             provider_endpoint_id: task.endpoint_id.clone(),
             provider_api_key_id: task.key_id.clone(),
@@ -900,7 +1036,15 @@ fn build_video_task_terminal_usage_event(task: &StoredVideoTask) -> Option<Usage
             error_message: task.error_message.clone().or(task.error_code.clone()),
             response_time_ms,
             request_body: task.original_request_body.clone(),
-            request_metadata: Some(build_video_task_billing_dimensions(task)),
+            request_metadata: Some({
+                let mut metadata = build_video_task_billing_dimensions(task);
+                if let Some(observed_model) = observed_model {
+                    if let Some(object) = metadata.as_object_mut() {
+                        object.insert("observed_model".to_string(), Value::String(observed_model));
+                    }
+                }
+                metadata
+            }),
             input_tokens: usage_tokens.map(|(completion_tokens, total_tokens)| {
                 total_tokens.saturating_sub(completion_tokens)
             }),
@@ -933,7 +1077,7 @@ mod tests {
     };
     use aether_data_contracts::repository::video_tasks::{StoredVideoTask, VideoTaskStatus};
     use aether_video_tasks_core::DoubaoVideoTaskSeed;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::BTreeMap;
 
     fn sample_sparse_stored_task() -> StoredVideoTask {
@@ -969,6 +1113,10 @@ mod tests {
                     "size": "1280x720"
                 }),
                 format_converted: false,
+                global_model_name: Some("sora-2".to_string()),
+                mapped_model: Some("sora-2".to_string()),
+                model_id: None,
+                global_model_id: None,
             },
             transport: LocalVideoTaskTransport {
                 upstream_base_url: "https://example.com".to_string(),
@@ -1204,6 +1352,7 @@ mod tests {
             user_id: task.user_id.clone(),
             api_key_id: task.api_key_id.clone(),
             model: Some("doubao-seedance-2-0".to_string()),
+            observed_model: None,
             prompt: Some("hello".to_string()),
             resolution: Some("720p".to_string()),
             ratio: Some("16:9".to_string()),
@@ -1228,6 +1377,10 @@ mod tests {
                 provider_api_format: "doubao:video".to_string(),
                 original_request_body: task.original_request_body.clone().expect("request body"),
                 format_converted: false,
+                global_model_name: Some("doubao-seedance-2-0".to_string()),
+                mapped_model: Some("doubao-seedance-2-0".to_string()),
+                model_id: None,
+                global_model_id: None,
             },
             transport,
         });
@@ -1294,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_doubao_usage_uses_provider_model_and_splits_input_tokens() {
+    fn terminal_doubao_usage_preserves_model_identities_and_splits_input_tokens() {
         let mut task = sample_sparse_stored_task();
         task.status = VideoTaskStatus::Completed;
         task.completed_at_unix_secs = Some(30);
@@ -1319,7 +1472,8 @@ mod tests {
             updated_at_unix_secs: Some(30),
             user_id: task.user_id.clone(),
             api_key_id: task.api_key_id.clone(),
-            model: Some("doubao-provider-reported-model".to_string()),
+            model: Some("sora-client-alias".to_string()),
+            observed_model: Some("doubao-provider-reported-model".to_string()),
             prompt: Some("hello".to_string()),
             resolution: Some("720p".to_string()),
             ratio: Some("16:9".to_string()),
@@ -1344,9 +1498,13 @@ mod tests {
                 provider_api_format: "doubao:video".to_string(),
                 original_request_body: json!({"model": "sora-client-alias"}),
                 format_converted: true,
+                global_model_name: Some("Sora Global".to_string()),
+                mapped_model: Some("doubao-configured-model".to_string()),
+                model_id: Some("model-1".to_string()),
+                global_model_id: Some("global-1".to_string()),
             },
             transport: LocalVideoTaskTransport {
-                model_name: Some("doubao-configured-model".to_string()),
+                model_name: Some("transport-only-model-should-not-win".to_string()),
                 ..base_transport
             },
         });
@@ -1356,10 +1514,21 @@ mod tests {
 
         let event = build_video_task_terminal_usage_event(&task)
             .expect("completed task should produce a usage event");
-        assert_eq!(event.data.model, "doubao-provider-reported-model");
+        assert_eq!(event.data.model, "Sora Global");
         assert_eq!(
             event.data.target_model.as_deref(),
             Some("doubao-configured-model")
+        );
+        assert_eq!(event.data.model_id.as_deref(), Some("model-1"));
+        assert_eq!(event.data.global_model_id.as_deref(), Some("global-1"));
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("observed_model"))
+                .and_then(Value::as_str),
+            Some("doubao-provider-reported-model")
         );
         assert_eq!(event.data.input_tokens, Some(20));
         assert_eq!(event.data.output_tokens, Some(80));
@@ -1383,6 +1552,14 @@ mod tests {
 
         event.data.total_cost_usd = Some(0.0);
         event.data.actual_total_cost_usd = Some(0.0);
+        // Monetary fields alone cannot distinguish a complete free rule from
+        // an unresolved `NoRule`/`Incomplete` result.
+        assert!(!terminal_video_billing_is_resolved(&event));
+
+        event.data.request_metadata = Some(json!({
+            "billing_snapshot_status": "complete",
+            "billing_snapshot": { "status": "complete" }
+        }));
         assert!(terminal_video_billing_is_resolved(&event));
     }
 

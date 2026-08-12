@@ -201,6 +201,7 @@ fn gateway_service_enforces_owner_and_cross_doubao_content_contract() {
         user_id: Some("user-123".to_string()),
         api_key_id: Some("key-123".to_string()),
         model: Some("doubao-seedance".to_string()),
+        observed_model: None,
         prompt: Some("hello".to_string()),
         resolution: Some("720p".to_string()),
         ratio: Some("16:9".to_string()),

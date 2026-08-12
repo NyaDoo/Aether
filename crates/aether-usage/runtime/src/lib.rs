@@ -46,7 +46,10 @@ pub use runtime::{
     DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
-pub use settlement::{settle_usage_if_needed, UsageSettlementWriter};
+pub use settlement::{
+    billing_snapshot_status, settle_usage_if_needed, usage_billing_is_resolved,
+    UsageSettlementWriter,
+};
 pub use standardized_usage::StandardizedUsage;
 pub use usage_mapper::{map_usage, map_usage_from_response, UsageMapper};
 pub use worker::{

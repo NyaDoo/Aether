@@ -43,6 +43,7 @@ mod tests {
             user_id: Some("user-1".to_string()),
             api_key_id: Some("api-key-1".to_string()),
             model: Some("doubao-seedance-resolved".to_string()),
+            observed_model: None,
             prompt: Some("a cat yawning".to_string()),
             resolution: Some("720p".to_string()),
             ratio: Some("16:9".to_string()),
@@ -76,6 +77,10 @@ mod tests {
                     "seconds": "5"
                 }),
                 format_converted: true,
+                global_model_name: None,
+                mapped_model: None,
+                model_id: None,
+                global_model_id: None,
             },
             transport: LocalVideoTaskTransport {
                 upstream_base_url: "https://ark.example.com/api".to_string(),

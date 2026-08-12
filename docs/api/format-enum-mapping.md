@@ -161,6 +161,10 @@ canonical status and projects it back per surface.
 Doubao notes:
 
 - Ark reports no progress percentage; it is derived from the status (0/50/100).
+- The public `model` is the stable Aether/global identity selected at creation;
+  the request-side model remains the exact `filter.model` key. Ark's echoed
+  provider/version name is retained only as an internal observed field and
+  never replaces the public identity or billing target.
 - Ark has no separate cancel verb — `DELETE` cancels an in-flight task and
   removes a finished one. Cancelled tasks remain queryable for the provider's
   retention window; explicitly deleted tasks read back as `404`.

@@ -195,6 +195,7 @@ mod tests {
             user_id: Some("user-1".to_string()),
             api_key_id: Some("caller-key-1".to_string()),
             model: Some("doubao-seedance-1-0-pro-250528".to_string()),
+            observed_model: None,
             prompt: Some("test".to_string()),
             resolution: None,
             ratio: None,
@@ -219,6 +220,10 @@ mod tests {
                 provider_api_format: "doubao:video".to_string(),
                 original_request_body: json!({"model": "endpoint-1"}),
                 format_converted: false,
+                global_model_name: None,
+                mapped_model: None,
+                model_id: None,
+                global_model_id: None,
             },
             transport: LocalVideoTaskTransport {
                 upstream_base_url:

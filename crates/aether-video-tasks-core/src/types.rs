@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use aether_contracts::{ExecutionPlan, ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub const DEFAULT_VIDEO_TASK_POLL_INTERVAL_SECONDS: u32 = 10;
 pub const DEFAULT_VIDEO_TASK_MAX_POLL_COUNT: u32 = 360;
@@ -134,6 +134,61 @@ pub struct LocalVideoTaskPersistence {
     pub provider_api_format: String,
     pub original_request_body: Value,
     pub format_converted: bool,
+    /// Stable public/global model identity captured at task creation.
+    #[serde(default)]
+    pub global_model_name: Option<String>,
+    /// Stable provider mapping selected at task creation.
+    #[serde(default)]
+    pub mapped_model: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub global_model_id: Option<String>,
+}
+
+impl LocalVideoTaskPersistence {
+    /// Adds the model routing identity to task metadata. The video task table
+    /// currently keeps the request model for provider-side filtering; these
+    /// explicit metadata keys make the global/mapped identities recoverable
+    /// after a restart without consulting an upstream response.
+    pub fn append_identity_metadata(&self, metadata: &mut Map<String, Value>) {
+        if let Some(value) = self
+            .global_model_name
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            metadata.insert(
+                "global_model_name".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        if let Some(value) = self
+            .mapped_model
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            metadata.insert(
+                "mapped_model".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        if let Some(value) = self.model_id.as_deref().filter(|v| !v.trim().is_empty()) {
+            metadata.insert(
+                "model_id".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        if let Some(value) = self
+            .global_model_id
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            metadata.insert(
+                "global_model_id".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,7 +247,13 @@ pub struct DoubaoVideoTaskSeed {
     pub updated_at_unix_secs: Option<u64>,
     pub user_id: Option<String>,
     pub api_key_id: Option<String>,
+    /// Aether's stable/public model identity. This is initialized from the
+    /// request/report context and must never be replaced by an Ark poll.
     pub model: Option<String>,
+    /// The model name/version observed in the latest Ark response. It is
+    /// telemetry only; it must not drive public identity or pricing lookup.
+    #[serde(default)]
+    pub observed_model: Option<String>,
     pub prompt: Option<String>,
     pub resolution: Option<String>,
     pub ratio: Option<String>,

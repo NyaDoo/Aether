@@ -17,10 +17,10 @@ use axum::{
 use serde_json::json;
 
 use super::builders::{
-    admin_video_task_detail_id_from_path, admin_video_task_nested_id_from_path,
-    admin_video_task_status_name, admin_video_task_timestamp, build_admin_video_task_list_item,
-    build_admin_video_task_provider_names, build_admin_video_task_usage_summaries,
-    current_admin_video_task_unix_secs,
+    admin_video_task_detail_id_from_path, admin_video_task_model_identities,
+    admin_video_task_nested_id_from_path, admin_video_task_status_name, admin_video_task_timestamp,
+    build_admin_video_task_list_item, build_admin_video_task_provider_names,
+    build_admin_video_task_usage_summaries, current_admin_video_task_unix_secs,
 };
 
 pub(super) async fn maybe_build_local_admin_video_tasks_response(
@@ -241,6 +241,11 @@ pub(super) async fn maybe_build_local_admin_video_tasks_response(
             );
             payload.insert("format_converted".to_string(), json!(task.format_converted));
             payload.insert("model".to_string(), json!(task.model));
+            let (global_model_name, mapped_model, observed_model) =
+                admin_video_task_model_identities(&task);
+            payload.insert("global_model_name".to_string(), json!(global_model_name));
+            payload.insert("mapped_model".to_string(), json!(mapped_model));
+            payload.insert("observed_model".to_string(), json!(observed_model));
             payload.insert("prompt".to_string(), json!(task.prompt));
             payload.insert(
                 "original_request_body".to_string(),

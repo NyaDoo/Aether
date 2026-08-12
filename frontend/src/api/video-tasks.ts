@@ -32,6 +32,13 @@ export interface VideoTaskItem {
   external_task_id?: string | null
   user_id?: string | null
   username: string
+  /** Stable Aether/global model identity shown to API clients. */
+  global_model_name?: string | null
+  /** Provider-facing model selected after routing and model mapping. */
+  mapped_model?: string | null
+  /** Model/version echoed by the upstream provider during execution. */
+  observed_model?: string | null
+  /** Exact model value supplied on the original request; also used by the model filter. */
   model?: string | null
   prompt?: string | null
   status: VideoTaskStatus

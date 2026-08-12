@@ -112,8 +112,9 @@
         </Select>
         <Input
           v-model="filterModel"
-          placeholder="按模型筛选"
-          class="w-44 h-8 text-xs"
+          placeholder="按请求模型筛选"
+          aria-label="按请求模型筛选"
+          class="w-52 h-8 text-xs"
           @keyup.enter="applyFilters"
         />
         <Button
@@ -152,7 +153,7 @@
               预览
             </TableHead>
             <TableHead class="w-[24%]">
-              模型 / 提示词
+              全局模型 / 提示词
             </TableHead>
             <TableHead
               v-if="isAdmin"
@@ -232,7 +233,36 @@
             <!-- 模型 / 提示词 -->
             <TableCell>
               <div class="space-y-1 min-w-0">
-                <span class="font-medium text-sm truncate block">{{ task.model || '-' }}</span>
+                <span
+                  class="font-medium text-sm truncate block"
+                  :title="taskModelIdentity(task).primary"
+                >{{ taskModelIdentity(task).primary }}</span>
+                <div
+                  v-if="taskModelIdentity(task).requested || taskModelIdentity(task).mapped || taskModelIdentity(task).observed"
+                  class="space-y-0.5 text-[11px] leading-tight text-muted-foreground"
+                >
+                  <p
+                    v-if="taskModelIdentity(task).requested"
+                    class="truncate"
+                    :title="`请求模型：${taskModelIdentity(task).requested}`"
+                  >
+                    <span class="text-foreground/60">请求模型：</span>{{ taskModelIdentity(task).requested }}
+                  </p>
+                  <p
+                    v-if="taskModelIdentity(task).mapped"
+                    class="truncate"
+                    :title="`映射目标：${taskModelIdentity(task).mapped}`"
+                  >
+                    <span class="text-foreground/60">映射目标：</span>{{ taskModelIdentity(task).mapped }}
+                  </p>
+                  <p
+                    v-if="taskModelIdentity(task).observed"
+                    class="truncate"
+                    :title="`上游观测：${taskModelIdentity(task).observed}`"
+                  >
+                    <span class="text-foreground/60">上游观测：</span>{{ taskModelIdentity(task).observed }}
+                  </p>
+                </div>
                 <p
                   class="text-xs text-muted-foreground truncate"
                   :title="task.prompt || ''"
@@ -400,7 +430,32 @@
         @click.stop
       >
         <div class="flex items-center justify-between text-white">
-          <span class="text-sm truncate">{{ previewTask.model }} — {{ previewTask.prompt }}</span>
+          <div class="min-w-0 pr-4">
+            <p
+              class="text-sm font-medium truncate"
+              :title="taskModelIdentity(previewTask).primary"
+            >
+              {{ taskModelIdentity(previewTask).primary }}
+            </p>
+            <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-white/65">
+              <span v-if="taskModelIdentity(previewTask).requested">
+                请求模型：{{ taskModelIdentity(previewTask).requested }}
+              </span>
+              <span v-if="taskModelIdentity(previewTask).mapped">
+                映射目标：{{ taskModelIdentity(previewTask).mapped }}
+              </span>
+              <span v-if="taskModelIdentity(previewTask).observed">
+                上游观测：{{ taskModelIdentity(previewTask).observed }}
+              </span>
+            </div>
+            <p
+              v-if="previewTask.prompt"
+              class="mt-0.5 text-xs text-white/80 truncate"
+              :title="previewTask.prompt"
+            >
+              {{ previewTask.prompt }}
+            </p>
+          </div>
           <Button
             variant="ghost"
             size="icon"
@@ -439,6 +494,7 @@ import {
 import { useToast } from '@/composables/useToast'
 import { useAuthStore } from '@/stores/auth'
 import { formatTokens, formatCurrency } from '@/utils/format'
+import { videoTaskModelIdentity } from '@/features/async-tasks/utils/videoTaskModelIdentity'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
@@ -495,6 +551,8 @@ const processingCount = computed(() => {
     ?? stats.value?.by_status?.processing
     ?? 0
 })
+
+const taskModelIdentity = videoTaskModelIdentity
 
 function isCompleted(status: string): boolean {
   return status === 'completed'

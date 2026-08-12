@@ -41,6 +41,46 @@ pub(super) fn truncate_admin_video_task_prompt(prompt: Option<&str>) -> Option<S
     })
 }
 
+/// Returns the stable identities captured by the video planner. The legacy
+/// `model` column remains the raw request/filter key; these explicit fields
+/// keep the admin surface from presenting that key or an Ark echo as the
+/// selected mapping.
+pub(super) fn admin_video_task_model_identities(
+    task: &StoredVideoTask,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let metadata = task.request_metadata.as_ref().and_then(Value::as_object);
+    let metadata_string = |key: &str| {
+        metadata
+            .and_then(|object| object.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let snapshot = metadata
+        .and_then(|object| object.get("rust_local_snapshot"))
+        .and_then(|value| {
+            serde_json::from_value::<aether_video_tasks_core::LocalVideoTaskSnapshot>(value.clone())
+                .ok()
+        });
+    let global = metadata_string("global_model_name").or_else(|| {
+        snapshot
+            .as_ref()
+            .and_then(|value| value.requested_model_name().map(ToOwned::to_owned))
+    });
+    let mapped = metadata_string("mapped_model").or_else(|| {
+        snapshot
+            .as_ref()
+            .and_then(|value| value.mapped_model_name().map(ToOwned::to_owned))
+    });
+    let observed = metadata_string("observed_model").or_else(|| {
+        snapshot
+            .as_ref()
+            .and_then(|value| value.observed_model_name().map(ToOwned::to_owned))
+    });
+    (global, mapped, observed)
+}
+
 pub(super) async fn build_admin_video_task_provider_names(
     state: &AdminAppState<'_>,
     tasks: &[StoredVideoTask],
@@ -139,6 +179,7 @@ pub(super) fn build_admin_video_task_list_item(
     // Absent while the task is still queued or running; the client renders a
     // placeholder instead of a misleading zero.
     let usage = usage_summaries.get(task.request_id.trim());
+    let (global_model_name, mapped_model, observed_model) = admin_video_task_model_identities(task);
     json!({
         "id": task.id,
         "request_id": task.request_id,
@@ -147,6 +188,9 @@ pub(super) fn build_admin_video_task_list_item(
         "user_id": task.user_id,
         "username": task.username.clone().unwrap_or_else(|| "Unknown".to_string()),
         "model": task.model,
+        "global_model_name": global_model_name,
+        "mapped_model": mapped_model,
+        "observed_model": observed_model,
         "prompt": truncate_admin_video_task_prompt(task.prompt.as_deref()),
         "status": admin_video_task_status_name(task.status),
         "progress_percent": task.progress_percent,

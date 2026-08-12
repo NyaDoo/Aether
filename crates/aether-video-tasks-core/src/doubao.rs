@@ -76,6 +76,7 @@ pub fn map_doubao_stored_task_to_read_response_at(
 
 #[derive(Default)]
 struct DoubaoStoredSnapshotFields {
+    global_model_name: Option<String>,
     model: Option<String>,
     last_frame_url: Option<String>,
     completion_tokens: Option<u64>,
@@ -87,6 +88,14 @@ struct DoubaoStoredSnapshotFields {
 }
 
 fn build_doubao_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus) -> Value {
+    let metadata_global_model = task
+        .request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("global_model_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let snapshot_fields = task
         .request_metadata
         .as_ref()
@@ -94,6 +103,7 @@ fn build_doubao_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus)
         .and_then(|value| serde_json::from_value::<LocalVideoTaskSnapshot>(value.clone()).ok())
         .and_then(|snapshot| match snapshot {
             LocalVideoTaskSnapshot::Doubao(seed) => Some(DoubaoStoredSnapshotFields {
+                global_model_name: seed.persistence.global_model_name,
                 model: seed.model,
                 last_frame_url: seed
                     .last_frame_url
@@ -170,7 +180,11 @@ fn build_doubao_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus)
         "updated_at": task.updated_at_unix_secs,
     });
 
-    if let Some(model) = snapshot_fields.model.or(task.model) {
+    if let Some(model) = metadata_global_model
+        .or(snapshot_fields.global_model_name)
+        .or(snapshot_fields.model)
+        .or(task.model)
+    {
         body["model"] = Value::String(model);
     }
     let video_url = (status == VideoTaskStatus::Completed)
@@ -349,7 +363,10 @@ impl DoubaoVideoTaskSeed {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            self.model = Some(model.to_string());
+            // Ark's response model is an observed provider/version identity.
+            // Never overwrite the request/global model used by the public
+            // contract, list filtering, or billing dimensions.
+            self.observed_model = Some(model.to_string());
         }
 
         if let Some(created_at) = provider_body.get("created_at").and_then(value_u64) {
@@ -462,8 +479,26 @@ impl DoubaoVideoTaskSeed {
                 .unwrap_or(self.created_at_unix_secs),
         });
 
-        if let Some(model) = &self.model {
-            body["model"] = Value::String(model.clone());
+        // The request/global identity is intentionally projected here. The
+        // provider-observed value remains available internally as
+        // `observed_model` and is not allowed to cause response drift.
+        if let Some(model) = self
+            .persistence
+            .global_model_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.persistence
+                    .original_request_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| self.model.as_deref())
+        {
+            body["model"] = Value::String(model.to_string());
         }
         if let Some(resolution) = &self.resolution {
             body["resolution"] = Value::String(resolution.clone());
@@ -763,6 +798,10 @@ impl DoubaoVideoTaskSeed {
                     key_id: &self.transport.key_id,
                     provider_name: self.transport.provider_name.as_deref(),
                     model_name: model_name.as_deref(),
+                    global_model_name: self.persistence.global_model_name.as_deref(),
+                    mapped_model: self.persistence.mapped_model.as_deref(),
+                    model_id: self.persistence.model_id.as_deref(),
+                    global_model_id: self.persistence.global_model_id.as_deref(),
                     client_api_format,
                     provider_api_format: "doubao:video",
                 },
@@ -1064,10 +1103,10 @@ impl DoubaoVideoTaskSeed {
             client_api_format: Some(self.persistence.client_api_format.clone()),
             provider_api_format: Some(self.persistence.provider_api_format.clone()),
             format_converted: self.persistence.format_converted,
-            // Ark's list `filter.model` is the request-side model/endpoint ID,
-            // while the response `model` is the provider-resolved model name.
-            // Keep the request value in the indexed column and retain the
-            // resolved value in `rust_local_snapshot` for response projection.
+            // Ark's list `filter.model` remains an exact request-side
+            // model/endpoint-ID filter. Keep that raw value in the indexed
+            // column, while the public response projects the stable global
+            // identity and the provider echo remains diagnostic metadata.
             model: crate::request_body_string(&self.persistence.original_request_body, "model")
                 .or_else(|| self.model.clone())
                 .or_else(|| Some(String::new())),
@@ -1095,11 +1134,28 @@ impl DoubaoVideoTaskSeed {
             error_code: self.error_code.clone(),
             error_message: self.error_message.clone(),
             video_url: self.video_url.clone(),
-            request_metadata: Some(json!({
-                "rust_owner": "async_task",
-                "rust_local_snapshot": LocalVideoTaskSnapshot::Doubao(self.clone())
-                    .redacted_for_persistence(),
-            })),
+            request_metadata: Some({
+                let mut metadata = Map::new();
+                metadata.insert(
+                    "rust_owner".to_string(),
+                    Value::String("async_task".to_string()),
+                );
+                metadata.insert(
+                    "rust_local_snapshot".to_string(),
+                    serde_json::to_value(
+                        LocalVideoTaskSnapshot::Doubao(self.clone()).redacted_for_persistence(),
+                    )
+                    .expect("video snapshot should serialize"),
+                );
+                self.persistence.append_identity_metadata(&mut metadata);
+                if let Some(observed_model) = self.observed_model.as_deref() {
+                    metadata.insert(
+                        "observed_model".to_string(),
+                        Value::String(observed_model.to_string()),
+                    );
+                }
+                Value::Object(metadata)
+            }),
         }
     }
 }
@@ -1108,7 +1164,7 @@ impl DoubaoVideoTaskSeed {
 mod tests {
     use aether_contracts::EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER;
     use aether_data_contracts::repository::video_tasks::{StoredVideoTask, VideoTaskStatus};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
         map_doubao_stored_task_to_read_response, map_doubao_stored_task_to_read_response_at,
@@ -1128,6 +1184,7 @@ mod tests {
             user_id: Some("user-1".to_string()),
             api_key_id: Some("api-key-1".to_string()),
             model: Some("doubao-seedance-2-0-260128".to_string()),
+            observed_model: None,
             prompt: Some("a cat yawning".to_string()),
             resolution: None,
             ratio: Some("16:9".to_string()),
@@ -1152,6 +1209,10 @@ mod tests {
                 provider_api_format: "doubao:video".to_string(),
                 original_request_body: json!({}),
                 format_converted: false,
+                global_model_name: None,
+                mapped_model: None,
+                model_id: None,
+                global_model_id: None,
             },
             transport: LocalVideoTaskTransport {
                 upstream_base_url: "https://ark.cn-beijing.volces.com/api".to_string(),
@@ -1252,9 +1313,51 @@ mod tests {
         assert_eq!(seed.created_at_unix_secs, 1_768_294_533);
         assert_eq!(seed.updated_at_unix_secs, Some(1_768_294_581));
         assert_eq!(seed.completed_at_unix_secs, Some(1_768_294_581));
+        assert_eq!(seed.model.as_deref(), Some("doubao-seedance-2-0-260128"));
         assert_eq!(
-            seed.model.as_deref(),
+            seed.observed_model.as_deref(),
             Some("doubao-seedance-2-0-260128-resolved")
+        );
+    }
+
+    #[test]
+    fn provider_poll_model_does_not_drift_public_model_identity() {
+        let mut seed = sample_seed();
+        seed.persistence.global_model_name = Some("Doubao-Seedance-2.0".to_string());
+        seed.persistence.mapped_model = Some("doubao-seedance-2-0-260128".to_string());
+        seed.persistence.original_request_body = json!({
+            "model": "ep-requested-model",
+            "prompt": "a cat yawning"
+        });
+
+        seed.apply_provider_body(
+            json!({
+                "status": "succeeded",
+                "model": "doubao-seedance-2-0-260128-resolved",
+                "content": {"video_url": "https://tos.example.com/v.mp4?X-Sig=abc"},
+                "usage": {"completion_tokens": 10, "total_tokens": 15}
+            })
+            .as_object()
+            .expect("object"),
+        );
+
+        assert_eq!(seed.client_body_json()["model"], "Doubao-Seedance-2.0");
+        assert_eq!(
+            seed.observed_model.as_deref(),
+            Some("doubao-seedance-2-0-260128-resolved")
+        );
+        let record = seed.to_upsert_record();
+        assert_eq!(record.model.as_deref(), Some("ep-requested-model"));
+        let metadata = record
+            .request_metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .expect("identity metadata");
+        assert_eq!(metadata["global_model_name"], "Doubao-Seedance-2.0");
+        assert_eq!(metadata["mapped_model"], "doubao-seedance-2-0-260128");
+        assert_eq!(
+            metadata["observed_model"],
+            "doubao-seedance-2-0-260128-resolved"
         );
     }
 
@@ -1707,10 +1810,13 @@ mod tests {
     }
 
     #[test]
-    fn persists_request_model_for_exact_filter_but_projects_resolved_model() {
+    fn persists_request_model_for_filter_but_projects_stable_global_model() {
         let mut seed = sample_seed();
         seed.persistence.original_request_body = json!({"model": "ep-requested-123"});
-        seed.model = Some("doubao-seedance-resolved-260128".to_string());
+        seed.persistence.global_model_name = Some("Doubao-Seedance-2.0".to_string());
+        seed.persistence.mapped_model = Some("doubao-seedance-2-0-260128".to_string());
+        seed.model = Some("Doubao-Seedance-2.0".to_string());
+        seed.observed_model = Some("doubao-seedance-2-0-260128-resolved".to_string());
 
         let record = seed.to_upsert_record();
         assert_eq!(record.model.as_deref(), Some("ep-requested-123"));
@@ -1719,10 +1825,7 @@ mod tests {
         task.model = record.model;
         task.request_metadata = record.request_metadata;
         let response = map_doubao_stored_task_to_read_response(task);
-        assert_eq!(
-            response.body_json["model"],
-            "doubao-seedance-resolved-260128"
-        );
+        assert_eq!(response.body_json["model"], "Doubao-Seedance-2.0");
     }
 
     #[test]

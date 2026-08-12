@@ -106,6 +106,15 @@ impl LocalVideoTaskPersistence {
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new())),
             format_converted,
+            global_model_name: context_text(report_context, "global_model_name")
+                .or_else(|| context_text(report_context, "model")),
+            // `ExecutionPlan.model_name` is the request/client identity for
+            // the generic planner. It is not a provider mapping. Keeping the
+            // fallback empty is important: a missing mapping must remain
+            // observable and must not be billed as a fabricated target.
+            mapped_model: context_text(report_context, "mapped_model"),
+            model_id: context_text(report_context, "model_id"),
+            global_model_id: context_text(report_context, "global_model_id"),
         }
     }
 
@@ -126,6 +135,31 @@ impl LocalVideoTaskPersistence {
                 .clone()
                 .unwrap_or_else(|| Value::Object(Map::new())),
             format_converted: task.format_converted,
+            global_model_name: task
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("global_model_name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| non_empty_owned(task.model.as_ref())),
+            mapped_model: task
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("mapped_model"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model_id: task
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("model_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            global_model_id: task
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("global_model_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 }

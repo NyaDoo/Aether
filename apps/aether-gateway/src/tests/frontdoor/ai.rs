@@ -1813,6 +1813,7 @@ async fn gateway_creates_then_reads_native_doubao_video_task_through_public_rout
     assert!(local_task_id.starts_with("cgt-"));
     assert_ne!(local_task_id, "cgt-upstream-public-e2e");
     assert_eq!(create_body["status"], "queued");
+    assert_eq!(create_body["model"], "Doubao-Seedance-2.0");
 
     let detail_response = client
         .get(format!(
@@ -1833,6 +1834,7 @@ async fn gateway_creates_then_reads_native_doubao_video_task_through_public_rout
         serde_json::from_str(&detail_text).expect("detail body should parse");
     assert_eq!(detail_body["id"], local_task_id);
     assert_eq!(detail_body["status"], "running");
+    assert_eq!(detail_body["model"], "Doubao-Seedance-2.0");
     assert_eq!(detail_body["duration"], "5");
 
     let seen_requests = seen_requests.lock().expect("mutex should lock").clone();

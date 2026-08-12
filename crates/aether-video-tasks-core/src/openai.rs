@@ -44,6 +44,24 @@ pub fn map_openai_stored_task_to_read_response(
 }
 
 fn build_openai_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus) -> Value {
+    let metadata_global_model = task
+        .request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("global_model_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let snapshot_global_model = task
+        .request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("rust_local_snapshot"))
+        .and_then(|value| serde_json::from_value::<LocalVideoTaskSnapshot>(value.clone()).ok())
+        .and_then(|snapshot| match snapshot {
+            LocalVideoTaskSnapshot::OpenAi(seed) => seed.persistence.global_model_name,
+            _ => None,
+        })
+        .filter(|value| !value.trim().is_empty());
     let mut body = json!({
         "id": task.id,
         "object": "video",
@@ -52,7 +70,10 @@ fn build_openai_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus)
         "created_at": task.created_at_unix_ms,
     });
 
-    if let Some(model) = task.model {
+    if let Some(model) = metadata_global_model
+        .or(snapshot_global_model)
+        .or(task.model)
+    {
         body["model"] = Value::String(model);
     }
     if let Some(prompt) = task.prompt {
@@ -259,8 +280,13 @@ impl OpenAiVideoTaskSeed {
             "created_at": self.created_at_unix_ms,
         });
 
-        if let Some(model) = &self.model {
-            body["model"] = Value::String(model.clone());
+        if let Some(model) = self
+            .persistence
+            .global_model_name
+            .as_deref()
+            .or(self.model.as_deref())
+        {
+            body["model"] = Value::String(model.to_string());
         }
         if let Some(prompt) = &self.prompt {
             body["prompt"] = Value::String(prompt.clone());
@@ -363,6 +389,10 @@ impl OpenAiVideoTaskSeed {
                     key_id: &self.transport.key_id,
                     provider_name: self.transport.provider_name.as_deref(),
                     model_name: model_name.as_deref(),
+                    global_model_name: self.persistence.global_model_name.as_deref(),
+                    mapped_model: self.persistence.mapped_model.as_deref(),
+                    model_id: self.persistence.model_id.as_deref(),
+                    global_model_id: self.persistence.global_model_id.as_deref(),
                     client_api_format: "openai:video",
                     provider_api_format: "openai:video",
                 },
@@ -487,6 +517,10 @@ impl OpenAiVideoTaskSeed {
                     key_id: &self.transport.key_id,
                     provider_name: self.transport.provider_name.as_deref(),
                     model_name: model_name.as_deref(),
+                    global_model_name: self.persistence.global_model_name.as_deref(),
+                    mapped_model: self.persistence.mapped_model.as_deref(),
+                    model_id: self.persistence.model_id.as_deref(),
+                    global_model_id: self.persistence.global_model_id.as_deref(),
                     client_api_format: "openai:video",
                     provider_api_format: "openai:video",
                 },
@@ -537,6 +571,10 @@ impl OpenAiVideoTaskSeed {
                 key_id: &self.transport.key_id,
                 provider_name: self.transport.provider_name.as_deref(),
                 model_name: model_name.as_deref(),
+                global_model_name: self.persistence.global_model_name.as_deref(),
+                mapped_model: self.persistence.mapped_model.as_deref(),
+                model_id: self.persistence.model_id.as_deref(),
+                global_model_id: self.persistence.global_model_id.as_deref(),
                 client_api_format: "openai:video",
                 provider_api_format: "openai:video",
             });
@@ -626,11 +664,22 @@ impl OpenAiVideoTaskSeed {
             error_code: self.error_code.clone(),
             error_message: self.error_message.clone(),
             video_url: self.video_url.clone(),
-            request_metadata: Some(json!({
-                "rust_owner": "async_task",
-                "rust_local_snapshot": LocalVideoTaskSnapshot::OpenAi(self.clone())
-                    .redacted_for_persistence(),
-            })),
+            request_metadata: Some({
+                let mut metadata = Map::new();
+                metadata.insert(
+                    "rust_owner".to_string(),
+                    Value::String("async_task".to_string()),
+                );
+                metadata.insert(
+                    "rust_local_snapshot".to_string(),
+                    serde_json::to_value(
+                        LocalVideoTaskSnapshot::OpenAi(self.clone()).redacted_for_persistence(),
+                    )
+                    .expect("video snapshot should serialize"),
+                );
+                self.persistence.append_identity_metadata(&mut metadata);
+                Value::Object(metadata)
+            }),
         }
     }
 }
@@ -674,6 +723,10 @@ mod tests {
                 provider_api_format: "openai:video".to_string(),
                 original_request_body: json!({"model": "sora-2"}),
                 format_converted: false,
+                global_model_name: None,
+                mapped_model: None,
+                model_id: None,
+                global_model_id: None,
             },
             transport: LocalVideoTaskTransport {
                 upstream_base_url: "https://api.openai.example/v1".to_string(),

@@ -4,6 +4,7 @@ use aether_data_contracts::repository::settlement::{StoredUsageSettlement, Usage
 use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
 use aether_data_contracts::{DataLayerError, DataLayerError::InvalidInput};
 use async_trait::async_trait;
+use serde_json::Value;
 
 use crate::keyed_lock::KeyedAsyncLockPool;
 
@@ -27,6 +28,15 @@ pub async fn settle_usage_if_needed(
     if !matches!(usage.status.as_str(), "completed" | "failed") {
         return Ok(());
     }
+    // A numeric zero is not proof that billing succeeded: unresolved pricing
+    // (`no_rule`/`incomplete`) used to be materialized as `0.0` and was then
+    // settled as if it were a valid free request.  Once a billing snapshot is
+    // present, only its explicit `complete` state may reach the wallet.  Video
+    // tasks are asynchronous and always require a snapshot, even for legacy
+    // rows that have no metadata yet; those rows remain pending for retry.
+    if !usage_billing_is_resolved(usage) {
+        return Ok(());
+    }
 
     let finalized_at_unix_secs = usage
         .finalized_at_unix_secs
@@ -48,6 +58,62 @@ pub async fn settle_usage_if_needed(
     let _guard = settlement_lock.lock().await;
     let _ = writer.settle_usage(input).await?;
     Ok(())
+}
+
+/// Returns the normalized billing snapshot status stored in usage metadata.
+///
+/// New writes keep a flat `billing_snapshot_status` mirror for efficient reads,
+/// while older records may only contain `billing_snapshot.status`; accept both
+/// forms during the development transition.
+pub fn billing_snapshot_status(metadata: Option<&Value>) -> Option<&str> {
+    let object = metadata?.as_object()?;
+    object
+        .get("billing_snapshot_status")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .get("billing_snapshot")
+                .and_then(Value::as_object)
+                .and_then(|snapshot| snapshot.get("status"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+}
+
+/// Whether a stored usage row has a billable, fully resolved pricing result.
+///
+/// Rows with an explicit snapshot status must say `complete`; this includes a
+/// legitimate free-tier rule whose complete computation has a zero cost. Rows
+/// without any snapshot retain the legacy behavior for non-video traffic, but
+/// video rows fail closed because their asynchronous cost is not knowable from
+/// the numeric cost mirror alone.
+pub fn usage_billing_is_resolved(usage: &StoredRequestUsageAudit) -> bool {
+    match billing_snapshot_status(usage.request_metadata.as_ref()) {
+        Some(status) => status.eq_ignore_ascii_case("complete"),
+        None => !usage_requires_billing_snapshot(usage),
+    }
+}
+
+fn usage_requires_billing_snapshot(usage: &StoredRequestUsageAudit) -> bool {
+    [
+        usage.request_type.as_deref(),
+        usage.api_format.as_deref(),
+        usage.endpoint_kind.as_deref(),
+        usage.endpoint_api_format.as_deref(),
+        usage.provider_endpoint_kind.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(is_video_contract)
+}
+
+fn is_video_contract(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("video")
+        || value
+            .rsplit_once(':')
+            .is_some_and(|(_, kind)| kind.trim().eq_ignore_ascii_case("video"))
 }
 
 fn usage_settlement_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -228,6 +294,77 @@ mod tests {
         assert_eq!(inputs[0].total_cost_usd, 1.25);
         assert_eq!(inputs[0].actual_total_cost_usd, 0.75);
         assert!(!inputs[0].api_key_is_standalone);
+    }
+
+    #[tokio::test]
+    async fn skips_unresolved_billing_snapshot_even_when_cost_is_zero() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.total_cost_usd = 0.0;
+        usage.actual_total_cost_usd = 0.0;
+        usage.request_metadata = Some(json!({
+            "billing_snapshot_status": "no_rule",
+            "billing_snapshot": { "status": "no_rule", "total_cost": 0.0 }
+        }));
+
+        settle_usage_if_needed(&writer, &usage)
+            .await
+            .expect("unresolved billing should be left pending");
+
+        assert!(writer
+            .inputs
+            .lock()
+            .expect("settlement inputs lock")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn allows_complete_free_tier_with_zero_cost() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.total_cost_usd = 0.0;
+        usage.actual_total_cost_usd = 0.0;
+        usage.request_metadata = Some(json!({
+            "billing_snapshot_status": "complete",
+            "billing_snapshot": { "status": "complete", "total_cost": 0.0 },
+            "is_free_tier": true
+        }));
+
+        settle_usage_if_needed(&writer, &usage)
+            .await
+            .expect("complete free tier should settle");
+
+        assert_eq!(
+            writer.inputs.lock().expect("settlement inputs lock").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn video_usage_without_snapshot_fails_closed() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.request_type = Some("video".to_string());
+        usage.api_format = Some("doubao:video".to_string());
+
+        settle_usage_if_needed(&writer, &usage)
+            .await
+            .expect("video without billing snapshot should remain pending");
+
+        assert!(writer
+            .inputs
+            .lock()
+            .expect("settlement inputs lock")
+            .is_empty());
     }
 
     #[tokio::test]

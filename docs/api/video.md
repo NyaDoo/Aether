@@ -95,8 +95,12 @@ across all tenants. Supported query parameters: `page_size`, `page_num`,
 `filter.model`, and `filter.task_ids` (repeated or comma-separated). Task IDs
 are filtered after ownership checks, before pagination. Unknown filters are
 ignored rather than rejected. `filter.model` is an exact match against the
-request-side model/Ark endpoint ID; the `model` returned in each item remains
-the provider-resolved model name and version.
+request-side model/Ark endpoint ID. The returned `model` is the stable
+Aether/global model identity captured at creation (for example,
+`Doubao-Seedance-2.0`), so it does not change when Ark echoes a resolved
+version such as `doubao-seedance-2-0-260128`. The selected provider mapping and
+latest provider-observed version are internal billing and diagnostic fields,
+not replacements for the public model identity.
 
 ### Downloading
 

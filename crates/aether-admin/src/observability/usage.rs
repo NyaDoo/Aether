@@ -1332,7 +1332,10 @@ pub fn admin_usage_record_json(
         "has_format_conversion": item.has_format_conversion,
         "api_key_name": api_key_name,
         "provider_key_name": provider_key_name,
-        "model_version": Value::Null,
+        // Video tasks keep the provider-echoed/versioned identity separately
+        // from the stable public model and selected target. The usage UI
+        // already treats model_version as the provider-observed fallback.
+        "model_version": admin_usage_metadata_string(item, "observed_model"),
     });
     let object = payload
         .as_object_mut()

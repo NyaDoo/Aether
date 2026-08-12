@@ -226,6 +226,7 @@ impl LocalVideoTaskSnapshot {
                     user_id: task.user_id.clone(),
                     api_key_id: task.api_key_id.clone(),
                     model: non_empty_owned(task.model.as_ref()),
+                    observed_model: None,
                     prompt: non_empty_owned(task.prompt.as_ref())
                         .or_else(|| {
                             doubao_content_prompt(request_body)
@@ -378,20 +379,64 @@ impl LocalVideoTaskSnapshot {
         }
     }
 
-    pub fn provider_model_name(&self) -> Option<&str> {
-        match self {
+    /// Public/request-side model identity. This value is captured before the
+    /// provider call and remains stable across polling and restart.
+    pub fn requested_model_name(&self) -> Option<&str> {
+        let value = match self {
             Self::OpenAi(seed) => seed
-                .model
+                .persistence
+                .global_model_name
                 .as_deref()
-                .or(seed.transport.model_name.as_deref()),
-            Self::Gemini(seed) => Some(seed.model.as_str()),
+                .or_else(|| {
+                    seed.persistence
+                        .original_request_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                })
+                .or(seed.model.as_deref()),
+            Self::Gemini(seed) => seed
+                .persistence
+                .global_model_name
+                .as_deref()
+                .or(Some(seed.model.as_str())),
             Self::Doubao(seed) => seed
-                .model
+                .persistence
+                .global_model_name
                 .as_deref()
-                .or(seed.transport.model_name.as_deref()),
-        }
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    seed.persistence
+                        .original_request_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                })
+                .or(seed.model.as_deref()),
+        };
+        value.map(str::trim).filter(|value| !value.is_empty())
+    }
+
+    /// Provider model selected by routing. This is the stable pricing/dispatch
+    /// target, not the model echoed by a provider response.
+    pub fn mapped_model_name(&self) -> Option<&str> {
+        let value = match self {
+            Self::OpenAi(seed) => seed.persistence.mapped_model.as_deref(),
+            Self::Gemini(seed) => seed.persistence.mapped_model.as_deref(),
+            Self::Doubao(seed) => seed.persistence.mapped_model.as_deref(),
+        };
+        value.map(str::trim).filter(|value| !value.is_empty())
+    }
+
+    /// Model/version observed from the most recent provider response.
+    pub fn observed_model_name(&self) -> Option<&str> {
+        let value = match self {
+            Self::OpenAi(_) | Self::Gemini(_) => None,
+            Self::Doubao(seed) => seed.observed_model.as_deref(),
+        };
+        value.map(str::trim).filter(|value| !value.is_empty())
+    }
+
+    pub fn provider_model_name(&self) -> Option<&str> {
+        self.observed_model_name()
+            .or_else(|| self.mapped_model_name())
     }
 
     /// Token usage reported by the provider, for surfaces that bill by tokens.
@@ -447,6 +492,29 @@ fn reconcile_snapshot_with_stored_task(
     let status = local_status_from_stored(task.status);
     match &mut snapshot {
         LocalVideoTaskSnapshot::OpenAi(seed) => {
+            if seed.persistence.global_model_name.is_none() {
+                seed.persistence.global_model_name = task
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("global_model_name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| non_empty_owned(task.model.as_ref()));
+            }
+            if seed.persistence.mapped_model.is_none() {
+                seed.persistence.mapped_model = task
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("mapped_model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            if seed.persistence.model_id.is_none() {
+                seed.persistence.model_id = stored_metadata_string(task, "model_id");
+            }
+            if seed.persistence.global_model_id.is_none() {
+                seed.persistence.global_model_id = stored_metadata_string(task, "global_model_id");
+            }
             if task.user_id.is_some() {
                 seed.user_id = task.user_id.clone();
             }
@@ -466,6 +534,29 @@ fn reconcile_snapshot_with_stored_task(
             }
         }
         LocalVideoTaskSnapshot::Gemini(seed) => {
+            if seed.persistence.global_model_name.is_none() {
+                seed.persistence.global_model_name = task
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("global_model_name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| non_empty_owned(task.model.as_ref()));
+            }
+            if seed.persistence.mapped_model.is_none() {
+                seed.persistence.mapped_model = task
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("mapped_model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            if seed.persistence.model_id.is_none() {
+                seed.persistence.model_id = stored_metadata_string(task, "model_id");
+            }
+            if seed.persistence.global_model_id.is_none() {
+                seed.persistence.global_model_id = stored_metadata_string(task, "global_model_id");
+            }
             if task.user_id.is_some() {
                 seed.user_id = task.user_id.clone();
             }
@@ -482,6 +573,50 @@ fn reconcile_snapshot_with_stored_task(
             }
         }
         LocalVideoTaskSnapshot::Doubao(seed) => {
+            if seed.persistence.global_model_name.is_none() {
+                seed.persistence.global_model_name = task
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("global_model_name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        seed.persistence
+                            .original_request_body
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .or_else(|| non_empty_owned(task.model.as_ref()));
+            }
+            if seed.persistence.mapped_model.is_none() {
+                seed.persistence.mapped_model = task
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("mapped_model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            if seed.persistence.model_id.is_none() {
+                seed.persistence.model_id = stored_metadata_string(task, "model_id");
+            }
+            if seed.persistence.global_model_id.is_none() {
+                seed.persistence.global_model_id = stored_metadata_string(task, "global_model_id");
+            }
+            if seed.observed_model.is_none() {
+                seed.observed_model = task
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("observed_model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        stored_poll_raw_response(task)
+                            .and_then(|body| body.get("model"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+            }
             let recovered_seed =
                 stored_doubao_i32(task, &seed.persistence.original_request_body, "seed");
             let recovered_frames =
@@ -530,6 +665,16 @@ fn reconcile_snapshot_with_stored_task(
         }
     }
     snapshot
+}
+
+fn stored_metadata_string(task: &StoredVideoTask, key: &str) -> Option<String> {
+    task.request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn stored_poll_raw_response(task: &StoredVideoTask) -> Option<&Map<String, Value>> {
