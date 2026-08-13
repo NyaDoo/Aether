@@ -180,10 +180,12 @@ SELECT
   EXTRACT(EPOCH FROM last_probe_increase_at)::bigint AS last_probe_increase_at_unix_secs,
   last_rpm_peak,
   request_count,
+  sla_eligible_count,
   total_tokens,
   CAST(total_cost_usd AS DOUBLE PRECISION) AS total_cost_usd,
   success_count,
   error_count,
+  user_error_count,
   total_response_time_ms,
   EXTRACT(EPOCH FROM last_used_at)::bigint AS last_used_at_unix_secs,
   auto_fetch_models,
@@ -239,10 +241,12 @@ SELECT
   EXTRACT(EPOCH FROM last_probe_increase_at)::bigint AS last_probe_increase_at_unix_secs,
   last_rpm_peak,
   request_count,
+  sla_eligible_count,
   total_tokens,
   CAST(total_cost_usd AS DOUBLE PRECISION) AS total_cost_usd,
   success_count,
   error_count,
+  user_error_count,
   total_response_time_ms,
   EXTRACT(EPOCH FROM last_used_at)::bigint AS last_used_at_unix_secs,
   auto_fetch_models,
@@ -300,10 +304,12 @@ SELECT
   NULL::bigint AS last_probe_increase_at_unix_secs,
   NULL::integer AS last_rpm_peak,
   NULL::bigint AS request_count,
+  NULL::bigint AS sla_eligible_count,
   0::bigint AS total_tokens,
   0::double precision AS total_cost_usd,
   NULL::bigint AS success_count,
   NULL::bigint AS error_count,
+  NULL::bigint AS user_error_count,
   NULL::bigint AS total_response_time_ms,
   NULL::bigint AS last_used_at_unix_secs,
   FALSE AS auto_fetch_models,
@@ -1498,7 +1504,9 @@ INSERT INTO provider_api_keys (
   is_active,
   created_at,
   updated_at,
-  allow_auth_channel_mismatch_formats
+  allow_auth_channel_mismatch_formats,
+  sla_eligible_count,
+  user_error_count
 ) VALUES (
   $1,
   $2,
@@ -1576,7 +1584,9 @@ INSERT INTO provider_api_keys (
     WHEN $52::double precision IS NULL THEN NOW()
     ELSE TO_TIMESTAMP($52::double precision)
   END,
-  $53
+  $53,
+  COALESCE($54, 0),
+  COALESCE($55, 0)
 )
 "#,
         )
@@ -1651,6 +1661,8 @@ INSERT INTO provider_api_keys (
         .bind(key.created_at_unix_ms.map(|value| value as f64))
         .bind(key.updated_at_unix_secs.map(|value| value as f64))
         .bind(&key.allow_auth_channel_mismatch_formats)
+        .bind(key.sla_eligible_count.map(i64::from))
+        .bind(key.user_error_count.map(i64::from))
         .execute(&self.pool)
         .await
         .map_postgres_err()?;
@@ -3109,6 +3121,15 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
             })
         })
         .transpose()?;
+    let sla_eligible_count = row_get::<Option<i64>>(row, "sla_eligible_count")?
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                DataLayerError::UnexpectedValue(format!(
+                    "invalid provider_api_keys.sla_eligible_count: {value}"
+                ))
+            })
+        })
+        .transpose()?;
     let total_tokens = row_get::<Option<i64>>(row, "total_tokens")?
         .unwrap_or(0)
         .try_into()
@@ -3135,6 +3156,15 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
             u32::try_from(value).map_err(|_| {
                 DataLayerError::UnexpectedValue(format!(
                     "invalid provider_api_keys.error_count: {value}"
+                ))
+            })
+        })
+        .transpose()?;
+    let user_error_count = row_get::<Option<i64>>(row, "user_error_count")?
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                DataLayerError::UnexpectedValue(format!(
+                    "invalid provider_api_keys.user_error_count: {value}"
                 ))
             })
         })
@@ -3251,6 +3281,7 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
                 success_count,
             )
             .with_usage_fields(error_count, total_response_time_ms)
+            .with_sla_usage_fields(sla_eligible_count, user_error_count)
             .with_usage_totals(total_tokens, total_cost_usd)
             .with_health_fields(
                 row.try_get("health_by_format").ok(),
