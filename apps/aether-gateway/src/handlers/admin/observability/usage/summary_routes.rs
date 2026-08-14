@@ -59,7 +59,11 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
     match status {
         "stream" => query.is_stream = Some(true),
         "standard" => query.is_stream = Some(false),
-        "error" | "failed" => query.error_only = true,
+        // `error` is the service-error view used by operational metrics.
+        // `failed` is the request lifecycle view and must also include
+        // user-originated HTTP 400 rows whose status is persisted as failed.
+        "error" => query.error_only = true,
+        "failed" => query.statuses = Some(vec!["failed".to_string()]),
         "active" => {
             query.statuses = Some(vec!["pending".to_string(), "streaming".to_string()]);
         }
@@ -321,7 +325,10 @@ pub(super) fn admin_usage_terminal_candidate_state_override(
         RequestCandidateStatus::Success | RequestCandidateStatus::Failed
             if outcome.is_user_error() =>
         {
-            "completed"
+            // A user-originated 400 is excluded from SLA/success-rate metrics by
+            // its outcome class, but the request lifecycle still terminated in
+            // failure. Keep that lifecycle status visible to usage records.
+            "failed"
         }
         RequestCandidateStatus::Success => "completed",
         RequestCandidateStatus::Failed => "failed",
@@ -1045,7 +1052,11 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{admin_usage_terminal_candidate_state_override, apply_admin_usage_state_override};
+    use super::{
+        admin_usage_terminal_candidate_state_override, apply_admin_usage_state_override,
+        apply_admin_usage_status_filter,
+    };
+    use aether_data_contracts::repository::usage::UsageAuditListQuery;
 
     fn sample_usage(status: &str) -> StoredRequestUsageAudit {
         StoredRequestUsageAudit::new(
@@ -1126,6 +1137,19 @@ mod tests {
     }
 
     #[test]
+    fn failed_usage_filter_is_lifecycle_based_but_error_filter_is_service_based() {
+        let mut failed_query = UsageAuditListQuery::default();
+        apply_admin_usage_status_filter(&mut failed_query, Some("failed"));
+        assert_eq!(failed_query.statuses, Some(vec!["failed".to_string()]));
+        assert!(!failed_query.error_only);
+
+        let mut error_query = UsageAuditListQuery::default();
+        apply_admin_usage_status_filter(&mut error_query, Some("error"));
+        assert!(error_query.statuses.is_none());
+        assert!(error_query.error_only);
+    }
+
+    #[test]
     fn admin_usage_active_override_uses_current_terminal_candidate_latency() {
         let candidate = sample_candidate(
             0,
@@ -1167,7 +1191,7 @@ mod tests {
         let payload =
             admin_usage_terminal_candidate_state_override(&[candidate]).expect("override");
 
-        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["status"], "failed");
         assert_eq!(payload["outcome_class"], "user_error");
         assert_eq!(payload["sla_eligible"], false);
         assert_eq!(payload["status_code"], 400);
@@ -1175,7 +1199,7 @@ mod tests {
         let mut usage = sample_usage("pending");
         apply_admin_usage_state_override(&mut usage, &payload);
 
-        assert_eq!(usage.status, "completed");
+        assert_eq!(usage.status, "failed");
         assert_eq!(usage.status_code, Some(400));
         assert_eq!(usage.outcome_class().as_str(), "user_error");
         assert!(!usage.sla_eligible());

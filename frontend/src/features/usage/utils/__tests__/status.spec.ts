@@ -63,7 +63,7 @@ describe('usage status helpers', () => {
     expect(isUsageRecordSuccessful(record)).toBe(false)
   })
 
-  it('uses the explicit outcome class before legacy failed status and error fields', () => {
+  it('keeps HTTP 400 user-error records failed in the lifecycle view', () => {
     const record = buildUsageRecord({
       status: 'failed',
       status_code: 400,
@@ -73,12 +73,12 @@ describe('usage status helpers', () => {
     })
 
     expect(normalizeRequestOutcomeClass(' USER_ERROR ')).toBe('user_error')
-    expect(isUsageRecordFailed(record)).toBe(false)
+    expect(isUsageRecordFailed(record)).toBe(true)
     expect(isUsageRecordSuccessful(record)).toBe(false)
-    expect(resolveDisplayRequestStatus(record)).toBe('completed')
+    expect(resolveDisplayRequestStatus(record)).toBe('failed')
   })
 
-  it('does not include a legacy exact HTTP 400 in the failed-record filter', () => {
+  it('keeps a legacy exact HTTP 400 failed in the lifecycle view', () => {
     const record = buildUsageRecord({
       status: 'failed',
       status_code: 400,
@@ -86,8 +86,19 @@ describe('usage status helpers', () => {
       outcome_class: undefined,
     })
 
-    expect(isUsageRecordFailed(record)).toBe(false)
+    expect(isUsageRecordFailed(record)).toBe(true)
     expect(isUsageRecordSuccessful(record)).toBe(false)
+    expect(resolveDisplayRequestStatus(record)).toBe('failed')
+  })
+
+  it('does not overwrite an explicit completed lifecycle with user-error metadata', () => {
+    const record = buildUsageRecord({
+      status: 'completed',
+      status_code: 400,
+      outcome_class: 'user_error',
+    })
+
+    expect(isUsageRecordFailed(record)).toBe(false)
     expect(resolveDisplayRequestStatus(record)).toBe('completed')
   })
 

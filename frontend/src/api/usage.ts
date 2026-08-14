@@ -499,7 +499,9 @@ export const usageApi = {
     model?: string
     provider?: string
     api_format?: string  // API 格式筛选（如 openai:chat, claude:messages）
-    status?: string // 'stream' | 'standard' | 'error'
+    // `failed` is the lifecycle view (includes user-error/HTTP 400 rows);
+    // `error` remains the service-error-only operational view.
+    status?: string // 'stream' | 'standard' | 'active' | 'failed' | 'cancelled' | 'error'
     client_family?: string
     hide_unknown?: boolean
     include_total?: boolean
