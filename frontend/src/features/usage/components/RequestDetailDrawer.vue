@@ -1034,8 +1034,11 @@ function mapTraceFinalStatusToRequestStatus(
 ): RequestStateStatus | undefined {
   switch (status) {
     case 'success':
-    case 'user_error':
       return 'completed'
+    case 'user_error':
+      // The trace uses user_error for the outcome label, while the request
+      // lifecycle remains failed. Keep those two dimensions separate.
+      return 'failed'
     case 'failed':
       return 'failed'
     case 'cancelled':
@@ -1057,7 +1060,6 @@ function normalizeRequestStateStatus(status: unknown): RequestStateStatus | unde
 }
 
 function hasRequestFailureSignal(statusCode?: number | null, errorMessage?: string | null): boolean {
-  if (statusCode === 400) return false
   return (typeof statusCode === 'number' && statusCode >= 400) ||
     (typeof errorMessage === 'string' && errorMessage.trim().length > 0)
 }
@@ -1070,8 +1072,14 @@ function resolveRequestStateStatus(
 ): RequestStateStatus | undefined {
   if (outcomeClass === 'service_error') return 'failed'
   if (outcomeClass === 'cancelled') return 'cancelled'
-  if (outcomeClass === 'success' || outcomeClass === 'user_error') return 'completed'
-  if (statusCode === 400) return 'completed'
+  if (outcomeClass === 'success') return 'completed'
+  if (outcomeClass === 'user_error') {
+    const normalized = normalizeRequestStateStatus(status)
+    if (normalized === 'failed') return 'failed'
+    if (normalized === 'cancelled') return 'cancelled'
+    return normalized == null && statusCode === 400 ? 'failed' : 'completed'
+  }
+  if (statusCode === 400) return 'failed'
 
   const normalized = normalizeRequestStateStatus(status)
   if ((normalized == null || normalized === 'pending' || normalized === 'streaming') &&

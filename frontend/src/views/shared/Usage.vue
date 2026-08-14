@@ -509,9 +509,10 @@ async function pollActiveRequests() {
       const shouldApply = !updateSnapshotIsOlder && newRank >= currentRank
       const updateHasFailureSignal =
         update.outcome_class === 'service_error' ||
+        update.outcome_class === 'user_error' ||
         (update.outcome_class == null && typeof update.status_code === 'number' &&
-          update.status_code >= 400 && update.status_code !== 400) ||
-        (update.outcome_class == null && update.status_code !== 400 &&
+          update.status_code >= 400) ||
+        (update.outcome_class == null &&
           typeof update.error_message === 'string' && update.error_message.trim().length > 0) ||
         update.image_progress?.phase === 'failed'
       const shouldApplyData = shouldApply || (
@@ -1239,13 +1240,18 @@ function resolveDetailUpdateStatus(update: {
   if (update.outcomeClass === 'service_error') return 'failed'
   if (update.outcomeClass === 'cancelled') return 'cancelled'
   if (update.outcomeClass === 'success') return 'completed'
-  if (update.outcomeClass === 'user_error') return 'completed'
-  if (update.statusCode === 400) return 'completed'
+  if (update.outcomeClass === 'user_error') {
+    const status = normalizeRequestStatus(update.status)
+    if (status === 'failed') return 'failed'
+    if (status === 'cancelled') return 'cancelled'
+    return status == null && update.statusCode === 400 ? 'failed' : 'completed'
+  }
+  if (update.statusCode === 400) return 'failed'
 
   const status = normalizeRequestStatus(update.status)
   const hasFailureSignal =
-    (typeof update.statusCode === 'number' && update.statusCode >= 400 && update.statusCode !== 400) ||
-    (update.statusCode !== 400 && typeof update.errorMessage === 'string' &&
+    (typeof update.statusCode === 'number' && update.statusCode >= 400) ||
+    (typeof update.errorMessage === 'string' &&
       update.errorMessage.trim().length > 0) ||
     update.imageProgress?.phase === 'failed'
 

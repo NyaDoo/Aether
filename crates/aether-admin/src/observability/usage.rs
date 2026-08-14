@@ -239,7 +239,26 @@ pub fn admin_usage_matches_api_format(
 }
 
 pub fn admin_usage_is_failed(item: &StoredRequestUsageAudit) -> bool {
-    item.outcome_class().is_service_error()
+    // This helper drives the usage-record lifecycle/filter presentation.  It
+    // must not be used as the SLA/service-error counter (those projections use
+    // `outcome_class` directly).  A 400 is therefore still a failed request in
+    // the lifecycle view, while an explicitly completed row keeps its
+    // terminal status even if legacy error fields are populated.
+    let has_failure_signal = item.status_code.is_some_and(|value| value >= 400)
+        || item
+            .error_message
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let status = item.status.trim().to_ascii_lowercase();
+    if !status.is_empty() {
+        return match status.as_str() {
+            "completed" | "cancelled" => false,
+            "pending" | "streaming" => has_failure_signal,
+            "failed" => true,
+            _ => false,
+        };
+    }
+    has_failure_signal
 }
 
 pub fn admin_usage_has_fallback(item: &StoredRequestUsageAudit) -> bool {
@@ -253,7 +272,21 @@ pub fn admin_usage_matches_status(item: &StoredRequestUsageAudit, status: Option
     match status {
         "stream" => item.is_stream,
         "standard" => !item.is_stream,
-        "error" => item.outcome_class().is_service_error(),
+        "error" => {
+            // `error` is the service/transport-error view.  Preserve legacy
+            // non-2xx diagnostics (including redirects), but never classify a
+            // canonical HTTP 400 user error as a service error.
+            (!matches!(item.status_code, Some(400))
+                && item
+                    .status_code
+                    .is_some_and(|value| !(200..300).contains(&value)))
+                || (!item.outcome_class().is_user_error()
+                    && item
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty()))
+                || item.outcome_class().is_service_error()
+        }
         "pending" | "streaming" | "completed" | "cancelled" => item.status == status,
         "failed" => admin_usage_is_failed(item),
         "active" => matches!(item.status.as_str(), "pending" | "streaming"),
@@ -1691,7 +1724,15 @@ pub fn admin_usage_aggregation_by_provider_json(
             .saturating_add(item.response_time_ms.unwrap_or_default());
         entry.14 = entry
             .14
-            .saturating_add(if admin_usage_is_success(item) { 1 } else { 0 });
+            // Provider aggregation is a metrics projection; use the
+            // canonical outcome classifier rather than the lifecycle/display
+            // helper below (which intentionally treats only 2xx as a visible
+            // success and keeps redirects out of the success badge).
+            .saturating_add(if item.outcome_class().is_success() {
+                1
+            } else {
+                0
+            });
         entry.15 = entry
             .15
             .saturating_add(if item.sla_eligible() { 1 } else { 0 });
@@ -1968,7 +2009,21 @@ pub fn admin_usage_heatmap_json(usage: &[StoredRequestUsageAudit]) -> Value {
 }
 
 pub fn admin_usage_is_success(item: &StoredRequestUsageAudit) -> bool {
-    item.outcome_class().is_success()
+    // This helper is consumed by usage-record presentation.  Keep the
+    // historical UI contract that a terminal success must carry a 2xx
+    // response; SLA/aggregate math uses `outcome_class().is_success()` above
+    // and in the repository rollups.
+    let status = item.status.trim().to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "completed" | "success" | "ok" | "billed" | "settled"
+    ) && item
+        .status_code
+        .is_none_or(|code| (200..300).contains(&code))
+        && item
+            .error_message
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
 }
 
 pub fn admin_usage_matches_optional_id(value: Option<&str>, expected: Option<&str>) -> bool {
@@ -3110,6 +3165,18 @@ mod tests {
         assert!(admin_usage_matches_status(&item, Some("failed")));
         assert!(admin_usage_matches_status(&item, Some("error")));
         assert!(!admin_usage_is_success(&item));
+    }
+
+    #[test]
+    fn failed_user_error_is_lifecycle_failed_but_not_service_error() {
+        let item = sample_usage("failed", Some(400), Some("invalid request"));
+
+        assert!(admin_usage_is_failed(&item));
+        assert!(admin_usage_matches_status(&item, Some("failed")));
+        assert!(!admin_usage_matches_status(&item, Some("error")));
+        assert!(!admin_usage_is_success(&item));
+        assert_eq!(item.outcome_class().as_str(), "user_error");
+        assert!(!item.sla_eligible());
     }
 
     #[test]

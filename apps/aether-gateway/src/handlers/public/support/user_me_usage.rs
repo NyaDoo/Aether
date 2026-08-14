@@ -669,7 +669,9 @@ fn users_me_usage_terminal_candidate_state_override(
         RequestCandidateStatus::Success | RequestCandidateStatus::Failed
             if outcome.is_user_error() =>
         {
-            "completed"
+            // Keep the terminal lifecycle as failed. `outcome_class` remains
+            // user_error so metrics can exclude it from SLA/success-rate math.
+            "failed"
         }
         RequestCandidateStatus::Success => "completed",
         RequestCandidateStatus::Failed => "failed",
@@ -739,7 +741,24 @@ async fn resolve_users_me_usage_active_state_overrides_by_request_id(
 }
 
 fn users_me_usage_is_failed(item: &StoredRequestUsageAudit) -> bool {
-    item.outcome_class().is_service_error()
+    // Active-record filtering is lifecycle-oriented.  Keep terminal user
+    // errors out of the active list even though their `user_error` outcome is
+    // intentionally excluded from SLA/service-error aggregates.
+    let has_failure_signal = item.status_code.is_some_and(|value| value >= 400)
+        || item
+            .error_message
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let status = item.status.trim().to_ascii_lowercase();
+    if !status.is_empty() {
+        return match status.as_str() {
+            "completed" | "cancelled" => false,
+            "pending" | "streaming" => has_failure_signal,
+            "failed" => true,
+            _ => false,
+        };
+    }
+    has_failure_signal
 }
 
 fn build_users_me_usage_summary_by_model(
@@ -1819,7 +1838,7 @@ mod tests {
         let payload =
             users_me_usage_terminal_candidate_state_override(&[candidate]).expect("override");
 
-        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["status"], "failed");
         assert_eq!(payload["outcome_class"], "user_error");
         assert_eq!(payload["sla_eligible"], false);
         assert_eq!(payload["status_code"], 400);
@@ -1829,7 +1848,7 @@ mod tests {
             active[key] = value.clone();
         }
 
-        assert_eq!(active["status"], "completed");
+        assert_eq!(active["status"], "failed");
         assert_eq!(active["outcome_class"], "user_error");
         assert_eq!(active["sla_eligible"], false);
         assert_eq!(active["status_code"], 400);

@@ -11,6 +11,7 @@ export type TimelineFinalStatus =
 type RequestStatusLike = RequestStatus | string | null | undefined
 
 type UsageFailureSignal = {
+  status?: RequestStatusLike
   status_code?: number | null
   error_message?: string | null
   outcome_class?: RequestOutcomeClass | string | null
@@ -54,7 +55,17 @@ export function normalizeRequestOutcomeClass(
 function outcomeClassImpliesFailure(record: UsageFailureSignal): boolean | undefined {
   const outcomeClass = normalizeRequestOutcomeClass(record.outcome_class)
   if (!outcomeClass) return undefined
-  return outcomeClass === 'service_error'
+  if (outcomeClass === 'service_error') return true
+
+  // User errors are intentionally excluded from SLA and success-rate
+  // denominators, but they still represent a failed request lifecycle when
+  // the persisted record says it terminated as `failed`.
+  if (outcomeClass === 'user_error') {
+    const status = normalizeRequestStatus(record.status)
+    return status === 'failed' || (status == null && record.status_code === 400)
+  }
+
+  return false
 }
 
 function hasImageProgressFailureSignal(
@@ -221,7 +232,9 @@ export function isUsageRecordFailed(record: UsageFailureSignal & Pick<UsageRecor
   if (outcomeFailure !== undefined) {
     return outcomeFailure
   }
-  if (record.status_code === 400) return false
+  // Legacy rows may not have `outcome_class`; HTTP 400 still represents a
+  // terminal user-request failure and must remain visible in the failed view.
+  if (record.status_code === 400) return true
 
   const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : ''
   if (status) {
@@ -291,9 +304,11 @@ export function resolveDisplayRequestStatus(record: UsageDisplayStatusRecord): R
   if (outcomeClass === 'success') return 'completed'
   if (outcomeClass === 'user_error') {
     const status = normalizeRequestStatus(record.status)
-    return status === 'cancelled' ? 'cancelled' : 'completed'
+    if (status === 'failed') return 'failed'
+    if (status === 'cancelled') return 'cancelled'
+    return status == null && record.status_code === 400 ? 'failed' : 'completed'
   }
-  if (record.status_code === 400) return 'completed'
+  if (record.status_code === 400) return 'failed'
 
   const status = normalizeRequestStatus(record.status)
   if ((status === 'pending' || status === 'streaming') &&
