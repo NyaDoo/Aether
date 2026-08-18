@@ -22,8 +22,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    any, build_router_with_state, json, start_server, AppState, Json, Request, Router, StatusCode,
-    UsageRuntimeConfig, CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER, TRACE_ID_HEADER,
+    any, build_router_with_state, json, signed_internal_admin_headers, start_server, AppState,
+    Json, Request, Router, StatusCode, UsageRuntimeConfig, CONTROL_CANDIDATE_ID_HEADER,
+    CONTROL_REQUEST_ID_HEADER, TRACE_ID_HEADER,
 };
 
 fn hash_api_key(value: &str) -> String {
@@ -51,6 +52,45 @@ where
     if let Err(payload) = handle.join() {
         std::panic::resume_unwind(payload);
     }
+}
+
+#[tokio::test]
+async fn sensitive_operational_routes_require_one_time_signed_internal_admin_proof() {
+    let gateway = build_router_with_state(AppState::new().expect("gateway state should build"));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/_gateway/async-tasks/video-tasks",
+        "/_gateway/audit/request-usage/missing-request",
+    ] {
+        let response = client
+            .get(format!("{gateway_url}{path}"))
+            .send()
+            .await
+            .expect("anonymous operational request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    let path = "/_gateway/async-tasks/video-tasks/missing-task";
+    let signed_headers = signed_internal_admin_headers(http::Method::GET, path);
+    let admitted = client
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_headers.clone())
+        .send()
+        .await
+        .expect("signed operational request should complete");
+    assert_eq!(admitted.status(), StatusCode::NOT_FOUND);
+
+    let replayed = client
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_headers)
+        .send()
+        .await
+        .expect("replayed operational request should complete");
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+
+    gateway_handle.abort();
 }
 
 fn sample_local_openai_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
@@ -276,9 +316,12 @@ async fn gateway_exposes_request_id_header_for_local_execution_response_impl() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
+    let audit_path = format!("/_gateway/audit/request-audit/{request_id}?attempted_only=true");
     let audit_response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/audit/request-audit/{request_id}?attempted_only=true"
+        .get(format!("{gateway_url}{audit_path}"))
+        .headers(signed_internal_admin_headers(
+            http::Method::GET,
+            &audit_path,
         ))
         .send()
         .await
@@ -447,10 +490,10 @@ async fn gateway_exposes_request_usage_via_internal_audit_endpoint() {
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/audit/request-usage/req-usage-2";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/audit/request-usage/req-usage-2"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("audit request should succeed");
@@ -504,10 +547,10 @@ async fn gateway_exposes_request_audit_bundle_via_internal_audit_endpoint() {
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/audit/request-audit/req-audit-1?attempted_only=true";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/audit/request-audit/req-audit-1?attempted_only=true"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("audit request should succeed");
@@ -557,10 +600,10 @@ async fn gateway_exposes_request_candidate_trace_via_internal_audit_endpoint() {
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/audit/request-candidates/req-trace-1?attempted_only=true";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/audit/request-candidates/req-trace-1?attempted_only=true"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("audit request should succeed");
@@ -606,10 +649,10 @@ async fn gateway_exposes_decision_trace_via_internal_audit_endpoint() {
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/audit/decision-trace/req-trace-2?attempted_only=true";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/audit/decision-trace/req-trace-2?attempted_only=true"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("audit request should succeed");
@@ -653,10 +696,10 @@ async fn gateway_exposes_auth_api_key_snapshot_via_internal_audit_endpoint() {
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let path = "/_gateway/audit/auth/users/user-1/api-keys/key-1";
     let response = reqwest::Client::new()
-        .get(format!(
-            "{gateway_url}/_gateway/audit/auth/users/user-1/api-keys/key-1"
-        ))
+        .get(format!("{gateway_url}{path}"))
+        .headers(signed_internal_admin_headers(http::Method::GET, path))
         .send()
         .await
         .expect("audit request should succeed");

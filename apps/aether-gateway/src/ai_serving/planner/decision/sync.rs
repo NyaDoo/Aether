@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use crate::ai_serving::planner::common::{
-    EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_FILES_DELETE_PLAN_KIND,
-    GEMINI_FILES_GET_PLAN_KIND, GEMINI_FILES_LIST_PLAN_KIND, GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND,
-    OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
+    DOUBAO_VIDEO_DELETE_SYNC_PLAN_KIND, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
+    GEMINI_FILES_DELETE_PLAN_KIND, GEMINI_FILES_GET_PLAN_KIND, GEMINI_FILES_LIST_PLAN_KIND,
+    GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
+    OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND, OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
 use crate::ai_serving::planner::route::resolve_execution_runtime_sync_plan_kind;
 use crate::ai_serving::{
@@ -187,17 +187,15 @@ async fn maybe_build_local_video_task_follow_up_sync_decision_payload(
             | OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND
             | OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND
             | GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND
+            | DOUBAO_VIDEO_DELETE_SYNC_PLAN_KIND
     ) {
         return Ok(None);
     }
 
-    let _ = state
-        .hydrate_video_task_for_route(decision.route_family.as_deref(), parts.uri.path())
-        .await?;
-
     let auth_context = resolve_execution_runtime_auth_context(
         state,
         decision,
+        &parts.method,
         &parts.headers,
         &parts.uri,
         trace_id,
@@ -206,7 +204,14 @@ async fn maybe_build_local_video_task_follow_up_sync_decision_payload(
     let Some(auth_context) = auth_context else {
         return Ok(None);
     };
-    let Some(follow_up) = state.video_tasks.prepare_follow_up_sync_plan(
+    let _ = state
+        .hydrate_video_task_for_route_for_user(
+            decision.route_family.as_deref(),
+            parts.uri.path(),
+            auth_context.user_id.as_str(),
+        )
+        .await?;
+    let Some(follow_up) = state.video_tasks.prepare_follow_up_sync_plan_for_user(
         plan_kind,
         parts.uri.path(),
         Some(body_json),

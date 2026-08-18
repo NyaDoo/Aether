@@ -8,6 +8,7 @@ use super::PostgresBackend;
 #[cfg(feature = "sqlite")]
 use super::SqliteBackend;
 use crate::repository::announcements::AnnouncementWriteRepository;
+use crate::repository::asset_library::AssetLibraryWriteRepository;
 use crate::repository::auth::AuthApiKeyWriteRepository;
 use crate::repository::auth_modules::AuthModuleWriteRepository;
 use crate::repository::background_tasks::BackgroundTaskWriteRepository;
@@ -31,6 +32,7 @@ pub struct DataWriteRepositories {
     announcements: Option<Arc<dyn AnnouncementWriteRepository>>,
     auth_api_keys: Option<Arc<dyn AuthApiKeyWriteRepository>>,
     auth_modules: Option<Arc<dyn AuthModuleWriteRepository>>,
+    asset_library: Option<Arc<dyn AssetLibraryWriteRepository>>,
     background_tasks: Option<Arc<dyn BackgroundTaskWriteRepository>>,
     request_candidates: Option<Arc<dyn RequestCandidateWriteRepository>>,
     gemini_file_mappings: Option<Arc<dyn GeminiFileMappingWriteRepository>>,
@@ -54,6 +56,7 @@ impl fmt::Debug for DataWriteRepositories {
             .field("has_announcements", &self.announcements.is_some())
             .field("has_auth_api_keys", &self.auth_api_keys.is_some())
             .field("has_auth_modules", &self.auth_modules.is_some())
+            .field("has_asset_library", &self.asset_library.is_some())
             .field("has_background_tasks", &self.background_tasks.is_some())
             .field("has_request_candidates", &self.request_candidates.is_some())
             .field(
@@ -77,6 +80,15 @@ impl fmt::Debug for DataWriteRepositories {
 }
 
 impl DataWriteRepositories {
+    pub(super) fn with_asset_library_repository(
+        repository: Arc<dyn AssetLibraryWriteRepository>,
+    ) -> Self {
+        Self {
+            asset_library: Some(repository),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn from_backends(
         #[cfg(feature = "postgres")] postgres: Option<&PostgresBackend>,
         #[cfg(feature = "mysql")] mysql: Option<&MysqlBackend>,
@@ -108,6 +120,9 @@ impl DataWriteRepositories {
         }
         if self.auth_modules.is_none() {
             self.auth_modules = Some(PostgresBackend::auth_module_write_repository(backend));
+        }
+        if self.asset_library.is_none() {
+            self.asset_library = Some(PostgresBackend::asset_library_write_repository(backend));
         }
         if self.background_tasks.is_none() {
             self.background_tasks =
@@ -173,6 +188,9 @@ impl DataWriteRepositories {
         if self.auth_modules.is_none() {
             self.auth_modules = Some(MysqlBackend::auth_module_write_repository(backend));
         }
+        if self.asset_library.is_none() {
+            self.asset_library = Some(MysqlBackend::asset_library_write_repository(backend));
+        }
         if self.background_tasks.is_none() {
             self.background_tasks = Some(MysqlBackend::background_task_write_repository(backend));
         }
@@ -232,6 +250,9 @@ impl DataWriteRepositories {
         }
         if self.auth_modules.is_none() {
             self.auth_modules = Some(SqliteBackend::auth_module_write_repository(backend));
+        }
+        if self.asset_library.is_none() {
+            self.asset_library = Some(SqliteBackend::asset_library_write_repository(backend));
         }
         if self.background_tasks.is_none() {
             self.background_tasks = Some(SqliteBackend::background_task_write_repository(backend));
@@ -306,6 +327,10 @@ impl DataWriteRepositories {
         self.auth_modules.clone()
     }
 
+    pub fn asset_library(&self) -> Option<Arc<dyn AssetLibraryWriteRepository>> {
+        self.asset_library.clone()
+    }
+
     pub fn background_tasks(&self) -> Option<Arc<dyn BackgroundTaskWriteRepository>> {
         self.background_tasks.clone()
     }
@@ -370,6 +395,7 @@ impl DataWriteRepositories {
         self.announcements.is_some()
             || self.auth_api_keys.is_some()
             || self.auth_modules.is_some()
+            || self.asset_library.is_some()
             || self.background_tasks.is_some()
             || self.request_candidates.is_some()
             || self.gemini_file_mappings.is_some()
@@ -414,6 +440,7 @@ mod tests {
         assert!(write.announcements().is_some());
         assert!(write.auth_api_keys().is_some());
         assert!(write.auth_modules().is_some());
+        assert!(write.asset_library().is_some());
         assert!(write.request_candidates().is_some());
         assert!(write.gemini_file_mappings().is_some());
         assert!(write.global_models().is_some());

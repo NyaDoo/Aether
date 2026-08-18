@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use super::{
     GeminiVideoTaskSeed, LocalVideoTaskSnapshot, LocalVideoTaskStatus, OpenAiVideoTaskSeed,
-    VideoTaskService, VideoTaskTruthSourceMode,
+    ProxySnapshot, VideoTaskService, VideoTaskTruthSourceMode,
 };
 
 #[test]
@@ -370,6 +370,17 @@ fn file_video_task_store_persists_snapshots_across_service_rebuilds() {
     let service =
         VideoTaskService::with_file_store(VideoTaskTruthSourceMode::RustAuthoritative, &store_path)
             .expect("file-backed service should build");
+    let mut transport = sample_transport("https://api.openai.example", "openai:video");
+    transport.upstream_base_url =
+        "https://base-user:base-password@api.openai.example/v1?token=base-secret".to_string();
+    transport.proxy = Some(ProxySnapshot {
+        enabled: Some(true),
+        mode: Some("custom".to_string()),
+        node_id: None,
+        label: None,
+        url: Some("http://proxy-user:proxy-password@proxy.example:8080".to_string()),
+        extra: Some(json!({"proxy_token": "proxy-extra-secret"})),
+    });
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
         local_task_id: "task-file-123".to_string(),
         upstream_task_id: "ext-video-task-123".to_string(),
@@ -389,9 +400,20 @@ fn file_video_task_store_persists_snapshots_across_service_rebuilds() {
         error_message: None,
         video_url: None,
         persistence: sample_persistence("openai:video"),
-        transport: sample_transport("https://api.openai.example", "openai:video"),
+        transport,
     }));
     drop(service);
+
+    let persisted = std::fs::read_to_string(&store_path).expect("store should be readable");
+    for secret in [
+        "upstream-key",
+        "base-password",
+        "base-secret",
+        "proxy-password",
+        "proxy-extra-secret",
+    ] {
+        assert!(!persisted.contains(secret), "persisted secret: {secret}");
+    }
 
     let reopened =
         VideoTaskService::with_file_store(VideoTaskTruthSourceMode::RustAuthoritative, &store_path)
@@ -404,6 +426,13 @@ fn file_video_task_store_persists_snapshots_across_service_rebuilds() {
         response.body_json.get("id").and_then(Value::as_str),
         Some("task-file-123")
     );
+    assert!(reopened
+        .prepare_read_refresh_sync_plan(
+            Some("openai"),
+            "/v1/videos/task-file-123",
+            "trace-redacted-file-store",
+        )
+        .is_none());
 
     let _ = std::fs::remove_file(store_path);
 }

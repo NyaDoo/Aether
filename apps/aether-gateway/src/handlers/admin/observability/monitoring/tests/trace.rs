@@ -284,16 +284,16 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
     assert_eq!(payload["outcome_class"], json!("service_error"));
     assert_eq!(payload["sla_eligible"], json!(true));
     assert_eq!(payload["candidates"][0]["id"], json!("routing-cand-1"));
-     assert_eq!(payload["candidates"][0]["status"], json!("failed"));
-     assert_eq!(
-         payload["candidates"][0]["outcome_class"],
-         json!("service_error")
-     );
-     assert_eq!(payload["candidates"][0]["sla_eligible"], json!(true));
+    assert_eq!(payload["candidates"][0]["status"], json!("failed"));
     assert_eq!(
-         payload["candidates"][0]["skip_reason"],
-         json!("provider_request_body_build_failed")
-     );
+        payload["candidates"][0]["outcome_class"],
+        json!("service_error")
+    );
+    assert_eq!(payload["candidates"][0]["sla_eligible"], json!(true));
+    assert_eq!(
+        payload["candidates"][0]["skip_reason"],
+        json!("provider_request_body_build_failed")
+    );
     assert_eq!(
         payload["candidates"][0]["error_type"],
         json!("no_local_stream_plans")

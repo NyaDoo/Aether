@@ -1,8 +1,76 @@
 use http::Uri;
 
-use crate::control::management_token_required_permission;
+use crate::control::{management_token_required_permission, GatewayPublicRequestContext};
+use crate::handlers::shared::local_proxy_route_requires_buffered_body;
 
 use super::{classify_control_route, headers};
+
+#[test]
+fn classifies_admin_material_asset_routes_with_scoped_permissions() {
+    for (method, path, route_kind, expected_permission, should_buffer) in [
+        (
+            http::Method::GET,
+            "/api/admin/material-assets/groups?user_id=user-1",
+            "list_groups",
+            "admin:material_assets:read",
+            false,
+        ),
+        (
+            http::Method::POST,
+            "/api/admin/material-assets/assets/url",
+            "create_asset_url",
+            "admin:material_assets:write",
+            true,
+        ),
+        (
+            http::Method::PATCH,
+            "/api/admin/material-assets/groups/group-1",
+            "update_group",
+            "admin:material_assets:write",
+            true,
+        ),
+        (
+            http::Method::GET,
+            "/api/admin/material-assets/verification-sessions/session-1",
+            "get_verification_session",
+            "admin:material_assets:read",
+            false,
+        ),
+    ] {
+        let headers = headers(&[]);
+        let uri: Uri = path.parse().expect("uri should parse");
+        let decision = classify_control_route(&method, &uri, &headers)
+            .expect("admin material asset route should classify");
+
+        assert_eq!(decision.route_class.as_deref(), Some("admin_proxy"));
+        assert_eq!(
+            decision.route_family.as_deref(),
+            Some("material_assets_manage")
+        );
+        assert_eq!(decision.route_kind.as_deref(), Some(route_kind));
+        assert_eq!(
+            decision.auth_endpoint_signature.as_deref(),
+            Some("admin:material_assets")
+        );
+        assert_eq!(
+            management_token_required_permission(&method, &decision).as_deref(),
+            Some(expected_permission)
+        );
+
+        let context = GatewayPublicRequestContext::from_request_parts(
+            "trace-admin-material-assets",
+            &method,
+            &uri,
+            &headers,
+            Some(decision),
+        );
+        assert_eq!(
+            local_proxy_route_requires_buffered_body(&context),
+            should_buffer,
+            "unexpected body-buffer policy for {method} {path}"
+        );
+    }
+}
 
 #[test]
 fn classifies_admin_endpoint_health_api_formats_as_admin_proxy_route() {

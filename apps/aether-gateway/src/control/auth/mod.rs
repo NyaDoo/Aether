@@ -1,5 +1,6 @@
 mod credentials;
 mod gate;
+mod internal_forward;
 mod principal;
 mod resolution;
 mod types;
@@ -9,6 +10,11 @@ pub(super) use credentials::resolve_gateway_credential_carrier;
 pub(crate) use gate::{
     execution_plan_balance_capacity_rejection, request_model_local_rejection,
     should_buffer_request_for_local_auth, trusted_auth_local_rejection, GatewayLocalAuthRejection,
+};
+pub(crate) use internal_forward::{
+    internal_forward_proof_is_replay, is_internal_forward_identity_header,
+    sign_trusted_admin_forward_headers, sign_trusted_auth_forward_headers,
+    verify_trusted_admin_forward_headers, verify_trusted_auth_forward_headers,
 };
 pub(crate) use resolution::{
     refresh_execution_runtime_auth_context, refresh_execution_runtime_auth_context_with_snapshot,

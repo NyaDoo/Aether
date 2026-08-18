@@ -143,3 +143,56 @@ Cross-provider rules:
 - Gemini `taskType` to OpenAI Embedding is blocked because OpenAI has no equivalent task field.
 - Gemini `taskType` to Doubao/Aliyun is blocked for the same reason.
 - Jina `task` may carry through canonical and emit as Jina `task`; when targeting Gemini it must match the valid Gemini task set above.
+
+## Video Task Status
+
+Each video surface keeps its own client contract; the gateway stores a single
+canonical status and projects it back per surface.
+
+| Canonical status | OpenAI `status` | Gemini operation | Doubao `status` |
+| --- | --- | --- | --- |
+| `Submitted` / `Queued` | `queued` | `done: false` | `queued` |
+| `Processing` | `processing` | `done: false` | `running` |
+| `Completed` | `completed` | `done: true` with `response` | `succeeded` |
+| `Failed` / `Expired` | `failed` | `done: true` with `error` | `failed` |
+| `Cancelled` | 404 | 404 | `cancelled` |
+| `Deleted` | 404 | 404 | 404 |
+
+Doubao notes:
+
+- Ark reports no progress percentage; it is derived from the status (0/50/100).
+- The public `model` is the stable Aether/global identity selected at creation;
+  the request-side model remains the exact `filter.model` key. Ark's echoed
+  provider/version name is retained only as an internal observed field and
+  never replaces the public identity or billing target.
+- Ark has no separate cancel verb — `DELETE` cancels an in-flight task and
+  removes a finished one. Cancelled tasks remain queryable for the provider's
+  retention window; explicitly deleted tasks read back as `404`.
+- The generated asset lives at `content.video_url` and its URL is signed and
+  short-lived. Native Doubao GET/list keeps that field for compatibility; the
+  OpenAI projection suppresses it and serves bytes only through its authenticated
+  content route.
+
+## OpenAI Video to Doubao Video Request Conversion
+
+One-way and opt-in per provider. Set the provider's format-conversion switch (or
+an endpoint acceptance rule) before routing an OpenAI video request to a
+`doubao:video` endpoint. Ark requests can carry reference video/audio, multiple
+images and `generate_audio`; OpenAI Video cannot express those, so the reverse
+direction is rejected rather than silently losing data.
+
+| OpenAI Video field | Doubao field | Status |
+| --- | --- | --- |
+| `prompt` | `content[0]` as `{"type":"text"}` | native |
+| `input_reference` | `content[]` as `{"type":"image_url","role":"first_frame"}` | mapped |
+| `size` `1280x720` | `ratio` `16:9` + `resolution` `720p` | mapped |
+| `size` `720x1280` | `ratio` `9:16` + `resolution` `720p` | mapped |
+| `size` `1920x1080` | `ratio` `16:9` + `resolution` `1080p` | mapped |
+| `size` `1080x1920` | `ratio` `9:16` + `resolution` `1080p` | mapped |
+| `size` `854x480` | `ratio` `16:9` + `resolution` `480p` | mapped |
+| `size` `480x854` | `ratio` `9:16` + `resolution` `480p` | mapped |
+| `size` `1024x1024` | `ratio` `1:1` | mapped; Ark treats `resolution` as optional |
+| `size` any other value | none | blocked |
+| `seconds` | `duration` | mapped; must be a whole number of seconds |
+| `remix_video_id` | none | blocked; Ark has no remix surface |
+| missing `prompt` | none | blocked; Ark requires text content |

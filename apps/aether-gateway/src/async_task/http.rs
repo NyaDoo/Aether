@@ -182,8 +182,10 @@ fn parse_filter(
     Ok(VideoTaskQueryFilter {
         user_id: query.user_id.clone(),
         status,
+        model_exact: None,
         model_substring: query.model.clone(),
         client_api_format: query.client_api_format.clone(),
+        exclude_deleted: false,
     })
 }
 
@@ -209,15 +211,22 @@ fn video_task_status_name(status: VideoTaskStatus) -> &'static str {
 }
 
 async fn proxy_video_stream(
-    state: &AppState,
+    _state: &AppState,
     task_id: &str,
     url: &str,
     header_name: &str,
     header_value: &str,
     filename: &str,
 ) -> Result<axum::response::Response, GatewayError> {
-    let response = state
-        .client
+    // This request carries a provider credential, so it must never inherit the
+    // shared client's redirect policy. In particular, `x-goog-api-key` is not
+    // one of the headers HTTP clients reliably strip on cross-origin redirects.
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let response = client
         .get(url)
         .header(header_name, header_value)
         .send()
@@ -227,7 +236,7 @@ async fn proxy_video_stream(
             message: err.to_string(),
         })?;
 
-    if response.status().is_client_error() || response.status().is_server_error() {
+    if !response.status().is_success() {
         return Err(GatewayError::UpstreamUnavailable {
             trace_id: task_id.to_string(),
             message: format!("video upstream returned HTTP {}", response.status()),

@@ -1,6 +1,7 @@
 fn normalize_reveal_auth_type(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "service_account" | "vertex_ai" => "service_account",
+        "volc_aksk" => "volc_aksk",
         "oauth" => "oauth",
         "bearer" => "bearer",
         _ => "api_key",
@@ -48,7 +49,7 @@ pub(crate) fn build_admin_reveal_key_payload(
     } else {
         normalize_reveal_auth_type(&key.auth_type)
     };
-    if matches!(auth_type, "service_account") {
+    if matches!(auth_type, "service_account" | "volc_aksk") {
         if let Some(auth_config) = parsed_auth_config {
             return Ok(json!({
                 "auth_type": auth_type,

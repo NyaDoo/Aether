@@ -5,6 +5,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Map, Value};
 
+use crate::video_tasks::LocalVideoTaskSnapshot;
 use crate::{AppState, GatewayError};
 
 use super::super::finalize_video_task_if_terminal;
@@ -45,39 +46,67 @@ pub(crate) async fn cancel_video_task_record(
     }
 
     let trace_id = format!("async-task-admin-cancel-{task_id}");
-    if let Some(cancel_plan) = build_video_task_cancel_plan(&task) {
-        state
-            .hydrate_video_task_for_route(Some(cancel_plan.route_family), &cancel_plan.request_path)
-            .await?;
+    let cancel_plan = build_video_task_cancel_plan(&task).ok_or_else(|| {
+        CancelVideoTaskError::Gateway(GatewayError::Internal(
+            "video task provider cancellation contract is unavailable".to_string(),
+        ))
+    })?;
+    state
+        .hydrate_video_task_for_route(Some(cancel_plan.route_family), &cancel_plan.request_path)
+        .await?;
 
-        let body_json = json!({});
-        let follow_up = state.video_tasks.prepare_follow_up_sync_plan(
+    let body_json = json!({});
+    let follow_up = state
+        .video_tasks
+        .prepare_follow_up_sync_plan(
             cancel_plan.plan_kind,
             &cancel_plan.request_path,
             Some(&body_json),
             None,
             &trace_id,
-        );
-
-        if let Some(follow_up) = follow_up {
-            execute_video_task_cancel_plan(state, &trace_id, follow_up.plan)
-                .await
-                .map_err(CancelVideoTaskError::Response)?;
-        }
-
-        state
-            .video_tasks
-            .apply_finalize_mutation(&cancel_plan.request_path, cancel_plan.report_kind);
-    }
-
-    let request_metadata = build_cancelled_request_metadata(state, &task).await?;
-    let stored = persist_cancelled_video_task(state, &task, request_metadata)
-        .await?
+        )
         .ok_or_else(|| {
             CancelVideoTaskError::Gateway(GatewayError::Internal(
-                "video task repository is unavailable".to_string(),
+                "video task provider credentials are unavailable for cancellation".to_string(),
             ))
         })?;
+
+    execute_video_task_cancel_plan(state, &trace_id, follow_up.plan)
+        .await
+        .map_err(CancelVideoTaskError::Response)?;
+
+    // The upstream DELETE races the background poller.  Re-read immediately
+    // before the local mutation and use the repository's active-only CAS so a
+    // late admin cancel cannot resurrect a task that has already completed or
+    // failed (and cannot erase its asset/billing fields).
+    let Some(current_task) = state.find_video_task_by_id(task_id).await? else {
+        return Err(CancelVideoTaskError::NotFound);
+    };
+    if !current_task.status.is_active() {
+        return Err(CancelVideoTaskError::InvalidStatus(current_task.status));
+    }
+    let request_metadata = build_cancelled_request_metadata(state, &current_task).await?;
+    let stored = match persist_cancelled_video_task(state, &current_task, request_metadata).await? {
+        Some(stored) => stored,
+        None => {
+            // A concurrent poll/cancel won the CAS.  Restore the latest
+            // database truth in memory and surface the conflict to the caller;
+            // never claim local cancellation succeeded without an atomic write.
+            if let Some(latest) = state.find_video_task_by_id(task_id).await? {
+                state.video_tasks.hydrate_from_stored_task(&latest);
+                return Err(CancelVideoTaskError::InvalidStatus(latest.status));
+            }
+            return Err(CancelVideoTaskError::NotFound);
+        }
+    };
+    state
+        .video_tasks
+        .apply_finalize_mutation(&cancel_plan.request_path, cancel_plan.report_kind);
+    // The Doubao delete transport mutates the in-memory registry to `Deleted`,
+    // while this admin operation is represented to callers as `Cancelled`.
+    // Rehydrate from the just-persisted snapshot so reads are consistent both
+    // before and after a process restart.
+    state.video_tasks.hydrate_from_stored_task(&stored);
     finalize_video_task_if_terminal(state, &stored).await;
     Ok(stored)
 }
@@ -91,6 +120,12 @@ struct VideoTaskCancelPlan<'a> {
 }
 
 fn build_video_task_cancel_plan(task: &StoredVideoTask) -> Option<VideoTaskCancelPlan<'_>> {
+    let client_api_format = task
+        .client_api_format
+        .as_deref()
+        .or(task.provider_api_format.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
     let provider_api_format = task
         .provider_api_format
         .as_deref()
@@ -98,14 +133,14 @@ fn build_video_task_cancel_plan(task: &StoredVideoTask) -> Option<VideoTaskCance
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
 
-    match provider_api_format {
-        "openai:video" => Some(VideoTaskCancelPlan {
+    match (client_api_format, provider_api_format) {
+        ("openai:video", "openai:video" | "doubao:video") => Some(VideoTaskCancelPlan {
             route_family: "openai",
             plan_kind: "openai_video_cancel_sync",
             report_kind: "openai_video_cancel_sync_finalize",
             request_path: format!("/v1/videos/{}/cancel", task.id),
         }),
-        "gemini:video" => {
+        ("gemini:video", "gemini:video") => {
             let short_id = task.short_id.as_deref().unwrap_or(task.id.as_str()).trim();
             let model = task
                 .model
@@ -119,6 +154,17 @@ fn build_video_task_cancel_plan(task: &StoredVideoTask) -> Option<VideoTaskCance
                 request_path: format!("/v1beta/models/{model}/operations/{short_id}:cancel"),
             })
         }
+        // Ark folds cancel into delete, so an admin-initiated cancel retires the task.
+        ("doubao:video", "doubao:video") => Some(VideoTaskCancelPlan {
+            route_family: "doubao",
+            plan_kind: "doubao_video_delete_sync",
+            report_kind: "doubao_video_cancel_sync_finalize",
+            request_path: format!(
+                "{}/{}",
+                aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH,
+                task.id
+            ),
+        }),
         _ => None,
     }
 }
@@ -134,7 +180,7 @@ async fn execute_video_task_cancel_plan(
             .map_err(|err| {
                 GatewayError::UpstreamUnavailable {
                     trace_id: trace_id.to_string(),
-                    message: format!("{err:?}"),
+                    message: err.into_message(),
                 }
                 .into_response()
             })?;
@@ -172,17 +218,15 @@ async fn build_cancelled_request_metadata(
         Some(Value::Object(object)) => object,
         _ => Map::new(),
     };
-    let mut snapshot_value = metadata.get("rust_local_snapshot").cloned();
-    if snapshot_value.is_none() {
-        snapshot_value = state
-            .reconstruct_video_task_snapshot(task)
-            .await?
-            .map(|snapshot| {
-                serde_json::to_value(snapshot)
-                    .map_err(|err| GatewayError::Internal(err.to_string()))
-            })
-            .transpose()?;
-    }
+    let snapshot = match LocalVideoTaskSnapshot::from_stored_task(task) {
+        Some(snapshot) => Some(snapshot),
+        None => state.reconstruct_video_task_snapshot(task).await?,
+    };
+    let mut snapshot_value = snapshot
+        .map(|snapshot| snapshot.redacted_for_persistence())
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
     if let Some(snapshot_value_ref) = snapshot_value.as_mut() {
         mark_snapshot_value_cancelled(snapshot_value_ref);
         metadata.insert(
@@ -196,22 +240,44 @@ async fn build_cancelled_request_metadata(
         return Ok(Some(Value::Object(metadata)));
     }
 
-    Ok(task.request_metadata.clone())
+    // A malformed legacy snapshot cannot be safely inspected for credentials.
+    // Drop only that internal field while preserving unrelated audit metadata.
+    metadata.remove("rust_local_snapshot");
+    Ok((!metadata.is_empty()).then_some(Value::Object(metadata)))
 }
 
 fn mark_snapshot_value_cancelled(snapshot_value: &mut Value) {
-    if let Some(object) = snapshot_value
-        .get_mut("OpenAi")
-        .and_then(Value::as_object_mut)
-    {
-        object.insert("status".to_string(), Value::String("Cancelled".to_string()));
-        return;
+    for variant in ["OpenAi", "Gemini", "Doubao"] {
+        if let Some(object) = snapshot_value
+            .get_mut(variant)
+            .and_then(Value::as_object_mut)
+        {
+            object.insert("status".to_string(), Value::String("Cancelled".to_string()));
+            return;
+        }
     }
-    if let Some(object) = snapshot_value
-        .get_mut("Gemini")
-        .and_then(Value::as_object_mut)
-    {
-        object.insert("status".to_string(), Value::String("Cancelled".to_string()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_snapshot_value_cancelled;
+    use serde_json::json;
+
+    #[test]
+    fn marks_doubao_snapshot_cancelled_without_dropping_other_fields() {
+        let mut snapshot = json!({
+            "Doubao": {
+                "local_task_id": "cgt-local-1",
+                "status": "Processing",
+                "progress_percent": 50
+            }
+        });
+
+        mark_snapshot_value_cancelled(&mut snapshot);
+
+        assert_eq!(snapshot["Doubao"]["status"], json!("Cancelled"));
+        assert_eq!(snapshot["Doubao"]["local_task_id"], json!("cgt-local-1"));
+        assert_eq!(snapshot["Doubao"]["progress_percent"], json!(50));
     }
 }
 
@@ -223,7 +289,7 @@ async fn persist_cancelled_video_task(
     let now_unix_secs = current_unix_secs();
     state
         .data
-        .upsert_video_task(UpsertVideoTask {
+        .update_active_video_task(UpsertVideoTask {
             id: task.id.clone(),
             short_id: task.short_id.clone(),
             request_id: task.request_id.clone(),

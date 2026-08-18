@@ -1,5 +1,6 @@
 use super::*;
 use crate::ai_serving::provider_key_pool_score_scope;
+use crate::state::ProviderCatalogKeyDeleteOutcome;
 use aether_data_contracts::repository::pool_scores::{
     ListPoolMemberScoresQuery, PoolMemberHardState, POOL_KIND_PROVIDER_KEY_POOL,
 };
@@ -500,11 +501,12 @@ impl<'a> AdminAppState<'a> {
         provider: &StoredProviderCatalogProvider,
         key: &StoredProviderCatalogKey,
     ) -> Result<bool, GatewayError> {
-        if !provider_requires_credential_cas_cleanup(provider) {
-            return self.delete_provider_catalog_key(&key.id).await;
-        }
-        self.compare_and_delete_provider_catalog_key_oauth_credential(
-            &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyOAuthCredentialCasDelete {
+        let outcome = if !provider_requires_credential_cas_cleanup(provider) {
+            self.delete_provider_catalog_key_if_unreferenced(&key.id)
+                .await?
+        } else {
+            self.compare_and_delete_provider_catalog_key_oauth_credential_if_unreferenced(
+                &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyOAuthCredentialCasDelete {
                 key_id: key.id.clone(),
                 expected_encrypted_auth_config: key.encrypted_auth_config.clone(),
                 expected_credential: aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyOAuthCredentialFence {
@@ -516,7 +518,18 @@ impl<'a> AdminAppState<'a> {
                 expected_upstream_metadata_namespace: None,
             },
         )
-        .await
+            .await?
+        };
+        if let ProviderCatalogKeyDeleteOutcome::Referenced(references) = outcome {
+            tracing::info!(
+                provider_id = %provider.id,
+                key_id = %key.id,
+                asset_groups = references.asset_groups,
+                visual_validation_sessions = references.visual_validation_sessions,
+                "gateway retained provider key referenced by material assets"
+            );
+        }
+        Ok(matches!(outcome, ProviderCatalogKeyDeleteOutcome::Deleted))
     }
 
     pub(crate) async fn cleanup_provider_catalog_key_if_current<F>(
@@ -541,12 +554,16 @@ impl<'a> AdminAppState<'a> {
             return Ok(false);
         }
 
-        self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
-            .await;
-        self.reset_admin_provider_pool_cost(&provider.id, &key.id)
-            .await;
-        let deleted = self.delete_provider_catalog_key(&key.id).await?;
+        let deleted = matches!(
+            self.delete_provider_catalog_key_if_unreferenced(&key.id)
+                .await?,
+            ProviderCatalogKeyDeleteOutcome::Deleted
+        );
         if deleted {
+            self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
+                .await;
+            self.reset_admin_provider_pool_cost(&provider.id, &key.id)
+                .await;
             let deleted_key_ids = [key.id.clone()];
             self.cleanup_deleted_provider_catalog_refs(&provider.id, false, &[], &deleted_key_ids)
                 .await?;
@@ -595,22 +612,31 @@ impl<'a> AdminAppState<'a> {
             .collect::<Vec<_>>();
 
         if plan.action == AdminPoolBatchActionKind::Delete {
-            let deleted_key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
-            for key in &keys {
-                self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
-                    .await;
-                self.reset_admin_provider_pool_cost(&provider.id, &key.id)
-                    .await;
-            }
-
             let mut affected = 0usize;
-            for key_id in &deleted_key_ids {
-                if self.delete_provider_catalog_key(key_id).await? {
+            let mut deleted_key_ids = Vec::new();
+            for key in &keys {
+                if matches!(
+                    self.delete_provider_catalog_key_if_unreferenced(&key.id)
+                        .await?,
+                    ProviderCatalogKeyDeleteOutcome::Deleted
+                ) {
+                    self.clear_admin_provider_pool_cooldown(&provider.id, &key.id)
+                        .await;
+                    self.reset_admin_provider_pool_cost(&provider.id, &key.id)
+                        .await;
+                    deleted_key_ids.push(key.id.clone());
                     affected = affected.saturating_add(1);
                 }
             }
-            self.cleanup_deleted_provider_catalog_refs(&provider.id, false, &[], &deleted_key_ids)
+            if !deleted_key_ids.is_empty() {
+                self.cleanup_deleted_provider_catalog_refs(
+                    &provider.id,
+                    false,
+                    &[],
+                    &deleted_key_ids,
+                )
                 .await?;
+            }
 
             return Ok(Json(
                 admin_provider_pool_pure::build_admin_pool_batch_action_result_payload(

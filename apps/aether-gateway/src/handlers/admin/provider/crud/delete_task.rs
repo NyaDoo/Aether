@@ -1,3 +1,7 @@
+use crate::data::AssetProviderReference;
+use crate::handlers::admin::provider::material_references::{
+    count_material_references, material_reference_conflict_response,
+};
 use crate::handlers::admin::provider::shared::paths::{
     admin_provider_delete_task_parts, admin_provider_id_for_manage_path,
 };
@@ -57,6 +61,18 @@ pub(crate) async fn maybe_build_local_admin_provider_delete_task_response(
                 "Provider 不存在",
             )));
         };
+        let reference_counts =
+            count_material_references(state, AssetProviderReference::ProviderId(&provider_id))
+                .await?;
+        if reference_counts.is_referenced() {
+            return Ok(Some(attach_admin_audit_response(
+                material_reference_conflict_response("Provider", &provider_id, reference_counts),
+                "admin_provider_delete_blocked_by_material_references",
+                "delete_provider",
+                "provider",
+                &provider_id,
+            )));
+        }
         let Some(task_id) =
             crate::task_runtime::submit_provider_delete_task(state, &provider_id, Some("admin"))
                 .await?

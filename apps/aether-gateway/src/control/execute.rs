@@ -30,6 +30,7 @@ pub(crate) async fn maybe_execute_via_control(
     if let Some(auth_context) = resolve_execution_runtime_auth_context(
         state,
         &local_decision,
+        &parts.method,
         &parts.headers,
         &parts.uri,
         trace_id,

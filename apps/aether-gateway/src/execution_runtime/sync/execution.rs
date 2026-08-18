@@ -38,6 +38,7 @@ use crate::api::response::{
     attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
     build_client_response_from_parts_with_mutator,
 };
+use crate::async_task::finalize_video_task_if_terminal;
 use crate::clock::current_unix_ms as current_request_candidate_unix_ms;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::chatgpt_web_image::maybe_execute_chatgpt_web_image_sync;
@@ -3076,8 +3077,14 @@ async fn execute_execution_runtime_sync_impl(
                 )
                 .await;
                 if let Some(snapshot) = local_task_snapshot {
-                    let _ = state.upsert_video_task_snapshot(&snapshot).await?;
+                    let stored = state.upsert_video_task_snapshot(&snapshot).await?;
                     state.video_tasks.record_snapshot(snapshot);
+                    if let Some(stored) = stored.as_ref() {
+                        // Async create normally remains pending, but a provider is
+                        // allowed to return an immediate terminal state. Settle the
+                        // original create request in that case as well.
+                        finalize_video_task_if_terminal(state, stored).await;
+                    }
                 }
                 match report_mode {
                     VideoTaskSyncReportMode::InlineSync => {
@@ -3093,7 +3100,30 @@ async fn execute_execution_runtime_sync_impl(
                     candidate_id,
                 )?));
             }
-            LocalVideoSyncSuccessBuild::NotHandled(payload) => payload,
+            LocalVideoSyncSuccessBuild::NotHandled(payload) => {
+                // A video create that reports success but produces no task would
+                // silently never reach the database, leaving the task invisible
+                // in the admin UI with no trace of why.
+                if payload.report_kind.starts_with("doubao_video_create")
+                    || payload.report_kind.starts_with("openai_video_create")
+                    || payload.report_kind.starts_with("openai_video_remix")
+                    || payload.report_kind.starts_with("gemini_video_create")
+                {
+                    warn!(
+                        event_name = "local_video_task_not_persisted",
+                        log_type = "event",
+                        trace_id = %trace_id,
+                        report_kind = %payload.report_kind,
+                        status_code = payload.status_code,
+                        provider_api_format = %plan.provider_api_format,
+                        upstream_url = %plan.url,
+                        truth_source_rust_authoritative = state.video_tasks.is_rust_authoritative(),
+                        has_body_json = payload.body_json.is_some(),
+                        "gateway video create succeeded upstream but produced no local task"
+                    );
+                }
+                payload
+            }
         };
         if let Some(response) =
             maybe_build_local_sync_finalize_response(trace_id, decision, &payload)?
@@ -3119,7 +3149,16 @@ async fn execute_execution_runtime_sync_impl(
                 .video_tasks
                 .snapshot_for_route(decision.route_family.as_deref(), request_path)
             {
-                let _ = state.upsert_video_task_snapshot(&snapshot).await?;
+                if let Some(stored) = state.upsert_video_task_snapshot(&snapshot).await? {
+                    if payload.report_kind.ends_with("_cancel_sync_finalize") {
+                        // The follow-up execution uses its own trace request id.
+                        // The task row retains the original create request id, so
+                        // cancellation settlement must be driven from the task.
+                        // A delete of an already completed/failed task must not
+                        // rewrite that task's settled generation usage as cancelled.
+                        finalize_video_task_if_terminal(state, &stored).await;
+                    }
+                }
             }
             if let Some(success_report_kind) = background_success_report_kind {
                 payload.report_kind = success_report_kind.to_string();

@@ -5,7 +5,8 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data::repository::video_tasks::InMemoryVideoTaskRepository;
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
 use aether_data_contracts::repository::video_tasks::{
-    UpsertVideoTask, VideoTaskStatus, VideoTaskWriteRepository,
+    UpsertVideoTask, VideoTaskLookupKey, VideoTaskReadRepository, VideoTaskStatus,
+    VideoTaskWriteRepository,
 };
 use axum::body::{to_bytes, Body, Bytes};
 use axum::response::Response;
@@ -16,22 +17,21 @@ use serde_json::json;
 
 use super::super::{
     build_router_with_state, build_state_with_execution_runtime_override, sample_endpoint,
-    sample_key, sample_provider, start_server, AppState,
+    sample_key, sample_provider, start_server, AppState, VideoTaskTruthSourceMode,
 };
 use crate::admin_api::{
     maybe_build_local_admin_video_tasks_response, AdminAppState, AdminRequestContext,
 };
 use crate::audit::AdminAuditEvent;
 use crate::constants::{
-    GATEWAY_HEADER, TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER,
+    TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER,
     TRUSTED_ADMIN_USER_ID_HEADER, TRUSTED_ADMIN_USER_ROLE_HEADER,
 };
 use crate::control::resolve_public_request_context;
 use crate::data::GatewayDataState;
 
-fn trusted_admin_headers() -> HeaderMap {
+fn trusted_admin_headers(method: &http::Method, uri: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(GATEWAY_HEADER, HeaderValue::from_static("rust-phase3b"));
     headers.insert(
         TRUSTED_ADMIN_USER_ID_HEADER,
         HeaderValue::from_static("admin-user-123"),
@@ -48,6 +48,12 @@ fn trusted_admin_headers() -> HeaderMap {
         TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER,
         HeaderValue::from_static("management-token-123"),
     );
+    crate::control::sign_trusted_admin_forward_headers(
+        &mut headers,
+        method,
+        &uri.parse().expect("admin URI should parse"),
+    )
+    .expect("admin headers should sign");
     headers
 }
 
@@ -57,7 +63,7 @@ async fn local_admin_video_tasks_response(
     uri: &str,
     _body: Option<serde_json::Value>,
 ) -> axum::response::Response<Body> {
-    let headers = trusted_admin_headers();
+    let headers = trusted_admin_headers(&method, uri);
     let request_context = resolve_public_request_context(
         state,
         &method,
@@ -205,10 +211,10 @@ async fn gateway_handles_admin_video_tasks_list_locally_with_trusted_admin_princ
         .get(format!(
             "{gateway_url}/api/admin/video-tasks?status=completed&page=1&page_size=20"
         ))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .headers(trusted_admin_headers(
+            &http::Method::GET,
+            "/api/admin/video-tasks?status=completed&page=1&page_size=20",
+        ))
         .send()
         .await
         .expect("request should succeed");
@@ -299,10 +305,10 @@ async fn gateway_handles_admin_video_tasks_stats_locally_with_trusted_admin_prin
 
     let response = reqwest::Client::new()
         .get(format!("{gateway_url}/api/admin/video-tasks/stats"))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .headers(trusted_admin_headers(
+            &http::Method::GET,
+            "/api/admin/video-tasks/stats",
+        ))
         .send()
         .await
         .expect("request should succeed");
@@ -340,19 +346,26 @@ async fn gateway_handles_admin_video_task_detail_locally_with_trusted_admin_prin
     );
 
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
-    repository
-        .upsert(sample_admin_video_task(
-            "task-detail",
-            VideoTaskStatus::Completed,
-            1_710_000_300,
-            "user-9",
-            "charlie",
-            "provider-openai",
-            "gpt-video",
-            "detail prompt",
-        ))
-        .await
-        .expect("task should upsert");
+    let mut task = sample_admin_video_task(
+        "task-detail",
+        VideoTaskStatus::Completed,
+        1_710_000_300,
+        "user-9",
+        "charlie",
+        "provider-openai",
+        "gpt-video",
+        "detail prompt",
+    );
+    task.request_metadata = Some(json!({
+        "audit_label": "safe-metadata",
+        "rust_local_snapshot": {
+            "legacy_transport": {
+                "headers": {"authorization": "Bearer legacy-provider-secret"},
+                "proxy": "http://proxy-user:proxy-password@proxy.example:8080"
+            }
+        }
+    }));
+    repository.upsert(task).await.expect("task should upsert");
 
     let provider_catalog_repository: Arc<dyn ProviderCatalogReadRepository> =
         Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -381,10 +394,10 @@ async fn gateway_handles_admin_video_task_detail_locally_with_trusted_admin_prin
 
     let response = reqwest::Client::new()
         .get(format!("{gateway_url}/api/admin/video-tasks/task-detail"))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .headers(trusted_admin_headers(
+            &http::Method::GET,
+            "/api/admin/video-tasks/task-detail",
+        ))
         .send()
         .await
         .expect("request should succeed");
@@ -397,6 +410,13 @@ async fn gateway_handles_admin_video_task_detail_locally_with_trusted_admin_prin
     assert_eq!(payload["endpoint"]["id"], "endpoint-1");
     assert_eq!(payload["endpoint"]["api_format"], "openai:video");
     assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["request_metadata"]["audit_label"], "safe-metadata");
+    assert!(payload["request_metadata"]
+        .get("rust_local_snapshot")
+        .is_none());
+    let rendered_payload = serde_json::to_string(&payload).expect("payload should serialize");
+    assert!(!rendered_payload.contains("legacy-provider-secret"));
+    assert!(!rendered_payload.contains("proxy-password"));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -594,9 +614,31 @@ async fn gateway_cancels_admin_video_task_locally_with_trusted_admin_principal()
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let provider_catalog_repository: Arc<dyn ProviderCatalogReadRepository> =
+        Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider("provider-openai", "OpenAI", 10)],
+            vec![sample_endpoint(
+                "endpoint-1",
+                "provider-openai",
+                "openai:video",
+                "https://api.openai.example/v1",
+            )],
+            vec![sample_key(
+                "provider-key-1",
+                "provider-openai",
+                "openai:video",
+                "sk-upstream-openai-video",
+            )],
+        ));
+    let data_state = GatewayDataState::with_video_task_repository_and_provider_transport_for_tests(
+        Arc::clone(&repository),
+        provider_catalog_repository,
+        DEVELOPMENT_ENCRYPTION_KEY,
+    );
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
-            .with_video_task_data_repository_for_tests(Arc::clone(&repository)),
+            .with_data_state_for_tests(data_state)
+            .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -604,10 +646,10 @@ async fn gateway_cancels_admin_video_task_locally_with_trusted_admin_principal()
         .post(format!(
             "{gateway_url}/api/admin/video-tasks/task-openai-cancel/cancel"
         ))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .headers(trusted_admin_headers(
+            &http::Method::POST,
+            "/api/admin/video-tasks/task-openai-cancel/cancel",
+        ))
         .send()
         .await
         .expect("request should succeed");
@@ -629,10 +671,10 @@ async fn gateway_cancels_admin_video_task_locally_with_trusted_admin_principal()
         .get(format!(
             "{gateway_url}/api/admin/video-tasks/task-openai-cancel"
         ))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .headers(trusted_admin_headers(
+            &http::Method::GET,
+            "/api/admin/video-tasks/task-openai-cancel",
+        ))
         .send()
         .await
         .expect("detail request should succeed");
@@ -666,7 +708,7 @@ async fn gateway_cancels_admin_video_task_locally_with_trusted_admin_principal()
 }
 
 #[tokio::test]
-async fn local_admin_video_task_cancel_attaches_explicit_audit() {
+async fn local_admin_video_task_cancel_fails_closed_without_provider_contract() {
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
     let mut task = sample_admin_video_task(
         "task-cancel-audit",
@@ -685,26 +727,28 @@ async fn local_admin_video_task_cancel_attaches_explicit_audit() {
 
     let state = AppState::new()
         .expect("gateway state should build")
-        .with_video_task_data_repository_for_tests(repository);
+        .with_video_task_data_repository_for_tests(Arc::clone(&repository));
 
-    let response = local_admin_video_tasks_response(
-        &state,
-        http::Method::POST,
-        "/api/admin/video-tasks/task-cancel-audit/cancel",
-        None,
+    let uri_text = "/api/admin/video-tasks/task-cancel-audit/cancel";
+    let headers = trusted_admin_headers(&http::Method::POST, uri_text);
+    let uri = uri_text.parse().expect("uri should parse");
+    let request_context =
+        resolve_public_request_context(&state, &http::Method::POST, &uri, &headers, "trace-123")
+            .await
+            .expect("request context should resolve");
+    let result = maybe_build_local_admin_video_tasks_response(
+        &AdminAppState::new(&state),
+        &AdminRequestContext::new(&request_context),
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let audit = response
-        .extensions()
-        .get::<AdminAuditEvent>()
-        .cloned()
-        .expect("video task cancel should attach audit");
-    assert_eq!(audit.event_name, "admin_video_task_cancelled");
-    assert_eq!(audit.action, "cancel_video_task");
-    assert_eq!(audit.target_type, "video_task");
-    assert_eq!(audit.target_id, "task-cancel-audit");
+    assert!(result.is_err());
+    let stored = repository
+        .find(VideoTaskLookupKey::Id("task-cancel-audit"))
+        .await
+        .expect("lookup should succeed")
+        .expect("task should remain stored");
+    assert_eq!(stored.status, VideoTaskStatus::Processing);
 }
 
 #[tokio::test]
@@ -753,10 +797,10 @@ async fn gateway_redirects_admin_video_task_video_locally_with_trusted_admin_pri
         .get(format!(
             "{gateway_url}/api/admin/video-tasks/task-redirect/video"
         ))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .headers(trusted_admin_headers(
+            &http::Method::GET,
+            "/api/admin/video-tasks/task-redirect/video",
+        ))
         .send()
         .await
         .expect("request should succeed");
@@ -794,7 +838,7 @@ async fn local_admin_video_task_video_redirect_attaches_explicit_audit() {
 
     let state = AppState::new()
         .expect("gateway state should build")
-        .with_video_task_data_repository_for_tests(repository);
+        .with_video_task_data_repository_for_tests(Arc::clone(&repository));
 
     let response = local_admin_video_tasks_response(
         &state,
@@ -817,7 +861,7 @@ async fn local_admin_video_task_video_redirect_attaches_explicit_audit() {
 }
 
 #[tokio::test]
-async fn gateway_proxies_admin_video_task_video_locally_with_trusted_admin_principal() {
+async fn gateway_does_not_send_admin_video_key_to_a_spoofed_google_media_url() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let seen_api_key = Arc::new(Mutex::new(None::<String>));
@@ -907,40 +951,36 @@ async fn gateway_proxies_admin_video_task_video_locally_with_trusted_admin_princ
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client should build");
+    let response = client
         .get(format!(
             "{gateway_url}/api/admin/video-tasks/task-proxy/video"
         ))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .headers(trusted_admin_headers(
+            &http::Method::GET,
+            "/api/admin/video-tasks/task-proxy/video",
+        ))
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(
         response
             .headers()
-            .get(http::header::CONTENT_TYPE)
+            .get(http::header::LOCATION)
             .and_then(|value| value.to_str().ok()),
-        Some("video/mp4")
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get(http::header::CONTENT_DISPOSITION)
-            .and_then(|value| value.to_str().ok()),
-        Some("inline; filename=\"video_task-proxy.mp4\"")
-    );
-    assert_eq!(
-        response.bytes().await.expect("body should read"),
-        Bytes::from_static(b"proxied-video-bytes")
+        Some(format!(
+            "{upstream_url}/generativelanguage.googleapis.com/v1beta/files/video-task-123:download"
+        ))
+        .as_deref()
     );
     assert_eq!(
         seen_api_key.lock().expect("mutex should lock").as_deref(),
-        Some("gemini-upstream-secret")
+        None
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 

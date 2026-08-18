@@ -212,6 +212,13 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 return false;
             }
 
+            if decision.route_family.as_deref() == Some("material_assets_manage") {
+                return matches!(
+                    request_context.request_method,
+                    http::Method::POST | http::Method::PATCH
+                );
+            }
+
             match (
                 decision.route_family.as_deref(),
                 request_context.request_method.clone(),
@@ -455,6 +462,13 @@ pub(crate) fn public_support_local_requires_buffered_body(
         .is_some_and(|decision| {
             if decision.route_class.as_deref() != Some("public_support") {
                 return false;
+            }
+
+            if decision.route_family.as_deref() == Some("material_assets") {
+                return matches!(
+                    request_context.request_method,
+                    http::Method::POST | http::Method::PATCH
+                );
             }
 
             matches!(

@@ -28,12 +28,13 @@ function isGrokSessionCredential(input: ProviderKeyAuthCarrier, providerType?: s
 
 export function getProviderCredentialKind(
   input: ProviderKeyAuthCarrier,
-): 'raw_secret' | 'oauth_session' | 'service_account' {
+): 'raw_secret' | 'oauth_session' | 'service_account' | 'volc_aksk' {
   const credentialKind = normalizeText(input.credential_kind)
   if (
     credentialKind === 'raw_secret'
     || credentialKind === 'oauth_session'
     || credentialKind === 'service_account'
+    || credentialKind === 'volc_aksk'
   ) {
     return credentialKind
   }
@@ -45,17 +46,19 @@ export function getProviderCredentialKind(
   const authType = normalizeText(input.auth_type)
   if (authType === 'oauth') return 'oauth_session'
   if (authType === 'service_account' || authType === 'vertex_ai') return 'service_account'
+  if (authType === 'volc_aksk') return 'volc_aksk'
   return 'raw_secret'
 }
 
 export function getProviderRuntimeAuthKind(
   input: ProviderKeyAuthCarrier,
-): 'api_key' | 'bearer' | 'service_account' | 'mixed' | 'unknown' {
+): 'api_key' | 'bearer' | 'service_account' | 'volc_aksk' | 'mixed' | 'unknown' {
   const runtimeAuthKind = normalizeText(input.runtime_auth_kind)
   if (
     runtimeAuthKind === 'api_key'
     || runtimeAuthKind === 'bearer'
     || runtimeAuthKind === 'service_account'
+    || runtimeAuthKind === 'volc_aksk'
     || runtimeAuthKind === 'mixed'
   ) {
     return runtimeAuthKind
@@ -63,6 +66,7 @@ export function getProviderRuntimeAuthKind(
 
   const authType = normalizeText(input.auth_type)
   if (authType === 'service_account' || authType === 'vertex_ai') return 'service_account'
+  if (authType === 'volc_aksk') return 'volc_aksk'
   if (authType === 'bearer') return 'bearer'
   if (authType === 'api_key') return 'api_key'
   return 'unknown'
@@ -77,6 +81,10 @@ export function isOAuthManagedCredential(input: ProviderKeyAuthCarrier): boolean
 
 export function isServiceAccountCredential(input: ProviderKeyAuthCarrier): boolean {
   return getProviderCredentialKind(input) === 'service_account'
+}
+
+export function isVolcAkSkCredential(input: ProviderKeyAuthCarrier): boolean {
+  return getProviderCredentialKind(input) === 'volc_aksk'
 }
 
 export function canRefreshOAuthCredential(input: ProviderKeyAuthCarrier): boolean {
@@ -115,6 +123,7 @@ export function getProviderAuthLabel(input: ProviderKeyAuthCarrier): string {
   if (input.agent_identity === true) return 'Agent Identity'
   if (isOAuthManagedCredential(input)) return 'OAuth'
   if (isServiceAccountCredential(input)) return '服务账号'
+  if (isVolcAkSkCredential(input)) return 'Volcengine AK/SK'
   if (getProviderRuntimeAuthKind(input) === 'mixed') return '混合'
   return getProviderRuntimeAuthKind(input) === 'bearer' ? 'Bearer' : 'API Key'
 }
@@ -128,6 +137,7 @@ export function getProviderMaskedSecretLabel(
   if (isOAuthManagedCredential(input) && input.oauth_header_auth === true) return '[OAuth Header]'
   if (isOAuthManagedCredential(input)) return '[OAuth Token]'
   if (isServiceAccountCredential(input)) return '[Service Account]'
+  if (isVolcAkSkCredential(input)) return '[Volcengine AK/SK]'
   if (getProviderRuntimeAuthKind(input) === 'mixed') return '[Key]'
   return getProviderRuntimeAuthKind(input) === 'bearer' ? '[Bearer Token]' : '[Key]'
 }

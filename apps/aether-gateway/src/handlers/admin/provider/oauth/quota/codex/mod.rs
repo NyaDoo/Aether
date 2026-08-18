@@ -28,7 +28,7 @@ use super::shared::{
 };
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::provider_key_auth::provider_key_is_oauth_managed;
-use crate::state::ProviderTransportCredentialFence;
+use crate::state::{ProviderCatalogKeyDeleteOutcome, ProviderTransportCredentialFence};
 use crate::GatewayError;
 use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::{
@@ -1294,9 +1294,14 @@ async fn refresh_codex_provider_quota_locally_with_reset_fence(
         let auto_removed_hard_banned = if should_auto_remove_hard_banned {
             match credential_cas_delete.as_ref() {
                 Some(delete) => {
-                    state
-                        .compare_and_delete_provider_catalog_key_oauth_credential(delete)
-                        .await?
+                    matches!(
+                        state
+                            .compare_and_delete_provider_catalog_key_oauth_credential_if_unreferenced(
+                                delete,
+                            )
+                            .await?,
+                        ProviderCatalogKeyDeleteOutcome::Deleted
+                    )
                 }
                 None => false,
             }
@@ -1314,9 +1319,14 @@ async fn refresh_codex_provider_quota_locally_with_reset_fence(
         {
             match credential_cas_delete.as_ref() {
                 Some(delete) => {
-                    state
-                        .compare_and_delete_provider_catalog_key_oauth_credential(delete)
-                        .await?
+                    matches!(
+                        state
+                            .compare_and_delete_provider_catalog_key_oauth_credential_if_unreferenced(
+                                delete,
+                            )
+                            .await?,
+                        ProviderCatalogKeyDeleteOutcome::Deleted
+                    )
                 }
                 None => false,
             }

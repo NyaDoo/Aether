@@ -45,6 +45,7 @@ pub(crate) fn extract_requested_model(
 
 pub(super) fn extract_request_credentials(
     headers: &http::HeaderMap,
+    method: &http::Method,
     uri: &Uri,
     auth_endpoint_signature: &str,
 ) -> GatewayExtractedCredentials {
@@ -59,8 +60,8 @@ pub(super) fn extract_request_credentials(
         query_key: extract_query_api_key(uri),
         cookie_header: header_value_str(headers, http::header::COOKIE.as_str()),
     };
-    let trusted_headers = extract_trusted_auth_headers(headers);
-    let trusted_admin_headers = extract_trusted_admin_headers(headers);
+    let trusted_headers = extract_trusted_auth_headers(headers, method, uri);
+    let trusted_admin_headers = extract_trusted_admin_headers(headers, method, uri);
     let primary = select_primary_credential(auth_endpoint_signature, &bundle);
 
     GatewayExtractedCredentials {
@@ -73,10 +74,11 @@ pub(super) fn extract_request_credentials(
 
 pub(in crate::control) fn resolve_gateway_credential_carrier(
     headers: &http::HeaderMap,
+    method: &http::Method,
     uri: &Uri,
     auth_endpoint_signature: &str,
 ) -> Option<GatewayCredentialCarrier> {
-    extract_request_credentials(headers, uri, auth_endpoint_signature)
+    extract_request_credentials(headers, method, uri, auth_endpoint_signature)
         .primary
         .map(|credential| match credential {
             GatewayPrimaryCredential::ProviderApiKey { carrier, .. }
@@ -85,16 +87,9 @@ pub(in crate::control) fn resolve_gateway_credential_carrier(
         })
 }
 
-fn has_trusted_gateway_marker(headers: &http::HeaderMap) -> bool {
-    header_value_str(headers, crate::constants::GATEWAY_HEADER)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("rust-phase3")
-}
-
 pub(super) fn build_auth_context_cache_key(
     headers: &http::HeaderMap,
+    method: &http::Method,
     uri: &Uri,
     auth_endpoint_signature: &str,
 ) -> Option<String> {
@@ -103,7 +98,7 @@ pub(super) fn build_auth_context_cache_key(
         return None;
     }
 
-    let extracted = extract_request_credentials(headers, uri, signature);
+    let extracted = extract_request_credentials(headers, method, uri, signature);
     let trusted_headers = extracted.trusted_headers;
     let bundle = extracted.bundle;
     if bundle.authorization_bearer.is_none()
@@ -150,8 +145,12 @@ pub(super) fn build_auth_context_cache_key(
     ))
 }
 
-fn extract_trusted_auth_headers(headers: &http::HeaderMap) -> Option<GatewayTrustedAuthHeaders> {
-    if !has_trusted_gateway_marker(headers) {
+fn extract_trusted_auth_headers(
+    headers: &http::HeaderMap,
+    method: &http::Method,
+    uri: &Uri,
+) -> Option<GatewayTrustedAuthHeaders> {
+    if !super::internal_forward::verify_trusted_auth_forward_headers(headers, method, uri) {
         return None;
     }
     let user_id = header_value_str(headers, crate::constants::TRUSTED_AUTH_USER_ID_HEADER)
@@ -179,8 +178,10 @@ fn extract_trusted_auth_headers(headers: &http::HeaderMap) -> Option<GatewayTrus
 
 pub(super) fn extract_trusted_admin_headers(
     headers: &http::HeaderMap,
+    method: &http::Method,
+    uri: &Uri,
 ) -> Option<GatewayTrustedAdminHeaders> {
-    if !has_trusted_gateway_marker(headers) {
+    if !super::internal_forward::verify_trusted_admin_forward_headers(headers, method, uri) {
         return None;
     }
     let user_id = header_value_str(headers, crate::constants::TRUSTED_ADMIN_USER_ID_HEADER)?
@@ -221,6 +222,14 @@ fn select_primary_credential(
     bundle: &GatewayCredentialBundle,
 ) -> Option<GatewayPrimaryCredential> {
     let signature = auth_endpoint_signature.trim().to_ascii_lowercase();
+    if signature == crate::material_assets::ARK_ASSET_API_FORMAT
+        && bundle
+            .authorization_bearer
+            .as_deref()
+            .is_some_and(crate::local_auth_token::is_aether_access_token)
+    {
+        return first_bearer_token(bundle);
+    }
     if signature.starts_with("gemini:") {
         return select_gemini_credential(bundle);
     }
@@ -233,10 +242,15 @@ fn select_primary_credential(
     if signature.starts_with("openai:") {
         return select_openai_credential(bundle);
     }
+    // Doubao (Volcengine Ark) authenticates with a bearer token, so the caller's
+    // API key arrives the same way it does on the OpenAI surface. Without this the
+    // generic branch would treat it as a deferred bearer token and drop it.
+    if signature.starts_with("doubao:") {
+        return select_openai_credential(bundle);
+    }
     if signature.starts_with("aether:") {
         return select_openai_credential(bundle);
     }
-
     select_generic_credential(bundle)
 }
 
@@ -427,6 +441,72 @@ mod tests {
         path.parse().expect("uri should parse")
     }
 
+    fn sign_trusted_auth_headers(headers: &mut http::HeaderMap, request_uri: &Uri) {
+        headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b-affinity".parse().unwrap(),
+        );
+        headers
+            .entry(crate::constants::TRUSTED_AUTH_ACCESS_ALLOWED_HEADER)
+            .or_insert("true".parse().unwrap());
+        headers.insert(
+            crate::constants::TUNNEL_AFFINITY_FORWARDED_BY_HEADER,
+            "gateway-a".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
+            "gateway-b".parse().unwrap(),
+        );
+        crate::control::sign_trusted_auth_forward_headers(
+            headers,
+            &http::Method::POST,
+            request_uri,
+        )
+        .unwrap();
+    }
+
+    fn sign_trusted_admin_headers(headers: &mut http::HeaderMap, request_uri: &Uri) {
+        crate::control::sign_trusted_admin_forward_headers(
+            headers,
+            &http::Method::GET,
+            request_uri,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn doubao_signature_treats_bearer_as_caller_api_key() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer sk-caller-key"),
+        );
+
+        // A deferred bearer token would be dropped by the auth resolver, so the
+        // Doubao surface must classify it as a caller-provided API key.
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::POST,
+            &uri("/v3/contents/generations/tasks"),
+            "doubao:video",
+        );
+
+        assert!(matches!(
+            extracted.primary,
+            Some(GatewayPrimaryCredential::ProviderApiKey {
+                carrier: GatewayCredentialCarrier::AuthorizationBearer,
+                ..
+            })
+        ));
+        assert!(build_auth_context_cache_key(
+            &headers,
+            &http::Method::POST,
+            &uri("/v3/contents/generations/tasks"),
+            "doubao:video"
+        )
+        .is_some());
+    }
+
     #[test]
     fn extract_requested_model_reads_zstd_encoded_json_body() {
         let decision = GatewayControlDecision::synthetic(
@@ -467,12 +547,67 @@ mod tests {
             "Bearer sk-openai".parse().unwrap(),
         );
 
-        let extracted =
-            extract_request_credentials(&headers, &uri("/v1/chat/completions"), "openai:chat");
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::POST,
+            &uri("/v1/chat/completions"),
+            "openai:chat",
+        );
         assert_eq!(
             extracted.primary,
             Some(GatewayPrimaryCredential::ProviderApiKey {
                 raw: "sk-openai".to_string(),
+                carrier: GatewayCredentialCarrier::AuthorizationBearer,
+            })
+        );
+    }
+
+    #[test]
+    fn selects_material_assets_bearer_as_provider_api_key() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer sk-material-assets".parse().unwrap(),
+        );
+
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::GET,
+            &uri("/api/material-assets/assets"),
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+        );
+        assert_eq!(
+            extracted.primary,
+            Some(GatewayPrimaryCredential::ProviderApiKey {
+                raw: "sk-material-assets".to_string(),
+                carrier: GatewayCredentialCarrier::AuthorizationBearer,
+            })
+        );
+    }
+
+    #[test]
+    fn defers_aether_session_token_for_material_assets() {
+        let token = crate::local_auth_token::sign_for_tests(
+            "access",
+            serde_json::Map::from_iter([("user_id".to_string(), serde_json::json!("user-1"))]),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::GET,
+            &uri("/api/material-assets/assets"),
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+        );
+        assert_eq!(
+            extracted.primary,
+            Some(GatewayPrimaryCredential::BearerToken {
+                raw: token,
                 carrier: GatewayCredentialCarrier::AuthorizationBearer,
             })
         );
@@ -487,8 +622,12 @@ mod tests {
         );
         headers.insert("x-api-key", "claude-key".parse().unwrap());
 
-        let extracted =
-            extract_request_credentials(&headers, &uri("/v1/messages"), "claude:messages");
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::POST,
+            &uri("/v1/messages"),
+            "claude:messages",
+        );
         assert_eq!(
             extracted.primary,
             Some(GatewayPrimaryCredential::ProviderApiKey {
@@ -506,8 +645,12 @@ mod tests {
             "Bearer cli-token".parse().unwrap(),
         );
 
-        let extracted =
-            extract_request_credentials(&headers, &uri("/v1/messages"), "claude:messages");
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::POST,
+            &uri("/v1/messages"),
+            "claude:messages",
+        );
         assert_eq!(
             extracted.primary,
             Some(GatewayPrimaryCredential::ProviderApiKey {
@@ -528,6 +671,7 @@ mod tests {
 
         let extracted = extract_request_credentials(
             &headers,
+            &http::Method::POST,
             &uri("/v1internal:streamGenerateContent?alt=sse"),
             "antigravity:v1internal",
         );
@@ -547,6 +691,7 @@ mod tests {
 
         let extracted = extract_request_credentials(
             &headers,
+            &http::Method::POST,
             &uri("/v1beta/models?key=gemini-query"),
             "gemini:generate_content",
         );
@@ -564,8 +709,12 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(http::header::COOKIE, "session=abc123".parse().unwrap());
 
-        let extracted =
-            extract_request_credentials(&headers, &uri("/v1/chat/completions"), "internal:session");
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::POST,
+            &uri("/v1/chat/completions"),
+            "internal:session",
+        );
         assert_eq!(
             extracted.primary,
             Some(GatewayPrimaryCredential::CookieHeader {
@@ -582,6 +731,7 @@ mod tests {
 
         let cache_key = build_auth_context_cache_key(
             &headers,
+            &http::Method::POST,
             &uri("/v1/chat/completions"),
             "internal:session",
         )
@@ -591,11 +741,8 @@ mod tests {
 
     #[test]
     fn cache_key_includes_trusted_auth_headers() {
+        let request_uri = uri("/v1/chat/completions");
         let mut first_headers = http::HeaderMap::new();
-        first_headers.insert(
-            crate::constants::GATEWAY_HEADER,
-            "rust-phase3b".parse().unwrap(),
-        );
         first_headers.insert(
             crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
             "user-1".parse().unwrap(),
@@ -612,6 +759,7 @@ mod tests {
             crate::constants::TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
             "true".parse().unwrap(),
         );
+        sign_trusted_auth_headers(&mut first_headers, &request_uri);
 
         let mut second_headers = first_headers.clone();
         second_headers.insert(
@@ -622,16 +770,19 @@ mod tests {
             crate::constants::TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
             "false".parse().unwrap(),
         );
+        sign_trusted_auth_headers(&mut second_headers, &request_uri);
 
         let first = build_auth_context_cache_key(
             &first_headers,
-            &uri("/v1/chat/completions"),
+            &http::Method::POST,
+            &request_uri,
             "openai:chat",
         )
         .expect("trusted cache key should exist");
         let second = build_auth_context_cache_key(
             &second_headers,
-            &uri("/v1/chat/completions"),
+            &http::Method::POST,
+            &request_uri,
             "openai:chat",
         )
         .expect("trusted cache key should exist");
@@ -647,11 +798,8 @@ mod tests {
 
     #[test]
     fn cache_key_ignores_untrusted_auth_identity_headers() {
+        let request_uri = uri("/v1/chat/completions");
         let mut trusted_headers = http::HeaderMap::new();
-        trusted_headers.insert(
-            crate::constants::GATEWAY_HEADER,
-            "rust-phase3b".parse().unwrap(),
-        );
         trusted_headers.insert(
             crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
             "user-1".parse().unwrap(),
@@ -660,6 +808,7 @@ mod tests {
             crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
             "key-1".parse().unwrap(),
         );
+        sign_trusted_auth_headers(&mut trusted_headers, &request_uri);
 
         let mut untrusted_headers = http::HeaderMap::new();
         untrusted_headers.insert(
@@ -673,12 +822,14 @@ mod tests {
 
         let trusted = build_auth_context_cache_key(
             &trusted_headers,
-            &uri("/v1/chat/completions"),
+            &http::Method::POST,
+            &request_uri,
             "openai:chat",
         );
         let untrusted = build_auth_context_cache_key(
             &untrusted_headers,
-            &uri("/v1/chat/completions"),
+            &http::Method::POST,
+            &request_uri,
             "openai:chat",
         );
 
@@ -688,11 +839,8 @@ mod tests {
 
     #[test]
     fn extracts_trusted_auth_headers() {
+        let request_uri = uri("/v1/chat/completions");
         let mut headers = http::HeaderMap::new();
-        headers.insert(
-            crate::constants::GATEWAY_HEADER,
-            "rust-phase3b".parse().unwrap(),
-        );
         headers.insert(
             crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
             "user-1".parse().unwrap(),
@@ -709,9 +857,10 @@ mod tests {
             crate::constants::TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
             "true".parse().unwrap(),
         );
+        sign_trusted_auth_headers(&mut headers, &request_uri);
 
         let extracted =
-            extract_request_credentials(&headers, &uri("/v1/chat/completions"), "openai:chat");
+            extract_request_credentials(&headers, &http::Method::POST, &request_uri, "openai:chat");
         assert_eq!(
             extracted.trusted_headers,
             Some(GatewayTrustedAuthHeaders {
@@ -725,8 +874,12 @@ mod tests {
     }
 
     #[test]
-    fn ignores_trusted_auth_headers_without_gateway_marker() {
+    fn ignores_forged_trusted_auth_headers_without_proof() {
         let mut headers = http::HeaderMap::new();
+        headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b-affinity".parse().unwrap(),
+        );
         headers.insert(
             crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
             "user-1".parse().unwrap(),
@@ -736,18 +889,19 @@ mod tests {
             "key-1".parse().unwrap(),
         );
 
-        let extracted =
-            extract_request_credentials(&headers, &uri("/v1/chat/completions"), "openai:chat");
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::POST,
+            &uri("/v1/chat/completions"),
+            "openai:chat",
+        );
         assert_eq!(extracted.trusted_headers, None);
     }
 
     #[test]
     fn extracts_trusted_admin_headers() {
+        let request_uri = uri("/api/admin/endpoints/health/api-formats");
         let mut headers = http::HeaderMap::new();
-        headers.insert(
-            crate::constants::GATEWAY_HEADER,
-            "rust-phase3b".parse().unwrap(),
-        );
         headers.insert(
             crate::constants::TRUSTED_ADMIN_USER_ID_HEADER,
             "admin-user-1".parse().unwrap(),
@@ -760,10 +914,12 @@ mod tests {
             crate::constants::TRUSTED_ADMIN_SESSION_ID_HEADER,
             "sess-1".parse().unwrap(),
         );
+        sign_trusted_admin_headers(&mut headers, &request_uri);
 
         let extracted = extract_request_credentials(
             &headers,
-            &uri("/api/admin/endpoints/health/api-formats"),
+            &http::Method::GET,
+            &request_uri,
             "admin:endpoints_health",
         );
         assert_eq!(
@@ -779,11 +935,8 @@ mod tests {
 
     #[test]
     fn extracts_trusted_audit_admin_headers() {
+        let request_uri = uri("/api/admin/endpoints/health/api-formats");
         let mut headers = http::HeaderMap::new();
-        headers.insert(
-            crate::constants::GATEWAY_HEADER,
-            "rust-phase3b".parse().unwrap(),
-        );
         headers.insert(
             crate::constants::TRUSTED_ADMIN_USER_ID_HEADER,
             "audit-admin-1".parse().unwrap(),
@@ -796,10 +949,12 @@ mod tests {
             crate::constants::TRUSTED_ADMIN_SESSION_ID_HEADER,
             "sess-audit-1".parse().unwrap(),
         );
+        sign_trusted_admin_headers(&mut headers, &request_uri);
 
         let extracted = extract_request_credentials(
             &headers,
-            &uri("/api/admin/endpoints/health/api-formats"),
+            &http::Method::GET,
+            &request_uri,
             "admin:endpoints_health",
         );
         assert_eq!(
@@ -814,8 +969,12 @@ mod tests {
     }
 
     #[test]
-    fn ignores_trusted_admin_headers_without_gateway_marker() {
+    fn ignores_forged_trusted_admin_headers_without_proof() {
         let mut headers = http::HeaderMap::new();
+        headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b-admin".parse().unwrap(),
+        );
         headers.insert(
             crate::constants::TRUSTED_ADMIN_USER_ID_HEADER,
             "admin-user-1".parse().unwrap(),
@@ -831,6 +990,7 @@ mod tests {
 
         let extracted = extract_request_credentials(
             &headers,
+            &http::Method::GET,
             &uri("/api/admin/endpoints/health/api-formats"),
             "admin:endpoints_health",
         );

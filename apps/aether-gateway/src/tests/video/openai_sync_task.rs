@@ -24,7 +24,7 @@ use crate::constants::{CONTROL_EXECUTED_HEADER, CONTROL_EXECUTE_FALLBACK_HEADER,
 
 use super::{
     build_router_with_state, build_state_with_execution_runtime_override, start_server,
-    VideoTaskTruthSourceMode,
+    video_auth_repository, VideoTaskTruthSourceMode,
 };
 
 #[tokio::test]
@@ -285,6 +285,14 @@ async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_loca
         vec![sample_key()],
     ));
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let auth_repository = video_auth_repository(
+        "client-openai-video-delete-local-key",
+        "key-openai-video-delete-local-123",
+        "user-openai-video-delete-local-123",
+        "openai",
+        "openai:video",
+        "sora-2",
+    );
 
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
@@ -295,13 +303,15 @@ async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_loca
                     provider_catalog_repository,
                     Arc::clone(&request_candidate_repository),
                     DEVELOPMENT_ENCRYPTION_KEY,
-                ),
+                )
+                .with_auth_api_key_reader(auth_repository),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
         .delete(format!("{gateway_url}/v1/videos/task-local-followup-123"))
+        .bearer_auth("client-openai-video-delete-local-key")
         .header(CONTROL_EXECUTE_FALLBACK_HEADER, "true")
         .header(TRACE_ID_HEADER, "trace-openai-video-delete-local-123")
         .send()

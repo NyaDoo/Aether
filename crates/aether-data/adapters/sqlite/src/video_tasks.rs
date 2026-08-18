@@ -547,6 +547,14 @@ fn push_filter<'args>(
         push_clause(builder, "status = ");
         builder.push_bind(status_to_database(status));
     }
+    if filter.exclude_deleted {
+        push_clause(builder, "status <> ");
+        builder.push_bind(status_to_database(VideoTaskStatus::Deleted));
+    }
+    if let Some(model_exact) = filter.model_exact.as_deref() {
+        push_clause(builder, "model = ");
+        builder.push_bind(model_exact.trim());
+    }
     if let Some(model_substring) = filter.model_substring.as_deref() {
         push_clause(builder, "LOWER(model) LIKE ");
         builder.push_bind(format!(
@@ -767,8 +775,10 @@ mod tests {
         let filter = VideoTaskQueryFilter {
             user_id: Some("user-2".to_string()),
             status: Some(VideoTaskStatus::Completed),
+            model_exact: None,
             model_substring: Some("veo".to_string()),
             client_api_format: Some("gemini:video".to_string()),
+            exclude_deleted: false,
         };
         assert_eq!(
             repository.count(&filter).await.expect("count should load"),

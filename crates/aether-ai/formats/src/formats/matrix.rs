@@ -53,6 +53,17 @@ pub fn request_candidate_api_format_preference(
 ) -> Option<(u8, u8)> {
     let client_api_format = normalize_api_format_alias(client_api_format);
     let provider_api_format = normalize_api_format_alias(provider_api_format);
+    if client_api_format == "doubao:asset_library" {
+        return (provider_api_format == "doubao:asset_library").then_some((0, 0));
+    }
+    if client_api_format == "openai:video" || client_api_format == "doubao:video" {
+        return match (client_api_format.as_str(), provider_api_format.as_str()) {
+            ("openai:video", "openai:video") => Some((0, 0)),
+            ("openai:video", "doubao:video") => Some((1, 0)),
+            ("doubao:video", "doubao:video") => Some((0, 0)),
+            _ => None,
+        };
+    }
 
     if client_api_format == "openai:responses:compact" {
         return (provider_api_format == "openai:responses:compact").then_some((0, 0));
@@ -109,6 +120,15 @@ pub fn request_candidate_api_formats(
     _require_streaming: bool,
 ) -> Vec<&'static str> {
     let client_api_format = normalize_api_format_alias(client_api_format);
+    if client_api_format == "doubao:asset_library" {
+        return vec!["doubao:asset_library"];
+    }
+    if client_api_format == "openai:video" {
+        return vec!["openai:video", "doubao:video"];
+    }
+    if client_api_format == "doubao:video" {
+        return vec!["doubao:video"];
+    }
     if client_api_format == "openai:responses:compact" {
         return vec!["openai:responses:compact"];
     }
@@ -417,6 +437,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn video_candidate_registry_allows_only_openai_to_doubao_conversion() {
+        assert_eq!(
+            request_candidate_api_formats("openai:video", false),
+            vec!["openai:video", "doubao:video"]
+        );
+        assert_eq!(
+            request_candidate_api_format_preference("openai:video", "doubao:video"),
+            Some((1, 0))
+        );
+        assert_eq!(
+            request_candidate_api_format_preference("doubao:video", "openai:video"),
+            None
+        );
     }
 
     #[test]

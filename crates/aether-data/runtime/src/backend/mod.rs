@@ -113,6 +113,20 @@ fn ensure_driver_enabled(driver: DatabaseDriver) -> Result<(), DataLayerError> {
 }
 
 impl DataBackends {
+    #[doc(hidden)]
+    pub fn with_asset_library_repository_for_tests<T>(repository: std::sync::Arc<T>) -> Self
+    where
+        T: crate::repository::asset_library::AssetLibraryReadRepository
+            + crate::repository::asset_library::AssetLibraryWriteRepository
+            + 'static,
+    {
+        Self {
+            read: DataReadRepositories::with_asset_library_repository(repository.clone()),
+            write: DataWriteRepositories::with_asset_library_repository(repository),
+            ..Self::default()
+        }
+    }
+
     fn sql_backend(&self) -> Option<SqlBackendRef<'_>> {
         #[cfg(feature = "postgres")]
         if let Some(postgres) = self.postgres.as_ref() {
@@ -293,6 +307,7 @@ mod tests {
         assert!(backends.leases().postgres().is_none());
         assert!(backends.read().auth_api_keys().is_none());
         assert!(backends.read().auth_modules().is_none());
+        assert!(backends.read().asset_library().is_none());
         assert!(backends.read().billing().is_none());
         assert!(backends.read().gemini_file_mappings().is_none());
         assert!(backends.read().global_models().is_none());
@@ -307,6 +322,7 @@ mod tests {
         #[cfg(feature = "postgres")]
         assert!(backends.transactions().postgres().is_none());
         assert!(backends.write().settlement().is_none());
+        assert!(backends.write().asset_library().is_none());
         assert!(backends.write().usage().is_none());
     }
 
@@ -339,6 +355,7 @@ mod tests {
         assert!(backends.leases().postgres().is_some());
         assert!(backends.read().auth_api_keys().is_some());
         assert!(backends.read().auth_modules().is_some());
+        assert!(backends.read().asset_library().is_some());
         assert!(backends.read().billing().is_some());
         assert!(backends.read().gemini_file_mappings().is_some());
         assert!(backends.read().global_models().is_some());
@@ -355,6 +372,7 @@ mod tests {
         assert!(backends.read().wallets().is_some());
         assert!(backends.transactions().postgres().is_some());
         assert!(backends.write().auth_modules().is_some());
+        assert!(backends.write().asset_library().is_some());
         assert!(backends.write().gemini_file_mappings().is_some());
         assert!(backends.write().management_tokens().is_some());
         assert!(backends.write().oauth_providers().is_some());
@@ -391,6 +409,7 @@ mod tests {
         assert!(backends.read().announcements().is_some());
         assert!(backends.read().auth_api_keys().is_some());
         assert!(backends.read().auth_modules().is_some());
+        assert!(backends.read().asset_library().is_some());
         assert!(backends.read().billing().is_some());
         assert!(backends.read().gemini_file_mappings().is_some());
         assert!(backends.read().global_models().is_some());
@@ -409,6 +428,7 @@ mod tests {
         assert!(backends.write().announcements().is_some());
         assert!(backends.write().auth_api_keys().is_some());
         assert!(backends.write().auth_modules().is_some());
+        assert!(backends.write().asset_library().is_some());
         assert!(backends.write().gemini_file_mappings().is_some());
         assert!(backends.write().global_models().is_some());
         assert!(backends.write().management_tokens().is_some());
@@ -446,6 +466,7 @@ mod tests {
         assert!(backends.read().announcements().is_some());
         assert!(backends.read().auth_api_keys().is_some());
         assert!(backends.read().auth_modules().is_some());
+        assert!(backends.read().asset_library().is_some());
         assert!(backends.read().billing().is_some());
         assert!(backends.read().gemini_file_mappings().is_some());
         assert!(backends.read().global_models().is_some());
@@ -463,6 +484,7 @@ mod tests {
         assert!(backends.write().announcements().is_some());
         assert!(backends.write().auth_api_keys().is_some());
         assert!(backends.write().auth_modules().is_some());
+        assert!(backends.write().asset_library().is_some());
         assert!(backends.write().gemini_file_mappings().is_some());
         assert!(backends.write().global_models().is_some());
         assert!(backends.write().management_tokens().is_some());

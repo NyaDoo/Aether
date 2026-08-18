@@ -161,6 +161,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 let auth_context = crate::control::resolve_execution_runtime_auth_context(
                     state,
                     &synthetic_decision,
+                    &http::Method::POST,
                     &headers,
                     &uri,
                     payload

@@ -49,7 +49,77 @@
             </SelectContent>
           </Select>
         </div>
-        <div :class="showAuthTypeSelector ? 'col-span-2' : undefined">
+        <div
+          v-if="form.auth_type === 'volc_aksk'"
+          class="col-span-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.04] p-3"
+        >
+          <div class="mb-3 flex items-start justify-between gap-3">
+            <div>
+              <p class="text-sm font-medium text-foreground">
+                Volcengine AK/SK
+              </p>
+              <p class="mt-0.5 text-xs leading-5 text-muted-foreground">
+                {{ volcAkSkDescription }}
+              </p>
+            </div>
+            <span class="rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
+              HMAC-SHA256
+            </span>
+          </div>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <div>
+              <Label :for="volcAccessKeyIdInputId">Access Key ID {{ volcAkSkRequiredMark }}</Label>
+              <Input
+                :id="volcAccessKeyIdInputId"
+                v-model="form.volc_access_key_id"
+                :name="volcAccessKeyIdFieldName"
+                masked
+                :placeholder="editingKey ? '留空表示不修改' : 'AKLT...'"
+              />
+            </div>
+            <div>
+              <Label :for="volcSecretAccessKeyInputId">Secret Access Key {{ volcAkSkRequiredMark }}</Label>
+              <Input
+                :id="volcSecretAccessKeyInputId"
+                v-model="form.volc_secret_access_key"
+                :name="volcSecretAccessKeyFieldName"
+                masked
+                :placeholder="editingKey ? '留空表示不修改' : '请输入 SK'"
+              />
+            </div>
+            <div>
+              <Label :for="volcSecurityTokenInputId">Security Token</Label>
+              <Input
+                :id="volcSecurityTokenInputId"
+                v-model="form.volc_security_token"
+                masked
+                placeholder="可选，临时凭据时填写"
+              />
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <Label :for="volcRegionInputId">Region</Label>
+                <Input
+                  :id="volcRegionInputId"
+                  v-model="form.volc_region"
+                  placeholder="cn-beijing"
+                />
+              </div>
+              <div>
+                <Label :for="volcServiceInputId">Service</Label>
+                <Input
+                  :id="volcServiceInputId"
+                  v-model="form.volc_service"
+                  placeholder="ark"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+        <div
+          v-else
+          :class="showAuthTypeSelector ? 'col-span-2' : undefined"
+        >
           <Label :for="apiKeyInputId">
             {{ authSecretLabel }}
             {{ authSecretRequiredMark }}
@@ -85,6 +155,70 @@
           >
             {{ legacyT('留空表示不修改') }}
           </p>
+        </div>
+      </div>
+
+      <div
+        v-if="showArkAccountBindingFields"
+        class="rounded-xl border border-sky-500/25 bg-sky-500/[0.04] p-3"
+      >
+        <div class="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <p class="text-sm font-medium text-foreground">
+              {{ legacyT('Ark 账号与项目') }}
+            </p>
+            <p class="mt-0.5 text-xs leading-5 text-muted-foreground">
+              {{ arkAccountBindingDescription }}
+            </p>
+          </div>
+          <span class="rounded-full border border-sky-500/25 bg-sky-500/10 px-2 py-0.5 font-mono text-[10px] font-medium text-sky-700 dark:text-sky-300">
+            auth_config
+          </span>
+        </div>
+        <div class="grid gap-3 sm:grid-cols-2">
+          <div>
+            <Label :for="arkAccountIdInputId">Ark Account ID (account_id)</Label>
+            <Input
+              :id="arkAccountIdInputId"
+              v-model="form.ark_account_id"
+              autocomplete="off"
+              :placeholder="editingKey ? legacyT('留空表示保留原值') : legacyT('请输入 Ark Account ID')"
+            />
+          </div>
+          <div>
+            <Label :for="arkProjectInputId">Ark Project (project)</Label>
+            <Input
+              :id="arkProjectInputId"
+              v-model="form.ark_project"
+              autocomplete="off"
+              :placeholder="editingKey ? legacyT('留空表示保留原值') : legacyT('请输入 Ark Project')"
+            />
+          </div>
+          <div
+            v-if="showArkApiKeyHeaderField"
+            class="sm:col-span-2"
+          >
+            <Label :for="arkApiKeyHeaderSelectId">{{ legacyT('上游 API Key 请求头') }}</Label>
+            <Select
+              v-model="form.ark_api_key_header"
+              data-ark-api-key-header
+            >
+              <SelectTrigger :id="arkApiKeyHeaderSelectId">
+                <SelectValue :placeholder="legacyT('留空表示保留原值')" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="x-api-key">
+                  X-Api-Key
+                </SelectItem>
+                <SelectItem value="api-key">
+                  Api-Key
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p class="mt-1 text-xs leading-5 text-muted-foreground">
+              {{ legacyT('仅用于 doubao:asset_library 的第三方 API Key 中转。') }}
+            </p>
+          </div>
         </div>
       </div>
 
@@ -125,7 +259,7 @@
               role="tooltip"
               class="absolute left-0 top-full z-[100] mt-1 w-80 rounded-md border bg-popover px-3 py-2 text-xs font-normal normal-case leading-5 tracking-normal text-popover-foreground shadow-md"
             >
-              {{ legacyT('选择此密钥支持的 API 格式及对应认证方式。OpenAI 格式固定使用 Bearer Token；Claude / Gemini 格式可选 API Key 或 Bearer Token（如 Claude Code 应使用 Bearer Token）。') }}
+              {{ apiFormatHelpText }}
             </span>
           </span>
         </div>
@@ -161,7 +295,7 @@
                 @click.stop
               >
                 <button
-                  v-for="opt in authTypeOptions.filter(o => isRawSecretAuthType(o.value))"
+                  v-for="opt in rawSecretAuthTypeOptions"
                   :key="opt.value"
                   type="button"
                   class="flex items-center gap-1 text-[10px] leading-none transition-colors"
@@ -381,15 +515,18 @@ import {
   addProviderKey,
   updateProviderKey,
   sortApiFormats,
+  API_FORMATS,
+  type ArkApiKeyHeader,
   type EndpointAPIKey,
   type EndpointAPIKeyUpdate,
+  type ProviderKeyAuthConfig,
   type ProviderEndpoint,
   type ProviderType
 } from '@/api/endpoints'
 import { formatApiFormat, normalizeApiFormatAlias, formatSupportsAuthOverride } from '@/api/endpoints/types/api-format'
 
 type RawSecretAuthType = 'api_key' | 'bearer'
-type ProviderKeyFormAuthType = RawSecretAuthType | 'service_account'
+type ProviderKeyFormAuthType = RawSecretAuthType | 'service_account' | 'volc_aksk'
 
 interface AuthTypeOption {
   value: ProviderKeyFormAuthType
@@ -428,7 +565,24 @@ function normalizeFormAuthType(authType: string | null | undefined): ProviderKey
   const normalized = (authType || '').trim().toLowerCase()
   if (normalized === 'bearer') return 'bearer'
   if (normalized === 'service_account' || normalized === 'vertex_ai') return 'service_account'
+  if (normalized === 'volc_aksk' || normalized === 'volcengine_aksk' || normalized === 'aksk') return 'volc_aksk'
   return 'api_key'
+}
+
+function providerSupportsVolcAkSk(): boolean {
+  if (normalizeFormAuthType(props.editingKey?.auth_type) === 'volc_aksk') return true
+  return props.availableApiFormats.some(format => normalizeApiFormat(format) === API_FORMATS.DOUBAO_ASSET_LIBRARY)
+}
+
+function isArkAccountBindingFormat(format: string): boolean {
+  const normalized = normalizeApiFormat(format)
+  return normalized === API_FORMATS.DOUBAO_ASSET_LIBRARY
+    || normalized === API_FORMATS.DOUBAO_VIDEO
+}
+
+function providerSupportsArkAccountBinding(): boolean {
+  return props.availableApiFormats.some(isArkAccountBindingFormat)
+    || Boolean(props.editingKey?.api_formats?.some(isArkAccountBindingFormat))
 }
 
 function getAuthTypeOptions(providerType: ProviderType | null): AuthTypeOption[] {
@@ -439,10 +593,14 @@ function getAuthTypeOptions(providerType: ProviderType | null): AuthTypeOption[]
     ]
   }
 
-  return [
+  const options: AuthTypeOption[] = [
     { value: 'api_key', label: 'API Key' },
     { value: 'bearer', label: 'Bearer Token' },
   ]
+  if (providerSupportsVolcAkSk()) {
+    options.push({ value: 'volc_aksk', label: 'Volcengine AK/SK' })
+  }
+  return options
 }
 
 function getVertexAllowedFormatsByAuth(authType: ProviderKeyFormAuthType): Set<string> {
@@ -461,6 +619,9 @@ function normalizeApiFormat(format: string): string {
 
 function getSelectableApiFormats(authType = form.value.auth_type): string[] {
   const sorted = sortApiFormats(props.availableApiFormats)
+  if (authType === 'volc_aksk') {
+    return sorted.filter(format => normalizeApiFormat(format) === API_FORMATS.DOUBAO_ASSET_LIBRARY)
+  }
   if (props.providerType !== 'vertex_ai') {
     return sorted
   }
@@ -535,11 +696,27 @@ function getDefaultApiFormats(): string[] {
 const visibleApiFormats = computed(() => getSelectableApiFormats())
 
 const authTypeOptions = computed(() => getAuthTypeOptions(props.providerType))
-const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai')
+const rawSecretAuthTypeOptions = computed(() => authTypeOptions.value.filter(
+  (option): option is AuthTypeOption & { value: RawSecretAuthType } => isRawSecretAuthType(option.value),
+))
+const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai' || providerSupportsArkAccountBinding())
+const showArkAccountBindingFields = computed(() =>
+  (isRawSecretAuthType(form.value.auth_type) || form.value.auth_type === 'volc_aksk')
+  && form.value.api_formats.some(isArkAccountBindingFormat)
+)
+const showArkApiKeyHeaderField = computed(() =>
+  form.value.api_formats.some(format =>
+    normalizeApiFormat(format) === API_FORMATS.DOUBAO_ASSET_LIBRARY
+    && getFormatAuthType(format) === 'api_key'
+  )
+)
 
 const apiFormatHelpOpen = ref(false)
 const apiFormatHelpHovered = ref(false)
 const apiFormatHelpVisible = computed(() => apiFormatHelpOpen.value || apiFormatHelpHovered.value)
+const apiFormatHelpText = computed(() => providerSupportsVolcAkSk()
+  ? legacyT('Ark 素材库支持 Volcengine AK/SK、Bearer Token 或 API Key；AK/SK 仅用于 doubao:asset_library。其他格式继续使用现有 Relay 认证方式。')
+  : legacyT('选择此密钥支持的 API 格式及对应认证方式。OpenAI 格式固定使用 Bearer Token；Claude / Gemini 格式可选 API Key 或 Bearer Token（如 Claude Code 应使用 Bearer Token）。'))
 
 function toggleApiFormatHelp() {
   apiFormatHelpOpen.value = !apiFormatHelpOpen.value
@@ -564,6 +741,25 @@ const authSecretRequiredMark = computed(() => {
   }
   return ''
 })
+
+const switchingToVolcAkSk = computed(() =>
+  !!props.editingKey
+  && normalizeFormAuthType(props.editingKey.auth_type) !== 'volc_aksk'
+  && form.value.auth_type === 'volc_aksk'
+)
+
+const volcAkSkRequiresCredentials = computed(() => !props.editingKey || switchingToVolcAkSk.value)
+const volcAkSkRequiredMark = computed(() => volcAkSkRequiresCredentials.value ? '*' : '')
+const volcAkSkDescription = computed(() => legacyT(
+  props.editingKey && !switchingToVolcAkSk.value
+    ? 'AK 与 SK 留空表示保持原凭据；填写时必须成对更新。Region 默认 cn-beijing，Service 默认 ark。'
+    : '用于火山方舟素材库请求签名。AK 与 SK 必须成对填写；临时凭据可附带 Security Token。',
+))
+const arkAccountBindingDescription = computed(() => legacyT(
+  props.editingKey
+    ? '用于关联 Ark 素材与 Doubao 视频凭据；留空表示保留现有值，仅填写的字段会更新。'
+    : '用于关联 Ark 素材与 Doubao 视频凭据；填写后将保存到 auth_config。',
+))
 
 
 
@@ -682,9 +878,15 @@ const canSave = computed(() => {
   // 新增模式下根据认证类型判断必填字段
   if (!props.editingKey) {
     if (form.value.auth_type === 'service_account' && !form.value.auth_config_text.trim()) return false
+    if (form.value.auth_type === 'volc_aksk'
+      && (!form.value.volc_access_key_id.trim() || !form.value.volc_secret_access_key.trim())) return false
   } else {
     // 编辑模式下切换认证类型时，必须填写对应字段
     if (switchingToServiceAccount.value && !form.value.auth_config_text.trim()) return false
+    if (switchingToVolcAkSk.value
+      && (!form.value.volc_access_key_id.trim() || !form.value.volc_secret_access_key.trim())) return false
+    if (form.value.auth_type === 'volc_aksk'
+      && Boolean(form.value.volc_access_key_id.trim()) !== Boolean(form.value.volc_secret_access_key.trim())) return false
   }
   // 必须至少选择一个 API 格式
   if (form.value.api_formats.length === 0) return false
@@ -699,6 +901,16 @@ const apiKeyInputId = computed(() => `api-key-${formNonce.value}`)
 const authTypeSelectId = computed(() => `auth-type-${formNonce.value}`)
 const keyNameFieldName = computed(() => `key-name-field-${formNonce.value}`)
 const apiKeyFieldName = computed(() => `api-key-field-${formNonce.value}`)
+const volcAccessKeyIdInputId = computed(() => `volc-access-key-id-${formNonce.value}`)
+const volcSecretAccessKeyInputId = computed(() => `volc-secret-access-key-${formNonce.value}`)
+const volcSecurityTokenInputId = computed(() => `volc-security-token-${formNonce.value}`)
+const volcRegionInputId = computed(() => `volc-region-${formNonce.value}`)
+const volcServiceInputId = computed(() => `volc-service-${formNonce.value}`)
+const arkAccountIdInputId = computed(() => `ark-account-id-${formNonce.value}`)
+const arkProjectInputId = computed(() => `ark-project-${formNonce.value}`)
+const arkApiKeyHeaderSelectId = computed(() => `ark-api-key-header-${formNonce.value}`)
+const volcAccessKeyIdFieldName = computed(() => `volc-access-key-id-field-${formNonce.value}`)
+const volcSecretAccessKeyFieldName = computed(() => `volc-secret-access-key-field-${formNonce.value}`)
 
 // 新增密钥时默认不自动开启上游模型获取
 const defaultAutoFetchModels = computed(() => false)
@@ -710,6 +922,14 @@ const form = ref({
   auth_type_by_format: {} as Record<string, RawSecretAuthType>,
   allow_auth_channel_mismatch_formats: [] as string[],
   auth_config_text: '',  // Service Account JSON 文本（用于表单输入）
+  volc_access_key_id: '',
+  volc_secret_access_key: '',
+  volc_security_token: '',
+  volc_region: 'cn-beijing',
+  volc_service: 'ark',
+  ark_account_id: '',
+  ark_project: '',
+  ark_api_key_header: 'x-api-key' as ArkApiKeyHeader | '',
   api_formats: [] as string[],  // 支持的 API 格式列表
   rate_multipliers: {} as Record<string, number>,  // 按 API 格式的成本倍率
   internal_priority: 10,
@@ -733,8 +953,13 @@ watch(
       return
     }
 
-    const filtered = sanitizeApiFormats(form.value.api_formats)
-    if (filtered.length !== form.value.api_formats.length) {
+    let filtered = sanitizeApiFormats(form.value.api_formats)
+    if (filtered.length === 0) {
+      const fallback = getSelectableApiFormats()[0]
+      filtered = fallback ? [fallback] : []
+    }
+    if (filtered.length !== form.value.api_formats.length
+      || filtered.some((format, index) => format !== form.value.api_formats[index])) {
       form.value.api_formats = [...filtered]
     }
     form.value.auth_type_by_format = sanitizeAuthTypeByFormat(form.value.auth_type_by_format)
@@ -804,6 +1029,14 @@ function resetForm() {
     allow_auth_channel_mismatch_formats:
       getDefaultAllowAuthChannelMismatchFormats(defaultApiFormats),
     auth_config_text: '',
+    volc_access_key_id: '',
+    volc_secret_access_key: '',
+    volc_security_token: '',
+    volc_region: 'cn-beijing',
+    volc_service: 'ark',
+    ark_account_id: '',
+    ark_project: '',
+    ark_api_key_header: 'x-api-key',
     api_formats: defaultApiFormats,
     rate_multipliers: {},
     internal_priority: 10,
@@ -825,6 +1058,12 @@ function clearForNextAdd() {
   form.value.name = ''
   form.value.api_key = ''
   form.value.auth_config_text = ''
+  form.value.volc_access_key_id = ''
+  form.value.volc_secret_access_key = ''
+  form.value.volc_security_token = ''
+  form.value.ark_account_id = ''
+  form.value.ark_project = ''
+  form.value.ark_api_key_header = 'x-api-key'
   form.value.auth_type_by_format = sanitizeAuthTypeByFormat(form.value.auth_type_by_format)
   form.value.allow_auth_channel_mismatch_formats = sanitizeAllowAuthChannelMismatchFormats(
     form.value.allow_auth_channel_mismatch_formats
@@ -849,6 +1088,14 @@ function loadKeyData() {
       props.editingKey.api_formats || []
     ),
     auth_config_text: '',  // auth_config 不返回给前端，编辑时需要重新输入
+    volc_access_key_id: '',
+    volc_secret_access_key: '',
+    volc_security_token: '',
+    volc_region: 'cn-beijing',
+    volc_service: 'ark',
+    ark_account_id: '',
+    ark_project: '',
+    ark_api_key_header: '',
     api_formats: props.editingKey.api_formats?.length > 0
       ? sanitizeApiFormats(
         props.editingKey.api_formats,
@@ -895,15 +1142,46 @@ function parsePatternText(text: string): string[] {
   return [...new Set(patterns)]
 }
 
-// 解析 Service Account JSON 文本
-function parseAuthConfig(): Record<string, unknown> | null {
-  if (form.value.auth_type !== 'service_account') return null
-  const text = form.value.auth_config_text.trim()
-  if (!text) return null
-  try {
-    return JSON.parse(text)
-  } catch {
-    return null
+// 解析结构化认证配置
+function parseAuthConfig(): ProviderKeyAuthConfig | null {
+  if (form.value.auth_type === 'service_account') {
+    const text = form.value.auth_config_text.trim()
+    if (!text) return null
+    try {
+      return JSON.parse(text)
+    } catch {
+      return null
+    }
+  }
+
+  const arkAccountBinding: ProviderKeyAuthConfig = {}
+  if (showArkAccountBindingFields.value) {
+    const accountId = form.value.ark_account_id.trim()
+    const project = form.value.ark_project.trim()
+    if (accountId) arkAccountBinding.account_id = accountId
+    if (project) arkAccountBinding.project = project
+  }
+  if (showArkApiKeyHeaderField.value && form.value.ark_api_key_header) {
+    arkAccountBinding.api_key_header = form.value.ark_api_key_header
+  }
+
+  if (form.value.auth_type !== 'volc_aksk') {
+    return Object.keys(arkAccountBinding).length > 0 ? arkAccountBinding : null
+  }
+  const accessKeyId = form.value.volc_access_key_id.trim()
+  const secretAccessKey = form.value.volc_secret_access_key.trim()
+  if (!accessKeyId && !secretAccessKey) {
+    return Object.keys(arkAccountBinding).length > 0 ? arkAccountBinding : null
+  }
+  return {
+    ...arkAccountBinding,
+    access_key_id: accessKeyId,
+    secret_access_key: secretAccessKey,
+    ...(form.value.volc_security_token.trim()
+      ? { security_token: form.value.volc_security_token.trim() }
+      : {}),
+    region: form.value.volc_region.trim() || 'cn-beijing',
+    service: form.value.volc_service.trim() || 'ark',
   }
 }
 
@@ -936,6 +1214,18 @@ async function handleSave() {
         showError(legacyT('Service Account JSON 缺少必要字段 (client_email, private_key, project_id)'), legacyT('验证失败'))
         return
       }
+    }
+  }
+  if (form.value.auth_type === 'volc_aksk') {
+    const accessKeyId = form.value.volc_access_key_id.trim()
+    const secretAccessKey = form.value.volc_secret_access_key.trim()
+    if (volcAkSkRequiresCredentials.value && (!accessKeyId || !secretAccessKey)) {
+      showError(legacyT('请输入完整的 Volcengine Access Key ID 与 Secret Access Key'), legacyT('验证失败'))
+      return
+    }
+    if (Boolean(accessKeyId) !== Boolean(secretAccessKey)) {
+      showError(legacyT('Volcengine Access Key ID 与 Secret Access Key 必须成对填写'), legacyT('验证失败'))
+      return
     }
   }
 
@@ -997,7 +1287,7 @@ async function handleSave() {
       if (isRawSecretAuthType(form.value.auth_type) && form.value.api_key.trim()) {
         updateData.api_key = form.value.api_key
       }
-      if (form.value.auth_type === 'service_account' && authConfig) {
+      if (authConfig) {
         updateData.auth_config = authConfig
       }
 
@@ -1007,7 +1297,7 @@ async function handleSave() {
       // 新增模式
       await addProviderKey(props.providerId, {
         api_formats: form.value.api_formats,
-        api_key: form.value.api_key,
+        api_key: isRawSecretAuthType(form.value.auth_type) ? form.value.api_key : '',
         auth_type: form.value.auth_type,
         auth_type_by_format: authTypeByFormat,
         allow_auth_channel_mismatch_formats: allowAuthChannelMismatchFormats,

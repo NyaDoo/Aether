@@ -4,10 +4,17 @@ use std::collections::BTreeMap;
 pub(super) use aether_admin::provider::ops::ProviderOpsCheckinOutcome as AdminProviderOpsCheckinOutcome;
 
 pub(super) const ADMIN_PROVIDER_OPS_SENSITIVE_FIELDS: &[&str] = &[
+    "access_key",
+    "access_key_id",
+    "_cached_access_token",
+    "ak",
     "api_key",
     "password",
     "refresh_token",
-    "_cached_access_token",
+    "secret_access_key",
+    "secret_key",
+    "security_token",
+    "sk",
     "session_token",
     "session_cookie",
     "token_cookie",

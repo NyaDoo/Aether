@@ -237,6 +237,19 @@ fn provider_query_field_is_sensitive(key: &str) -> bool {
     ) {
         return false;
     }
+    if matches!(
+        normalized.as_str(),
+        "accesskey"
+            | "accesskeyid"
+            | "ak"
+            | "secretaccesskey"
+            | "secretkey"
+            | "securitytoken"
+            | "sessiontoken"
+            | "sk"
+    ) {
+        return true;
+    }
     matches!(
         key.as_str(),
         "authorization"
@@ -418,6 +431,8 @@ mod tests {
         let body = json!({
             "metadata": {
                 "apiKey": "devin-session-token$secret",
+                "access_key_id": "AKLT-sensitive",
+                "secret_access_key": "secret-sensitive",
                 "ideName": "windsurf"
             },
             "messages": [{"role": "user", "content": "hello"}],
@@ -428,6 +443,14 @@ mod tests {
 
         assert_eq!(
             redacted.pointer("/metadata/apiKey"),
+            Some(&json!("[REDACTED]"))
+        );
+        assert_eq!(
+            redacted.pointer("/metadata/access_key_id"),
+            Some(&json!("[REDACTED]"))
+        );
+        assert_eq!(
+            redacted.pointer("/metadata/secret_access_key"),
             Some(&json!("[REDACTED]"))
         );
         assert_eq!(

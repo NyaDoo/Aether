@@ -37,6 +37,10 @@ pub(super) fn sample_persistence(provider_api_format: &str) -> LocalVideoTaskPer
             "size": "1280x720"
         }),
         format_converted: false,
+        global_model_name: None,
+        mapped_model: None,
+        model_id: None,
+        global_model_id: None,
     }
 }
 

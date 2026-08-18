@@ -564,6 +564,7 @@ dependencies = [
  "chrono",
  "crypto_box",
  "ed25519-dalek",
+ "hmac",
  "http",
  "regex",
  "reqwest",

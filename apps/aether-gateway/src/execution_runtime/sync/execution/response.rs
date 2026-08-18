@@ -44,6 +44,81 @@ fn cloned_report_context_object(
         .unwrap_or_default()
 }
 
+fn is_openai_video_client_with_doubao_provider(payload: &GatewaySyncReportRequest) -> bool {
+    let Some(report_context) = payload
+        .report_context
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let Some(client_api_format) = report_context
+        .get("client_api_format")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(provider_api_format) = report_context
+        .get("provider_api_format")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+
+    crate::ai_serving::normalize_api_format_alias(client_api_format) == "openai:video"
+        && crate::ai_serving::normalize_api_format_alias(provider_api_format) == "doubao:video"
+}
+
+fn provider_error_field<'a>(
+    body_json: &'a serde_json::Value,
+    field_name: &str,
+) -> Option<&'a serde_json::Value> {
+    [
+        body_json.get("error"),
+        body_json.pointer("/ResponseMetadata/Error"),
+        Some(body_json),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_object)
+    .find_map(|object| {
+        object
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(field_name))
+            .map(|(_, value)| value)
+    })
+}
+
+fn provider_error_code(body_json: &serde_json::Value) -> Option<String> {
+    let code = provider_error_field(body_json, "code")?;
+    match code {
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn openai_video_error_body(body_json: &serde_json::Value) -> serde_json::Value {
+    let message = provider_error_field(body_json, "message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Video generation request failed");
+    let code = provider_error_code(body_json);
+
+    json!({
+        "error": {
+            "message": message,
+            "type": "video_generation_error",
+            "param": null,
+            "code": code,
+        }
+    })
+}
+
 fn build_local_video_success_response(
     trace_id: &str,
     decision: &GatewayControlDecision,
@@ -157,7 +232,10 @@ pub(crate) fn maybe_build_local_video_error_response(
     }
 
     let empty_body = json!({});
-    let response_body = payload.body_json.as_ref().unwrap_or(&empty_body);
+    let upstream_body = payload.body_json.as_ref().unwrap_or(&empty_body);
+    let projected_body = is_openai_video_client_with_doubao_provider(payload)
+        .then(|| openai_video_error_body(upstream_body));
+    let response_body = projected_body.as_ref().unwrap_or(upstream_body);
     let body_bytes =
         serde_json::to_vec(response_body).map_err(|err| GatewayError::Internal(err.to_string()))?;
     let body_len = body_bytes.len().to_string();
@@ -264,6 +342,117 @@ mod tests {
                 .body_json
                 .clone()
                 .expect("payload body should exist")
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_format_video_error_is_projected_to_openai_envelope() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/videos",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("video".to_string()),
+            Some("openai:video".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-cross-error".to_string(),
+            report_kind: "openai_video_create_sync_finalize".to_string(),
+            report_context: Some(json!({
+                "request_id": "req_cross_error",
+                "client_api_format": "openai:video",
+                "provider_api_format": "doubao:video",
+            })),
+            status_code: http::StatusCode::BAD_GATEWAY.as_u16(),
+            headers: BTreeMap::new(),
+            body_json: Some(json!({
+                "error": {
+                    "code": "InputImageSensitiveContentDetected",
+                    "message": "blocked by provider policy",
+                    "provider_private_detail": "must not leak",
+                },
+                "request_id": "ark-request-id",
+            })),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+        let original_body = payload.body_json.clone();
+
+        let response = maybe_build_local_video_error_response(
+            "trace-cross-error-response",
+            &decision,
+            &payload,
+        )
+        .expect("cross-format video error should build")
+        .expect("cross-format video error should match local video error kinds");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("response body should parse"),
+            json!({
+                "error": {
+                    "message": "blocked by provider policy",
+                    "type": "video_generation_error",
+                    "param": null,
+                    "code": "InputImageSensitiveContentDetected",
+                }
+            })
+        );
+        assert_eq!(payload.body_json, original_body);
+    }
+
+    #[tokio::test]
+    async fn native_doubao_video_error_keeps_provider_body_unchanged() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/contents/generations/tasks",
+            Some("ai_public".to_string()),
+            Some("doubao".to_string()),
+            Some("video".to_string()),
+            Some("doubao:video".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-doubao-error".to_string(),
+            report_kind: "doubao_video_create_sync_finalize".to_string(),
+            report_context: Some(json!({
+                "request_id": "req_doubao_error",
+                "client_api_format": "doubao:video",
+                "provider_api_format": "doubao:video",
+            })),
+            status_code: http::StatusCode::BAD_REQUEST.as_u16(),
+            headers: BTreeMap::new(),
+            body_json: Some(json!({
+                "ResponseMetadata": {
+                    "Error": {
+                        "Code": "InvalidParameter",
+                        "Message": "native Ark error",
+                    }
+                },
+                "request_id": "ark-request-id",
+            })),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+        let original_body = payload.body_json.clone();
+
+        let response = maybe_build_local_video_error_response(
+            "trace-doubao-error-response",
+            &decision,
+            &payload,
+        )
+        .expect("native Doubao video error should build")
+        .expect("native Doubao video error should match local video error kinds");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("response body should parse"),
+            original_body.expect("payload body should exist")
         );
     }
 }

@@ -178,6 +178,11 @@ fn calculate_billing_computation(
         image_size: usage_event_dimension_string(&event.data, "image_size"),
         image_quality: usage_event_dimension_string(&event.data, "image_quality"),
         image_output_format: usage_event_dimension_string(&event.data, "image_output_format"),
+        video_resolution: usage_event_dimension_string(&event.data, "video_resolution"),
+        video_duration_seconds: usage_event_dimension_i64(&event.data, "video_duration_seconds")
+            .unwrap_or_default(),
+        video_has_video_input: usage_event_dimension_bool(&event.data, "video_has_video_input")
+            .unwrap_or(false),
         cache_ttl_minutes: usage_event_provider_cache_ttl_minutes(&event.data)
             .or(pricing.provider_api_key_cache_ttl_minutes),
     };
@@ -256,6 +261,49 @@ fn usage_event_dimension_string(
     )
 }
 
+fn usage_event_dimension_i64(
+    data: &aether_usage_runtime::UsageEventData,
+    dimension_key: &str,
+) -> Option<i64> {
+    metadata_dimension_i64(data.request_metadata.as_ref(), "dimensions", dimension_key).or_else(
+        || {
+            metadata_dimension_i64(
+                data.request_metadata.as_ref(),
+                "billing_dimensions",
+                dimension_key,
+            )
+        },
+    )
+}
+
+fn usage_event_dimension_bool(
+    data: &aether_usage_runtime::UsageEventData,
+    dimension_key: &str,
+) -> Option<bool> {
+    metadata_dimension_bool(data.request_metadata.as_ref(), "dimensions", dimension_key).or_else(
+        || {
+            metadata_dimension_bool(
+                data.request_metadata.as_ref(),
+                "billing_dimensions",
+                dimension_key,
+            )
+        },
+    )
+}
+
+fn metadata_dimension_bool(
+    metadata: Option<&Value>,
+    bag_key: &str,
+    dimension_key: &str,
+) -> Option<bool> {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(bag_key))
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(dimension_key))
+        .and_then(Value::as_bool)
+}
+
 fn metadata_dimension_string(
     metadata: Option<&Value>,
     bag_key: &str,
@@ -301,8 +349,20 @@ fn apply_billing_computation(
     pricing: &BillingModelPricingSnapshot,
     computation: BillingComputation,
 ) -> Result<(), DataLayerError> {
-    event.data.total_cost_usd = Some(computation.cost_result.cost);
-    event.data.actual_total_cost_usd = Some(computation.actual_total_cost);
+    // A zero-valued computation is not necessarily a zero-priced request.  The
+    // billing service intentionally returns a numeric zero for `NoRule` and
+    // `Incomplete` so callers can inspect the calculation snapshot, but putting
+    // that value in the usage event makes the settlement layer mistake an
+    // unresolved price for a legitimate free tier.  Only a complete formula is
+    // allowed to publish monetary fields; unresolved computations remain
+    // pending and are retriable.
+    if computation.cost_result.status == BillingSnapshotStatus::Complete {
+        event.data.total_cost_usd = Some(computation.cost_result.cost);
+        event.data.actual_total_cost_usd = Some(computation.actual_total_cost);
+    } else {
+        event.data.total_cost_usd = None;
+        event.data.actual_total_cost_usd = None;
+    }
     merge_billing_snapshot_metadata(&mut event.data.request_metadata, pricing, &computation)
 }
 
@@ -326,6 +386,19 @@ fn merge_billing_snapshot_metadata(
         _ => Map::new(),
     };
     metadata.insert("billing_snapshot".to_string(), billing_snapshot);
+    // Keep a small, indexed-friendly status mirror alongside the full snapshot.
+    // The usage adapters already copy this key into the settlement snapshot, and
+    // the settlement guard uses it without having to parse the complete pricing
+    // payload.  This is deliberately written for *all* outcomes, including
+    // no_rule/incomplete, so an unresolved zero can never look settled.
+    metadata.insert(
+        "billing_snapshot_schema_version".to_string(),
+        Value::from(snapshot.schema_version.clone()),
+    );
+    metadata.insert(
+        "billing_snapshot_status".to_string(),
+        Value::from(snapshot.status.as_str()),
+    );
     metadata.insert(
         "settlement_snapshot_schema_version".to_string(),
         Value::from(SETTLEMENT_SNAPSHOT_SCHEMA_VERSION),
@@ -402,7 +475,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        enrich_usage_event_with_billing, usage_event_processing_tiers, BillingModelContextLookup,
+        enrich_usage_event_with_billing, usage_event_dimension_bool, usage_event_dimension_i64,
+        usage_event_dimension_string, usage_event_processing_tiers, BillingModelContextLookup,
     };
 
     struct TestLookup {
@@ -431,6 +505,187 @@ mod tests {
         {
             Ok(self.name_context.clone())
         }
+    }
+
+    struct NameMatchingLookup {
+        expected_name: &'static str,
+        context: StoredBillingModelContext,
+    }
+
+    #[async_trait]
+    impl BillingModelContextLookup for NameMatchingLookup {
+        async fn find_billing_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, aether_data_contracts::DataLayerError>
+        {
+            Ok((model_name == self.expected_name).then(|| self.context.clone()))
+        }
+    }
+
+    #[test]
+    fn video_dimensions_read_from_the_dimensions_bag() {
+        let data = UsageEventData {
+            request_metadata: Some(json!({
+                "dimensions": {
+                    "video_resolution": " 720p ",
+                    "video_duration_seconds": 5,
+                    "video_has_video_input": true
+                }
+            })),
+            ..UsageEventData::default()
+        };
+
+        assert_eq!(
+            usage_event_dimension_string(&data, "video_resolution").as_deref(),
+            Some("720p")
+        );
+        assert_eq!(
+            usage_event_dimension_i64(&data, "video_duration_seconds"),
+            Some(5)
+        );
+        assert_eq!(
+            usage_event_dimension_bool(&data, "video_has_video_input"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn video_dimensions_fall_back_to_the_billing_dimensions_bag() {
+        let data = UsageEventData {
+            request_metadata: Some(json!({
+                "billing_dimensions": {
+                    "video_resolution": "1080p",
+                    "video_duration_seconds": 10,
+                    "video_has_video_input": false
+                }
+            })),
+            ..UsageEventData::default()
+        };
+
+        assert_eq!(
+            usage_event_dimension_string(&data, "video_resolution").as_deref(),
+            Some("1080p")
+        );
+        assert_eq!(
+            usage_event_dimension_i64(&data, "video_duration_seconds"),
+            Some(10)
+        );
+        assert_eq!(
+            usage_event_dimension_bool(&data, "video_has_video_input"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn video_dimensions_are_absent_without_metadata() {
+        let data = UsageEventData::default();
+
+        assert!(usage_event_dimension_string(&data, "video_resolution").is_none());
+        assert!(usage_event_dimension_i64(&data, "video_duration_seconds").is_none());
+        assert!(usage_event_dimension_bool(&data, "video_has_video_input").is_none());
+    }
+
+    #[test]
+    fn video_dimensions_reject_mistyped_values_instead_of_guessing() {
+        let data = UsageEventData {
+            request_metadata: Some(json!({
+                "dimensions": {
+                    "video_resolution": "   ",
+                    "video_duration_seconds": "5",
+                    "video_has_video_input": "true"
+                }
+            })),
+            ..UsageEventData::default()
+        };
+
+        // A blank resolution and string-typed number/bool must not silently
+        // become a price lookup key or a duration.
+        assert!(usage_event_dimension_string(&data, "video_resolution").is_none());
+        assert!(usage_event_dimension_i64(&data, "video_duration_seconds").is_none());
+        assert!(usage_event_dimension_bool(&data, "video_has_video_input").is_none());
+    }
+
+    #[tokio::test]
+    async fn video_billing_uses_configured_target_when_provider_reports_a_canonical_model() {
+        let configured_model = "Doubao-Seedance-2.0";
+        let lookup = NameMatchingLookup {
+            expected_name: configured_model,
+            context: StoredBillingModelContext::new(
+                "provider-doubao".to_string(),
+                Some("pay_as_you_go".to_string()),
+                Some("key-doubao".to_string()),
+                None,
+                None,
+                "global-model-doubao".to_string(),
+                configured_model.to_string(),
+                Some(json!({
+                    "billing": {
+                        "video": {
+                            "mode": "per_token",
+                            "token_prices_by_resolution": {
+                                "1080p": {
+                                    "input_price_per_1m": 0,
+                                    "output_price_per_1m": 15
+                                }
+                            }
+                        }
+                    }
+                })),
+                None,
+                Some(json!({
+                    "tiers": [{
+                        "up_to": null,
+                        "input_price_per_1m": 0,
+                        "output_price_per_1m": 0
+                    }]
+                })),
+                Some("model-doubao".to_string()),
+                Some(configured_model.to_string()),
+                None,
+                None,
+                None,
+            )
+            .expect("billing context should build"),
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-doubao-video",
+            UsageEventData {
+                provider_name: "Doubao".to_string(),
+                // Ark reports this canonical family in the terminal task body,
+                // while dispatch and pricing are configured under the public
+                // model name carried in `target_model`.
+                model: "doubao-seedance-2-0-260128".to_string(),
+                target_model: Some(configured_model.to_string()),
+                provider_id: Some("provider-doubao".to_string()),
+                provider_api_key_id: Some("key-doubao".to_string()),
+                request_type: Some("video".to_string()),
+                api_format: Some("doubao:video".to_string()),
+                endpoint_api_format: Some("doubao:video".to_string()),
+                input_tokens: Some(0),
+                output_tokens: Some(245_025),
+                total_tokens: Some(245_025),
+                status_code: Some(200),
+                request_metadata: Some(json!({
+                    "dimensions": {
+                        "video_resolution": "1080p",
+                        "video_duration_seconds": 5,
+                        "video_has_video_input": false
+                    }
+                })),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("video billing should resolve the configured target model");
+
+        assert_eq!(event.data.total_cost_usd, Some(3.675375));
+        assert_eq!(event.data.actual_total_cost_usd, Some(3.675375));
     }
 
     #[test]
@@ -1335,6 +1590,72 @@ mod tests {
                 .and_then(|value| value.get("status"))
                 .and_then(Value::as_str),
             Some("complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_no_rule_does_not_publish_zero_cost_as_settleable() {
+        // The context exists, but it has no token/request/video pricing.  This
+        // exercises the same `NoRule` path used when a mapped video model has
+        // not been configured in the billing catalog yet.
+        let context = StoredBillingModelContext::new(
+            "provider-1".to_string(),
+            Some("pay_as_you_go".to_string()),
+            Some("key-1".to_string()),
+            None,
+            None,
+            "global-video-1".to_string(),
+            "Doubao-Seedance-2.0".to_string(),
+            None,
+            None,
+            Some(json!({"tiers": []})),
+            Some("mapped-video-1".to_string()),
+            Some("mapped-video-1".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("billing context should build");
+        let lookup = NameMatchingLookup {
+            expected_name: "mapped-video-1",
+            context,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-billing-no-rule-video-1",
+            UsageEventData {
+                provider_name: "Doubao".to_string(),
+                model: "Doubao-Seedance-2.0".to_string(),
+                target_model: Some("mapped-video-1".to_string()),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("video".to_string()),
+                api_format: Some("doubao:video".to_string()),
+                endpoint_api_format: Some("doubao:video".to_string()),
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                status_code: Some(200),
+                request_metadata: Some(json!({
+                    "dimensions": {
+                        "video_resolution": "1080p",
+                        "video_duration_seconds": 5
+                    }
+                })),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("unresolved billing should be represented, not fail enrichment");
+
+        assert_eq!(event.data.total_cost_usd, None);
+        assert_eq!(event.data.actual_total_cost_usd, None);
+        let metadata = event.data.request_metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["billing_snapshot_status"], json!("no_rule"));
+        assert_eq!(
+            metadata.pointer("/billing_snapshot/status"),
+            Some(&json!("no_rule"))
         );
     }
 }

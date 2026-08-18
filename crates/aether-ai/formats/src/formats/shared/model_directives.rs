@@ -804,7 +804,11 @@ pub fn extract_gemini_model_from_path(path: &str) -> Option<String> {
     let marker = "/models/";
     let start = path.find(marker)? + marker.len();
     let tail = &path[start..];
-    let end = tail.find(':').unwrap_or(tail.len());
+    // Generation methods use `model:method`, while long-running operation
+    // resources use `model/operations/id`.  In both cases only the first path
+    // segment is the requested model; including the operation suffix makes a
+    // valid model allowlist reject authenticated task reads/cancellations.
+    let end = tail.find([':', '/']).unwrap_or(tail.len());
     let model = tail[..end].trim();
     (!model.is_empty()).then(|| model.to_string())
 }
@@ -815,10 +819,23 @@ mod tests {
 
     use super::{
         apply_model_directive_overrides_from_model, default_model_directive_suffixes,
-        default_model_directives_config, parse_model_directive,
+        default_model_directives_config, extract_gemini_model_from_path, parse_model_directive,
         parse_model_directive_with_suffixes, ModelDirective, ModelDirectiveSuffixResolution,
         ModelOverride, ReasoningEffort, ServiceTier, MODEL_DIRECTIVE_API_FORMATS,
     };
+
+    #[test]
+    fn gemini_model_extraction_stops_before_long_running_operation_resource() {
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/veo-3/operations/local-operation-id")
+                .as_deref(),
+            Some("veo-3")
+        );
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/veo-3:predictLongRunning").as_deref(),
+            Some("veo-3")
+        );
+    }
 
     #[test]
     fn policy_suffix_parser_prefers_the_longest_configured_suffix() {

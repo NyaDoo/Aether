@@ -10,7 +10,10 @@ use axum::{extract::Request, Json, Router};
 use http::StatusCode;
 use serde_json::json;
 
-use super::{build_router_with_state, build_state_with_execution_runtime_override, start_server};
+use super::{
+    build_router_with_state, build_state_with_execution_runtime_override, start_server,
+    video_auth_repository,
+};
 
 #[tokio::test]
 async fn gateway_reads_openai_video_task_via_data_read_side_without_hitting_public_route() {
@@ -93,20 +96,40 @@ async fn gateway_reads_openai_video_task_via_data_read_side_without_hitting_publ
         .await
         .expect("upsert should succeed");
 
+    let auth_repository = video_auth_repository(
+        "client-openai-video-db-key",
+        "api-key-video-db-123",
+        "user-video-db-123",
+        "openai",
+        "openai:video",
+        "sora-2",
+    );
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(upstream_url.clone())
-            .with_video_task_data_reader_for_tests(repository),
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_auth_and_video_task_repository_for_tests(
+                    auth_repository,
+                    repository,
+                ),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
         .get(format!("{gateway_url}/v1/videos/task-db-123"))
+        .bearer_auth("client-openai-video-db-key")
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.expect("body should parse");
+    let response_status = response.status();
+    let response_text = response.text().await.expect("body should read");
+    assert_eq!(
+        response_status,
+        StatusCode::OK,
+        "unexpected OpenAI data-read response: {response_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&response_text).expect("body should parse");
     assert_eq!(body["id"], "task-db-123");
     assert_eq!(body["status"], "processing");
     assert_eq!(body["progress"], 45);
@@ -212,9 +235,22 @@ async fn gateway_reads_gemini_video_task_via_data_read_side_without_hitting_publ
         .await
         .expect("upsert should succeed");
 
+    let auth_repository = video_auth_repository(
+        "client-gemini-video-db-key",
+        "api-key-video-db-123",
+        "user-video-db-123",
+        "gemini",
+        "gemini:video",
+        "veo-3",
+    );
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(upstream_url.clone())
-            .with_video_task_data_reader_for_tests(repository),
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_auth_and_video_task_repository_for_tests(
+                    auth_repository,
+                    repository,
+                ),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -222,12 +258,19 @@ async fn gateway_reads_gemini_video_task_via_data_read_side_without_hitting_publ
         .get(format!(
             "{gateway_url}/v1beta/models/veo-3/operations/localshort123"
         ))
+        .header("x-goog-api-key", "client-gemini-video-db-key")
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await.expect("body should parse");
+    let response_status = response.status();
+    let response_text = response.text().await.expect("body should read");
+    assert_eq!(
+        response_status,
+        StatusCode::OK,
+        "unexpected Gemini data-read response: {response_text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&response_text).expect("body should parse");
     assert_eq!(body["name"], "models/veo-3/operations/localshort123");
     assert_eq!(body["done"], true);
     assert_eq!(

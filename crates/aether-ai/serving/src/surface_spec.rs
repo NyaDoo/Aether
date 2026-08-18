@@ -114,16 +114,23 @@ pub const fn ai_requested_model_family_for_video_create(
     family: LocalVideoCreateFamily,
 ) -> AiRequestedModelFamily {
     match family {
-        LocalVideoCreateFamily::OpenAi => AiRequestedModelFamily::Standard,
+        // Doubao carries the model in the request body, same as OpenAI.
+        LocalVideoCreateFamily::OpenAi | LocalVideoCreateFamily::Doubao => {
+            AiRequestedModelFamily::Standard
+        }
         LocalVideoCreateFamily::Gemini => AiRequestedModelFamily::Gemini,
     }
 }
 
 pub fn extract_ai_gemini_model_from_path(path: &str) -> Option<String> {
     let (_, suffix) = path.split_once("/models/")?;
+    // Long-running operation resources are addressed as
+    // `/models/{model}/operations/{id}`, while generation methods use
+    // `/models/{model}:{method}`.  Authorization/model allowlists must see
+    // only `{model}` for either form.
     let model = suffix
-        .split_once(':')
-        .map(|(value, _)| value)
+        .find([':', '/'])
+        .map(|index| &suffix[..index])
         .unwrap_or(suffix);
     let model = model.trim();
     if model.is_empty() {
@@ -211,6 +218,14 @@ mod tests {
         );
 
         assert_eq!(model.as_deref(), Some("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn gemini_model_path_parser_trims_long_running_operation_suffix() {
+        let model =
+            extract_ai_gemini_model_from_path("/v1beta/models/veo-3/operations/local-operation-id");
+
+        assert_eq!(model.as_deref(), Some("veo-3"));
     }
 
     #[test]

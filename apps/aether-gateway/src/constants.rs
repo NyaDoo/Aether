@@ -58,6 +58,11 @@ pub(crate) const TRUSTED_AUTH_USER_ID_HEADER: &str = "x-aether-auth-user-id";
 pub(crate) const TRUSTED_AUTH_API_KEY_ID_HEADER: &str = "x-aether-auth-api-key-id";
 pub(crate) const TRUSTED_AUTH_BALANCE_HEADER: &str = "x-aether-auth-balance-remaining";
 pub(crate) const TRUSTED_AUTH_ACCESS_ALLOWED_HEADER: &str = "x-aether-auth-access-allowed";
+pub(crate) const INTERNAL_FORWARD_AUTH_TIMESTAMP_HEADER: &str =
+    "x-aether-internal-forward-timestamp";
+pub(crate) const INTERNAL_FORWARD_AUTH_NONCE_HEADER: &str = "x-aether-internal-forward-nonce";
+pub(crate) const INTERNAL_FORWARD_AUTH_SIGNATURE_HEADER: &str =
+    "x-aether-internal-forward-signature";
 pub(crate) const TRUSTED_ADMIN_USER_ID_HEADER: &str = "x-aether-admin-user-id";
 pub(crate) const TRUSTED_ADMIN_USER_ROLE_HEADER: &str = "x-aether-admin-user-role";
 pub(crate) const TRUSTED_ADMIN_SESSION_ID_HEADER: &str = "x-aether-admin-session-id";
@@ -137,6 +142,8 @@ pub(crate) const RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS: &[&str] = &[
     "/v1beta/operations/{id}",
     "/v1/videos",
     "/v1/videos/{path...}",
+    "/v3/contents/generations/tasks",
+    "/v3/contents/generations/tasks/{path...}",
     "/upload/v1beta/files",
     "/v1beta/files",
     "/v1beta/files/{path...}",

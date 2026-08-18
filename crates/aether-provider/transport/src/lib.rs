@@ -1,6 +1,7 @@
 mod agent_identity;
 mod anthropic_compat;
 pub mod antigravity;
+pub mod ark_assets;
 pub mod auth;
 mod auth_config;
 mod cache;
@@ -52,6 +53,13 @@ pub use agent_identity::{
 pub use anthropic_compat::{
     resolve_anthropic_compatibility_profile, validate_anthropic_compatibility_profile_config,
     AnthropicCompatibilityProfile, AnthropicCompatibilityProfileConfigError,
+};
+pub use ark_assets::{
+    apply_volc_action_signature, build_volc_action_request, build_volc_action_url,
+    normalize_volc_action_auth_type, resolve_volc_action_auth, VolcActionAuth, VolcActionRequest,
+    VolcActionRequestInput, VolcActionSignature, VolcActionTransportError, VolcAkSkCredentials,
+    ARK_ASSET_API_FORMAT, ARK_ASSET_REQUIRED_CAPABILITY, VOLC_ACTION_DEFAULT_BASE_URL,
+    VOLC_ACTION_DEFAULT_REGION, VOLC_ACTION_DEFAULT_SERVICE, VOLC_ACTION_VERSION,
 };
 pub use auth::{build_passthrough_headers, ensure_upstream_auth_header};
 pub use auth_config::apply_local_auth_config_header_overrides;
@@ -174,7 +182,8 @@ pub use vertex::{
     is_vertex_transport_context, uses_vertex_api_key_query_auth,
 };
 pub use video::{
-    build_video_create_headers, build_video_create_request_body, build_video_create_upstream_url,
+    build_video_create_headers, build_video_create_request_body,
+    build_video_create_request_body_for_client, build_video_create_upstream_url,
     reconstruct_local_video_task_snapshot, resolve_local_video_task_transport,
     resolve_video_create_auth, video_create_transport_unsupported_reason,
     ProviderVideoCreateFamily, ProviderVideoCreateHeadersInput, VideoTaskTransportSnapshotLookup,

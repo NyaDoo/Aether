@@ -7,9 +7,20 @@ use crate::ai_serving::ApiOperation;
 pub(super) fn classify_ai_public_route(
     method: &http::Method,
     normalized_path: &str,
+    query: Option<&str>,
     headers: &http::HeaderMap,
 ) -> Option<ClassifiedRoute> {
-    if let Some(route) = classify_antigravity_v1internal_route(method, normalized_path) {
+    if is_ark_asset_library_request(method, normalized_path, query) {
+        let request_auth_channel = ark_asset_request_auth_channel(headers);
+        Some(classified_with_request_auth_channel(
+            "ai_public",
+            "doubao",
+            "asset_library",
+            request_auth_channel,
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+            false,
+        ))
+    } else if let Some(route) = classify_antigravity_v1internal_route(method, normalized_path) {
         Some(route)
     } else if method == http::Method::POST && normalized_path == "/v1/chat/completions" {
         Some(classified(
@@ -115,6 +126,14 @@ pub(super) fn classify_ai_public_route(
             "openai:video",
             true,
         ))
+    } else if normalized_path.starts_with(aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH) {
+        Some(classified(
+            "ai_public",
+            "doubao",
+            "video",
+            "doubao:video",
+            true,
+        ))
     } else if method == http::Method::POST
         && matches!(normalized_path, "/v1/interactions" | "/v1beta/interactions")
     {
@@ -186,6 +205,36 @@ pub(super) fn classify_ai_public_route(
     } else {
         None
     }
+}
+
+fn ark_asset_request_auth_channel(headers: &http::HeaderMap) -> &'static str {
+    if crate::headers::header_value_str(headers, "x-api-key").is_some()
+        || crate::headers::header_value_str(headers, "api-key").is_some()
+    {
+        "api_key"
+    } else {
+        "bearer_like"
+    }
+}
+
+fn is_ark_asset_library_request(
+    method: &http::Method,
+    normalized_path: &str,
+    query: Option<&str>,
+) -> bool {
+    if method != http::Method::POST
+        || !crate::material_assets::is_asset_library_path(normalized_path)
+    {
+        return false;
+    }
+    if normalized_path != "/" {
+        return true;
+    }
+
+    query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, _)| key.eq_ignore_ascii_case("Action"))
+    })
 }
 
 fn claude_request_auth_channel(headers: &http::HeaderMap) -> &'static str {
@@ -277,7 +326,7 @@ mod tests {
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
         headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
 
-        let route = classify_ai_public_route(&Method::GET, "/v1/responses", &headers)
+        let route = classify_ai_public_route(&Method::GET, "/v1/responses", None, &headers)
             .expect("Responses WebSocket should be an AI public route");
         assert_eq!(route.route_class, "ai_public");
         assert_eq!(route.route_family, "openai");
@@ -288,7 +337,8 @@ mod tests {
     #[test]
     fn does_not_classify_plain_get_as_responses_websocket() {
         assert!(
-            classify_ai_public_route(&Method::GET, "/v1/responses", &HeaderMap::new()).is_none()
+            classify_ai_public_route(&Method::GET, "/v1/responses", None, &HeaderMap::new())
+                .is_none()
         );
     }
 }

@@ -3,7 +3,7 @@ use super::{AppState, GatewayError};
 use crate::{async_task, video_tasks};
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, UpsertVideoTask, VideoTaskLookupKey, VideoTaskModelCount,
-    VideoTaskQueryFilter, VideoTaskStatusCount,
+    VideoTaskQueryFilter, VideoTaskStatus, VideoTaskStatusCount,
 };
 
 impl AppState {
@@ -11,9 +11,10 @@ impl AppState {
         &self,
         route_family: Option<&str>,
         request_path: &str,
+        user_id: &str,
     ) -> Result<Option<video_tasks::LocalVideoTaskReadResponse>, GatewayError> {
         self.data
-            .read_video_task_response(route_family, request_path)
+            .read_video_task_response_for_user(route_family, request_path, user_id)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
@@ -42,8 +43,52 @@ impl AppState {
         &self,
         snapshot: &video_tasks::LocalVideoTaskSnapshot,
     ) -> Result<Option<StoredVideoTask>, GatewayError> {
+        // Keep this boundary defensive even though the current seed-specific
+        // serializers redact their embedded snapshot.  This method is the
+        // gateway's generic persistence entry point and must never make a
+        // future provider variant's runtime Authorization/proxy/profile data
+        // durable by accident.
+        let persisted_snapshot = snapshot.redacted_for_persistence();
+        let record = persisted_snapshot.to_upsert_record();
+
+        // Cancellation is a state transition, not an unconditional upsert.
+        // A poll can complete the task after the DELETE was sent but before
+        // this write; using UPSERT here would resurrect the row as Cancelled,
+        // erase the completed asset, and misclassify billing.  Use the
+        // repository CAS whenever a row already exists, and restore the
+        // winning database snapshot when the CAS loses.
+        if record.status == VideoTaskStatus::Cancelled {
+            if let Some(current) = self.find_video_task_by_id(&record.id).await? {
+                if !current.status.is_active() {
+                    self.video_tasks.hydrate_from_stored_task(&current);
+                    return Ok(Some(current));
+                }
+                let task_id = record.id.clone();
+                let updated = self.update_active_video_task(record).await?;
+                if updated.is_none() {
+                    if let Some(latest) = self.find_video_task_by_id(&task_id).await? {
+                        if !latest.status.is_active() {
+                            self.video_tasks.hydrate_from_stored_task(&latest);
+                            return Ok(Some(latest));
+                        }
+                        // The writer may be unavailable, or another active
+                        // update may still be in flight. Do not report a
+                        // cancellation success for an unchanged active row.
+                        if let Some(runtime) = self.reconstruct_video_task_snapshot(&latest).await?
+                        {
+                            self.video_tasks.record_snapshot(runtime);
+                        } else {
+                            self.video_tasks.hydrate_from_stored_task(&latest);
+                        }
+                        return Ok(None);
+                    }
+                }
+                return Ok(updated);
+            }
+        }
+
         self.data
-            .upsert_video_task(snapshot.to_upsert_record())
+            .upsert_video_task(record)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
@@ -66,15 +111,59 @@ impl AppState {
         else {
             return Ok(false);
         };
-        if self.video_tasks.hydrate_from_stored_task(&task) {
+        if let Some(snapshot) = self.reconstruct_video_task_snapshot(&task).await? {
+            self.video_tasks.record_snapshot(snapshot);
             return Ok(true);
         }
+        // Terminal reads can still be projected from a redacted snapshot when
+        // the provider/key was removed. Active follow-ups require reconstructed
+        // runtime credentials and therefore will not produce a plan.
+        Ok(self.video_tasks.hydrate_from_stored_task(&task))
+    }
 
-        let Some(snapshot) = self.reconstruct_video_task_snapshot(&task).await? else {
+    pub(crate) async fn hydrate_video_task_for_route_for_user(
+        &self,
+        route_family: Option<&str>,
+        request_path: &str,
+        user_id: &str,
+    ) -> Result<bool, GatewayError> {
+        let Some(lookup) =
+            video_tasks::resolve_video_task_hydration_lookup_key(route_family, request_path)
+        else {
             return Ok(false);
         };
-        self.video_tasks.record_snapshot(snapshot);
-        Ok(true)
+        let Some(task) = self
+            .data
+            .find_video_task(lookup)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+        else {
+            return Ok(false);
+        };
+        if task.user_id.as_deref().map(str::trim) != Some(user_id.trim()) {
+            return Ok(false);
+        }
+        let hydrated = if let Some(snapshot) = self.reconstruct_video_task_snapshot(&task).await? {
+            self.video_tasks.record_snapshot(snapshot);
+            true
+        } else {
+            self.video_tasks.hydrate_from_stored_task(&task)
+        };
+        if matches!(
+            task.status,
+            VideoTaskStatus::Completed
+                | VideoTaskStatus::Failed
+                | VideoTaskStatus::Expired
+                | VideoTaskStatus::Cancelled
+        ) {
+            // A terminal row can outlive a transient usage-upsert/settlement
+            // failure. Authenticated owner reads are a safe compensation point:
+            // terminal finalization is idempotent and foreign users never reach
+            // this branch. Deleted is deliberately excluded because deleting an
+            // already-settled task must not rewrite its original outcome.
+            async_task::finalize_video_task_if_terminal(self, &task).await;
+        }
+        Ok(hydrated)
     }
 
     pub(crate) async fn reconstruct_video_task_snapshot(

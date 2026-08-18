@@ -10,6 +10,7 @@ pub(crate) mod write;
 
 pub(crate) mod crud;
 pub(crate) mod delete_task;
+pub(crate) mod material_references;
 mod models;
 pub(crate) mod query;
 mod routes;

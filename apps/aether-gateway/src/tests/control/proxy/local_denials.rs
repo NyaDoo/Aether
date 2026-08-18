@@ -16,11 +16,77 @@ use crate::constants::{
     CONTROL_ROUTE_CLASS_HEADER, EXECUTION_PATH_HEADER, EXECUTION_PATH_LOCAL_AUTH_DENIED,
     GATEWAY_HEADER, TRACE_ID_HEADER, TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
     TRUSTED_AUTH_API_KEY_ID_HEADER, TRUSTED_AUTH_BALANCE_HEADER, TRUSTED_AUTH_USER_ID_HEADER,
+    TUNNEL_AFFINITY_FORWARDED_BY_HEADER, TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
 };
 
+fn signed_internal_auth_headers(
+    path: &str,
+    user_id: &str,
+    api_key_id: &str,
+    balance_remaining: Option<&str>,
+    access_allowed: bool,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(GATEWAY_HEADER, "rust-phase3b-affinity".parse().unwrap());
+    headers.insert(TRUSTED_AUTH_USER_ID_HEADER, user_id.parse().unwrap());
+    headers.insert(TRUSTED_AUTH_API_KEY_ID_HEADER, api_key_id.parse().unwrap());
+    headers.insert(
+        TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
+        access_allowed.to_string().parse().unwrap(),
+    );
+    if let Some(balance_remaining) = balance_remaining {
+        headers.insert(
+            TRUSTED_AUTH_BALANCE_HEADER,
+            balance_remaining.parse().unwrap(),
+        );
+    }
+    headers.insert(
+        TUNNEL_AFFINITY_FORWARDED_BY_HEADER,
+        "gateway-a".parse().unwrap(),
+    );
+    headers.insert(
+        TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
+        "gateway-b".parse().unwrap(),
+    );
+    crate::control::sign_trusted_auth_forward_headers(
+        &mut headers,
+        &http::Method::POST,
+        &path.parse().expect("request URI should parse"),
+    )
+    .expect("test internal auth headers should sign");
+    headers
+}
+
 #[tokio::test]
-async fn gateway_locally_denies_explicit_trusted_balance_failure_without_hitting_control_or_upstream(
-) {
+async fn gateway_rejects_a_valid_affinity_proof_for_a_different_owner_instance() {
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway state should build")
+            .with_tunnel_identity_for_tests("gateway-a", None),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let path = "/v1/chat/completions";
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}{path}"))
+        .headers(signed_internal_auth_headers(
+            path,
+            "user-target-mismatch",
+            "key-target-mismatch",
+            None,
+            true,
+        ))
+        .body("{\"model\":\"gpt-5\",\"messages\":[]}")
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_forged_trusted_identity_headers_without_hitting_control_or_upstream() {
     let auth_context_hits = Arc::new(Mutex::new(0usize));
     let auth_context_hits_clone = Arc::clone(&auth_context_hits);
     let public_hits = Arc::new(Mutex::new(0usize));
@@ -70,8 +136,12 @@ async fn gateway_locally_denies_explicit_trusted_balance_failure_without_hitting
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            "Bearer sk-forged-invalid-caller-key",
+        )
         .header(TRACE_ID_HEADER, "trace-control-balance-denied-1")
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b-affinity")
         .header(TRUSTED_AUTH_USER_ID_HEADER, "user-123")
         .header(TRUSTED_AUTH_API_KEY_ID_HEADER, "key-123")
         .header(TRUSTED_AUTH_BALANCE_HEADER, "0")
@@ -81,7 +151,7 @@ async fn gateway_locally_denies_explicit_trusted_balance_failure_without_hitting
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         response
             .headers()
@@ -97,10 +167,7 @@ async fn gateway_locally_denies_explicit_trusted_balance_failure_without_hitting
         Some("ai_public")
     );
     let payload: serde_json::Value = response.json().await.expect("response json should parse");
-    assert_eq!(payload["error"]["type"], "balance_exceeded");
-    assert_eq!(payload["error"]["message"], "余额不足（剩余: $0.00）");
-    assert_eq!(payload["error"]["details"]["balance_type"], "USD");
-    assert_eq!(payload["error"]["details"]["remaining"], 0.0);
+    assert_eq!(payload["error"]["type"], "http_error");
 
     assert_eq!(*auth_context_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
@@ -152,7 +219,8 @@ async fn gateway_locally_denies_invalid_trusted_snapshot_without_hitting_control
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway state should build")
-            .with_auth_api_key_data_reader_for_tests(repository),
+            .with_auth_api_key_data_reader_for_tests(repository)
+            .with_tunnel_identity_for_tests("gateway-b", None),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -160,9 +228,13 @@ async fn gateway_locally_denies_invalid_trusted_snapshot_without_hitting_control
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(TRACE_ID_HEADER, "trace-control-invalid-trusted-1")
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_AUTH_USER_ID_HEADER, "user-123")
-        .header(TRUSTED_AUTH_API_KEY_ID_HEADER, "key-123")
+        .headers(signed_internal_auth_headers(
+            "/v1/chat/completions",
+            "user-123",
+            "key-123",
+            None,
+            true,
+        ))
         .body("{\"model\":\"gpt-5\",\"messages\":[]}")
         .send()
         .await
@@ -227,7 +299,8 @@ async fn gateway_locally_denies_missing_wallet_without_hitting_control_or_upstre
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway state should build")
-            .with_data_state_for_tests(data_state),
+            .with_data_state_for_tests(data_state)
+            .with_tunnel_identity_for_tests("gateway-b", None),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -235,9 +308,13 @@ async fn gateway_locally_denies_missing_wallet_without_hitting_control_or_upstre
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(TRACE_ID_HEADER, "trace-control-wallet-missing-1")
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_AUTH_USER_ID_HEADER, "user-123")
-        .header(TRUSTED_AUTH_API_KEY_ID_HEADER, "key-123")
+        .headers(signed_internal_auth_headers(
+            "/v1/chat/completions",
+            "user-123",
+            "key-123",
+            None,
+            true,
+        ))
         .body("{\"model\":\"gpt-5\",\"messages\":[]}")
         .send()
         .await
@@ -757,7 +834,8 @@ async fn gateway_locally_denies_locked_trusted_snapshot_without_hitting_control_
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway state should build")
-            .with_auth_api_key_data_reader_for_tests(repository),
+            .with_auth_api_key_data_reader_for_tests(repository)
+            .with_tunnel_identity_for_tests("gateway-b", None),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -765,9 +843,13 @@ async fn gateway_locally_denies_locked_trusted_snapshot_without_hitting_control_
         .post(format!("{gateway_url}/v1/chat/completions"))
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(TRACE_ID_HEADER, "trace-control-locked-trusted-1")
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_AUTH_USER_ID_HEADER, "user-locked-123")
-        .header(TRUSTED_AUTH_API_KEY_ID_HEADER, "key-locked-123")
+        .headers(signed_internal_auth_headers(
+            "/v1/chat/completions",
+            "user-locked-123",
+            "key-locked-123",
+            None,
+            true,
+        ))
         .body("{\"model\":\"gpt-5\",\"messages\":[]}")
         .send()
         .await

@@ -15,6 +15,7 @@ import {
   Key,
   KeyRound,
   Layers,
+  Library,
   Package,
   Puzzle,
   Send,
@@ -87,6 +88,7 @@ export function buildNavigation(options: {
         title: t('nav.group.resources'),
         items: [
           { name: t('nav.modelCatalog'), href: '/dashboard/models', icon: Box },
+          { name: t('nav.materialAssets'), href: '/dashboard/material-assets', icon: Library },
           { name: t('nav.apiKeys'), href: '/dashboard/api-keys', icon: Key },
         ]
       },
@@ -133,6 +135,7 @@ export function buildNavigation(options: {
         { name: t('nav.standaloneKeys'), href: '/admin/keys', icon: Key },
         { name: t('nav.walletManagement'), href: '/admin/wallets', icon: Wallet },
         { name: t('nav.billingManagement'), href: '/admin/billing-plans', icon: Package },
+        { name: t('nav.materialAssets'), href: '/admin/material-assets', icon: Library },
         ...activeModuleItems(modules, 'management'),
         { name: t('nav.asyncTasks'), href: '/admin/async-tasks', icon: Zap },
         { name: t('nav.usageRecords'), href: '/admin/usage', icon: BarChart3 },

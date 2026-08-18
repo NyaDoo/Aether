@@ -2,6 +2,9 @@ mod decision;
 mod request;
 mod support;
 
+#[cfg(test)]
+mod tests;
+
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -85,6 +88,14 @@ pub(crate) async fn build_local_video_sync_attempt_source_for_kind<'a>(
     };
 
     if candidate_count == 0 {
+        // No provider/endpoint/key/model combination can serve this format.
+        tracing::debug!(
+            trace_id = %trace_id,
+            decision_kind = spec_metadata.decision_kind,
+            api_format = spec_metadata.api_format,
+            requested_model = %input.requested_model,
+            "gateway local video decision skipped: no selectable candidate for this api format"
+        );
         return Ok(None);
     }
 

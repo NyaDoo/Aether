@@ -142,6 +142,8 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
                 | "model_id"
                 | "global_model_id"
                 | "global_model_name"
+                | "mapped_model"
+                | "observed_model"
                 | "proxy"
         )
     });
@@ -377,6 +379,8 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_non_empty_string(source, target, "model_id");
     copy_non_empty_string(source, target, "global_model_id");
     copy_non_empty_string(source, target, "global_model_name");
+    copy_non_empty_string(source, target, "mapped_model");
+    copy_non_empty_string(source, target, "observed_model");
     copy_non_null_value(source, target, "dimensions");
     copy_non_null_value(source, target, "billing_rule_snapshot");
     copy_non_null_value(source, target, "scheduling_audit");
@@ -437,6 +441,8 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_empty_string(&mut source, target, "model_id");
     remove_non_empty_string(&mut source, target, "global_model_id");
     remove_non_empty_string(&mut source, target, "global_model_name");
+    remove_non_empty_string(&mut source, target, "mapped_model");
+    remove_non_empty_string(&mut source, target, "observed_model");
     remove_non_null_value(&mut source, target, "dimensions");
     remove_non_null_value(&mut source, target, "billing_rule_snapshot");
     remove_non_null_value(&mut source, target, "scheduling_audit");

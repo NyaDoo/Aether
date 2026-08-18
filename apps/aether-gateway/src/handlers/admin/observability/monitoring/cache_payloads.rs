@@ -32,6 +32,7 @@ pub(super) fn admin_monitoring_masked_provider_key_prefix(
 ) -> Option<String> {
     match key.auth_type.trim() {
         "service_account" | "vertex_ai" => Some("[Service Account]".to_string()),
+        "volc_aksk" => Some("[Volcengine AK/SK]".to_string()),
         "oauth" => {
             let auth_config = state.parse_catalog_auth_config_json(key);
             if provider_key_auth_config_is_agent_identity(provider_type, auth_config.as_ref()) {

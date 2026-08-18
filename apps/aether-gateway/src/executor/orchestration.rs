@@ -28,8 +28,9 @@ use crate::ai_serving::api::{
     build_local_same_format_sync_attempt_source, build_local_same_format_sync_plan_and_reports,
     build_local_video_sync_attempt_source_for_kind, build_standard_family_stream_attempt_source,
     build_standard_family_sync_attempt_source, parse_direct_request_body,
-    resolve_claude_stream_spec, resolve_claude_sync_spec, resolve_gemini_stream_spec,
-    resolve_gemini_sync_spec, resolve_local_same_format_stream_spec,
+    resolve_claude_stream_spec, resolve_claude_sync_spec,
+    resolve_execution_runtime_stream_plan_kind, resolve_execution_runtime_sync_plan_kind,
+    resolve_gemini_stream_spec, resolve_gemini_sync_spec, resolve_local_same_format_stream_spec,
     resolve_local_same_format_sync_spec, set_local_openai_chat_execution_exhausted_diagnostic,
     set_local_openai_image_execution_exhausted_diagnostic, AiStreamAttempt, AiSyncAttempt,
     LocalCoreSyncErrorKind, LocalStandardSpec, EXECUTION_RUNTIME_STREAM_DECISION_ACTION,
@@ -1505,26 +1506,12 @@ pub(crate) fn maybe_execute_sync_request<'a>(
         let Some(decision) = decision else {
             return Ok(LocalExecutionRequestOutcome::NoPath);
         };
-        #[cfg(not(test))]
+        if parts.method != http::Method::POST
+            && !supports_local_non_post_sync_request(parts, decision)
         {
-            if parts.method != http::Method::POST {
-                return Ok(LocalExecutionRequestOutcome::NoPath);
-            }
-            return maybe_execute_sync_local_path(state, parts, body_bytes, trace_id, decision)
-                .await;
+            return Ok(LocalExecutionRequestOutcome::NoPath);
         }
-        #[cfg(test)]
-        {
-            if state
-                .execution_runtime_override_base_url()
-                .unwrap_or_default()
-                .is_empty()
-                && parts.method != http::Method::POST
-            {
-                return Ok(LocalExecutionRequestOutcome::NoPath);
-            }
-            maybe_execute_sync_local_path(state, parts, body_bytes, trace_id, decision).await
-        }
+        maybe_execute_sync_local_path(state, parts, body_bytes, trace_id, decision).await
     })
 }
 
@@ -1539,27 +1526,36 @@ pub(crate) fn maybe_execute_stream_request<'a>(
         let Some(decision) = decision else {
             return Ok(LocalExecutionRequestOutcome::NoPath);
         };
-        #[cfg(not(test))]
+        if parts.method != http::Method::POST
+            && !supports_local_non_post_stream_request(parts, decision)
         {
-            if parts.method != http::Method::POST {
-                return Ok(LocalExecutionRequestOutcome::NoPath);
-            }
-            return maybe_execute_stream_local_path(state, parts, body_bytes, trace_id, decision)
-                .await;
+            return Ok(LocalExecutionRequestOutcome::NoPath);
         }
-        #[cfg(test)]
-        {
-            if state
-                .execution_runtime_override_base_url()
-                .unwrap_or_default()
-                .is_empty()
-                && parts.method != http::Method::POST
-            {
-                return Ok(LocalExecutionRequestOutcome::NoPath);
-            }
-            maybe_execute_stream_local_path(state, parts, body_bytes, trace_id, decision).await
-        }
+        maybe_execute_stream_local_path(state, parts, body_bytes, trace_id, decision).await
     })
+}
+
+fn supports_local_non_post_sync_request(
+    parts: &http::request::Parts,
+    decision: &GatewayControlDecision,
+) -> bool {
+    let is_video_task_read = parts.method == http::Method::GET
+        && decision.route_class.as_deref() == Some("ai_public")
+        && decision.route_kind.as_deref() == Some("video")
+        && crate::video_tasks::resolve_video_task_read_lookup_key(
+            decision.route_family.as_deref(),
+            parts.uri.path(),
+        )
+        .is_some();
+
+    is_video_task_read || resolve_execution_runtime_sync_plan_kind(parts, decision).is_some()
+}
+
+fn supports_local_non_post_stream_request(
+    parts: &http::request::Parts,
+    decision: &GatewayControlDecision,
+) -> bool {
+    resolve_execution_runtime_stream_plan_kind(parts, decision).is_some()
 }
 
 pub(crate) fn planner_decision_action(action: &str) -> bool {
@@ -1596,6 +1592,58 @@ mod tests {
     const TEST_STANDARD_TEXT_SYNC_PLAN_KIND: &str = "openai_responses_compact_sync";
     const HEARTBEAT_USAGE_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const HEARTBEAT_USAGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn test_doubao_video_decision() -> GatewayControlDecision {
+        GatewayControlDecision::synthetic(
+            "/v3/contents/generations/tasks",
+            Some("ai_public".to_string()),
+            Some("doubao".to_string()),
+            Some("video".to_string()),
+            Some("doubao:video".to_string()),
+        )
+        .with_execution_runtime_candidate(true)
+    }
+
+    fn test_request_parts(method: http::Method, uri: &str) -> http::request::Parts {
+        http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(())
+            .expect("request should build")
+            .into_parts()
+            .0
+    }
+
+    #[test]
+    fn non_post_execution_gate_allows_doubao_video_lifecycle_routes() {
+        let decision = test_doubao_video_decision();
+        let detail =
+            test_request_parts(http::Method::GET, "/v3/contents/generations/tasks/cgt-123");
+        let delete = test_request_parts(
+            http::Method::DELETE,
+            "/v3/contents/generations/tasks/cgt-123",
+        );
+        let content = test_request_parts(
+            http::Method::GET,
+            "/v3/contents/generations/tasks/cgt-123/content",
+        );
+
+        assert!(supports_local_non_post_sync_request(&detail, &decision));
+        assert!(supports_local_non_post_sync_request(&delete, &decision));
+        assert!(supports_local_non_post_stream_request(&content, &decision));
+    }
+
+    #[test]
+    fn non_post_execution_gate_rejects_unknown_doubao_video_paths() {
+        let decision = test_doubao_video_decision();
+        let unknown = test_request_parts(
+            http::Method::GET,
+            "/v3/contents/generations/tasks/cgt-123/unknown",
+        );
+
+        assert!(!supports_local_non_post_sync_request(&unknown, &decision));
+        assert!(!supports_local_non_post_stream_request(&unknown, &decision));
+    }
 
     struct TestSyncAttemptSource {
         attempts: VecDeque<AiSyncAttempt>,

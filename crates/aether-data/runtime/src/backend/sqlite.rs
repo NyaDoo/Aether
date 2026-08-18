@@ -5,6 +5,9 @@ use crate::driver::sqlite::{SqlitePool, SqlitePoolFactory};
 use crate::repository::announcements::{
     AnnouncementReadRepository, AnnouncementWriteRepository, SqliteAnnouncementRepository,
 };
+use crate::repository::asset_library::{
+    AssetLibraryReadRepository, AssetLibraryWriteRepository, SqliteAssetLibraryRepository,
+};
 use crate::repository::audit::{AuditLogReadRepository, SqliteAuditLogReadRepository};
 use crate::repository::auth::{
     AuthApiKeyReadRepository, AuthApiKeyWriteRepository, SqliteAuthApiKeyReadRepository,
@@ -95,6 +98,14 @@ impl SqliteBackend {
 
     pub fn auth_api_key_read_repository(&self) -> Arc<dyn AuthApiKeyReadRepository> {
         Arc::new(SqliteAuthApiKeyReadRepository::new(self.pool_clone()))
+    }
+
+    pub fn asset_library_read_repository(&self) -> Arc<dyn AssetLibraryReadRepository> {
+        Arc::new(SqliteAssetLibraryRepository::new(self.pool_clone()))
+    }
+
+    pub fn asset_library_write_repository(&self) -> Arc<dyn AssetLibraryWriteRepository> {
+        Arc::new(SqliteAssetLibraryRepository::new(self.pool_clone()))
     }
 
     pub fn announcement_read_repository(&self) -> Arc<dyn AnnouncementReadRepository> {

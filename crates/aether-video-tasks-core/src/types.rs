@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use aether_contracts::{ExecutionPlan, ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub const DEFAULT_VIDEO_TASK_POLL_INTERVAL_SECONDS: u32 = 10;
 pub const DEFAULT_VIDEO_TASK_MAX_POLL_COUNT: u32 = 360;
@@ -49,12 +49,14 @@ pub enum LocalVideoTaskContentAction {
 pub enum LocalVideoTaskProjectionTarget {
     OpenAi { task_id: String },
     Gemini { short_id: String },
+    Doubao { task_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LocalVideoTaskSnapshot {
     OpenAi(OpenAiVideoTaskSeed),
     Gemini(GeminiVideoTaskSeed),
+    Doubao(DoubaoVideoTaskSeed),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +82,8 @@ pub enum LocalVideoTaskRegistryMutation {
     OpenAiCancelled { task_id: String },
     OpenAiDeleted { task_id: String },
     GeminiCancelled { short_id: String },
+    DoubaoCancelled { task_id: String },
+    DoubaoDeleted { task_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +91,7 @@ pub enum LocalVideoTaskSeed {
     OpenAiCreate(OpenAiVideoTaskSeed),
     OpenAiRemix(OpenAiVideoTaskSeed),
     GeminiCreate(GeminiVideoTaskSeed),
+    DoubaoCreate(DoubaoVideoTaskSeed),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +134,61 @@ pub struct LocalVideoTaskPersistence {
     pub provider_api_format: String,
     pub original_request_body: Value,
     pub format_converted: bool,
+    /// Stable public/global model identity captured at task creation.
+    #[serde(default)]
+    pub global_model_name: Option<String>,
+    /// Stable provider mapping selected at task creation.
+    #[serde(default)]
+    pub mapped_model: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub global_model_id: Option<String>,
+}
+
+impl LocalVideoTaskPersistence {
+    /// Adds the model routing identity to task metadata. The video task table
+    /// currently keeps the request model for provider-side filtering; these
+    /// explicit metadata keys make the global/mapped identities recoverable
+    /// after a restart without consulting an upstream response.
+    pub fn append_identity_metadata(&self, metadata: &mut Map<String, Value>) {
+        if let Some(value) = self
+            .global_model_name
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            metadata.insert(
+                "global_model_name".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        if let Some(value) = self
+            .mapped_model
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            metadata.insert(
+                "mapped_model".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        if let Some(value) = self.model_id.as_deref().filter(|v| !v.trim().is_empty()) {
+            metadata.insert(
+                "model_id".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+        if let Some(value) = self
+            .global_model_id
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            metadata.insert(
+                "global_model_id".to_string(),
+                Value::String(value.trim().to_string()),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,6 +226,59 @@ pub struct GeminiVideoTaskSeed {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub metadata: Value,
+    pub persistence: LocalVideoTaskPersistence,
+    pub transport: LocalVideoTaskTransport,
+}
+
+/// Doubao (Volcengine Ark) content generation task.
+///
+/// Ark exposes generation parameters as top-level request fields and echoes them
+/// back on read, so the resolved values are refreshed from the provider body
+/// whenever it reports them. Only the fields the gateway must understand are
+/// modeled; everything else rides along in `persistence.original_request_body`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoubaoVideoTaskSeed {
+    pub local_task_id: String,
+    pub upstream_task_id: String,
+    pub created_at_unix_secs: u64,
+    /// Most recent provider-side update timestamp. Older persisted snapshots do
+    /// not contain this field, so deserialization must keep accepting them.
+    #[serde(default)]
+    pub updated_at_unix_secs: Option<u64>,
+    pub user_id: Option<String>,
+    pub api_key_id: Option<String>,
+    /// Aether's stable/public model identity. This is initialized from the
+    /// request/report context and must never be replaced by an Ark poll.
+    pub model: Option<String>,
+    /// The model name/version observed in the latest Ark response. It is
+    /// telemetry only; it must not drive public identity or pricing lookup.
+    #[serde(default)]
+    pub observed_model: Option<String>,
+    pub prompt: Option<String>,
+    pub resolution: Option<String>,
+    pub ratio: Option<String>,
+    pub duration_seconds: Option<u32>,
+    /// Provider-resolved random seed. Ark models this as a signed int32 and
+    /// may use negative sentinel values, so it must not be narrowed to u32.
+    #[serde(default)]
+    pub seed: Option<i32>,
+    /// Exact generated frame count. Ark returns either `frames` or `duration`,
+    /// never both, for a single task.
+    #[serde(default)]
+    pub frames: Option<i32>,
+    /// Provider-resolved frame rate, exposed as `framespersecond` to clients.
+    #[serde(default)]
+    pub frames_per_second: Option<i32>,
+    pub status: LocalVideoTaskStatus,
+    pub progress_percent: u16,
+    pub completed_at_unix_secs: Option<u64>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub video_url: Option<String>,
+    pub last_frame_url: Option<String>,
+    /// Ark bills video generation by tokens, unlike the per-second video surfaces.
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub persistence: LocalVideoTaskPersistence,
     pub transport: LocalVideoTaskTransport,
 }

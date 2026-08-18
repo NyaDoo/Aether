@@ -156,16 +156,7 @@ fn auth_environment() -> String {
 }
 
 pub(super) fn auth_jwt_secret() -> Result<String, String> {
-    if let Ok(value) = std::env::var("JWT_SECRET_KEY") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Ok(value.to_string());
-        }
-    }
-    if auth_environment().eq_ignore_ascii_case("production") {
-        return Err("JWT_SECRET_KEY 未配置".to_string());
-    }
-    Ok("aether-rust-dev-jwt-secret".to_string())
+    crate::local_auth_token::jwt_secret()
 }
 
 pub(super) fn auth_access_token_expiry_hours() -> i64 {

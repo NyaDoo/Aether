@@ -1,5 +1,6 @@
 use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyBatchDeleteRequest;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::state::ProviderCatalogKeyDeleteOutcome;
 use crate::GatewayError;
 use axum::{
     body::{Body, Bytes},
@@ -63,10 +64,25 @@ pub(super) async fn maybe_handle(
 
     let mut success_count = 0usize;
     for key_id in found_ids {
-        if state.delete_provider_catalog_key(&key_id).await? {
-            success_count += 1;
-        } else {
-            failed.push(json!({ "id": key_id, "error": "not found" }));
+        match state
+            .delete_provider_catalog_key_if_unreferenced(&key_id)
+            .await?
+        {
+            ProviderCatalogKeyDeleteOutcome::Deleted => success_count += 1,
+            ProviderCatalogKeyDeleteOutcome::NotDeleted => {
+                failed.push(json!({ "id": key_id, "error": "not found" }));
+            }
+            ProviderCatalogKeyDeleteOutcome::Referenced(reference_counts) => {
+                failed.push(json!({
+                    "id": key_id,
+                    "error": "asset_library_reference_conflict",
+                    "references": {
+                        "asset_groups": reference_counts.asset_groups,
+                        "visual_validation_sessions": reference_counts.visual_validation_sessions,
+                        "total": reference_counts.total(),
+                    }
+                }));
+            }
         }
     }
 

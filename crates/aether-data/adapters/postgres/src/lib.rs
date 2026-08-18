@@ -1,6 +1,7 @@
 //! PostgreSQL repositories, pool/transaction primitives, leases, and migrations.
 
 mod announcements;
+mod asset_library;
 mod audit;
 mod auth;
 mod auth_modules;
@@ -31,6 +32,7 @@ mod wallet;
 
 pub use aether_data_contracts::{DataLayerError, PostgresPoolConfig};
 pub use announcements::SqlxAnnouncementReadRepository;
+pub use asset_library::SqlxAssetLibraryRepository;
 pub use audit::PostgresAuditLogReadRepository;
 pub use auth::SqlxAuthApiKeySnapshotReadRepository;
 pub use auth_modules::{SqlxAuthModuleReadRepository, SqlxAuthModuleRepository};

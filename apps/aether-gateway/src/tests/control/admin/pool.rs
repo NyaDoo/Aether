@@ -28,7 +28,7 @@ use crate::constants::{
 use crate::control::resolve_public_request_context;
 use crate::data::GatewayDataState;
 
-fn trusted_admin_headers() -> HeaderMap {
+fn trusted_admin_headers(method: &http::Method, uri: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(GATEWAY_HEADER, HeaderValue::from_static("rust-phase3b"));
     headers.insert(
@@ -47,6 +47,12 @@ fn trusted_admin_headers() -> HeaderMap {
         TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER,
         HeaderValue::from_static("management-token-123"),
     );
+    crate::control::sign_trusted_admin_forward_headers(
+        &mut headers,
+        method,
+        &uri.parse().expect("admin URI should parse"),
+    )
+    .expect("admin headers should sign");
     headers
 }
 
@@ -56,7 +62,7 @@ async fn local_admin_pool_response(
     uri: &str,
     body: Option<serde_json::Value>,
 ) -> axum::response::Response<Body> {
-    let headers = trusted_admin_headers();
+    let headers = trusted_admin_headers(&method, uri);
     let request_context = resolve_public_request_context(
         state,
         &method,

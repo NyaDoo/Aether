@@ -6,11 +6,14 @@ use serde_json::Value;
 use crate::ai_serving::planner::candidate_preparation::resolve_candidate_mapped_model;
 use crate::ai_serving::planner::spec_metadata::local_video_create_spec_metadata;
 use crate::ai_serving::transport::{
-    build_video_create_headers, build_video_create_request_body, build_video_create_upstream_url,
+    build_video_create_headers, build_video_create_request_body,
+    build_video_create_request_body_for_client, build_video_create_upstream_url,
     resolve_video_create_auth, video_create_transport_unsupported_reason,
     ProviderVideoCreateFamily, ProviderVideoCreateHeadersInput,
 };
-use crate::ai_serving::{CandidateFailureDiagnostic, GatewayProviderTransportSnapshot};
+use crate::ai_serving::{
+    CandidateFailureDiagnostic, CandidateFailureDiagnosticKind, GatewayProviderTransportSnapshot,
+};
 use crate::AppState;
 
 use super::support::{
@@ -43,11 +46,26 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
     let transport = &attempt.eligible.transport;
     let effective_headers = input.effective_headers(&parts.headers);
 
-    let provider_family = provider_video_create_family(spec.family);
+    let client_family = provider_video_create_family(spec.family);
+    let Some(provider_family) =
+        provider_video_create_family_from_api_format(attempt.eligible.provider_api_format.as_str())
+    else {
+        mark_skipped_local_video_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            attempt.candidate_index,
+            &attempt.candidate_id,
+            "transport_api_format_unsupported",
+        )
+        .await;
+        return None;
+    };
     let transport_unsupported_reason = video_create_transport_unsupported_reason(
         transport,
         provider_family,
-        spec_metadata.api_format,
+        attempt.eligible.provider_api_format.as_str(),
     );
     if let Some(skip_reason) = transport_unsupported_reason {
         mark_skipped_local_video_candidate(
@@ -112,7 +130,7 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
             "upstream_url_missing",
             CandidateFailureDiagnostic::upstream_url_missing(
                 spec_metadata.api_format,
-                spec_metadata.api_format,
+                attempt.eligible.provider_api_format.as_str(),
                 "video_upstream_url",
             ),
         )
@@ -120,13 +138,25 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
         return None;
     };
 
-    let Some(provider_request_body) = build_video_create_request_body(
-        body_json,
-        provider_family,
-        &mapped_model,
-        transport.endpoint.body_rules.as_ref(),
-        Some(effective_headers),
-    ) else {
+    let provider_request_body = if client_family == provider_family {
+        build_video_create_request_body(
+            body_json,
+            provider_family,
+            &mapped_model,
+            transport.endpoint.body_rules.as_ref(),
+            Some(effective_headers),
+        )
+    } else {
+        build_video_create_request_body_for_client(
+            body_json,
+            client_family,
+            provider_family,
+            &mapped_model,
+            transport.endpoint.body_rules.as_ref(),
+            Some(effective_headers),
+        )
+    };
+    let Some(provider_request_body) = provider_request_body else {
         mark_skipped_local_video_candidate_with_failure_diagnostic(
             state,
             input,
@@ -137,12 +167,45 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
             "transport_body_rules_apply_failed",
             CandidateFailureDiagnostic::body_rules_apply_failed(
                 spec_metadata.api_format,
-                spec_metadata.api_format,
+                attempt.eligible.provider_api_format.as_str(),
                 "video_body_rules",
             ),
         )
         .await;
         return None;
+    };
+    let provider_request_body = match crate::material_assets::project_video_asset_references(
+        state,
+        &input.auth_context.user_id,
+        transport,
+        &provider_request_body,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(message) => {
+            mark_skipped_local_video_candidate_with_failure_diagnostic(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                "material_asset_reference_invalid",
+                CandidateFailureDiagnostic::new(
+                    CandidateFailureDiagnosticKind::RequestConversion,
+                    "$.content",
+                    message,
+                )
+                .formats(
+                    spec_metadata.api_format,
+                    attempt.eligible.provider_api_format.as_str(),
+                )
+                .source("material_asset_reference_projection"),
+            )
+            .await;
+            return None;
+        }
     };
 
     let Some(provider_request_headers) =
@@ -165,7 +228,7 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
             "transport_header_rules_apply_failed",
             CandidateFailureDiagnostic::header_rules_apply_failed(
                 spec_metadata.api_format,
-                spec_metadata.api_format,
+                attempt.eligible.provider_api_format.as_str(),
                 "video_header_rules",
             ),
         )
@@ -188,5 +251,17 @@ fn provider_video_create_family(family: LocalVideoCreateFamily) -> ProviderVideo
     match family {
         LocalVideoCreateFamily::OpenAi => ProviderVideoCreateFamily::OpenAi,
         LocalVideoCreateFamily::Gemini => ProviderVideoCreateFamily::Gemini,
+        LocalVideoCreateFamily::Doubao => ProviderVideoCreateFamily::Doubao,
+    }
+}
+
+fn provider_video_create_family_from_api_format(
+    api_format: &str,
+) -> Option<ProviderVideoCreateFamily> {
+    match api_format.trim().to_ascii_lowercase().as_str() {
+        "openai:video" => Some(ProviderVideoCreateFamily::OpenAi),
+        "gemini:video" => Some(ProviderVideoCreateFamily::Gemini),
+        "doubao:video" => Some(ProviderVideoCreateFamily::Doubao),
+        _ => None,
     }
 }

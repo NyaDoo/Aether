@@ -1,10 +1,93 @@
 use super::{AppState, GatewayError, LocalMutationOutcome, LocalProviderDeleteTaskState};
 use crate::handlers::shared::sync_provider_key_oauth_status_snapshot;
-use aether_data_contracts::repository::{candidates, global_models, pool_scores, provider_catalog};
+use aether_data_contracts::repository::{
+    asset_library::{AssetProviderReference, AssetProviderReferenceCounts},
+    candidates, global_models, pool_scores, provider_catalog,
+};
+use aether_runtime_state::RuntimeLockLease;
+use std::future::Future;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+const PROVIDER_CATALOG_MUTATION_FENCE_TTL: Duration = Duration::from_secs(5 * 60);
+const PROVIDER_CATALOG_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCatalogKeyDeleteOutcome {
+    Deleted,
+    NotDeleted,
+    Referenced(AssetProviderReferenceCounts),
+}
+
 impl AppState {
+    async fn acquire_provider_catalog_mutation_fence(
+        &self,
+        provider_id: &str,
+    ) -> Result<RuntimeLockLease, GatewayError> {
+        let lock_key = crate::task_runtime::provider_delete_lock_key(provider_id);
+        let owner = format!(
+            "{}:provider-catalog-mutation",
+            self.tunnel.local_instance_id()
+        );
+        self.runtime_state
+            .lock_try_acquire(&lock_key, &owner, PROVIDER_CATALOG_MUTATION_FENCE_TTL)
+            .await
+            .map_err(|error| GatewayError::Internal(error.to_string()))?
+            .ok_or_else(|| GatewayError::Client {
+                status: axum::http::StatusCode::CONFLICT,
+                message: format!("Provider {provider_id} 正在删除，当前修改已拒绝"),
+            })
+    }
+
+    async fn release_provider_catalog_mutation_fence(&self, lease: RuntimeLockLease) {
+        match self.runtime_state.lock_release(&lease).await {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                lock_key = %lease.key,
+                "gateway provider catalog mutation fence was no longer owned at release"
+            ),
+            Err(error) => warn!(
+                lock_key = %lease.key,
+                error = ?error,
+                "gateway failed to release provider catalog mutation fence"
+            ),
+        }
+    }
+
+    async fn run_provider_catalog_mutation<T, F>(
+        &self,
+        provider_id: &str,
+        operation: F,
+    ) -> Result<T, GatewayError>
+    where
+        F: Future<Output = Result<T, GatewayError>>,
+    {
+        let lease = self
+            .acquire_provider_catalog_mutation_fence(provider_id)
+            .await?;
+        match tokio::time::timeout(PROVIDER_CATALOG_MUTATION_TIMEOUT, operation).await {
+            Ok(result) => {
+                self.release_provider_catalog_mutation_fence(lease).await;
+                result
+            }
+            Err(_) => {
+                // Keep the lease until its TTL expires so a cancelled database
+                // statement cannot overlap a provider deletion immediately.
+                warn!(
+                    provider_id,
+                    lock_key = %lease.key,
+                    timeout_ms = PROVIDER_CATALOG_MUTATION_TIMEOUT.as_millis(),
+                    "gateway provider catalog mutation timed out; retaining deletion fence"
+                );
+                Err(GatewayError::Internal(format!(
+                    "provider catalog mutation timed out after {}ms",
+                    PROVIDER_CATALOG_MUTATION_TIMEOUT.as_millis()
+                )))
+            }
+        }
+    }
+
     pub fn has_provider_catalog_data_reader(&self) -> bool {
         self.data.has_provider_catalog_reader()
     }
@@ -285,10 +368,13 @@ impl AppState {
         record: &global_models::UpsertAdminProviderModelRecord,
     ) -> Result<Option<global_models::StoredAdminProviderModel>, GatewayError> {
         let created = self
-            .data
-            .create_admin_provider_model(record)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .run_provider_catalog_mutation(&record.provider_id, async {
+                self.data
+                    .create_admin_provider_model(record)
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))
+            })
+            .await?;
         if created.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -300,10 +386,13 @@ impl AppState {
         record: &global_models::UpsertAdminProviderModelRecord,
     ) -> Result<Option<global_models::StoredAdminProviderModel>, GatewayError> {
         let updated = self
-            .data
-            .update_admin_provider_model(record)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .run_provider_catalog_mutation(&record.provider_id, async {
+                self.data
+                    .update_admin_provider_model(record)
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))
+            })
+            .await?;
         if updated.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -311,6 +400,18 @@ impl AppState {
     }
 
     pub(crate) async fn delete_admin_provider_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<bool, GatewayError> {
+        self.run_provider_catalog_mutation(provider_id, async {
+            self.delete_admin_provider_model_during_delete(provider_id, model_id)
+                .await
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_admin_provider_model_during_delete(
         &self,
         provider_id: &str,
         model_id: &str,
@@ -515,10 +616,13 @@ impl AppState {
         key: &provider_catalog::StoredProviderCatalogKey,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
         let created = self
-            .data
-            .create_provider_catalog_key(key)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .run_provider_catalog_mutation(&key.provider_id, async {
+                self.data
+                    .create_provider_catalog_key(key)
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))
+            })
+            .await?;
         if created.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -531,10 +635,13 @@ impl AppState {
         shift_existing_priorities_from: Option<i32>,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
         let created = self
-            .data
-            .create_provider_catalog_provider(provider, shift_existing_priorities_from)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .run_provider_catalog_mutation(&provider.id, async {
+                self.data
+                    .create_provider_catalog_provider(provider, shift_existing_priorities_from)
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))
+            })
+            .await?;
         if created.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -542,6 +649,17 @@ impl AppState {
     }
 
     pub(crate) async fn update_provider_catalog_provider(
+        &self,
+        provider: &provider_catalog::StoredProviderCatalogProvider,
+    ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
+        self.run_provider_catalog_mutation(&provider.id, async {
+            self.update_provider_catalog_provider_during_delete(provider)
+                .await
+        })
+        .await
+    }
+
+    pub(crate) async fn update_provider_catalog_provider_during_delete(
         &self,
         provider: &provider_catalog::StoredProviderCatalogProvider,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogProvider>, GatewayError> {
@@ -617,10 +735,13 @@ impl AppState {
         endpoint: &provider_catalog::StoredProviderCatalogEndpoint,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogEndpoint>, GatewayError> {
         let created = self
-            .data
-            .create_provider_catalog_endpoint(endpoint)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            .run_provider_catalog_mutation(&endpoint.provider_id, async {
+                self.data
+                    .create_provider_catalog_endpoint(endpoint)
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))
+            })
+            .await?;
         if created.is_some() {
             self.invalidate_provider_routing_caches();
         }
@@ -913,6 +1034,40 @@ impl AppState {
         Ok(deleted)
     }
 
+    pub(crate) async fn delete_provider_catalog_key_if_unreferenced(
+        &self,
+        key_id: &str,
+    ) -> Result<ProviderCatalogKeyDeleteOutcome, GatewayError> {
+        let references = self
+            .data
+            .count_asset_provider_references(AssetProviderReference::KeyId(key_id))
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if references.is_referenced() {
+            return Ok(ProviderCatalogKeyDeleteOutcome::Referenced(references));
+        }
+
+        match self.delete_provider_catalog_key(key_id).await {
+            Ok(true) => Ok(ProviderCatalogKeyDeleteOutcome::Deleted),
+            Ok(false) => Ok(ProviderCatalogKeyDeleteOutcome::NotDeleted),
+            Err(error) => {
+                // An asset write can commit after the first count but before the
+                // catalog DELETE. The database FK rejects that DELETE; re-read
+                // the reference set so callers get a stable conflict outcome.
+                let references = self
+                    .data
+                    .count_asset_provider_references(AssetProviderReference::KeyId(key_id))
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+                if references.is_referenced() {
+                    Ok(ProviderCatalogKeyDeleteOutcome::Referenced(references))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub(crate) async fn compare_and_delete_provider_catalog_key_oauth_credential(
         &self,
         delete: &provider_catalog::ProviderCatalogKeyOAuthCredentialCasDelete,
@@ -943,6 +1098,40 @@ impl AppState {
             self.invalidate_provider_routing_caches();
         }
         Ok(deleted)
+    }
+
+    pub(crate) async fn compare_and_delete_provider_catalog_key_oauth_credential_if_unreferenced(
+        &self,
+        delete: &provider_catalog::ProviderCatalogKeyOAuthCredentialCasDelete,
+    ) -> Result<ProviderCatalogKeyDeleteOutcome, GatewayError> {
+        let references = self
+            .data
+            .count_asset_provider_references(AssetProviderReference::KeyId(&delete.key_id))
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if references.is_referenced() {
+            return Ok(ProviderCatalogKeyDeleteOutcome::Referenced(references));
+        }
+
+        match self
+            .compare_and_delete_provider_catalog_key_oauth_credential(delete)
+            .await
+        {
+            Ok(true) => Ok(ProviderCatalogKeyDeleteOutcome::Deleted),
+            Ok(false) => Ok(ProviderCatalogKeyDeleteOutcome::NotDeleted),
+            Err(error) => {
+                let references = self
+                    .data
+                    .count_asset_provider_references(AssetProviderReference::KeyId(&delete.key_id))
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+                if references.is_referenced() {
+                    Ok(ProviderCatalogKeyDeleteOutcome::Referenced(references))
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     pub(crate) async fn clear_provider_catalog_key_oauth_invalid_marker(
@@ -1157,7 +1346,7 @@ mod tests {
     use crate::cache::{CandidatePageCacheKey, SchedulerAffinityTarget};
     use crate::data::auth::GatewayAuthApiKeySnapshot;
     use crate::data::GatewayDataState;
-    use crate::AppState;
+    use crate::{AppState, GatewayError};
 
     fn sample_provider() -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
@@ -1480,6 +1669,82 @@ mod tests {
             .expect("provider transport should read after update")
             .expect("provider transport should exist after update");
         assert!(snapshot.provider.keep_priority_on_conversion);
+    }
+
+    #[tokio::test]
+    async fn provider_delete_fence_rejects_provider_mutations_and_child_creates() {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+
+        let lock_key = crate::task_runtime::provider_delete_lock_key("provider-1");
+        let lease = state
+            .runtime_state
+            .lock_try_acquire(&lock_key, "provider-delete-test", Duration::from_secs(60))
+            .await
+            .expect("provider delete lock acquisition should succeed")
+            .expect("provider delete lock should be available");
+
+        for result in [
+            state
+                .update_provider_catalog_provider(&sample_provider())
+                .await
+                .map(|_| ()),
+            state
+                .create_provider_catalog_provider(&sample_provider(), None)
+                .await
+                .map(|_| ()),
+            state
+                .create_provider_catalog_endpoint(&sample_endpoint())
+                .await
+                .map(|_| ()),
+            state
+                .create_provider_catalog_key(&sample_key())
+                .await
+                .map(|_| ()),
+            state
+                .create_admin_provider_model(&sample_provider_model_record(
+                    "model-create",
+                    "global-1",
+                    true,
+                ))
+                .await
+                .map(|_| ()),
+            state
+                .update_admin_provider_model(&sample_provider_model_record(
+                    "model-update",
+                    "global-1",
+                    true,
+                ))
+                .await
+                .map(|_| ()),
+            state
+                .delete_admin_provider_model("provider-1", "model-delete")
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(GatewayError::Client {
+                    status: axum::http::StatusCode::CONFLICT,
+                    ..
+                })
+            ));
+        }
+
+        assert!(state
+            .runtime_state
+            .lock_release(&lease)
+            .await
+            .expect("provider delete lock release should succeed"));
     }
 
     #[tokio::test]

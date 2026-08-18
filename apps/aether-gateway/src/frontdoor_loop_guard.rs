@@ -46,11 +46,27 @@ pub(crate) fn frontdoor_self_loop_public_ai_path(path: &str) -> bool {
             | "/upload/v1beta/files"
             | "/v1beta/operations"
             | "/v1/videos"
+            | aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH
     ) || path.starts_with("/v1/videos/")
+        || path.starts_with("/v3/contents/generations/tasks/")
+        || path == "/v3/asset-library"
+        || path.starts_with("/v3/asset-library/")
         || path.starts_with("/v1beta/files/")
         || path.starts_with("/v1beta/operations/")
         || path.starts_with("/v1internal:")
         || is_gemini_generation_path(path)
+}
+
+pub(crate) fn frontdoor_self_loop_public_ai_target(path: &str, query: Option<&str>) -> bool {
+    frontdoor_self_loop_public_ai_path(path)
+        || (path == "/"
+            && query.is_some_and(|query| {
+                url::form_urlencoded::parse(query.as_bytes()).any(|(key, value)| {
+                    key.eq_ignore_ascii_case("Action")
+                        && crate::material_assets::ArkAssetAction::from_str(value.as_ref())
+                            .is_some()
+                })
+            }))
 }
 
 pub fn set_gateway_frontdoor_app_port(app_port: u16) {
@@ -89,7 +105,7 @@ pub(crate) fn gateway_frontdoor_self_loop_guard_matches_with_port(
     let Some(target_url) = Url::parse(url).ok() else {
         return false;
     };
-    if !frontdoor_self_loop_public_ai_path(target_url.path()) {
+    if !frontdoor_self_loop_public_ai_target(target_url.path(), target_url.query()) {
         return false;
     }
 
@@ -140,4 +156,34 @@ fn normalize_host_for_frontdoor_loop_guard(host: &str) -> String {
 
 fn is_loopbackish_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "::")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gateway_frontdoor_self_loop_guard_matches_with_port;
+
+    #[test]
+    fn rejects_asset_library_targets_that_resolve_to_the_frontdoor() {
+        for url in [
+            "http://127.0.0.1:8084/v3/asset-library/CreateAsset",
+            "http://localhost:8084/?Action=ListAssets&Version=2024-01-01",
+        ] {
+            assert!(
+                gateway_frontdoor_self_loop_guard_matches_with_port(8084, url),
+                "frontdoor target should be rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_treat_unrelated_root_targets_as_asset_library_loops() {
+        assert!(!gateway_frontdoor_self_loop_guard_matches_with_port(
+            8084,
+            "http://127.0.0.1:8084/?Action=UnknownAction"
+        ));
+        assert!(!gateway_frontdoor_self_loop_guard_matches_with_port(
+            8084,
+            "http://127.0.0.1:8084/"
+        ));
+    }
 }

@@ -22,7 +22,7 @@ use crate::constants::{CONTROL_EXECUTED_HEADER, CONTROL_EXECUTE_FALLBACK_HEADER,
 
 use super::{
     build_router_with_state, build_state_with_execution_runtime_override, start_server,
-    VideoTaskTruthSourceMode,
+    video_auth_repository, VideoTaskTruthSourceMode,
 };
 
 #[tokio::test]
@@ -304,14 +304,25 @@ async fn gateway_executes_openai_video_content_from_reconstructed_data_task_with
         vec![sample_endpoint()],
         vec![sample_key()],
     ));
+    let auth_repository = video_auth_repository(
+        "client-openai-video-content-local-key",
+        "key-video-content-local-123",
+        "user-video-content-local-123",
+        "openai",
+        "openai:video",
+        "sora-2",
+    );
 
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
             .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
-            .with_video_task_repository_and_provider_transport_for_tests(
-                repository,
-                provider_catalog_repository,
-                DEVELOPMENT_ENCRYPTION_KEY,
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_video_task_repository_and_provider_transport_for_tests(
+                    repository,
+                    provider_catalog_repository,
+                    DEVELOPMENT_ENCRYPTION_KEY,
+                )
+                .with_auth_api_key_reader(auth_repository),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -320,6 +331,7 @@ async fn gateway_executes_openai_video_content_from_reconstructed_data_task_with
         .get(format!(
             "{gateway_url}/v1/videos/task-content-local-123/content?variant=video"
         ))
+        .bearer_auth("client-openai-video-content-local-key")
         .header(CONTROL_EXECUTE_FALLBACK_HEADER, "true")
         .header(TRACE_ID_HEADER, "trace-openai-video-content-local-123")
         .send()

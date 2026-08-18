@@ -16,6 +16,10 @@ vi.mock('@/api/endpoints', () => ({
   updateProviderKey: endpointMocks.updateProviderKey,
   getAllCapabilities: endpointMocks.getAllCapabilities,
   sortApiFormats: endpointMocks.sortApiFormats,
+  API_FORMATS: {
+    DOUBAO_VIDEO: 'doubao:video',
+    DOUBAO_ASSET_LIBRARY: 'doubao:asset_library',
+  },
 }))
 
 vi.mock('@/components/ui', async () => {
@@ -107,17 +111,19 @@ vi.mock('@/components/ui', async () => {
 
   const Select = defineComponent({
     name: 'SelectStub',
+    inheritAttrs: false,
     props: {
       modelValue: String,
     },
     emits: ['update:modelValue'],
-    setup(props, { emit, slots }) {
+    setup(props, { attrs, emit, slots }) {
       provide(SelectContextKey, {
         select: (value: string) => emit('update:modelValue', value),
         modelValue: props.modelValue,
       })
 
       return () => h('div', {
+        ...attrs,
         'data-select': 'true',
         'data-value': props.modelValue,
       }, slots.default?.())
@@ -309,6 +315,317 @@ afterEach(() => {
 })
 
 describe('provider key concurrent_limit form behavior', () => {
+  it('creates a Volcengine AK/SK key restricted to the Ark asset-library format', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: null,
+      providerId: 'provider-volcengine',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:video', 'doubao:asset_library'],
+    })
+    await settle()
+
+    expect(root.querySelector('[data-select]')?.getAttribute('data-value')).toBe('api_key')
+    const akSkOption = root.querySelector<HTMLButtonElement>('[data-select-item="volc_aksk"]')
+    expect(akSkOption).not.toBeNull()
+    akSkOption?.click()
+    await settle()
+
+    const nameInput = root.querySelector<HTMLInputElement>('input[placeholder="例如：主 Key、备用 Key 1"]')
+    const accessKeyInput = root.querySelector<HTMLInputElement>('input[id^="volc-access-key-id-"]')
+    const secretKeyInput = root.querySelector<HTMLInputElement>('input[id^="volc-secret-access-key-"]')
+    const securityTokenInput = root.querySelector<HTMLInputElement>('input[id^="volc-security-token-"]')
+    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
+    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
+    expect(nameInput).not.toBeNull()
+    expect(accessKeyInput).not.toBeNull()
+    expect(secretKeyInput).not.toBeNull()
+    expect(securityTokenInput).not.toBeNull()
+    expect(accountIdInput).not.toBeNull()
+    expect(projectInput).not.toBeNull()
+
+    updateInput(nameInput as HTMLInputElement, 'Ark asset signer')
+    updateInput(accessKeyInput as HTMLInputElement, 'AKLT-example')
+    updateInput(secretKeyInput as HTMLInputElement, 'secret-example')
+    updateInput(securityTokenInput as HTMLInputElement, 'session-token')
+    updateInput(accountIdInput as HTMLInputElement, 'ark-account-1')
+    updateInput(projectInput as HTMLInputElement, 'video-project')
+    await submit(root)
+
+    expect(endpointMocks.addProviderKey).toHaveBeenCalledWith(
+      'provider-volcengine',
+      expect.objectContaining({
+        auth_type: 'volc_aksk',
+        api_key: '',
+        api_formats: ['doubao:asset_library'],
+        auth_config: {
+          account_id: 'ark-account-1',
+          project: 'video-project',
+          access_key_id: 'AKLT-example',
+          secret_access_key: 'secret-example',
+          security_token: 'session-token',
+          region: 'cn-beijing',
+          service: 'ark',
+        },
+      }),
+    )
+  })
+
+  it('preserves an existing Volcengine AK/SK secret when credential fields stay blank', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: createProviderKey({
+        auth_type: 'volc_aksk',
+        api_formats: ['doubao:asset_library'],
+        api_key_masked: '[Volcengine AK/SK]',
+      }),
+      providerId: 'provider-volcengine',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:asset_library'],
+    })
+    await settle()
+
+    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
+    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
+    expect(accountIdInput?.value).toBe('')
+    expect(projectInput?.value).toBe('')
+    expect(root.textContent).toContain('留空表示保留现有值')
+
+    await submit(root)
+
+    const payload = lastUpdatePayload()
+    expect(payload.auth_type).toBe('volc_aksk')
+    expect(payload.api_formats).toEqual(['doubao:asset_library'])
+    expect(payload).not.toHaveProperty('api_key')
+    expect(payload).not.toHaveProperty('auth_config')
+  })
+
+  it('creates Bearer credentials with Ark account and project binding', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: null,
+      providerId: 'provider-relay',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:asset_library', 'doubao:video'],
+    })
+    await settle()
+
+    const bearerOption = root.querySelector<HTMLButtonElement>('[data-select-item="bearer"]')
+    expect(bearerOption).not.toBeNull()
+    bearerOption?.click()
+    await settle()
+
+    const nameInput = root.querySelector<HTMLInputElement>('input[placeholder="例如：主 Key、备用 Key 1"]')
+    const secretInput = root.querySelector<HTMLInputElement>('input[id^="api-key-"]')
+    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
+    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
+    expect(nameInput).not.toBeNull()
+    expect(secretInput).not.toBeNull()
+    expect(accountIdInput).not.toBeNull()
+    expect(projectInput).not.toBeNull()
+    updateInput(nameInput as HTMLInputElement, 'Relay bearer')
+    updateInput(secretInput as HTMLInputElement, 'relay-token')
+    updateInput(accountIdInput as HTMLInputElement, 'relay-account')
+    updateInput(projectInput as HTMLInputElement, 'relay-project')
+    await submit(root)
+
+    expect(endpointMocks.addProviderKey).toHaveBeenCalledWith(
+      'provider-relay',
+      expect.objectContaining({
+        auth_type: 'bearer',
+        api_key: 'relay-token',
+        auth_config: {
+          account_id: 'relay-account',
+          project: 'relay-project',
+        },
+      }),
+    )
+  })
+
+  it('selects the upstream header for an Ark asset-library API Key', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: null,
+      providerId: 'provider-asset-relay',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:asset_library'],
+    })
+    await settle()
+
+    const headerSelect = root.querySelector<HTMLElement>('[data-ark-api-key-header]')
+    expect(headerSelect?.getAttribute('data-value')).toBe('x-api-key')
+    const apiKeyHeaderOption = headerSelect?.querySelector<HTMLButtonElement>('[data-select-item="api-key"]')
+    expect(apiKeyHeaderOption).not.toBeNull()
+    apiKeyHeaderOption?.click()
+    await settle()
+
+    const nameInput = root.querySelector<HTMLInputElement>('input[placeholder="例如：主 Key、备用 Key 1"]')
+    const secretInput = root.querySelector<HTMLInputElement>('input[id^="api-key-"]')
+    updateInput(nameInput as HTMLInputElement, 'Ark API Key relay')
+    updateInput(secretInput as HTMLInputElement, 'asset-api-key')
+    await submit(root)
+
+    expect(endpointMocks.addProviderKey).toHaveBeenCalledWith(
+      'provider-asset-relay',
+      expect.objectContaining({
+        auth_type: 'api_key',
+        api_key: 'asset-api-key',
+        api_formats: ['doubao:asset_library'],
+        auth_config: {
+          api_key_header: 'api-key',
+        },
+      }),
+    )
+  })
+
+  it('shows the upstream API Key header when only the Ark format overrides Bearer auth', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: createProviderKey({
+        auth_type: 'bearer',
+        auth_type_by_format: {
+          'doubao:asset_library': 'api_key',
+        },
+        api_formats: ['doubao:asset_library'],
+      }),
+      providerId: 'provider-asset-relay',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:asset_library'],
+    })
+    await settle()
+
+    const headerSelect = root.querySelector<HTMLElement>('[data-ark-api-key-header]')
+    expect(headerSelect).not.toBeNull()
+    const apiKeyHeaderOption = headerSelect?.querySelector<HTMLButtonElement>('[data-select-item="api-key"]')
+    expect(apiKeyHeaderOption).not.toBeNull()
+    apiKeyHeaderOption?.click()
+    await submit(root)
+
+    const payload = lastUpdatePayload()
+    expect(payload.auth_type).toBe('bearer')
+    expect(payload.auth_type_by_format).toEqual({
+      'doubao:asset_library': 'api_key',
+    })
+    expect(payload.auth_config).toEqual({
+      api_key_header: 'api-key',
+    })
+  })
+
+  it('creates API Key credentials with Ark binding for Doubao video', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: null,
+      providerId: 'provider-video-relay',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:video'],
+    })
+    await settle()
+
+    const nameInput = root.querySelector<HTMLInputElement>('input[placeholder="例如：主 Key、备用 Key 1"]')
+    const secretInput = root.querySelector<HTMLInputElement>('input[id^="api-key-"]')
+    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
+    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
+    expect(accountIdInput).not.toBeNull()
+    expect(projectInput).not.toBeNull()
+
+    updateInput(nameInput as HTMLInputElement, 'Doubao video relay')
+    updateInput(secretInput as HTMLInputElement, 'video-api-key')
+    updateInput(accountIdInput as HTMLInputElement, 'video-account')
+    updateInput(projectInput as HTMLInputElement, 'video-project')
+    await submit(root)
+
+    expect(endpointMocks.addProviderKey).toHaveBeenCalledWith(
+      'provider-video-relay',
+      expect.objectContaining({
+        auth_type: 'api_key',
+        api_key: 'video-api-key',
+        api_formats: ['doubao:video'],
+        auth_config: {
+          account_id: 'video-account',
+          project: 'video-project',
+        },
+      }),
+    )
+  })
+
+  it('preserves blank Ark binding values and only updates explicitly entered fields', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: createProviderKey({
+        auth_type: 'bearer',
+        api_formats: ['doubao:video'],
+        api_key_masked: 'token-***',
+      }),
+      providerId: 'provider-video-relay',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:video'],
+    })
+    await settle()
+
+    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
+    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
+    expect(accountIdInput?.value).toBe('')
+    expect(projectInput?.value).toBe('')
+    expect(accountIdInput?.placeholder).toBe('留空表示保留原值')
+    expect(projectInput?.placeholder).toBe('留空表示保留原值')
+
+    updateInput(accountIdInput as HTMLInputElement, 'updated-account')
+    await submit(root)
+
+    const payload = lastUpdatePayload()
+    expect(payload).not.toHaveProperty('api_key')
+    expect(payload.auth_config).toEqual({ account_id: 'updated-account' })
+  })
+
+  it.each([
+    ['api_key', 'bearer'],
+    ['bearer', 'api_key'],
+  ] as const)(
+    'switches %s to %s without overwriting hidden Ark auth_config',
+    async (currentAuthType, nextAuthType) => {
+      const root = mountDialog(KeyFormDialog, {
+        open: true,
+        endpoint: null,
+        editingKey: createProviderKey({
+          auth_type: currentAuthType,
+          api_formats: ['doubao:asset_library'],
+          api_key_masked: 'relay-***',
+        }),
+        providerId: 'provider-asset-relay',
+        providerType: 'custom',
+        availableApiFormats: ['doubao:asset_library'],
+      })
+      await settle()
+
+      const nextAuthTypeOption = root.querySelector<HTMLButtonElement>(`[data-select-item="${nextAuthType}"]`)
+      expect(nextAuthTypeOption).not.toBeNull()
+      nextAuthTypeOption?.click()
+      await settle()
+
+      const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
+      const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
+      expect(accountIdInput?.value).toBe('')
+      expect(projectInput?.value).toBe('')
+      if (nextAuthType === 'api_key') {
+        expect(root.querySelector('[data-ark-api-key-header]')?.getAttribute('data-value')).toBe('')
+      }
+
+      await submit(root)
+
+      const payload = lastUpdatePayload()
+      expect(payload.auth_type).toBe(nextAuthType)
+      expect(payload).not.toHaveProperty('api_key')
+      expect(payload).not.toHaveProperty('auth_config')
+    },
+  )
+
   it('lets Vertex AI keys switch to Service Account JSON and submit auth_config', async () => {
     const root = mountDialog(KeyFormDialog, {
       open: true,

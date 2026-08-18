@@ -119,8 +119,14 @@ pub(crate) async fn read_video_task_video_source(
         return Ok(None);
     };
 
-    if !video_url.contains("generativelanguage.googleapis.com") {
+    if !is_google_generative_language_media_url(&video_url) {
         return Ok(Some(VideoTaskVideoSource::Redirect { url: video_url }));
+    }
+
+    if task.provider_api_format.as_deref().map(str::trim) != Some("gemini:video") {
+        return Err(GatewayError::Internal(
+            "proxied Google video is not backed by a Gemini video task".to_string(),
+        ));
     }
 
     let Some(provider_id) = task.provider_id.as_deref() else {
@@ -148,19 +154,53 @@ pub(crate) async fn read_video_task_video_source(
         ));
     };
 
-    let api_key = transport.key.decrypted_api_key.trim();
-    if api_key.is_empty() {
+    let Some(runtime_transport) = crate::provider_transport::resolve_local_video_task_transport(
+        &transport,
+        "gemini:video",
+        task.model.clone(),
+    ) else {
         return Err(GatewayError::Internal(
-            "provider transport key is unavailable for proxied video".to_string(),
+            "provider transport credentials are unavailable for proxied video".to_string(),
         ));
-    }
+    };
+    let Some((header_name, header_value)) = gemini_media_auth_header(&runtime_transport.headers)
+    else {
+        return Err(GatewayError::Internal(
+            "provider transport credentials are unavailable for proxied video".to_string(),
+        ));
+    };
 
     Ok(Some(VideoTaskVideoSource::Proxy {
         url: video_url,
-        header_name: "x-goog-api-key".to_string(),
-        header_value: api_key.to_string(),
+        header_name,
+        header_value,
         filename: format!("video_{task_id}.mp4"),
     }))
+}
+
+fn is_google_generative_language_media_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("generativelanguage.googleapis.com"))
+        && url.port().is_none_or(|port| port == 443)
+}
+
+fn gemini_media_auth_header(headers: &BTreeMap<String, String>) -> Option<(String, String)> {
+    for preferred in ["x-goog-api-key", "authorization"] {
+        if let Some((name, value)) = headers
+            .iter()
+            .find(|(name, value)| name.eq_ignore_ascii_case(preferred) && !value.trim().is_empty())
+        {
+            return Some((name.clone(), value.trim().to_string()));
+        }
+    }
+    None
 }
 
 pub(crate) async fn read_video_task_stats(
@@ -225,4 +265,51 @@ fn status_key(status: VideoTaskStatus) -> String {
 
 fn start_of_utc_day(now_unix_secs: u64) -> u64 {
     now_unix_secs - (now_unix_secs % 86_400)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gemini_media_auth_header, is_google_generative_language_media_url};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn google_media_auth_is_only_sent_to_the_exact_https_origin() {
+        assert!(is_google_generative_language_media_url(
+            "https://generativelanguage.googleapis.com/v1beta/files/video:download?alt=media"
+        ));
+        assert!(is_google_generative_language_media_url(
+            "https://generativelanguage.googleapis.com:443/v1beta/files/video:download"
+        ));
+
+        for spoofed in [
+            "http://generativelanguage.googleapis.com/v1beta/files/video:download",
+            "https://generativelanguage.googleapis.com.attacker.example/video",
+            "https://attacker.example/generativelanguage.googleapis.com/video",
+            "https://user@generativelanguage.googleapis.com/video",
+            "https://generativelanguage.googleapis.com:8443/video",
+        ] {
+            assert!(
+                !is_google_generative_language_media_url(spoofed),
+                "credential-bearing proxy must reject {spoofed}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_media_auth_prefers_api_key_and_rejects_empty_values() {
+        let headers = BTreeMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer oauth-token".to_string(),
+            ),
+            ("x-goog-api-key".to_string(), " google-key ".to_string()),
+        ]);
+        assert_eq!(
+            gemini_media_auth_header(&headers),
+            Some(("x-goog-api-key".to_string(), "google-key".to_string()))
+        );
+
+        let empty = BTreeMap::from([("x-goog-api-key".to_string(), "   ".to_string())]);
+        assert_eq!(gemini_media_auth_header(&empty), None);
+    }
 }

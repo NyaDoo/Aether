@@ -64,6 +64,11 @@ export const dashboardRoutes: RouteRecordRaw[] = [
         component: view(() => import('@/views/user/ModelCatalog.vue'))
       },
       {
+        path: 'material-assets',
+        name: 'MaterialAssets',
+        component: view(() => import('@/views/user/MaterialAssets.vue'))
+      },
+      {
         path: 'async-tasks',
         name: 'UserAsyncTasks',
         component: view(() => import('@/views/admin/AsyncTasks.vue'))

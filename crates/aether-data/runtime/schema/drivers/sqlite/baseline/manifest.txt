@@ -4,3 +4,4 @@
 004_proxy_nodes.sql
 005_wallet_billing.sql
 006_usage.sql
+007_asset_library.sql

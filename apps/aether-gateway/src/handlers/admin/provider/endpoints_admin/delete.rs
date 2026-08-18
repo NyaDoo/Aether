@@ -1,6 +1,10 @@
 use super::extractors::admin_endpoint_id;
 use super::payloads::key_api_formats_without_entry;
 use super::support::build_admin_endpoints_data_unavailable_response;
+use crate::data::AssetProviderReference;
+use crate::handlers::admin::provider::material_references::{
+    count_material_references, material_reference_conflict_response,
+};
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::GatewayError;
 use axum::{
@@ -56,6 +60,41 @@ pub(super) async fn maybe_handle(
                 .into_response(),
         ));
     };
+    let reference_counts =
+        count_material_references(state, AssetProviderReference::EndpointId(&endpoint_id)).await?;
+    if reference_counts.is_referenced() {
+        return Ok(Some(material_reference_conflict_response(
+            "Endpoint",
+            &endpoint_id,
+            reference_counts,
+        )));
+    }
+    match state.delete_provider_catalog_endpoint(&endpoint_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(Some(
+                (
+                    http::StatusCode::NOT_FOUND,
+                    Json(json!({ "detail": format!("Endpoint {endpoint_id} 不存在") })),
+                )
+                    .into_response(),
+            ));
+        }
+        Err(error) => {
+            let reference_counts =
+                count_material_references(state, AssetProviderReference::EndpointId(&endpoint_id))
+                    .await?;
+            if reference_counts.is_referenced() {
+                return Ok(Some(material_reference_conflict_response(
+                    "Endpoint",
+                    &endpoint_id,
+                    reference_counts,
+                )));
+            }
+            return Err(error);
+        }
+    }
+
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -91,16 +130,6 @@ pub(super) async fn maybe_handle(
         }
         affected_keys_count += 1;
     }
-    if !state.delete_provider_catalog_endpoint(&endpoint_id).await? {
-        return Ok(Some(
-            (
-                http::StatusCode::NOT_FOUND,
-                Json(json!({ "detail": format!("Endpoint {endpoint_id} 不存在") })),
-            )
-                .into_response(),
-        ));
-    }
-
     Ok(Some(
         Json(json!({
             "message": format!("Endpoint {endpoint_id} 已删除"),

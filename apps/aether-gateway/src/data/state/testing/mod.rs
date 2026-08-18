@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use aether_data::repository::asset_library::InMemoryAssetLibraryRepository;
 use aether_data_contracts::repository::candidates::RequestCandidateRepository;
 use aether_data_contracts::repository::pool_scores::PoolMemberScoreRepository;
 use aether_data_contracts::repository::quota::ProviderQuotaRepository;
@@ -310,7 +311,11 @@ impl GatewayDataState {
         let provider_catalog_writer: Arc<dyn ProviderCatalogWriteRepository> = repository;
         Self {
             config: GatewayDataConfig::disabled(),
-            backends: None,
+            backends: Some(
+                aether_data::DataBackends::with_asset_library_repository_for_tests(Arc::new(
+                    InMemoryAssetLibraryRepository::default(),
+                )),
+            ),
             auth_api_key_reader: None,
             auth_api_key_writer: None,
             auth_module_reader: None,

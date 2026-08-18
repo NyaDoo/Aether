@@ -989,6 +989,218 @@ async fn maps_openai_video_task_repository_row_into_read_response() {
     assert_eq!(response.body_json["id"], "task-1");
     assert_eq!(response.body_json["status"], "processing");
     assert_eq!(response.body_json["created_at"], 100);
+
+    assert!(state
+        .read_video_task_response_for_user(Some("openai"), "/v1/videos/task-1", "user-1")
+        .await
+        .expect("owned read should succeed")
+        .is_some());
+    assert!(state
+        .read_video_task_response_for_user(Some("openai"), "/v1/videos/task-1", "different-user",)
+        .await
+        .expect("foreign read should be hidden")
+        .is_none());
+    assert!(state
+        .read_video_task_response_for_user(Some("openai"), "/v1/videos/task-1", "   ")
+        .await
+        .expect("anonymous read should be hidden")
+        .is_none());
+}
+
+#[tokio::test]
+async fn maps_db_only_doubao_backed_task_to_openai_response_with_owner_isolation() {
+    let repository = Arc::new(InMemoryVideoTaskRepository::default());
+    repository
+        .upsert(UpsertVideoTask {
+            id: "task-openai-doubao-1".to_string(),
+            short_id: Some("short-openai-doubao-1".to_string()),
+            request_id: "request-openai-doubao-1".to_string(),
+            user_id: Some("owner-openai-doubao".to_string()),
+            api_key_id: Some("client-key-openai-doubao".to_string()),
+            username: Some("owner".to_string()),
+            api_key_name: Some("primary".to_string()),
+            external_task_id: Some("cgt-provider-task-1".to_string()),
+            provider_id: Some("doubao-provider-1".to_string()),
+            endpoint_id: Some("doubao-endpoint-1".to_string()),
+            key_id: Some("doubao-key-1".to_string()),
+            client_api_format: Some("openai:video".to_string()),
+            provider_api_format: Some("doubao:video".to_string()),
+            format_converted: true,
+            model: Some("doubao-seedance-1-0-pro-250528".to_string()),
+            prompt: Some("an OpenAI request persisted after Doubao conversion".to_string()),
+            original_request_body: Some(json!({
+                "model": "sora-2",
+                "prompt": "an OpenAI request persisted after Doubao conversion",
+                "seconds": "8",
+                "size": "1280x720"
+            })),
+            duration_seconds: Some(8),
+            resolution: Some("720p".to_string()),
+            aspect_ratio: Some("16:9".to_string()),
+            size: Some("1280x720".to_string()),
+            status: VideoTaskStatus::Completed,
+            progress_percent: 100,
+            progress_message: None,
+            retry_count: 0,
+            poll_interval_seconds: 10,
+            next_poll_at_unix_secs: None,
+            poll_count: 3,
+            max_poll_count: 360,
+            created_at_unix_ms: 1_000,
+            submitted_at_unix_secs: Some(1),
+            completed_at_unix_secs: Some(9),
+            updated_at_unix_secs: 9,
+            error_code: None,
+            error_message: None,
+            video_url: Some("https://example.invalid/video.mp4".to_string()),
+            request_metadata: Some(json!({
+                "provider_status": "succeeded",
+                "content": {
+                    "video_url": "https://example.invalid/video.mp4"
+                }
+            })),
+        })
+        .await
+        .expect("upsert should succeed");
+
+    // GatewayDataState has only the repository reader here: no in-memory
+    // VideoTaskService snapshot is available to satisfy this read.
+    let state = GatewayDataState::with_video_task_reader_for_tests(repository);
+    let response = state
+        .read_video_task_response_for_user(
+            Some("openai"),
+            "/v1/videos/task-openai-doubao-1",
+            "owner-openai-doubao",
+        )
+        .await
+        .expect("owned DB-only read should succeed")
+        .expect("owned converted task should be visible");
+
+    assert_eq!(response.status_code, 200);
+    assert_eq!(response.body_json["id"], "task-openai-doubao-1");
+    assert_eq!(response.body_json["object"], "video");
+    assert_eq!(response.body_json["status"], "completed");
+    assert_eq!(response.body_json["progress"], 100);
+    assert_eq!(response.body_json["seconds"], "8");
+    assert_eq!(response.body_json["size"], "1280x720");
+    // The signed Ark URL is an internal transport detail; clients fetch the
+    // asset through the authenticated OpenAI `/content` route.
+    assert!(response.body_json.get("video_url").is_none());
+    assert!(response.body_json.get("content").is_none());
+
+    assert!(state
+        .read_video_task_response_for_user(
+            Some("openai"),
+            "/v1/videos/task-openai-doubao-1",
+            "different-user",
+        )
+        .await
+        .expect("foreign DB-only read should not fail")
+        .is_none());
+    assert!(
+        state
+            .read_video_task_response_for_user(
+                Some("openai"),
+                "/v1/videos/task-openai-doubao-1",
+                "   ",
+            )
+            .await
+            .expect("anonymous DB-only read should not fail")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn db_only_doubao_get_hides_cancelled_task_after_retention_window() {
+    let now_unix_secs = aether_video_tasks_core::current_unix_timestamp_secs();
+    let repository = Arc::new(InMemoryVideoTaskRepository::default());
+    let fresh = UpsertVideoTask {
+        id: "cgt-cancelled-fresh".to_string(),
+        short_id: Some("cancel-fresh".to_string()),
+        request_id: "request-cancelled-fresh".to_string(),
+        user_id: Some("owner-doubao-cancelled".to_string()),
+        api_key_id: Some("client-key-doubao-cancelled".to_string()),
+        username: Some("owner".to_string()),
+        api_key_name: Some("primary".to_string()),
+        external_task_id: Some("cgt-provider-cancelled-fresh".to_string()),
+        provider_id: Some("doubao-provider-1".to_string()),
+        endpoint_id: Some("doubao-endpoint-1".to_string()),
+        key_id: Some("doubao-key-1".to_string()),
+        client_api_format: Some("doubao:video".to_string()),
+        provider_api_format: Some("doubao:video".to_string()),
+        format_converted: false,
+        model: Some("seedance-1-5-pro".to_string()),
+        prompt: Some("cancelled task".to_string()),
+        original_request_body: Some(json!({
+            "model": "seedance-1-5-pro",
+            "content": [{"type": "text", "text": "cancelled task"}]
+        })),
+        duration_seconds: Some(5),
+        resolution: Some("720p".to_string()),
+        aspect_ratio: Some("16:9".to_string()),
+        size: None,
+        status: VideoTaskStatus::Cancelled,
+        progress_percent: 50,
+        progress_message: None,
+        retry_count: 0,
+        poll_interval_seconds: 10,
+        next_poll_at_unix_secs: None,
+        poll_count: 1,
+        max_poll_count: 360,
+        created_at_unix_ms: now_unix_secs.saturating_sub(120) * 1_000,
+        submitted_at_unix_secs: Some(now_unix_secs.saturating_sub(120)),
+        completed_at_unix_secs: Some(now_unix_secs.saturating_sub(60)),
+        updated_at_unix_secs: now_unix_secs.saturating_sub(60),
+        error_code: None,
+        error_message: None,
+        // A stale signed URL must not appear in a cancelled response.
+        video_url: Some("https://example.invalid/stale-signed-video.mp4".to_string()),
+        request_metadata: None,
+    };
+    repository
+        .upsert(fresh.clone())
+        .await
+        .expect("fresh cancelled task should seed");
+
+    let mut expired = fresh;
+    expired.id = "cgt-cancelled-expired".to_string();
+    expired.short_id = Some("cancel-expired".to_string());
+    expired.request_id = "request-cancelled-expired".to_string();
+    expired.external_task_id = Some("cgt-provider-cancelled-expired".to_string());
+    let expired_at = now_unix_secs
+        .saturating_sub(aether_video_tasks_core::DOUBAO_CANCELLED_TASK_RETENTION_SECONDS);
+    expired.completed_at_unix_secs = Some(expired_at);
+    expired.updated_at_unix_secs = expired_at;
+    repository
+        .upsert(expired)
+        .await
+        .expect("expired cancelled task should seed");
+
+    let state = GatewayDataState::with_video_task_reader_for_tests(repository);
+    let fresh_response = state
+        .read_video_task_response_for_user(
+            Some("doubao"),
+            "/v3/contents/generations/tasks/cgt-cancelled-fresh",
+            "owner-doubao-cancelled",
+        )
+        .await
+        .expect("fresh DB-only read should succeed")
+        .expect("fresh cancelled task should still resolve");
+    assert_eq!(fresh_response.status_code, 200);
+    assert_eq!(fresh_response.body_json["status"], "cancelled");
+    assert!(fresh_response.body_json.get("content").is_none());
+
+    let expired_response = state
+        .read_video_task_response_for_user(
+            Some("doubao"),
+            "/v3/contents/generations/tasks/cgt-cancelled-expired",
+            "owner-doubao-cancelled",
+        )
+        .await
+        .expect("expired DB-only read should succeed")
+        .expect("expired task should be answered locally as not found");
+    assert_eq!(expired_response.status_code, 404);
+    assert_eq!(expired_response.body_json["error"]["code"], "NotFound");
 }
 
 #[tokio::test]

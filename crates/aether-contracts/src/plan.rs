@@ -7,6 +7,11 @@ pub const EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER: &str = "x-aether-execution-
 pub const EXECUTION_REQUEST_HTTP1_ONLY_HEADER: &str = "x-aether-execution-http1-only";
 pub const EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER: &str =
     "x-aether-execution-accept-invalid-certs";
+/// Marks a stream plan whose target URL came from an upstream media response
+/// rather than the configured provider API endpoint. Runtime transports use
+/// this internal-only marker to apply DNS-pinned asset egress.
+pub const EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER: &str =
+    "x-aether-execution-direct-video-asset";
 pub const EXECUTION_RESPONSE_BODY_MODE_HEADER: &str = "x-aether-execution-response-body-mode";
 pub const MAX_EXECUTION_REQUEST_TIMEOUT_SECS: u64 = 1_200;
 pub const MAX_EXECUTION_REQUEST_TIMEOUT_MS: u64 = MAX_EXECUTION_REQUEST_TIMEOUT_SECS * 1_000;

@@ -60,6 +60,14 @@ impl InMemoryVideoTaskRepository {
                 return false;
             }
         }
+        if filter.exclude_deleted && task.status == VideoTaskStatus::Deleted {
+            return false;
+        }
+        if let Some(model_exact) = filter.model_exact.as_deref() {
+            if task.model.as_deref().map(str::trim) != Some(model_exact.trim()) {
+                return false;
+            }
+        }
         if let Some(model_substring) = filter.model_substring.as_deref() {
             let needle = model_substring.trim().to_ascii_lowercase();
             let Some(model) = task.model.as_deref() else {
@@ -619,8 +627,10 @@ mod tests {
         let filter = VideoTaskQueryFilter {
             user_id: Some("user-2".to_string()),
             status: Some(VideoTaskStatus::Completed),
+            model_exact: None,
             model_substring: Some("veo".to_string()),
             client_api_format: Some("gemini:video".to_string()),
+            exclude_deleted: false,
         };
 
         let page = repo
@@ -655,6 +665,45 @@ mod tests {
             .await
             .expect("today count should succeed");
         assert_eq!(today_count, 1);
+    }
+
+    #[tokio::test]
+    async fn exact_model_filter_excludes_prefix_matches_and_deleted_tombstones() {
+        let repo = InMemoryVideoTaskRepository::default();
+        for (id, model, status) in [
+            ("task-exact", "ep-video-1", VideoTaskStatus::Completed),
+            (
+                "task-prefix",
+                "ep-video-1-canary",
+                VideoTaskStatus::Completed,
+            ),
+            ("task-deleted", "ep-video-1", VideoTaskStatus::Deleted),
+        ] {
+            repo.upsert(UpsertVideoTask {
+                model: Some(model.to_string()),
+                user_id: Some("user-1".to_string()),
+                client_api_format: Some("doubao:video".to_string()),
+                ..sample_task(id, status, 100)
+            })
+            .await
+            .expect("upsert should succeed");
+        }
+
+        let filter = VideoTaskQueryFilter {
+            user_id: Some("user-1".to_string()),
+            model_exact: Some("ep-video-1".to_string()),
+            client_api_format: Some("doubao:video".to_string()),
+            exclude_deleted: true,
+            ..VideoTaskQueryFilter::default()
+        };
+
+        let page = repo
+            .list_page(&filter, 0, 10)
+            .await
+            .expect("list page should succeed");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "task-exact");
+        assert_eq!(repo.count(&filter).await.expect("count"), 1);
     }
 
     #[tokio::test]

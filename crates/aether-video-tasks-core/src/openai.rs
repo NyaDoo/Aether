@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
-use aether_contracts::{ExecutionPlan, RequestBody};
+use aether_contracts::{ExecutionPlan, RequestBody, EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER};
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, UpsertVideoTask, VideoTaskStatus,
 };
 use serde_json::{json, Map, Value};
 
+use crate::util::safe_external_http_url;
 use crate::{
     build_video_follow_up_report_context, current_unix_timestamp_secs, map_openai_task_status,
     parse_video_content_variant, request_body_string, request_body_u32, resolve_follow_up_auth,
@@ -43,6 +44,24 @@ pub fn map_openai_stored_task_to_read_response(
 }
 
 fn build_openai_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus) -> Value {
+    let metadata_global_model = task
+        .request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("global_model_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let snapshot_global_model = task
+        .request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("rust_local_snapshot"))
+        .and_then(|value| serde_json::from_value::<LocalVideoTaskSnapshot>(value.clone()).ok())
+        .and_then(|snapshot| match snapshot {
+            LocalVideoTaskSnapshot::OpenAi(seed) => seed.persistence.global_model_name,
+            _ => None,
+        })
+        .filter(|value| !value.trim().is_empty());
     let mut body = json!({
         "id": task.id,
         "object": "video",
@@ -51,7 +70,10 @@ fn build_openai_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus)
         "created_at": task.created_at_unix_ms,
     });
 
-    if let Some(model) = task.model {
+    if let Some(model) = metadata_global_model
+        .or(snapshot_global_model)
+        .or(task.model)
+    {
         body["model"] = Value::String(model);
     }
     if let Some(prompt) = task.prompt {
@@ -60,8 +82,8 @@ fn build_openai_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus)
     if let Some(size) = task.size {
         body["size"] = Value::String(size);
     }
-    if let Some(video_url) = task.video_url {
-        body["video_url"] = Value::String(video_url);
+    if let Some(seconds) = task.duration_seconds {
+        body["seconds"] = Value::String(seconds.to_string());
     }
     if let Some(completed_at) = task.completed_at_unix_secs {
         body["completed_at"] = Value::Number(completed_at.into());
@@ -132,7 +154,7 @@ impl OpenAiVideoTaskSeed {
             .or_else(|| provider_body.get("url"))
             .or_else(|| provider_body.get("result_url"))
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .and_then(safe_external_http_url);
     }
 
     pub fn build_content_stream_action(
@@ -184,12 +206,14 @@ impl OpenAiVideoTaskSeed {
 
         let variant = parse_video_content_variant(query_string)?;
         let (url, headers) = if variant == "video" {
-            if let Some(video_url) = self
-                .video_url
-                .clone()
-                .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
-            {
-                (video_url, BTreeMap::new())
+            if let Some(video_url) = self.video_url.as_deref().and_then(safe_external_http_url) {
+                (
+                    video_url,
+                    BTreeMap::from([(
+                        EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER.to_string(),
+                        "1".to_string(),
+                    )]),
+                )
             } else {
                 let mut headers = self.transport.headers.clone();
                 headers.remove("content-type");
@@ -256,8 +280,13 @@ impl OpenAiVideoTaskSeed {
             "created_at": self.created_at_unix_ms,
         });
 
-        if let Some(model) = &self.model {
-            body["model"] = Value::String(model.clone());
+        if let Some(model) = self
+            .persistence
+            .global_model_name
+            .as_deref()
+            .or(self.model.as_deref())
+        {
+            body["model"] = Value::String(model.to_string());
         }
         if let Some(prompt) = &self.prompt {
             body["prompt"] = Value::String(prompt.clone());
@@ -360,6 +389,10 @@ impl OpenAiVideoTaskSeed {
                     key_id: &self.transport.key_id,
                     provider_name: self.transport.provider_name.as_deref(),
                     model_name: model_name.as_deref(),
+                    global_model_name: self.persistence.global_model_name.as_deref(),
+                    mapped_model: self.persistence.mapped_model.as_deref(),
+                    model_id: self.persistence.model_id.as_deref(),
+                    global_model_id: self.persistence.global_model_id.as_deref(),
                     client_api_format: "openai:video",
                     provider_api_format: "openai:video",
                 },
@@ -484,6 +517,10 @@ impl OpenAiVideoTaskSeed {
                     key_id: &self.transport.key_id,
                     provider_name: self.transport.provider_name.as_deref(),
                     model_name: model_name.as_deref(),
+                    global_model_name: self.persistence.global_model_name.as_deref(),
+                    mapped_model: self.persistence.mapped_model.as_deref(),
+                    model_id: self.persistence.model_id.as_deref(),
+                    global_model_id: self.persistence.global_model_id.as_deref(),
                     client_api_format: "openai:video",
                     provider_api_format: "openai:video",
                 },
@@ -534,6 +571,10 @@ impl OpenAiVideoTaskSeed {
                 key_id: &self.transport.key_id,
                 provider_name: self.transport.provider_name.as_deref(),
                 model_name: model_name.as_deref(),
+                global_model_name: self.persistence.global_model_name.as_deref(),
+                mapped_model: self.persistence.mapped_model.as_deref(),
+                model_id: self.persistence.model_id.as_deref(),
+                global_model_id: self.persistence.global_model_id.as_deref(),
                 client_api_format: "openai:video",
                 provider_api_format: "openai:video",
             });
@@ -584,7 +625,8 @@ impl OpenAiVideoTaskSeed {
         };
         UpsertVideoTask {
             id: self.local_task_id.clone(),
-            short_id: None,
+            // The column is NOT NULL; the OpenAI surface exposes no short id.
+            short_id: Some(crate::derive_video_task_short_id(&self.local_task_id)),
             request_id: self.persistence.request_id.clone(),
             user_id: self.user_id.clone(),
             api_key_id: self.api_key_id.clone(),
@@ -622,19 +664,90 @@ impl OpenAiVideoTaskSeed {
             error_code: self.error_code.clone(),
             error_message: self.error_message.clone(),
             video_url: self.video_url.clone(),
-            request_metadata: Some(json!({
-                "rust_owner": "async_task",
-                "rust_local_snapshot": LocalVideoTaskSnapshot::OpenAi(self.clone()),
-            })),
+            request_metadata: Some({
+                let mut metadata = Map::new();
+                metadata.insert(
+                    "rust_owner".to_string(),
+                    Value::String("async_task".to_string()),
+                );
+                metadata.insert(
+                    "rust_local_snapshot".to_string(),
+                    serde_json::to_value(
+                        LocalVideoTaskSnapshot::OpenAi(self.clone()).redacted_for_persistence(),
+                    )
+                    .expect("video snapshot should serialize"),
+                );
+                self.persistence.append_identity_metadata(&mut metadata);
+                Value::Object(metadata)
+            }),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use aether_contracts::EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER;
     use aether_data_contracts::repository::video_tasks::{StoredVideoTask, VideoTaskStatus};
+    use serde_json::json;
 
     use super::map_openai_stored_task_to_read_response;
+    use crate::{
+        LocalVideoTaskContentAction, LocalVideoTaskPersistence, LocalVideoTaskStatus,
+        LocalVideoTaskTransport, OpenAiVideoTaskSeed,
+    };
+
+    fn completed_openai_seed(video_url: Option<&str>) -> OpenAiVideoTaskSeed {
+        OpenAiVideoTaskSeed {
+            local_task_id: "task-openai-123".to_string(),
+            upstream_task_id: "upstream-openai-123".to_string(),
+            created_at_unix_ms: 1_712_345_678,
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("api-key-1".to_string()),
+            model: Some("sora-2".to_string()),
+            prompt: Some("hello".to_string()),
+            size: Some("1280x720".to_string()),
+            seconds: Some("5".to_string()),
+            remixed_from_video_id: None,
+            status: LocalVideoTaskStatus::Completed,
+            progress_percent: 100,
+            completed_at_unix_secs: Some(1_712_345_688),
+            expires_at_unix_secs: None,
+            error_code: None,
+            error_message: None,
+            video_url: video_url.map(str::to_string),
+            persistence: LocalVideoTaskPersistence {
+                request_id: "request-openai-123".to_string(),
+                username: None,
+                api_key_name: None,
+                client_api_format: "openai:video".to_string(),
+                provider_api_format: "openai:video".to_string(),
+                original_request_body: json!({"model": "sora-2"}),
+                format_converted: false,
+                global_model_name: None,
+                mapped_model: None,
+                model_id: None,
+                global_model_id: None,
+            },
+            transport: LocalVideoTaskTransport {
+                upstream_base_url: "https://api.openai.example/v1".to_string(),
+                provider_name: Some("OpenAI".to_string()),
+                provider_id: "provider-openai".to_string(),
+                endpoint_id: "endpoint-openai".to_string(),
+                key_id: "key-openai".to_string(),
+                headers: [(
+                    "authorization".to_string(),
+                    "Bearer provider-sk".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                content_type: Some("application/json".to_string()),
+                model_name: Some("sora-2".to_string()),
+                proxy: None,
+                transport_profile: None,
+                timeouts: None,
+            },
+        }
+    }
 
     fn sample_stored_task(status: VideoTaskStatus) -> StoredVideoTask {
         StoredVideoTask {
@@ -688,9 +801,75 @@ mod tests {
         assert_eq!(response.body_json["status"], "failed");
         assert_eq!(response.body_json["completed_at"], 1712345688u64);
         assert_eq!(response.body_json["error"]["code"], "upstream_failed");
+        assert!(response.body_json.get("video_url").is_none());
+    }
+
+    #[test]
+    fn provider_direct_asset_is_marked_but_configured_content_api_is_not() {
+        let direct = completed_openai_seed(Some("https://cdn.example.com/video.mp4?sig=1"))
+            .build_content_stream_action(None, "trace-direct")
+            .expect("completed video should produce content action");
+        let LocalVideoTaskContentAction::StreamPlan(direct) = direct else {
+            panic!("direct asset should stream");
+        };
+        assert_eq!(direct.url, "https://cdn.example.com/video.mp4?sig=1");
         assert_eq!(
-            response.body_json["video_url"],
-            "https://cdn.example.com/video.mp4"
+            direct
+                .headers
+                .get(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER)
+                .map(String::as_str),
+            Some("1")
         );
+        assert!(!direct.headers.contains_key("authorization"));
+
+        let configured = completed_openai_seed(None)
+            .build_content_stream_action(None, "trace-configured")
+            .expect("configured content endpoint should produce stream action");
+        let LocalVideoTaskContentAction::StreamPlan(configured) = configured else {
+            panic!("configured content endpoint should stream");
+        };
+        assert_eq!(
+            configured.url,
+            "https://api.openai.example/v1/videos/upstream-openai-123/content"
+        );
+        assert!(!configured
+            .headers
+            .contains_key(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER));
+        assert_eq!(
+            configured.headers.get("authorization").map(String::as_str),
+            Some("Bearer provider-sk")
+        );
+    }
+
+    #[test]
+    fn unsafe_provider_asset_is_not_persisted_or_marked_for_direct_egress() {
+        for unsafe_url in [
+            "http://cdn.example.com/video.mp4",
+            "https://user:pass@cdn.example.com/video.mp4",
+            "https://127.0.0.1/video.mp4",
+        ] {
+            let mut seed = completed_openai_seed(None);
+            seed.apply_provider_body(
+                json!({"status": "completed", "video_url": unsafe_url})
+                    .as_object()
+                    .expect("provider response should be an object"),
+            );
+            assert!(seed.video_url.is_none(), "{unsafe_url}");
+
+            // A legacy persisted snapshot may still contain an unsafe value.
+            // Content serving must fall back to the configured provider API,
+            // never turn that value into a marked direct-egress plan.
+            seed.video_url = Some(unsafe_url.to_string());
+            let action = seed
+                .build_content_stream_action(None, "trace-unsafe")
+                .expect("configured content fallback should remain available");
+            let LocalVideoTaskContentAction::StreamPlan(plan) = action else {
+                panic!("unsafe direct value should fall back to configured API");
+            };
+            assert!(plan.url.contains("/videos/upstream-openai-123/content"));
+            assert!(!plan
+                .headers
+                .contains_key(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER));
+        }
     }
 }
