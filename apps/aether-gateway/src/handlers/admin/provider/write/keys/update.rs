@@ -5,7 +5,7 @@ use crate::handlers::admin::provider::write::normalize::{
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
     normalize_max_probe_interval_minutes, normalize_rate_multipliers,
     normalize_volc_aksk_auth_config, reconcile_allow_auth_channel_mismatch_formats,
-    validate_vertex_api_formats,
+    validate_asset_library_auth_config, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -295,6 +295,12 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
 
     let effective_api_formats =
         normalize_api_format_list(json_string_list(updated.api_formats.as_ref()));
+    let effective_auth_config = if auth_config_present {
+        auth_config.clone()
+    } else {
+        parse_catalog_auth_config_json(state, &updated).map(serde_json::Value::Object)
+    };
+    validate_asset_library_auth_config(&effective_api_formats, effective_auth_config.as_ref())?;
     if matches!(target_auth_type.as_str(), "api_key" | "bearer") {
         if fields.contains("auth_type_by_format") {
             updated.auth_type_by_format = normalize_auth_type_by_format(
@@ -688,152 +694,11 @@ mod tests {
     }
 
     #[test]
-    fn merges_bearer_binding_patch_without_clearing_raw_secret() {
-        let app = test_app();
-        let state = AdminAppState::new(&app);
-        let mut existing = sample_key("bearer");
-        existing.encrypted_api_key = Some(
-            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
-                .expect("raw secret should encrypt"),
-        );
-        existing.encrypted_auth_config = Some(
-            encrypt_python_fernet_plaintext(
-                DEVELOPMENT_ENCRYPTION_KEY,
-                &json!({
-                    "account_id": "account-existing",
-                    "project": "project-existing"
-                })
-                .to_string(),
-            )
-            .expect("binding config should encrypt"),
-        );
-        let original_secret = existing.encrypted_api_key.clone();
-
-        let updated = build_admin_update_provider_key_record_with_existing_keys(
-            &state,
-            &sample_provider(),
-            &existing,
-            std::slice::from_ref(&existing),
-            patch(json!({
-                "auth_config": {
-                    "project": "project-updated"
-                }
-            })),
-        )
-        .expect("binding-only bearer update should succeed");
-
-        assert_eq!(updated.auth_type, "bearer");
-        assert_eq!(updated.encrypted_api_key, original_secret);
-        let plaintext = decrypt_python_fernet_ciphertext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            updated
-                .encrypted_auth_config
-                .as_deref()
-                .expect("merged binding config should be encrypted"),
-        )
-        .expect("merged binding config should decrypt");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&plaintext)
-                .expect("merged binding config should be JSON"),
-            json!({
-                "account_id": "account-existing",
-                "project": "project-updated"
-            })
-        );
-    }
-
-    #[test]
-    fn preserves_binding_when_switching_between_raw_auth_types() {
-        let app = test_app();
-        let state = AdminAppState::new(&app);
-        let mut existing = sample_key("api_key");
-        existing.encrypted_api_key = Some(
-            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
-                .expect("raw secret should encrypt"),
-        );
-        existing.encrypted_auth_config = Some(
-            encrypt_python_fernet_plaintext(
-                DEVELOPMENT_ENCRYPTION_KEY,
-                &json!({
-                    "account_id": "account-existing",
-                    "project": "project-existing",
-                    "api_key_header": "api-key"
-                })
-                .to_string(),
-            )
-            .expect("binding config should encrypt"),
-        );
-        let original_config = existing.encrypted_auth_config.clone();
-
-        let updated = build_admin_update_provider_key_record_with_existing_keys(
-            &state,
-            &sample_provider(),
-            &existing,
-            std::slice::from_ref(&existing),
-            patch(json!({"auth_type": "bearer"})),
-        )
-        .expect("raw auth type switch should preserve binding metadata");
-
-        assert_eq!(updated.auth_type, "bearer");
-        assert_eq!(updated.encrypted_auth_config, original_config);
-    }
-
-    #[test]
-    fn merges_partial_binding_when_switching_between_raw_auth_types() {
-        let app = test_app();
-        let state = AdminAppState::new(&app);
-        let mut existing = sample_key("api_key");
-        existing.encrypted_api_key = Some(
-            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
-                .expect("raw secret should encrypt"),
-        );
-        existing.encrypted_auth_config = Some(
-            encrypt_python_fernet_plaintext(
-                DEVELOPMENT_ENCRYPTION_KEY,
-                &json!({
-                    "account_id": "account-existing",
-                    "project": "project-existing",
-                    "api_key_header": "api-key"
-                })
-                .to_string(),
-            )
-            .expect("binding config should encrypt"),
-        );
-
-        let updated = build_admin_update_provider_key_record_with_existing_keys(
-            &state,
-            &sample_provider(),
-            &existing,
-            std::slice::from_ref(&existing),
-            patch(json!({
-                "auth_type": "bearer",
-                "auth_config": {"account_id": "account-updated"}
-            })),
-        )
-        .expect("partial raw auth switch should merge binding metadata");
-        let plaintext = decrypt_python_fernet_ciphertext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            updated
-                .encrypted_auth_config
-                .as_deref()
-                .expect("auth config"),
-        )
-        .expect("auth config decrypts");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&plaintext).expect("auth config JSON"),
-            json!({
-                "account_id": "account-updated",
-                "project": "project-existing",
-                "api_key_header": "api-key"
-            })
-        );
-    }
-
-    #[test]
-    fn merges_volc_aksk_binding_patch_without_clearing_credentials() {
+    fn asset_library_update_rejects_account_and_project_bindings() {
         let app = test_app();
         let state = AdminAppState::new(&app);
         let mut existing = sample_key("volc_aksk");
+        existing.api_formats = Some(json!(["doubao:asset_library"]));
         existing.encrypted_auth_config = Some(
             encrypt_python_fernet_plaintext(
                 DEVELOPMENT_ENCRYPTION_KEY,
@@ -842,51 +707,49 @@ mod tests {
                     "secret_access_key": "secret-existing",
                     "security_token": "token-existing",
                     "region": "cn-beijing",
-                    "service": "ark",
-                    "account_id": "account-existing",
-                    "project": "project-existing"
+                    "service": "ark"
                 })
                 .to_string(),
             )
             .expect("AK/SK config should encrypt"),
         );
 
-        let updated = build_admin_update_provider_key_record_with_existing_keys(
+        let error = build_admin_update_provider_key_record_with_existing_keys(
             &state,
             &sample_provider(),
             &existing,
             std::slice::from_ref(&existing),
             patch(json!({
                 "auth_config": {
-                    "account_id": "account-updated",
                     "project": "project-updated"
                 }
             })),
         )
-        .expect("binding-only AK/SK update should preserve credentials");
+        .expect_err("asset identity bindings must be rejected");
+        assert!(error.contains("不支持字段 project"));
+    }
 
-        assert_eq!(updated.auth_type, "volc_aksk");
-        assert!(updated.encrypted_api_key.is_none());
-        let plaintext = decrypt_python_fernet_ciphertext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            updated
-                .encrypted_auth_config
-                .as_deref()
-                .expect("merged AK/SK config should be encrypted"),
-        )
-        .expect("merged AK/SK config should decrypt");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&plaintext)
-                .expect("merged AK/SK config should be JSON"),
-            json!({
-                "access_key_id": "AKLT-existing",
-                "secret_access_key": "secret-existing",
-                "security_token": "token-existing",
-                "region": "cn-beijing",
-                "service": "ark",
-                "account_id": "account-updated",
-                "project": "project-updated"
-            })
-        );
+    #[test]
+    fn asset_library_raw_auth_update_rejects_binding_aliases() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+
+        for (auth_type, field) in [("api_key", "account_binding"), ("bearer", "project_id")] {
+            let mut existing = sample_key(auth_type);
+            existing.api_formats = Some(json!(["doubao:asset_library"]));
+            existing.encrypted_api_key = Some(
+                encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
+                    .expect("raw secret should encrypt"),
+            );
+            let error = build_admin_update_provider_key_record_with_existing_keys(
+                &state,
+                &sample_provider(),
+                &existing,
+                std::slice::from_ref(&existing),
+                patch(json!({"auth_config": {field: "legacy-binding"}})),
+            )
+            .expect_err("asset identity binding aliases must be rejected");
+            assert!(error.contains("仅按 Provider"));
+        }
     }
 }

@@ -86,9 +86,9 @@
             size="icon"
             class="h-8 w-8 rounded-lg"
             aria-label="创建素材组"
-            :disabled="!canCreate"
-            :title="createActionTitle('创建素材组')"
-            @click="createGroupOpen = true"
+            :disabled="!canMutate"
+            :title="createGroupActionTitle()"
+            @click="openCreateGroupDialog"
           >
             <FolderPlus class="h-4 w-4" />
           </Button>
@@ -586,9 +586,23 @@
     <Dialog
       v-model:open="createGroupOpen"
       title="创建素材组"
-      description="素材组会绑定到当前可用的火山方舟账户与项目。"
+      description="素材组会通过当前可用的方舟素材库提供商创建。"
     >
       <div class="space-y-4">
+        <div v-if="isAdmin">
+          <Label for="material-group-owner">所属用户 ID</Label>
+          <Input
+            id="material-group-owner"
+            v-model="newGroupOwnerUserId"
+            class="mt-2"
+            placeholder="输入素材组所属用户的 ID"
+            autocomplete="off"
+            @keyup.enter="createMaterialGroup"
+          />
+          <p class="mt-1.5 text-xs leading-5 text-muted-foreground">
+            创建成功后会自动切换到该用户的素材库。
+          </p>
+        </div>
         <div>
           <Label for="material-group-name">组名称</Label>
           <Input
@@ -619,7 +633,7 @@
           取消
         </Button>
         <Button
-          :disabled="!canCreate || creatingGroup || !newGroupName.trim()"
+          :disabled="!canMutate || creatingGroup || !newGroupName.trim() || (isAdmin && !newGroupOwnerUserId.trim())"
           @click="createMaterialGroup"
         >
           <Loader2
@@ -667,7 +681,7 @@
 
     <Dialog
       v-model:open="urlUploadOpen"
-      title="通过公网 URL 创建素材"
+      title="通过公网 URL 创建图片素材"
       description="火山方舟将抓取并处理远程文件，URL 必须可从公网直接访问。"
     >
       <div class="space-y-4">
@@ -677,7 +691,7 @@
             id="material-url"
             v-model="sourceUrl"
             class="mt-2"
-            placeholder="https://example.com/reference.mp4"
+            placeholder="https://example.com/reference.jpg"
             @keyup.enter="createAssetFromUrl"
           />
         </div>
@@ -687,7 +701,7 @@
             id="material-url-name"
             v-model="sourceUrlName"
             class="mt-2"
-            placeholder="参考视频"
+            placeholder="参考图片"
           />
         </div>
         <div>
@@ -703,25 +717,6 @@
                 :value="group.id"
               >
                 {{ group.name }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div>
-          <Label>素材类型</Label>
-          <Select v-model="sourceUrlAssetType">
-            <SelectTrigger class="mt-2 w-full">
-              <SelectValue placeholder="选择素材类型" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="Image">
-                图片
-              </SelectItem>
-              <SelectItem value="Video">
-                视频
-              </SelectItem>
-              <SelectItem value="Audio">
-                音频
               </SelectItem>
             </SelectContent>
           </Select>
@@ -852,7 +847,6 @@ import {
   type MaterialAssetGroup,
   type MaterialAssetScope,
   type MaterialAssetVerificationSession,
-  type ArkMaterialAssetType,
 } from '@/api/material-assets'
 import { EmptyState, LoadingState } from '@/components/common'
 import { PageHeader } from '@/components/layout'
@@ -944,6 +938,7 @@ let groupRequestSequence = 0
 let activeForegroundRequests = 0
 
 const createGroupOpen = ref(false)
+const newGroupOwnerUserId = ref('')
 const newGroupName = ref('')
 const newGroupDescription = ref('')
 const creatingGroup = ref(false)
@@ -956,7 +951,6 @@ const urlUploadOpen = ref(false)
 const sourceUrl = ref('')
 const sourceUrlName = ref('')
 const sourceUrlGroupId = ref('')
-const sourceUrlAssetType = ref<ArkMaterialAssetType>('Image')
 const creatingFromUrl = ref(false)
 
 const previewAsset = ref<MaterialAsset | null>(null)
@@ -1127,9 +1121,24 @@ function handleEmptyAction() {
 }
 
 function createActionTitle(defaultTitle: string): string {
+  if (!canMutate.value) return '当前账号没有素材库写权限'
   if (isAdmin.value && !ownerUserId.value) return '请先填写并应用用户 ID'
   if (hasUnappliedAdminOwner.value) return '请先应用当前用户 ID'
   return defaultTitle
+}
+
+function createGroupActionTitle(): string {
+  if (!canMutate.value) return '当前账号没有素材库写权限'
+  if (isAdmin.value && (!ownerUserId.value || hasUnappliedAdminOwner.value)) {
+    return '创建素材组并指定归属用户'
+  }
+  return '创建素材组'
+}
+
+function openCreateGroupDialog() {
+  if (!canMutate.value) return
+  newGroupOwnerUserId.value = ownerUserId.value || adminUserId.value.trim()
+  createGroupOpen.value = true
 }
 
 function applySearchNow() {
@@ -1221,16 +1230,22 @@ async function copyVideoUsageSnippet() {
 
 async function createMaterialGroup() {
   const name = newGroupName.value.trim()
-  if (!canCreate.value || !name || creatingGroup.value) return
+  const targetUserId = isAdmin.value ? newGroupOwnerUserId.value.trim() : ''
+  if (!canMutate.value || !name || (isAdmin.value && !targetUserId) || creatingGroup.value) return
   creatingGroup.value = true
   try {
     const group = await api.createGroup({
       name,
       description: newGroupDescription.value.trim() || undefined,
       group_type: 'AIGC',
-      user_id: ownerUserId.value || undefined,
+      user_id: targetUserId || undefined,
     })
+    if (isAdmin.value) {
+      adminUserId.value = targetUserId
+      appliedAdminUserId.value = targetUserId
+    }
     createGroupOpen.value = false
+    newGroupOwnerUserId.value = ''
     newGroupName.value = ''
     newGroupDescription.value = ''
     selectedGroupId.value = group.id
@@ -1322,7 +1337,6 @@ function openUrlUploadDialog() {
   sourceUrlGroupId.value = creatableGroups.value.some(group => group.id === selectedGroupId.value)
     ? selectedGroupId.value
     : creatableGroups.value[0]?.id || ''
-  sourceUrlAssetType.value = 'Image'
   urlUploadOpen.value = true
 }
 
@@ -1335,9 +1349,9 @@ async function createAssetFromUrl() {
   const url = sourceUrl.value.trim()
   try {
     const parsed = new URL(url)
-    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('unsupported protocol')
+    if (parsed.protocol !== 'https:') throw new Error('unsupported protocol')
   } catch {
-    toast({ title: 'URL 格式错误', description: '请输入可访问的 HTTP 或 HTTPS URL', variant: 'destructive' })
+    toast({ title: 'URL 格式错误', description: '请输入可从公网访问的 HTTPS URL', variant: 'destructive' })
     return
   }
 
@@ -1347,7 +1361,7 @@ async function createAssetFromUrl() {
       url,
       name: sourceUrlName.value.trim() || undefined,
       group_id: sourceUrlGroupId.value,
-      asset_type: sourceUrlAssetType.value,
+      asset_type: 'Image',
       user_id: ownerUserId.value || undefined,
     })
     urlUploadOpen.value = false
@@ -1430,8 +1444,10 @@ async function startVerification() {
   if (verificationWindow) verificationWindow.opener = null
 
   try {
+    const callbackUrl = new URL(window.location.href)
+    callbackUrl.hash = ''
     const session = await api.createVerificationSession({
-      return_url: window.location.href,
+      callback_url: callbackUrl.toString(),
       user_id: ownerAtStart || undefined,
     })
     if (sessionGeneration !== verificationSessionGeneration || ownerAtStart !== ownerUserId.value) {

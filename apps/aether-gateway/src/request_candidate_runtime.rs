@@ -693,6 +693,38 @@ pub(crate) async fn ensure_execution_request_candidate_slot(
     ));
 }
 
+pub(crate) fn assign_execution_request_candidate_slot(
+    plan: &mut ExecutionPlan,
+    report_context: &mut Option<Value>,
+) {
+    let existing_candidate_id = plan
+        .candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let report_candidate_id = parse_request_candidate_report_context(report_context.as_ref())
+        .and_then(|metadata| metadata.candidate_id);
+    if existing_candidate_id.as_deref().is_some()
+        && report_candidate_id.as_deref() == existing_candidate_id.as_deref()
+    {
+        return;
+    }
+
+    let seed = build_execution_request_candidate_seed(
+        plan,
+        report_context.as_ref(),
+        current_unix_ms(),
+        existing_candidate_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+    );
+    let candidate_id = seed.upsert_record.id.clone();
+    plan.candidate_id = Some(candidate_id.clone());
+    *report_context = Some(finalize_execution_request_candidate_report_context(
+        seed.report_context,
+        &candidate_id,
+    ));
+}
+
 pub(crate) async fn persist_available_local_candidate(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     trace_id: &str,

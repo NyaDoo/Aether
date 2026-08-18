@@ -2006,6 +2006,9 @@ pub(crate) fn build_public_health_timeline(
 pub(crate) fn api_format_display_name(api_format: &str) -> String {
     let raw = api_format.trim();
     let normalized = raw.to_ascii_lowercase();
+    if normalized == "doubao:asset_library" {
+        return "Ark Asset Library".to_string();
+    }
     let Some((family, kind)) = normalized.split_once(':') else {
         return if raw.is_empty() {
             api_format.to_string()
@@ -2018,7 +2021,16 @@ pub(crate) fn api_format_display_name(api_format: &str) -> String {
         "claude" => "Claude",
         "openai" => "OpenAI",
         "gemini" => "Gemini",
-        other => other,
+        "jina" => "Jina",
+        "doubao" => "Doubao",
+        "aliyun" => "Aliyun",
+        other => {
+            return format!(
+                "{} {}",
+                title_case_api_format_segment(other),
+                title_case_api_format_segment(kind)
+            )
+        }
     };
     let kind_label = match kind {
         "chat" => "Chat",
@@ -2030,18 +2042,56 @@ pub(crate) fn api_format_display_name(api_format: &str) -> String {
         "video" => "Video",
         "image" => "Image",
         "files" => "Files",
-        other => other,
+        "embedding" => "Embedding",
+        "rerank" => "Rerank",
+        "search" => "Search",
+        "interactions" => "Interactions",
+        "asset_library" => "Asset Library",
+        "multimodal_embedding" => "Multimodal Embedding",
+        other => return format!("{family_label} {}", title_case_api_format_segment(other)),
     };
     format!("{family_label} {kind_label}")
 }
 
+fn title_case_api_format_segment(segment: &str) -> String {
+    segment
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let Some(first) = characters.next() else {
+                return String::new();
+            };
+            format!("{}{}", first.to_uppercase(), characters.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::request_candidate_event_unix_ms;
+    use super::{api_format_display_name, request_candidate_event_unix_ms};
     use crate::handlers::shared::unix_ms_to_rfc3339;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
     };
+
+    #[test]
+    fn api_format_display_names_cover_current_and_future_multiword_formats() {
+        assert_eq!(
+            api_format_display_name("doubao:asset_library"),
+            "Ark Asset Library"
+        );
+        assert_eq!(
+            api_format_display_name("aliyun:multimodal_embedding"),
+            "Aliyun Multimodal Embedding"
+        );
+        assert_eq!(api_format_display_name("jina:rerank"), "Jina Rerank");
+        assert_eq!(
+            api_format_display_name("vendor:future_multi_word"),
+            "Vendor Future Multi Word"
+        );
+    }
 
     #[test]
     fn request_candidate_event_timestamp_uses_millisecond_precision() {

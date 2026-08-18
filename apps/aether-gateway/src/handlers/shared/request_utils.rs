@@ -227,6 +227,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 (Some("endpoints_manage"), http::Method::POST, Some("create_provider_key"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("create_endpoint"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("batch_delete_keys"))
+                | (
+                    Some("endpoints_manage"),
+                    http::Method::POST,
+                    Some("test_asset_library_connection"),
+                )
                 | (Some("endpoints_manage"), http::Method::POST, Some("refresh_quota"))
                 | (
                     Some("endpoints_manage"),

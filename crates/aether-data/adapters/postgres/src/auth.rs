@@ -40,6 +40,39 @@ SELECT
 FROM api_keys
 JOIN users ON users.id = api_keys.user_id
 WHERE api_keys.key_hash = $1
+  AND api_keys.credential_type = 'api_key'
+LIMIT 1
+"#;
+
+const FIND_BY_ACCESS_KEY_ID_SQL: &str = r#"
+SELECT
+  users.id AS user_id,
+  users.username,
+  users.email,
+  users.role::text AS user_role,
+  users.auth_source::text AS user_auth_source,
+  users.is_active AS user_is_active,
+  users.is_deleted AS user_is_deleted,
+  users.rate_limit AS user_rate_limit,
+  users.allowed_providers AS user_allowed_providers,
+  users.allowed_api_formats AS user_allowed_api_formats,
+  users.allowed_models AS user_allowed_models,
+  api_keys.id AS api_key_id,
+  api_keys.name AS api_key_name,
+  api_keys.is_active AS api_key_is_active,
+  api_keys.is_locked AS api_key_is_locked,
+  api_keys.is_standalone AS api_key_is_standalone,
+  api_keys.rate_limit AS api_key_rate_limit,
+  api_keys.concurrent_limit AS api_key_concurrent_limit,
+  CAST(EXTRACT(EPOCH FROM api_keys.expires_at) AS BIGINT) AS api_key_expires_at_unix_secs,
+  api_keys.allowed_providers AS api_key_allowed_providers,
+  api_keys.allowed_api_formats AS api_key_allowed_api_formats,
+  api_keys.allowed_models AS api_key_allowed_models,
+  api_keys.ip_rules AS api_key_ip_rules
+FROM api_keys
+JOIN users ON users.id = api_keys.user_id
+WHERE api_keys.access_key_id = $1
+  AND api_keys.credential_type = 'volc_aksk'
 LIMIT 1
 "#;
 
@@ -142,6 +175,8 @@ SELECT
   api_keys.id AS api_key_id,
   api_keys.key_hash,
   api_keys.key_encrypted,
+  api_keys.credential_type,
+  api_keys.access_key_id,
   api_keys.name,
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
@@ -173,6 +208,8 @@ SELECT
   api_keys.id AS api_key_id,
   api_keys.key_hash,
   api_keys.key_encrypted,
+  api_keys.credential_type,
+  api_keys.access_key_id,
   api_keys.name,
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
@@ -203,6 +240,8 @@ SELECT
   api_keys.id AS api_key_id,
   api_keys.key_hash,
   api_keys.key_encrypted,
+  api_keys.credential_type,
+  api_keys.access_key_id,
   api_keys.name,
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
@@ -233,6 +272,8 @@ SELECT
   api_keys.id AS api_key_id,
   api_keys.key_hash,
   api_keys.key_encrypted,
+  api_keys.credential_type,
+  api_keys.access_key_id,
   api_keys.name,
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
@@ -263,6 +304,8 @@ SELECT
   api_keys.id AS api_key_id,
   api_keys.key_hash,
   api_keys.key_encrypted,
+  api_keys.credential_type,
+  api_keys.access_key_id,
   api_keys.name,
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
@@ -337,6 +380,8 @@ SELECT
   api_keys.id AS api_key_id,
   api_keys.key_hash,
   api_keys.key_encrypted,
+  api_keys.credential_type,
+  api_keys.access_key_id,
   api_keys.name,
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
@@ -374,6 +419,8 @@ INSERT INTO api_keys (
   user_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -407,15 +454,17 @@ VALUES (
   $10,
   $11,
   $12,
-  NULL,
   $13,
   $14,
+  NULL,
   $15,
-  FALSE,
-  FALSE,
   $16,
   $17,
+  FALSE,
+  FALSE,
   $18,
+  $19,
+  $20,
   NOW(),
   NOW()
 )
@@ -424,6 +473,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -451,6 +502,8 @@ INSERT INTO api_keys (
   user_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -501,6 +554,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -538,6 +593,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -579,6 +636,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -613,6 +672,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -646,6 +707,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -680,6 +743,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -724,6 +789,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -758,6 +825,8 @@ RETURNING
   id AS api_key_id,
   key_hash,
   key_encrypted,
+  credential_type,
+  access_key_id,
   name,
   allowed_providers,
   allowed_api_formats,
@@ -856,6 +925,13 @@ impl SqlxAuthApiKeySnapshotReadRepository {
                 .fetch_optional(&self.pool)
                 .await
                 .map_postgres_err()?,
+            AuthApiKeyLookupKey::AccessKeyId(access_key_id) => {
+                sqlx::query(FIND_BY_ACCESS_KEY_ID_SQL)
+                    .bind(access_key_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_postgres_err()?
+            }
             AuthApiKeyLookupKey::ApiKeyId(api_key_id) => sqlx::query(FIND_BY_API_KEY_ID_SQL)
                 .bind(api_key_id)
                 .fetch_optional(&self.pool)
@@ -1184,6 +1260,8 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             .bind(record.user_id)
             .bind(record.key_hash)
             .bind(record.key_encrypted)
+            .bind(record.credential_type)
+            .bind(record.access_key_id)
             .bind(record.name)
             .bind(allowed_providers)
             .bind(allowed_api_formats)
@@ -1576,11 +1654,13 @@ fn map_auth_api_key_export_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<StoredAuthApiKeyExportRecord, DataLayerError> {
     let feature_settings = row_get(row, "feature_settings")?;
-    StoredAuthApiKeyExportRecord::new(
+    StoredAuthApiKeyExportRecord::new_with_credential(
         row_get(row, "user_id")?,
         row_get(row, "api_key_id")?,
         row_get(row, "key_hash")?,
         row_get(row, "key_encrypted")?,
+        row_get(row, "credential_type")?,
+        row_get(row, "access_key_id")?,
         row_get(row, "name")?,
         row_get(row, "allowed_providers")?,
         row_get(row, "allowed_api_formats")?,
@@ -1621,7 +1701,7 @@ mod tests {
         assert!(CREATE_USER_API_KEY_SQL
             .contains("expires_at,\n  auto_delete_on_expiry,\n  is_locked,\n  is_standalone,"));
         assert!(
-            CREATE_USER_API_KEY_SQL.contains("$13,\n  $14,\n  $15,\n  FALSE,\n  FALSE,\n  $16,")
+            CREATE_USER_API_KEY_SQL.contains("$15,\n  $16,\n  $17,\n  FALSE,\n  FALSE,\n  $18,")
         );
         assert!(CREATE_STANDALONE_API_KEY_SQL
             .contains("expires_at,\n  auto_delete_on_expiry,\n  is_locked,\n  is_standalone,"));

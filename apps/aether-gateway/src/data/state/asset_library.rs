@@ -78,8 +78,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: Some("account-1".to_string()),
-            project: None,
             group_type: "face".to_string(),
             name: "Faces".to_string(),
             description: None,

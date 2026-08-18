@@ -200,6 +200,92 @@ pub(crate) fn sanitize_action_body(body: &Value) -> Result<Value, ArkAssetProtoc
     Ok(Value::Object(sanitized))
 }
 
+/// Canonicalises provider payload fields shared by the Volcengine endpoint and
+/// compatible relays. Single-resource operations use `Id`; legacy Aether
+/// aliases are accepted at the public boundary but are never sent upstream.
+pub(crate) fn canonicalize_provider_body(
+    action: ArkAssetAction,
+    body: &Value,
+) -> Result<Value, ArkAssetProtocolError> {
+    let Some(source) = body.as_object() else {
+        return Err(ArkAssetProtocolError::InvalidBody(
+            "asset Action body must be a JSON object".to_string(),
+        ));
+    };
+    let mut canonical = source.clone();
+    match action {
+        ArkAssetAction::GetAssetGroup
+        | ArkAssetAction::UpdateAssetGroup
+        | ArkAssetAction::DeleteAssetGroup => {
+            canonicalize_string_alias(&mut canonical, "Id", &["GroupId", "group_id", "id"]);
+        }
+        ArkAssetAction::GetAsset | ArkAssetAction::UpdateAsset | ArkAssetAction::DeleteAsset => {
+            canonicalize_string_alias(&mut canonical, "Id", &["AssetId", "asset_id", "id"]);
+        }
+        ArkAssetAction::CreateVisualValidateSession => {
+            canonicalize_string_alias(
+                &mut canonical,
+                "CallbackURL",
+                &["callback_url", "ReturnUrl", "return_url"],
+            );
+        }
+        _ => {}
+    }
+    canonical.retain(|name, value| {
+        !value.is_null()
+            && !name.eq_ignore_ascii_case("ProjectName")
+            && !name.eq_ignore_ascii_case("project_name")
+    });
+    Ok(Value::Object(canonical))
+}
+
+fn canonicalize_string_alias(
+    object: &mut Map<String, Value>,
+    canonical_name: &str,
+    aliases: &[&str],
+) {
+    let value = object
+        .get(canonical_name)
+        .or_else(|| {
+            object
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(canonical_name))
+                .map(|(_, value)| value)
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            object.iter().find_map(|(name, value)| {
+                if aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias)) {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            })
+        });
+    let alias_keys = object
+        .keys()
+        .filter(|name| {
+            name.as_str() != canonical_name
+                && (name.eq_ignore_ascii_case(canonical_name)
+                    || aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for alias in alias_keys {
+        object.remove(&alias);
+    }
+    if let Some(value) = value {
+        object.insert(canonical_name.to_string(), Value::String(value));
+    }
+}
+
 pub(crate) fn extract_result(body: &Value) -> Option<&Value> {
     body.get("Result").or_else(|| body.get("result"))
 }
@@ -307,6 +393,123 @@ mod tests {
         assert_eq!(
             sanitize_action_body(&body).unwrap(),
             serde_json::json!({"GroupId":"g"})
+        );
+    }
+
+    #[test]
+    fn k23_request_fixtures_are_canonicalized_for_every_action() {
+        for (action, input, expected) in [
+            (
+                ArkAssetAction::CreateAssetGroup,
+                serde_json::json!({
+                    "Name": "products",
+                    "Description": "references",
+                    "GroupType": "AIGC",
+                    "ProjectName": "default"
+                }),
+                serde_json::json!({
+                    "Name": "products",
+                    "Description": "references",
+                    "GroupType": "AIGC"
+                }),
+            ),
+            (
+                ArkAssetAction::ListAssetGroups,
+                serde_json::json!({
+                    "Filter": {"GroupType": "AIGC", "GroupIds": ["group-1"]},
+                    "PageNumber": 1,
+                    "PageSize": 10
+                }),
+                serde_json::json!({
+                    "Filter": {"GroupType": "AIGC", "GroupIds": ["group-1"]},
+                    "PageNumber": 1,
+                    "PageSize": 10
+                }),
+            ),
+            (
+                ArkAssetAction::GetAssetGroup,
+                serde_json::json!({"GroupId": "group-1", "ProjectName": "default"}),
+                serde_json::json!({"Id": "group-1"}),
+            ),
+            (
+                ArkAssetAction::UpdateAssetGroup,
+                serde_json::json!({"GROUPID": "group-1", "Name": "new name"}),
+                serde_json::json!({"Id": "group-1", "Name": "new name"}),
+            ),
+            (
+                ArkAssetAction::DeleteAssetGroup,
+                serde_json::json!({"GroupId": "group-1"}),
+                serde_json::json!({"Id": "group-1"}),
+            ),
+            (
+                ArkAssetAction::CreateAsset,
+                serde_json::json!({
+                    "GroupId": "group-1",
+                    "URL": "https://example.com/image.jpg",
+                    "AssetType": "Image",
+                    "Name": null
+                }),
+                serde_json::json!({
+                    "GroupId": "group-1",
+                    "URL": "https://example.com/image.jpg",
+                    "AssetType": "Image"
+                }),
+            ),
+            (
+                ArkAssetAction::ListAssets,
+                serde_json::json!({
+                    "Filter": {"GroupIds": ["group-1"], "Statuses": ["Active"]},
+                    "PageNumber": 1,
+                    "PageSize": 10
+                }),
+                serde_json::json!({
+                    "Filter": {"GroupIds": ["group-1"], "Statuses": ["Active"]},
+                    "PageNumber": 1,
+                    "PageSize": 10
+                }),
+            ),
+            (
+                ArkAssetAction::GetAsset,
+                serde_json::json!({"AssetId": "asset-1"}),
+                serde_json::json!({"Id": "asset-1"}),
+            ),
+            (
+                ArkAssetAction::DeleteAsset,
+                serde_json::json!({"AssetId": "asset-1"}),
+                serde_json::json!({"Id": "asset-1"}),
+            ),
+            (
+                ArkAssetAction::UpdateAsset,
+                serde_json::json!({"asset_id": "asset-1", "Name": "new name"}),
+                serde_json::json!({"Id": "asset-1", "Name": "new name"}),
+            ),
+            (
+                ArkAssetAction::CreateVisualValidateSession,
+                serde_json::json!({"return_url": "https://example.com/callback"}),
+                serde_json::json!({"CallbackURL": "https://example.com/callback"}),
+            ),
+            (
+                ArkAssetAction::GetVisualValidateResult,
+                serde_json::json!({"BytedToken": "token-1", "ProjectName": "default"}),
+                serde_json::json!({"BytedToken": "token-1"}),
+            ),
+        ] {
+            let output = canonicalize_provider_body(action, &input).unwrap();
+            assert_eq!(output, expected, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn visual_validation_uses_only_callback_url_upstream() {
+        assert_eq!(
+            canonicalize_provider_body(
+                ArkAssetAction::CreateVisualValidateSession,
+                &serde_json::json!({
+                    "return_url": "https://example.com/legacy-callback"
+                }),
+            )
+            .unwrap(),
+            serde_json::json!({"CallbackURL": "https://example.com/legacy-callback"})
         );
     }
 

@@ -36,6 +36,14 @@ pub(crate) async fn build_admin_reveal_user_api_key_response(
             .into_response());
     };
 
+    if record.credential_type == "volc_aksk" {
+        return Ok((
+            http::StatusCode::BAD_REQUEST,
+            Json(json!({ "detail": "AK/SK 的 Secret Access Key 仅在创建时展示一次" })),
+        )
+            .into_response());
+    }
+
     let Some(ciphertext) = record.key_encrypted.as_deref().map(str::trim) else {
         return Ok((
             http::StatusCode::BAD_REQUEST,

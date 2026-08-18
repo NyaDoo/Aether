@@ -25,6 +25,7 @@ struct MemoryAuthApiKeyIndex {
     by_api_key_id: BTreeMap<String, StoredAuthApiKeySnapshot>,
     export_by_api_key_id: BTreeMap<String, StoredAuthApiKeyExportRecord>,
     by_key_hash: BTreeMap<String, String>,
+    by_access_key_id: BTreeMap<String, String>,
     touch_counts: BTreeMap<String, usize>,
     snapshot_lookup_counts: BTreeMap<String, usize>,
     key_hash_lookup_counts: BTreeMap<String, usize>,
@@ -101,6 +102,7 @@ impl InMemoryAuthApiKeySnapshotRepository {
                 by_api_key_id,
                 export_by_api_key_id,
                 by_key_hash,
+                by_access_key_id: BTreeMap::new(),
                 touch_counts: BTreeMap::new(),
                 snapshot_lookup_counts: BTreeMap::new(),
                 key_hash_lookup_counts: BTreeMap::new(),
@@ -123,6 +125,23 @@ impl InMemoryAuthApiKeySnapshotRepository {
             .get_mut()
             .expect("auth api key snapshot repository lock");
         for item in items {
+            index
+                .by_access_key_id
+                .retain(|_, api_key_id| api_key_id != &item.api_key_id);
+            if item.credential_type == "volc_aksk" {
+                let access_key_id = item
+                    .access_key_id
+                    .as_ref()
+                    .expect("volc_aksk export record must have access_key_id")
+                    .clone();
+                assert!(
+                    !index.by_access_key_id.contains_key(&access_key_id),
+                    "duplicate api_keys.access_key_id: {access_key_id}"
+                );
+                index
+                    .by_access_key_id
+                    .insert(access_key_id, item.api_key_id.clone());
+            }
             index
                 .export_by_api_key_id
                 .insert(item.api_key_id.clone(), item);
@@ -250,6 +269,11 @@ impl AuthApiKeyReadRepository for InMemoryAuthApiKeySnapshotRepository {
                     .and_then(|api_key_id| index.by_api_key_id.get(api_key_id))
                     .cloned()
             }
+            AuthApiKeyLookupKey::AccessKeyId(access_key_id) => index
+                .by_access_key_id
+                .get(access_key_id)
+                .and_then(|api_key_id| index.by_api_key_id.get(api_key_id))
+                .cloned(),
             AuthApiKeyLookupKey::ApiKeyId(api_key_id) => {
                 *index
                     .snapshot_lookup_counts
@@ -535,6 +559,26 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                 record.key_hash
             )));
         }
+        match record.credential_type.as_str() {
+            "api_key" if record.access_key_id.is_none() => {}
+            "volc_aksk" => {
+                let Some(access_key_id) = record.access_key_id.as_deref() else {
+                    return Err(DataLayerError::UnexpectedValue(
+                        "api_keys.access_key_id is required for volc_aksk".to_string(),
+                    ));
+                };
+                if index.by_access_key_id.contains_key(access_key_id) {
+                    return Err(DataLayerError::UnexpectedValue(format!(
+                        "duplicate api_keys.access_key_id: {access_key_id}"
+                    )));
+                }
+            }
+            credential_type => {
+                return Err(DataLayerError::UnexpectedValue(format!(
+                    "invalid api key credential fields: {credential_type}"
+                )));
+            }
+        }
 
         let template = index
             .by_api_key_id
@@ -602,11 +646,13 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
         };
 
         let now_unix_secs = current_unix_secs() as i64;
-        let export = StoredAuthApiKeyExportRecord::new(
+        let export = StoredAuthApiKeyExportRecord::new_with_credential(
             record.user_id.clone(),
             record.api_key_id.clone(),
             record.key_hash.clone(),
             record.key_encrypted,
+            record.credential_type.clone(),
+            record.access_key_id.clone(),
             record.name,
             record
                 .allowed_providers
@@ -639,9 +685,15 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
         )?
         .with_activity_timestamps(None, Some(now_unix_secs), Some(now_unix_secs))?;
 
-        index
-            .by_key_hash
-            .insert(record.key_hash, record.api_key_id.clone());
+        if record.credential_type == "api_key" {
+            index
+                .by_key_hash
+                .insert(record.key_hash, record.api_key_id.clone());
+        } else if let Some(access_key_id) = record.access_key_id {
+            index
+                .by_access_key_id
+                .insert(access_key_id, record.api_key_id.clone());
+        }
         index
             .by_api_key_id
             .insert(record.api_key_id.clone(), snapshot);
@@ -1105,6 +1157,9 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
         index.by_api_key_id.remove(api_key_id);
         index.export_by_api_key_id.remove(api_key_id);
         index.by_key_hash.retain(|_, value| value != api_key_id);
+        index
+            .by_access_key_id
+            .retain(|_, value| value != api_key_id);
         index.touch_counts.remove(api_key_id);
         Ok(true)
     }
@@ -1123,6 +1178,9 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
         index.by_api_key_id.remove(api_key_id);
         index.export_by_api_key_id.remove(api_key_id);
         index.by_key_hash.retain(|_, value| value != api_key_id);
+        index
+            .by_access_key_id
+            .retain(|_, value| value != api_key_id);
         index.touch_counts.remove(api_key_id);
         Ok(true)
     }

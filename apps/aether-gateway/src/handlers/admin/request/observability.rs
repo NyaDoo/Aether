@@ -308,6 +308,10 @@ impl<'a> AdminAppState<'a> {
         trace_id: Option<&str>,
         plan: &aether_contracts::ExecutionPlan,
     ) -> Result<aether_contracts::ExecutionResult, GatewayError> {
+        #[cfg(test)]
+        if let Some(override_fn) = self.app.execution_runtime_sync_override.as_ref() {
+            return (override_fn.0)(plan);
+        }
         crate::execution_runtime::execute_execution_runtime_sync_plan(self.app, trace_id, plan)
             .await
     }

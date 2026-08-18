@@ -401,6 +401,19 @@ mod tests {
     }
 
     #[test]
+    fn embeds_user_aksk_key_hash_capacity_upgrade() {
+        let migration = POSTGRES_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 20260818020000)
+            .expect("user AK/SK migration should be embedded");
+        let sql = migration.sql.as_ref();
+
+        assert!(sql.contains("ALTER COLUMN key_hash TYPE VARCHAR(255)"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS credential_type VARCHAR(32)"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS access_key_id VARCHAR(128)"));
+    }
+
+    #[test]
     fn concurrent_index_migrations_opt_out_of_transactions() {
         for version in [20260715000000, 20260715130000, 20260720000000] {
             let migration = POSTGRES_MIGRATOR

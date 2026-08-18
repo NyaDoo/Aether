@@ -10,7 +10,7 @@ use crate::error::SqlxResultExt;
 
 const GROUP_COLUMNS: &str = r#"
 SELECT id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       account_binding, project, group_type, name, description, status,
+       group_type, name, description, status,
        created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
 FROM public.asset_groups
 "#;
@@ -26,7 +26,7 @@ FROM public.assets
 
 const SESSION_COLUMNS: &str = r#"
 SELECT id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       account_binding, project, byted_token_hash, encrypted_byted_token,
+       byted_token_hash, encrypted_byted_token,
        callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
        group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
 FROM public.ark_visual_validation_sessions
@@ -207,17 +207,13 @@ impl AssetLibraryReadRepository for SqlxAssetLibraryRepository {
     async fn find_group_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         upstream_group_id: &str,
     ) -> Result<Option<StoredAssetGroup>, DataLayerError> {
         map_optional_group(
             sqlx::query(&format!(
-                "{GROUP_COLUMNS} WHERE provider_id = $1 AND account_binding = $2 AND COALESCE(project, '') = $3 AND upstream_group_id = $4 LIMIT 1"
+                "{GROUP_COLUMNS} WHERE provider_id = $1 AND upstream_group_id = $2 LIMIT 1"
             ))
             .bind(provider_id)
-            .bind(account_binding)
-            .bind(project.unwrap_or_default())
             .bind(upstream_group_id)
             .fetch_optional(&self.pool)
             .await
@@ -356,17 +352,13 @@ impl AssetLibraryReadRepository for SqlxAssetLibraryRepository {
     async fn find_visual_validation_session_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         session_id: &str,
     ) -> Result<Option<StoredArkVisualValidationSession>, DataLayerError> {
         map_optional_session(
             sqlx::query(&format!(
-                "{SESSION_COLUMNS} WHERE provider_id = $1 AND account_binding = $2 AND COALESCE(project, '') = $3 AND session_id = $4 LIMIT 1"
+                "{SESSION_COLUMNS} WHERE provider_id = $1 AND session_id = $2 LIMIT 1"
             ))
             .bind(provider_id)
-            .bind(account_binding)
-            .bind(project.unwrap_or_default())
             .bind(session_id)
             .fetch_optional(&self.pool)
             .await
@@ -412,7 +404,6 @@ impl AssetLibraryWriteRepository for SqlxAssetLibraryRepository {
         record: UpsertAssetGroupRecord,
     ) -> Result<StoredAssetGroup, DataLayerError> {
         record.validate()?;
-        let project = storage_project(record.project.clone());
         let mut tx = self.pool.begin().await.map_postgres_err()?;
         lock_active_catalog_binding(
             &mut tx,
@@ -425,13 +416,11 @@ impl AssetLibraryWriteRepository for SqlxAssetLibraryRepository {
             r#"
 INSERT INTO public.asset_groups (
   id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  account_binding, project, group_type, name, description, status,
+  group_type, name, description, status,
   created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 ON CONFLICT (id) DO UPDATE SET
   api_key_id = EXCLUDED.api_key_id,
-  endpoint_id = EXCLUDED.endpoint_id,
-  key_id = EXCLUDED.key_id,
   name = EXCLUDED.name,
   description = EXCLUDED.description,
   status = EXCLUDED.status,
@@ -439,8 +428,8 @@ ON CONFLICT (id) DO UPDATE SET
 WHERE public.asset_groups.upstream_group_id IS NOT DISTINCT FROM EXCLUDED.upstream_group_id
   AND public.asset_groups.user_id = EXCLUDED.user_id
   AND public.asset_groups.provider_id = EXCLUDED.provider_id
-  AND public.asset_groups.account_binding = EXCLUDED.account_binding
-  AND public.asset_groups.project IS NOT DISTINCT FROM EXCLUDED.project
+  AND public.asset_groups.endpoint_id = EXCLUDED.endpoint_id
+  AND public.asset_groups.key_id = EXCLUDED.key_id
   AND public.asset_groups.group_type = EXCLUDED.group_type
   AND public.asset_groups.deleted_at_unix_secs IS NOT DISTINCT FROM EXCLUDED.deleted_at_unix_secs
   AND (public.asset_groups.deleted_at_unix_secs IS NULL OR public.asset_groups.status = EXCLUDED.status)
@@ -454,8 +443,6 @@ RETURNING *
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
-        .bind(record.account_binding)
-        .bind(project)
         .bind(record.group_type)
         .bind(record.name)
         .bind(record.description)
@@ -634,7 +621,6 @@ RETURNING *
         record.validate()?;
         let id = record.id.clone();
         let immutable_record = record.clone();
-        let project = storage_project(record.project.clone());
         let mut tx = self.pool.begin().await.map_postgres_err()?;
         lock_active_catalog_binding(
             &mut tx,
@@ -650,8 +636,6 @@ SELECT id FROM public.asset_groups
  WHERE id = $1
    AND user_id = $2
    AND provider_id = $3
-   AND account_binding = $4
-   AND project = $5
    AND deleted_at_unix_secs IS NULL
  FOR UPDATE
 "#,
@@ -659,16 +643,13 @@ SELECT id FROM public.asset_groups
             .bind(group_id)
             .bind(&record.user_id)
             .bind(&record.provider_id)
-            .bind(&record.account_binding)
-            .bind(&project)
             .fetch_optional(&mut *tx)
             .await
             .map_postgres_err()?
             .is_some();
             if !valid_group {
                 return Err(DataLayerError::InvalidInput(
-                    "validation session group owner, account, or project binding is invalid"
-                        .to_string(),
+                    "validation session group owner or provider binding is invalid".to_string(),
                 ));
             }
         }
@@ -676,18 +657,16 @@ SELECT id FROM public.asset_groups
             r#"
 INSERT INTO public.ark_visual_validation_sessions (
   id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  account_binding, project, byted_token_hash, encrypted_byted_token,
+  byted_token_hash, encrypted_byted_token,
   callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
   group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
-) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
-   WHERE $16 IS NULL OR EXISTS (
+) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+   WHERE $14 IS NULL OR EXISTS (
      SELECT 1 FROM public.asset_groups
-      WHERE id = $16 AND user_id = $3 AND deleted_at_unix_secs IS NULL
+      WHERE id = $14 AND user_id = $3 AND provider_id = $5 AND deleted_at_unix_secs IS NULL
    )
 ON CONFLICT (id) DO UPDATE SET
   api_key_id = EXCLUDED.api_key_id,
-  endpoint_id = EXCLUDED.endpoint_id,
-  key_id = EXCLUDED.key_id,
   status = EXCLUDED.status,
   consumed_at_unix_secs = EXCLUDED.consumed_at_unix_secs,
   group_id = COALESCE(public.ark_visual_validation_sessions.group_id, EXCLUDED.group_id),
@@ -697,8 +676,8 @@ WHERE public.ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
   AND public.ark_visual_validation_sessions.session_id = EXCLUDED.session_id
   AND public.ark_visual_validation_sessions.user_id = EXCLUDED.user_id
   AND public.ark_visual_validation_sessions.provider_id = EXCLUDED.provider_id
-  AND public.ark_visual_validation_sessions.account_binding = EXCLUDED.account_binding
-  AND public.ark_visual_validation_sessions.project IS NOT DISTINCT FROM EXCLUDED.project
+  AND public.ark_visual_validation_sessions.endpoint_id = EXCLUDED.endpoint_id
+  AND public.ark_visual_validation_sessions.key_id = EXCLUDED.key_id
   AND public.ark_visual_validation_sessions.byted_token_hash = EXCLUDED.byted_token_hash
   AND public.ark_visual_validation_sessions.encrypted_byted_token = EXCLUDED.encrypted_byted_token
   AND public.ark_visual_validation_sessions.callback_state_hash = EXCLUDED.callback_state_hash
@@ -715,8 +694,6 @@ RETURNING *
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
-        .bind(record.account_binding)
-        .bind(project)
         .bind(record.byted_token_hash)
         .bind(record.encrypted_byted_token)
         .bind(record.callback_state_hash)
@@ -960,8 +937,6 @@ fn map_group(row: &PgRow) -> Result<StoredAssetGroup, DataLayerError> {
         provider_id: row.try_get("provider_id").map_postgres_err()?,
         endpoint_id: row.try_get("endpoint_id").map_postgres_err()?,
         key_id: row.try_get("key_id").map_postgres_err()?,
-        account_binding: row.try_get("account_binding").map_postgres_err()?,
-        project: read_project(row.try_get("project").map_postgres_err()?),
         group_type: row.try_get("group_type").map_postgres_err()?,
         name: row.try_get("name").map_postgres_err()?,
         description: row.try_get("description").map_postgres_err()?,
@@ -1014,8 +989,6 @@ fn map_session(row: &PgRow) -> Result<StoredArkVisualValidationSession, DataLaye
         provider_id: row.try_get("provider_id").map_postgres_err()?,
         endpoint_id: row.try_get("endpoint_id").map_postgres_err()?,
         key_id: row.try_get("key_id").map_postgres_err()?,
-        account_binding: row.try_get("account_binding").map_postgres_err()?,
-        project: read_project(row.try_get("project").map_postgres_err()?),
         byted_token_hash: row.try_get("byted_token_hash").map_postgres_err()?,
         encrypted_byted_token: row.try_get("encrypted_byted_token").map_postgres_err()?,
         callback_state_hash: row.try_get("callback_state_hash").map_postgres_err()?,
@@ -1085,14 +1058,6 @@ fn page_value(value: usize) -> i64 {
 
 fn trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn storage_project(project: Option<String>) -> String {
-    project.unwrap_or_default()
-}
-
-fn read_project(project: String) -> Option<String> {
-    (!project.is_empty()).then_some(project)
 }
 
 fn map_asset_upsert_error(error: sqlx::Error, group_id: &str) -> DataLayerError {
@@ -1200,14 +1165,18 @@ mod tests {
     }
 
     #[test]
-    fn forward_migration_uses_canonical_upstream_identity_and_restrictive_provider_fks() {
+    fn provider_binding_migration_uses_canonical_upstream_identity_and_restrictive_provider_fks() {
         let schema = include_str!("../migrations/20260818000000_add_asset_library.sql");
-        assert!(schema.contains(
-            "uq_asset_groups_upstream UNIQUE (provider_id, account_binding, project, upstream_group_id)"
+        let provider_binding =
+            include_str!("../migrations/20260818010000_bind_assets_to_provider.sql");
+        assert!(provider_binding.contains(
+            "ADD CONSTRAINT uq_asset_groups_upstream UNIQUE (provider_id, upstream_group_id)"
         ));
-        assert!(schema.contains(
-            "uq_ark_validation_upstream UNIQUE (provider_id, account_binding, project, session_id)"
+        assert!(provider_binding.contains(
+            "ADD CONSTRAINT uq_ark_validation_upstream UNIQUE (provider_id, session_id)"
         ));
+        assert!(provider_binding.contains("DROP COLUMN IF EXISTS account_binding"));
+        assert!(provider_binding.contains("DROP COLUMN IF EXISTS project"));
         for constraint in [
             "fk_asset_groups_provider",
             "fk_asset_groups_endpoint",

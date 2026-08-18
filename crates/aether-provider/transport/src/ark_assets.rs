@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -69,6 +69,60 @@ pub enum VolcActionTransportError {
     InvalidAkSkConfig,
     #[error("Ark Action request URL cannot be signed")]
     InvalidSigningUrl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VolcActionVerificationError {
+    #[error("Ark Action authorization header is missing or unsupported")]
+    MissingAuthorization,
+    #[error("Ark Action authorization header is malformed")]
+    MalformedAuthorization,
+    #[error("Ark Action credential scope is invalid")]
+    InvalidCredentialScope,
+    #[error("Ark Action signed headers are invalid")]
+    InvalidSignedHeaders,
+    #[error("Ark Action signed header is missing or invalid: {0}")]
+    InvalidSignedHeader(String),
+    #[error("Ark Action payload hash does not match the request body")]
+    PayloadHashMismatch,
+    #[error("Ark Action request timestamp is invalid or outside the allowed window")]
+    InvalidRequestTime,
+    #[error("Ark Action signature is invalid")]
+    InvalidSignature,
+    #[error("Ark Action request URL cannot be verified")]
+    InvalidRequestUrl,
+}
+
+#[derive(Clone, Copy)]
+pub struct VolcActionVerificationInput<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: &'a http::HeaderMap,
+    pub body: &'a [u8],
+    pub secret_access_key: &'a str,
+    pub expected_access_key_id: &'a str,
+    pub expected_region: &'a str,
+    pub expected_service: &'a str,
+    pub now: DateTime<Utc>,
+    pub max_clock_skew_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedVolcActionSignature {
+    pub access_key_id: String,
+    pub region: String,
+    pub service: String,
+    pub signed_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct ParsedVolcAuthorization {
+    access_key_id: String,
+    short_date: String,
+    region: String,
+    service: String,
+    signed_headers: Vec<String>,
+    signature: [u8; 32],
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -450,6 +504,239 @@ pub fn apply_volc_action_signature(
         canonical_request,
         string_to_sign,
     })
+}
+
+pub fn volc_action_authorization_access_key_id(
+    headers: &http::HeaderMap,
+) -> Result<Option<String>, VolcActionVerificationError> {
+    let Some(value) = headers.get(http::header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| VolcActionVerificationError::MalformedAuthorization)?
+        .trim();
+    if !value.starts_with(VOLC_AUTH_ALGORITHM) {
+        return Ok(None);
+    }
+    Ok(Some(parse_volc_authorization(value)?.access_key_id))
+}
+
+pub fn verify_volc_action_signature(
+    input: VolcActionVerificationInput<'_>,
+) -> Result<VerifiedVolcActionSignature, VolcActionVerificationError> {
+    let authorization = input
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(VolcActionVerificationError::MissingAuthorization)?;
+    let parsed = parse_volc_authorization(authorization.trim())?;
+    if parsed.access_key_id != input.expected_access_key_id.trim()
+        || parsed.region != input.expected_region.trim()
+        || parsed.service != input.expected_service.trim()
+    {
+        return Err(VolcActionVerificationError::InvalidCredentialScope);
+    }
+
+    let x_date = signed_header_value(input.headers, "x-date")?;
+    let signed_at = NaiveDateTime::parse_from_str(&x_date, "%Y%m%dT%H%M%SZ")
+        .map(|value| value.and_utc())
+        .map_err(|_| VolcActionVerificationError::InvalidRequestTime)?;
+    if parsed.short_date != signed_at.format("%Y%m%d").to_string()
+        || input.max_clock_skew_secs < 0
+        || input
+            .now
+            .signed_duration_since(signed_at)
+            .num_seconds()
+            .unsigned_abs()
+            > input.max_clock_skew_secs as u64
+    {
+        return Err(VolcActionVerificationError::InvalidRequestTime);
+    }
+
+    let actual_payload_hash = Sha256::digest(input.body);
+    let supplied_payload_hash =
+        decode_hex_32(&signed_header_value(input.headers, "x-content-sha256")?).ok_or(
+            VolcActionVerificationError::InvalidSignedHeader("x-content-sha256".to_string()),
+        )?;
+    if !constant_time_eq_32(actual_payload_hash.as_ref(), &supplied_payload_hash) {
+        return Err(VolcActionVerificationError::PayloadHashMismatch);
+    }
+
+    let url = Url::parse(input.url).map_err(|_| VolcActionVerificationError::InvalidRequestUrl)?;
+    let canonical_headers = parsed
+        .signed_headers
+        .iter()
+        .map(|name| {
+            signed_header_value(input.headers, name)
+                .map(|value| format!("{name}:{}\n", normalize_header_value(&value)))
+        })
+        .collect::<Result<String, _>>()?;
+    let signed_headers = parsed.signed_headers.join(";");
+    let payload_hash = hex_lower(actual_payload_hash.as_ref());
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        input.method.trim().to_ascii_uppercase(),
+        canonical_uri(&url),
+        canonical_query(&url),
+        canonical_headers,
+        signed_headers,
+        payload_hash,
+    );
+    let credential_scope = format!(
+        "{}/{}/{}/{}",
+        parsed.short_date, parsed.region, parsed.service, VOLC_AUTH_TERMINATOR
+    );
+    let string_to_sign = format!(
+        "{}\n{}\n{}\n{}",
+        VOLC_AUTH_ALGORITHM,
+        x_date,
+        credential_scope,
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let k_date = hmac_sha256(
+        input.secret_access_key.trim().as_bytes(),
+        parsed.short_date.as_bytes(),
+    );
+    let k_region = hmac_sha256(&k_date, parsed.region.as_bytes());
+    let k_service = hmac_sha256(&k_region, parsed.service.as_bytes());
+    let k_signing = hmac_sha256(&k_service, VOLC_AUTH_TERMINATOR.as_bytes());
+    let mut mac = HmacSha256::new_from_slice(&k_signing).expect("HMAC accepts any key length");
+    mac.update(string_to_sign.as_bytes());
+    mac.verify_slice(&parsed.signature)
+        .map_err(|_| VolcActionVerificationError::InvalidSignature)?;
+
+    Ok(VerifiedVolcActionSignature {
+        access_key_id: parsed.access_key_id,
+        region: parsed.region,
+        service: parsed.service,
+        signed_at,
+    })
+}
+
+fn parse_volc_authorization(
+    value: &str,
+) -> Result<ParsedVolcAuthorization, VolcActionVerificationError> {
+    let fields = value
+        .strip_prefix(VOLC_AUTH_ALGORITHM)
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .ok_or(VolcActionVerificationError::MalformedAuthorization)?
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .map(|field| {
+            field
+                .split_once('=')
+                .ok_or(VolcActionVerificationError::MalformedAuthorization)
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if fields.len() != 3 {
+        return Err(VolcActionVerificationError::MalformedAuthorization);
+    }
+    let credential = fields
+        .get("Credential")
+        .ok_or(VolcActionVerificationError::MalformedAuthorization)?;
+    let credential = credential.split('/').collect::<Vec<_>>();
+    if credential.len() != 5
+        || credential.iter().any(|value| value.trim().is_empty())
+        || credential[4] != VOLC_AUTH_TERMINATOR
+        || credential[1].len() != 8
+        || !credential[1].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(VolcActionVerificationError::InvalidCredentialScope);
+    }
+    let signed_headers = fields
+        .get("SignedHeaders")
+        .ok_or(VolcActionVerificationError::MalformedAuthorization)?
+        .split(';')
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut sorted_headers = signed_headers.clone();
+    sorted_headers.sort();
+    sorted_headers.dedup();
+    if signed_headers != sorted_headers
+        || signed_headers.iter().any(|name| {
+            name.is_empty()
+                || name != &name.to_ascii_lowercase()
+                || http::HeaderName::from_bytes(name.as_bytes()).is_err()
+        })
+        || ["content-type", "host", "x-content-sha256", "x-date"]
+            .iter()
+            .any(|required| !signed_headers.iter().any(|name| name == required))
+    {
+        return Err(VolcActionVerificationError::InvalidSignedHeaders);
+    }
+    let signature = decode_hex_32(
+        fields
+            .get("Signature")
+            .ok_or(VolcActionVerificationError::MalformedAuthorization)?,
+    )
+    .ok_or(VolcActionVerificationError::MalformedAuthorization)?;
+    Ok(ParsedVolcAuthorization {
+        access_key_id: credential[0].to_string(),
+        short_date: credential[1].to_string(),
+        region: credential[2].to_string(),
+        service: credential[3].to_string(),
+        signed_headers,
+        signature,
+    })
+}
+
+fn signed_header_value(
+    headers: &http::HeaderMap,
+    name: &str,
+) -> Result<String, VolcActionVerificationError> {
+    let values = headers
+        .get_all(name)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::trim)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .ok_or_else(|| VolcActionVerificationError::InvalidSignedHeader(name.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Err(VolcActionVerificationError::InvalidSignedHeader(
+            name.to_string(),
+        ));
+    }
+    Ok(values.join(","))
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    let value = value.trim().as_bytes();
+    if value.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn constant_time_eq_32(left: &[u8], right: &[u8; 32]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
 }
 
 fn normalize_action(action: &str) -> Result<&str, VolcActionTransportError> {
@@ -846,6 +1133,79 @@ mod tests {
                 "e280d025e397a7b39c92c34ac0621014f9e24477a1d220e4121aa5486d850a73"
             )
         );
+
+        let url = "https://ark.cn-beijing.volcengineapi.com/?Action=ListAssets&Version=2024-01-01&PageNumber=1";
+        let request_headers = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    http::HeaderValue::from_str(value).unwrap(),
+                )
+            })
+            .collect::<http::HeaderMap>();
+        let verified = verify_volc_action_signature(VolcActionVerificationInput {
+            method: "POST",
+            url,
+            headers: &request_headers,
+            body,
+            secret_access_key: &credentials.secret_access_key,
+            expected_access_key_id: &credentials.access_key_id,
+            expected_region: VOLC_ACTION_DEFAULT_REGION,
+            expected_service: VOLC_ACTION_DEFAULT_SERVICE,
+            now: Utc.with_ymd_and_hms(2024, 1, 2, 3, 10, 0).unwrap(),
+            max_clock_skew_secs: 15 * 60,
+        })
+        .expect("golden request should verify");
+        assert_eq!(verified.access_key_id, "AKLTEXAMPLE");
+    }
+
+    #[test]
+    fn verifier_recomputes_payload_hash_from_actual_body() {
+        let credentials = VolcAkSkCredentials {
+            access_key_id: "AKLTEXAMPLE".to_string(),
+            secret_access_key: "secretEXAMPLE".to_string(),
+            security_token: None,
+            region: VOLC_ACTION_DEFAULT_REGION.to_string(),
+            service: VOLC_ACTION_DEFAULT_SERVICE.to_string(),
+        };
+        let signed_body = br#"{"AssetId":"asset-1"}"#;
+        let mut headers = BTreeMap::new();
+        let signed_at = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+        let url = "https://ark.cn-beijing.volcengineapi.com/?Action=GetAsset&Version=2024-01-01";
+        apply_volc_action_signature(
+            &mut headers,
+            "POST",
+            url,
+            signed_body,
+            &credentials,
+            signed_at,
+        )
+        .unwrap();
+        let request_headers = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    http::HeaderValue::from_str(value).unwrap(),
+                )
+            })
+            .collect::<http::HeaderMap>();
+
+        let error = verify_volc_action_signature(VolcActionVerificationInput {
+            method: "POST",
+            url,
+            headers: &request_headers,
+            body: br#"{"AssetId":"asset-2"}"#,
+            secret_access_key: &credentials.secret_access_key,
+            expected_access_key_id: &credentials.access_key_id,
+            expected_region: VOLC_ACTION_DEFAULT_REGION,
+            expected_service: VOLC_ACTION_DEFAULT_SERVICE,
+            now: signed_at,
+            max_clock_skew_secs: 15 * 60,
+        })
+        .unwrap_err();
+        assert_eq!(error, VolcActionVerificationError::PayloadHashMismatch);
     }
 
     #[test]

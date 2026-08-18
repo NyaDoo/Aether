@@ -50,9 +50,11 @@ vi.mock('lucide-vue-next', async () => {
   })
 
   return {
+    Activity: Icon,
     BarChart3: Icon,
     Edit: Icon,
     Globe: Icon,
+    Loader2: Icon,
     Power: Icon,
     RefreshCw: Icon,
     Shield: Icon,
@@ -196,6 +198,44 @@ describe('ProviderKeyActionCluster', () => {
     enableButton?.click()
     expect(onToggleActive).toHaveBeenCalledTimes(1)
 
+    unmount()
+  })
+
+  it('shows a stable asset-library test action and emits without owning the request', () => {
+    const onTestAssetLibrary = vi.fn()
+    const { root, unmount } = mount({
+      apiKey: createProviderKey({ api_formats: ['doubao:asset_library'] }),
+      showAssetLibraryTest: true,
+      assetLibraryTestTitle: '测试素材库连接',
+      onTestAssetLibrary,
+    })
+
+    const testButton = root.querySelector(
+      '[data-testid="provider-key-asset-library-test"]',
+    ) as HTMLButtonElement | null
+    expect(testButton).toBeTruthy()
+    expect(testButton?.getAttribute('title')).toBe('测试素材库连接')
+    expect(testButton?.getAttribute('aria-label')).toBe('测试素材库连接')
+
+    testButton?.click()
+    expect(onTestAssetLibrary).toHaveBeenCalledTimes(1)
+    unmount()
+  })
+
+  it('keeps the asset-library action disabled while testing', () => {
+    const { root, unmount } = mount({
+      apiKey: createProviderKey({ api_formats: ['doubao:asset_library'] }),
+      showAssetLibraryTest: true,
+      assetLibraryTesting: true,
+      assetLibraryTestDisabled: true,
+      assetLibraryTestTitle: '正在测试素材库连接',
+    })
+
+    const testButton = root.querySelector(
+      '[data-testid="provider-key-asset-library-test"]',
+    ) as HTMLButtonElement | null
+    expect(testButton?.disabled).toBe(true)
+    expect(testButton?.getAttribute('title')).toBe('正在测试素材库连接')
     unmount()
   })
 })

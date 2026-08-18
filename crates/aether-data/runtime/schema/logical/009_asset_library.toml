@@ -41,17 +41,6 @@ type = "text_id"
 length = 64
 
 [[table.asset_groups.columns]]
-name = "account_binding"
-type = "text"
-length = 128
-
-[[table.asset_groups.columns]]
-name = "project"
-type = "text"
-length = 255
-default = ""
-
-[[table.asset_groups.columns]]
 name = "group_type"
 type = "text"
 length = 64
@@ -86,7 +75,7 @@ nullable = true
 
 [[table.asset_groups.uniques]]
 name = "uq_asset_groups_upstream"
-columns = ["provider_id", "account_binding", "project", "upstream_group_id"]
+columns = ["provider_id", "upstream_group_id"]
 
 [[table.asset_groups.indexes]]
 name = "idx_asset_groups_user_deleted_created"
@@ -317,17 +306,6 @@ type = "text_id"
 length = 64
 
 [[table.ark_visual_validation_sessions.columns]]
-name = "account_binding"
-type = "text"
-length = 128
-
-[[table.ark_visual_validation_sessions.columns]]
-name = "project"
-type = "text"
-length = 255
-default = ""
-
-[[table.ark_visual_validation_sessions.columns]]
 name = "byted_token_hash"
 type = "text"
 length = 128
@@ -376,7 +354,7 @@ type = "unix_seconds"
 
 [[table.ark_visual_validation_sessions.uniques]]
 name = "uq_ark_validation_upstream"
-columns = ["provider_id", "account_binding", "project", "session_id"]
+columns = ["provider_id", "session_id"]
 
 [[table.ark_visual_validation_sessions.uniques]]
 name = "uq_ark_validation_callback_state"

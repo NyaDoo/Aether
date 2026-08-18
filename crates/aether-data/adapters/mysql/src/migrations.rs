@@ -179,6 +179,20 @@ mod tests {
     }
 
     #[test]
+    fn embeds_user_aksk_credential_type_constraint() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 20260818020000)
+            .expect("user AK/SK migration should be embedded");
+        let sql = migration.sql.as_ref();
+
+        assert!(sql.contains("ADD COLUMN credential_type VARCHAR(32) NOT NULL DEFAULT 'api_key'"));
+        assert!(sql.contains("ADD COLUMN access_key_id VARCHAR(128) NULL"));
+        assert!(sql.contains("CONSTRAINT api_keys_credential_type_check"));
+        assert!(sql.contains("CHECK (credential_type IN ('api_key', 'volc_aksk'))"));
+    }
+
+    #[test]
     fn embeds_cross_driver_schema_parity_migration() {
         let migration = MIGRATOR
             .iter()

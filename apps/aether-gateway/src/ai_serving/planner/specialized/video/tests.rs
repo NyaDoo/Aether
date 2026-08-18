@@ -7,7 +7,6 @@ use aether_provider_transport::snapshot::{
     GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
 };
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::data::GatewayDataState;
 use crate::material_assets::project_video_asset_references;
@@ -19,8 +18,6 @@ const ASSET_ENDPOINT_ID: &str = "endpoint-ark-assets";
 const ASSET_KEY_ID: &str = "key-ark-aksk";
 const VIDEO_ENDPOINT_ID: &str = "endpoint-seedance-video";
 const VIDEO_KEY_ID: &str = "key-seedance-bearer";
-const PROJECT: &str = "project-asset-tests";
-const ACCOUNT_ID: &str = "ark-account-asset-tests";
 
 struct ProjectionFixture {
     state: AppState,
@@ -42,37 +39,26 @@ impl ProjectionFixture {
         }
     }
 
-    async fn insert_asset(
-        &self,
-        asset_id: &str,
-        user_id: &str,
-        status: &str,
-        account_binding: &str,
-    ) {
+    async fn insert_asset(&self, asset_id: &str, user_id: &str, status: &str) {
         self.insert_asset_with_binding(
             asset_id,
             user_id,
             status,
-            account_binding,
             PROVIDER_ID,
             ASSET_ENDPOINT_ID,
             ASSET_KEY_ID,
-            PROJECT,
         )
         .await;
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn insert_asset_with_binding(
         &self,
         asset_id: &str,
         user_id: &str,
         status: &str,
-        account_binding: &str,
         provider_id: &str,
         endpoint_id: &str,
         key_id: &str,
-        project: &str,
     ) {
         let writer = self
             .state
@@ -89,8 +75,6 @@ impl ProjectionFixture {
                 provider_id: provider_id.to_string(),
                 endpoint_id: endpoint_id.to_string(),
                 key_id: key_id.to_string(),
-                account_binding: Some(account_binding.to_string()),
-                project: Some(project.to_string()),
                 group_type: "character".to_string(),
                 name: format!("Group for {asset_id}"),
                 description: None,
@@ -133,12 +117,7 @@ impl ProjectionFixture {
 async fn video_asset_projection_replaces_nested_owned_active_asset_reference() {
     let fixture = ProjectionFixture::new().await;
     fixture
-        .insert_asset(
-            "asset-success",
-            USER_ID,
-            "Active",
-            &expected_account_binding(),
-        )
+        .insert_asset("asset-success", USER_ID, "Active")
         .await;
     let body = json!({
         "model": "Doubao-Seedance-2.0",
@@ -172,12 +151,7 @@ async fn video_asset_projection_replaces_nested_owned_active_asset_reference() {
 async fn video_asset_projection_rejects_asset_owned_by_another_user() {
     let fixture = ProjectionFixture::new().await;
     fixture
-        .insert_asset(
-            "asset-other-owner",
-            "user-other",
-            "Active",
-            &expected_account_binding(),
-        )
+        .insert_asset("asset-other-owner", "user-other", "Active")
         .await;
 
     let error = project_video_asset_references(
@@ -196,12 +170,7 @@ async fn video_asset_projection_rejects_asset_owned_by_another_user() {
 async fn video_asset_projection_rejects_non_active_asset() {
     let fixture = ProjectionFixture::new().await;
     fixture
-        .insert_asset(
-            "asset-processing",
-            USER_ID,
-            "Processing",
-            &expected_account_binding(),
-        )
+        .insert_asset("asset-processing", USER_ID, "Processing")
         .await;
 
     let error = project_video_asset_references(
@@ -217,90 +186,50 @@ async fn video_asset_projection_rejects_non_active_asset() {
 }
 
 #[tokio::test]
-async fn video_asset_projection_rejects_mismatched_upstream_account() {
+async fn video_asset_projection_rejects_provider_mismatch() {
     let fixture = ProjectionFixture::new().await;
     fixture
-        .insert_asset("asset-account-mismatch", USER_ID, "Active", "ak:different")
+        .insert_asset_with_binding(
+            "asset-provider-mismatch",
+            USER_ID,
+            "Active",
+            "provider-other",
+            ASSET_ENDPOINT_ID,
+            ASSET_KEY_ID,
+        )
         .await;
 
     let error = project_video_asset_references(
         &fixture.state,
         USER_ID,
         &fixture.transport,
-        &body_for("asset-account-mismatch"),
+        &body_for("asset-provider-mismatch"),
     )
     .await
-    .expect_err("asset from another upstream account must fail closed");
+    .expect_err("provider binding must match");
 
-    assert!(error.contains("上游账号或项目不一致"), "{error}");
+    assert!(error.contains("Provider 不一致"), "{error}");
 }
 
 #[tokio::test]
-async fn video_asset_projection_rejects_provider_or_project_mismatch() {
-    let mismatches = [
-        (
-            "asset-provider-mismatch",
-            "provider-other",
-            ASSET_ENDPOINT_ID,
-            ASSET_KEY_ID,
-            PROJECT,
-        ),
-        (
-            "asset-project-mismatch",
-            PROVIDER_ID,
-            ASSET_ENDPOINT_ID,
-            ASSET_KEY_ID,
-            "project-other",
-        ),
-    ];
-
-    for (asset_id, provider_id, endpoint_id, key_id, project) in mismatches {
-        let fixture = ProjectionFixture::new().await;
-        fixture
-            .insert_asset_with_binding(
-                asset_id,
-                USER_ID,
-                "Active",
-                &expected_account_binding(),
-                provider_id,
-                endpoint_id,
-                key_id,
-                project,
-            )
-            .await;
-
-        let error = project_video_asset_references(
-            &fixture.state,
-            USER_ID,
-            &fixture.transport,
-            &body_for(asset_id),
-        )
-        .await
-        .expect_err("provider and project bindings must match");
-
-        assert!(error.contains("上游账号或项目不一致"), "{error}");
-    }
-}
-
-#[tokio::test]
-async fn video_asset_projection_rejects_request_project_override() {
+async fn video_asset_projection_preserves_optional_project_name() {
     let fixture = ProjectionFixture::new().await;
     fixture
-        .insert_asset(
-            "asset-project-override",
-            USER_ID,
-            "Active",
-            &expected_account_binding(),
-        )
+        .insert_asset("asset-project-override", USER_ID, "Active")
         .await;
     let mut body = body_for("asset-project-override");
     body["ProjectName"] = json!("project-overridden-by-request");
 
-    let error = project_video_asset_references(&fixture.state, USER_ID, &fixture.transport, &body)
-        .await
-        .expect_err("request/body rules must not override the video credential project");
+    let projected =
+        project_video_asset_references(&fixture.state, USER_ID, &fixture.transport, &body)
+            .await
+            .expect("ProjectName is an upstream request field, not an Aether ownership binding");
 
-    assert!(error.contains("视频凭据配置"), "{error}");
+    assert_eq!(projected["ProjectName"], "project-overridden-by-request");
+    assert_eq!(
+        projected["content"][0]["image_url"]["url"],
+        "asset://upstream-asset-project-override"
+    );
 }
 
 #[tokio::test]
@@ -328,11 +257,6 @@ fn body_for(asset_id: &str) -> Value {
             "role": "reference_image"
         }]
     })
-}
-
-fn expected_account_binding() -> String {
-    let digest = format!("{:x}", Sha256::digest(ACCOUNT_ID.as_bytes()));
-    format!("account:{}", &digest[..24])
 }
 
 fn test_transport() -> GatewayProviderTransportSnapshot {
@@ -384,10 +308,7 @@ fn test_transport() -> GatewayProviderTransportSnapshot {
             expires_at_unix_secs: None,
             proxy: None,
             fingerprint: None,
-            upstream_metadata: Some(json!({
-                "account_id": ACCOUNT_ID,
-                "project": PROJECT
-            })),
+            upstream_metadata: None,
             decrypted_api_key: "relay-secret".to_string(),
             decrypted_auth_config: None,
         },

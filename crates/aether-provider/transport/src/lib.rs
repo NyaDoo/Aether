@@ -56,8 +56,10 @@ pub use anthropic_compat::{
 };
 pub use ark_assets::{
     apply_volc_action_signature, build_volc_action_request, build_volc_action_url,
-    normalize_volc_action_auth_type, resolve_volc_action_auth, VolcActionAuth, VolcActionRequest,
-    VolcActionRequestInput, VolcActionSignature, VolcActionTransportError, VolcAkSkCredentials,
+    normalize_volc_action_auth_type, resolve_volc_action_auth, verify_volc_action_signature,
+    volc_action_authorization_access_key_id, VerifiedVolcActionSignature, VolcActionAuth,
+    VolcActionRequest, VolcActionRequestInput, VolcActionSignature, VolcActionTransportError,
+    VolcActionVerificationError, VolcActionVerificationInput, VolcAkSkCredentials,
     ARK_ASSET_API_FORMAT, ARK_ASSET_REQUIRED_CAPABILITY, VOLC_ACTION_DEFAULT_BASE_URL,
     VOLC_ACTION_DEFAULT_REGION, VOLC_ACTION_DEFAULT_SERVICE, VOLC_ACTION_VERSION,
 };

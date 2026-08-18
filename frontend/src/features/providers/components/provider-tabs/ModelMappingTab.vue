@@ -374,6 +374,7 @@ import {
   type ProviderMappingPreviewResponse,
 } from '@/api/endpoints'
 import { type EndpointAPIKey } from '@/api/endpoints/keys'
+import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { updateModel } from '@/api/endpoints/models'
 import { useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
@@ -907,7 +908,7 @@ async function handleStartMappingTest() {
   await modelTest.startTest({
     mode: 'direct',
     modelName: testingModelName.value,
-    displayLabel: `[${endpoint.api_format}] 映射 "${testingModelName.value}"`,
+    displayLabel: `[${formatApiFormat(endpoint.api_format)}] 映射 "${testingModelName.value}"`,
     apiFormat: endpoint.api_format,
     endpointId: endpoint.id,
     endpointBaseUrl: endpoint.base_url,

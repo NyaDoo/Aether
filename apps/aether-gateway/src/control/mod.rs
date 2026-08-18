@@ -12,11 +12,12 @@ pub(crate) use auth::{
     execution_plan_balance_capacity_rejection, extract_requested_model,
     internal_forward_proof_is_replay, refresh_execution_runtime_auth_context,
     refresh_execution_runtime_auth_context_with_snapshot, request_model_local_rejection,
-    resolve_execution_runtime_auth_context, should_buffer_request_for_local_auth,
-    sign_trusted_admin_forward_headers, sign_trusted_auth_forward_headers,
-    trusted_auth_local_rejection, verify_trusted_admin_forward_headers,
-    verify_trusted_auth_forward_headers, GatewayAdminPrincipalContext, GatewayControlAuthContext,
-    GatewayCredentialCarrier, GatewayLocalAuthRejection,
+    resolve_execution_runtime_auth_context, resolve_verified_api_key_snapshot_auth_context,
+    should_buffer_request_for_local_auth, sign_trusted_admin_forward_headers,
+    sign_trusted_auth_forward_headers, trusted_auth_local_rejection,
+    verify_trusted_admin_forward_headers, verify_trusted_auth_forward_headers,
+    GatewayAdminPrincipalContext, GatewayControlAuthContext, GatewayCredentialCarrier,
+    GatewayLocalAuthRejection,
 };
 pub(crate) use execute::{allows_control_execute_emergency, maybe_execute_via_control};
 pub(crate) use management_token_permissions::{

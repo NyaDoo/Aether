@@ -47,6 +47,13 @@ pub(crate) fn admin_codex_reset_credit_consume_key_id(request_path: &str) -> Opt
         .map(ToOwned::to_owned)
 }
 
+pub(crate) fn admin_asset_library_test_key_id(request_path: &str) -> Option<String> {
+    let key_id = request_path
+        .strip_prefix("/api/admin/endpoints/keys/")?
+        .strip_suffix("/asset-library/test")?;
+    (!key_id.is_empty() && !key_id.contains('/')).then_some(key_id.to_string())
+}
+
 pub(crate) fn admin_update_key_id(request_path: &str) -> Option<String> {
     let key_id = request_path.strip_prefix("/api/admin/endpoints/keys/")?;
     (!key_id.is_empty() && !key_id.contains('/')).then_some(key_id.to_string())

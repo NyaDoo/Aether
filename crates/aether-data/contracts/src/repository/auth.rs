@@ -356,6 +356,8 @@ pub struct StoredAuthApiKeyExportRecord {
     pub api_key_id: String,
     pub key_hash: String,
     pub key_encrypted: Option<String>,
+    pub credential_type: String,
+    pub access_key_id: Option<String>,
     pub name: Option<String>,
     pub allowed_providers: Option<Vec<String>>,
     pub allowed_api_formats: Option<Vec<String>>,
@@ -399,6 +401,53 @@ impl StoredAuthApiKeyExportRecord {
         total_cost_usd: f64,
         is_standalone: bool,
     ) -> Result<Self, crate::DataLayerError> {
+        Self::new_with_credential(
+            user_id,
+            api_key_id,
+            key_hash,
+            key_encrypted,
+            "api_key".to_string(),
+            None,
+            name,
+            allowed_providers,
+            allowed_api_formats,
+            allowed_models,
+            rate_limit,
+            concurrent_limit,
+            force_capabilities,
+            is_active,
+            expires_at_unix_secs,
+            auto_delete_on_expiry,
+            total_requests,
+            total_tokens,
+            total_cost_usd,
+            is_standalone,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_credential(
+        user_id: String,
+        api_key_id: String,
+        key_hash: String,
+        key_encrypted: Option<String>,
+        credential_type: String,
+        access_key_id: Option<String>,
+        name: Option<String>,
+        allowed_providers: Option<serde_json::Value>,
+        allowed_api_formats: Option<serde_json::Value>,
+        allowed_models: Option<serde_json::Value>,
+        rate_limit: Option<i32>,
+        concurrent_limit: Option<i32>,
+        force_capabilities: Option<serde_json::Value>,
+        is_active: bool,
+        expires_at_unix_secs: Option<i64>,
+        auto_delete_on_expiry: bool,
+        total_requests: i64,
+        total_tokens: i64,
+        total_cost_usd: f64,
+        is_standalone: bool,
+    ) -> Result<Self, crate::DataLayerError> {
         if user_id.trim().is_empty() {
             return Err(crate::DataLayerError::UnexpectedValue(
                 "api_keys.user_id is empty".to_string(),
@@ -414,6 +463,20 @@ impl StoredAuthApiKeyExportRecord {
                 "api_keys.key_hash is empty".to_string(),
             ));
         }
+        let credential_type = credential_type.trim().to_ascii_lowercase();
+        if !matches!(credential_type.as_str(), "api_key" | "volc_aksk") {
+            return Err(crate::DataLayerError::UnexpectedValue(format!(
+                "invalid api_keys.credential_type: {credential_type}"
+            )));
+        }
+        let access_key_id = access_key_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if credential_type == "volc_aksk" && access_key_id.is_none() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "api_keys.access_key_id is required for volc_aksk".to_string(),
+            ));
+        }
         if !total_cost_usd.is_finite() {
             return Err(crate::DataLayerError::UnexpectedValue(
                 "api_keys.total_cost_usd is not finite".to_string(),
@@ -425,6 +488,8 @@ impl StoredAuthApiKeyExportRecord {
             api_key_id,
             key_hash,
             key_encrypted,
+            credential_type,
+            access_key_id,
             name,
             allowed_providers: parse_string_list(allowed_providers, "api_keys.allowed_providers")?,
             allowed_api_formats: parse_string_list(
@@ -503,6 +568,8 @@ pub struct CreateUserApiKeyRecord {
     pub api_key_id: String,
     pub key_hash: String,
     pub key_encrypted: Option<String>,
+    pub credential_type: String,
+    pub access_key_id: Option<String>,
     pub name: Option<String>,
     pub allowed_providers: Option<Vec<String>>,
     pub allowed_api_formats: Option<Vec<String>>,
@@ -572,6 +639,7 @@ pub struct UpdateStandaloneApiKeyBasicRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthApiKeyLookupKey<'a> {
     KeyHash(&'a str),
+    AccessKeyId(&'a str),
     ApiKeyId(&'a str),
     UserApiKeyIds {
         user_id: &'a str,

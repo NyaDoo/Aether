@@ -182,11 +182,15 @@ export interface UsageResponse {
   activity_heatmap?: ActivityHeatmap | null
 }
 
+export type ApiKeyCredentialType = 'api_key' | 'volc_aksk'
+
 export interface ApiKey {
   id: string // UUID
   name: string
   key?: string
   key_display: string
+  credential_type: ApiKeyCredentialType
+  access_key_id?: string | null
   is_active: boolean
   is_locked: boolean  // 管理员锁定标志
   last_used_at?: string | null
@@ -199,6 +203,19 @@ export interface ApiKey {
   allowed_providers?: ProviderConfig[]
   force_capabilities?: Record<string, boolean> | null  // 强制能力配置
   feature_settings?: FeatureSettingsMap | null
+}
+
+export interface CreateApiKeyRequest {
+  name: string
+  credential_type?: ApiKeyCredentialType
+  rate_limit?: number | null
+  concurrent_limit?: number | null
+  ip_rules?: string[] | null
+  feature_settings?: FeatureSettingsMap | null
+}
+
+export interface CreatedApiKey extends ApiKey {
+  secret_access_key?: string
 }
 
 export type InstallTargetCli = 'claude_code' | 'codex_cli' | 'gemini_cli'
@@ -280,8 +297,8 @@ export const meApi = {
     return response.data
   },
 
-  async createApiKey(data: { name: string; rate_limit?: number | null; concurrent_limit?: number | null; ip_rules?: string[] | null; feature_settings?: FeatureSettingsMap | null }): Promise<ApiKey> {
-    const response = await apiClient.post<ApiKey>('/api/users/me/api-keys', data)
+  async createApiKey(data: CreateApiKeyRequest): Promise<CreatedApiKey> {
+    const response = await apiClient.post<CreatedApiKey>('/api/users/me/api-keys', data)
     return response.data
   },
 

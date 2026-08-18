@@ -1,3 +1,4 @@
+mod asset_library_test;
 mod batch;
 mod codex_reset_credit;
 mod create;
@@ -18,6 +19,11 @@ pub(super) async fn maybe_handle(
     request_context: &AdminRequestContext<'_>,
     request_body: Option<&Bytes>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    if let Some(response) =
+        asset_library_test::maybe_handle(state, request_context, request_body).await?
+    {
+        return Ok(Some(response));
+    }
     if let Some(response) = update::maybe_handle(state, request_context, request_body).await? {
         return Ok(Some(response));
     }

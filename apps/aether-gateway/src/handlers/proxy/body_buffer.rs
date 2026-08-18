@@ -114,6 +114,32 @@ pub(super) enum RequestBodyBufferError {
     },
 }
 
+#[derive(Debug)]
+pub(super) struct BufferedWireRequestBody {
+    inner: aether_gateway_frontdoor::BufferedBody,
+    max_bytes: u64,
+}
+
+impl BufferedWireRequestBody {
+    pub(super) fn bytes(&self) -> &Bytes {
+        self.inner.bytes()
+    }
+
+    pub(super) fn normalize(
+        self,
+        headers: &mut http::HeaderMap,
+    ) -> Result<Bytes, RequestBodyBufferError> {
+        let Self { inner, max_bytes } = self;
+        inner
+            .try_map(|body| {
+                crate::headers::normalize_request_body_headers_and_bytes_with_limit(
+                    headers, body, max_bytes,
+                )
+            })
+            .map_err(RequestBodyBufferError::Normalization)
+    }
+}
+
 impl RequestBodyBufferError {
     pub(super) fn http_status(&self) -> http::StatusCode {
         match self {
@@ -188,30 +214,17 @@ pub(super) async fn buffer_and_normalize_request_body(
     phase: &'static str,
     policy: RequestBodyBufferPolicy,
 ) -> Result<Bytes, RequestBodyBufferError> {
-    let reservation = policy
-        .reserve(headers)
-        .await
-        .map_err(RequestBodyBufferError::from)?;
-    let reservation_bytes = reservation.requested_bytes();
-
-    info!(
-        event_name = "frontdoor_request_body_buffer_started",
-        log_type = "event",
+    let buffered = collect_request_body(
+        request_body,
+        headers,
+        body_owner_expectation,
         trace_id,
-        method = %method,
-        path = %path_and_query,
+        method,
+        path_and_query,
         phase,
-        max_body_bytes = policy.max_bytes(),
-        reserved_body_bytes = reservation_bytes,
-        body_buffer_budget_bytes = policy.budget_bytes(),
-        timeout_ms = policy.read_timeout().as_millis() as u64,
-        "gateway started buffering request body"
-    );
-
-    let buffered = reservation
-        .collect(request_body.take().expect(body_owner_expectation))
-        .await
-        .map_err(RequestBodyBufferError::from)?;
+        &policy,
+    )
+    .await?;
     let elapsed_ms = buffered.elapsed().as_millis() as u64;
     let normalized = buffered
         .try_map(|body| {
@@ -234,6 +247,80 @@ pub(super) async fn buffer_and_normalize_request_body(
         "gateway completed buffering request body"
     );
     Ok(normalized)
+}
+
+pub(super) async fn buffer_wire_request_body(
+    request_body: &mut Option<Body>,
+    headers: &http::HeaderMap,
+    body_owner_expectation: &'static str,
+    trace_id: &str,
+    method: &http::Method,
+    path_and_query: &str,
+    phase: &'static str,
+    policy: RequestBodyBufferPolicy,
+) -> Result<BufferedWireRequestBody, RequestBodyBufferError> {
+    let buffered = collect_request_body(
+        request_body,
+        headers,
+        body_owner_expectation,
+        trace_id,
+        method,
+        path_and_query,
+        phase,
+        &policy,
+    )
+    .await?;
+    info!(
+        event_name = "frontdoor_request_body_wire_buffer_completed",
+        log_type = "event",
+        trace_id,
+        method = %method,
+        path = %path_and_query,
+        phase,
+        body_bytes = buffered.bytes().len(),
+        elapsed_ms = buffered.elapsed().as_millis() as u64,
+        "gateway completed buffering wire request body before authentication"
+    );
+    Ok(BufferedWireRequestBody {
+        inner: buffered,
+        max_bytes: policy.max_bytes(),
+    })
+}
+
+async fn collect_request_body(
+    request_body: &mut Option<Body>,
+    headers: &http::HeaderMap,
+    body_owner_expectation: &'static str,
+    trace_id: &str,
+    method: &http::Method,
+    path_and_query: &str,
+    phase: &'static str,
+    policy: &RequestBodyBufferPolicy,
+) -> Result<aether_gateway_frontdoor::BufferedBody, RequestBodyBufferError> {
+    let reservation = policy
+        .reserve(headers)
+        .await
+        .map_err(RequestBodyBufferError::from)?;
+    let reservation_bytes = reservation.requested_bytes();
+
+    info!(
+        event_name = "frontdoor_request_body_buffer_started",
+        log_type = "event",
+        trace_id,
+        method = %method,
+        path = %path_and_query,
+        phase,
+        max_body_bytes = policy.max_bytes(),
+        reserved_body_bytes = reservation_bytes,
+        body_buffer_budget_bytes = policy.budget_bytes(),
+        timeout_ms = policy.read_timeout().as_millis() as u64,
+        "gateway started buffering request body"
+    );
+
+    reservation
+        .collect(request_body.take().expect(body_owner_expectation))
+        .await
+        .map_err(RequestBodyBufferError::from)
 }
 
 pub(super) fn build_request_body_buffer_error_response(

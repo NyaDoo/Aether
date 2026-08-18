@@ -12,6 +12,37 @@ export type { EndpointAPIKey, AllowedModels, ProviderKeyAuthConfig, ProviderKeyA
 
 interface KeyRequestOptions {
   timeout?: number
+  signal?: AbortSignal
+}
+
+export interface AssetLibraryConnectionTestResult {
+  success: boolean
+  action: 'ListAssetGroups'
+  provider_id: string
+  endpoint_id: string
+  key_id: string
+  status_code?: number
+  latency_ms: number
+  request_id?: string | null
+  total?: number | null
+  error_code?: string | null
+  error_message?: string | null
+}
+
+export async function testAssetLibraryConnection(
+  keyId: string,
+  endpointId: string,
+  options: KeyRequestOptions = {},
+): Promise<AssetLibraryConnectionTestResult> {
+  const response = await client.post<AssetLibraryConnectionTestResult>(
+    `/api/admin/endpoints/keys/${encodeURIComponent(keyId)}/asset-library/test`,
+    { endpoint_id: endpointId },
+    {
+      timeout: options.timeout ?? 60_000,
+      signal: options.signal,
+    },
+  )
+  return response.data
 }
 
 /**

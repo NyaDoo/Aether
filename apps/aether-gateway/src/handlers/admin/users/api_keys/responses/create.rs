@@ -155,6 +155,8 @@ pub(crate) async fn build_admin_create_user_api_key_response(
             api_key_id: uuid::Uuid::new_v4().to_string(),
             key_hash: hash_admin_user_api_key(&plaintext_key),
             key_encrypted: Some(key_encrypted),
+            credential_type: "api_key".to_string(),
+            access_key_id: None,
             name: Some(name.clone()),
             allowed_providers: None,
             allowed_api_formats: None,

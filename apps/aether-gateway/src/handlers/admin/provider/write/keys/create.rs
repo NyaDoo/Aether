@@ -4,7 +4,8 @@ use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
     normalize_max_probe_interval_minutes, normalize_rate_multipliers,
-    normalize_volc_aksk_auth_config, validate_vertex_api_formats,
+    normalize_volc_aksk_auth_config, validate_asset_library_auth_config,
+    validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -52,6 +53,7 @@ pub(crate) async fn build_admin_create_provider_key_record(
     if auth_type == "volc_aksk" {
         auth_config = Some(normalize_volc_aksk_auth_config(auth_config)?);
     }
+    validate_asset_library_auth_config(&api_formats, auth_config.as_ref())?;
     let auth_config_object = auth_config
         .as_ref()
         .and_then(serde_json::Value::as_object)
@@ -366,5 +368,75 @@ mod tests {
         .await
         .expect_err("raw secret and AK/SK must be mutually exclusive");
         assert!(mixed.contains("不允许直接填写 api_key"));
+    }
+
+    #[tokio::test]
+    async fn asset_library_rejects_account_and_project_bindings() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let provider = sample_provider();
+
+        for (auth_type, auth_config) in [
+            ("api_key", json!({"account_id": "account-1"})),
+            ("bearer", json!({"project": "project-1"})),
+            (
+                "volc_aksk",
+                json!({
+                    "access_key_id": "AKLT-example",
+                    "secret_access_key": "secret-example",
+                    "project_name": "project-1"
+                }),
+            ),
+        ] {
+            let error = build_admin_create_provider_key_record(
+                &state,
+                &provider,
+                create_payload(json!({
+                    "name": format!("reject-{auth_type}"),
+                    "api_formats": ["doubao:asset_library"],
+                    "auth_type": auth_type,
+                    "api_key": if auth_type == "volc_aksk" { "" } else { "secret" },
+                    "auth_config": auth_config,
+                })),
+            )
+            .await
+            .expect_err("asset identity bindings must be rejected");
+            assert!(
+                error.contains("仅按 Provider") || error.contains("不支持字段"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn asset_library_api_key_keeps_configurable_header() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let record = build_admin_create_provider_key_record(
+            &state,
+            &sample_provider(),
+            create_payload(json!({
+                "name": "ark-api-key",
+                "api_formats": ["doubao:asset_library"],
+                "auth_type": "api_key",
+                "api_key": "relay-secret",
+                "auth_config": {"api_key_header": "api-key"}
+            })),
+        )
+        .await
+        .expect("API key header metadata should remain supported");
+
+        let plaintext = decrypt_python_fernet_ciphertext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            record
+                .encrypted_auth_config
+                .as_deref()
+                .expect("auth config should be encrypted"),
+        )
+        .expect("auth config should decrypt");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plaintext).expect("auth config JSON"),
+            json!({"api_key_header": "api-key"})
+        );
     }
 }

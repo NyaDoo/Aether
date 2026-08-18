@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     user_id TEXT NOT NULL,
     key_hash TEXT NOT NULL,
     key_encrypted TEXT,
+    credential_type TEXT NOT NULL DEFAULT 'api_key',
+    access_key_id TEXT,
     name TEXT,
     key_prefix TEXT,
     status TEXT NOT NULL DEFAULT 'active',
@@ -90,7 +92,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE (key_hash)
+    UNIQUE (key_hash),
+    UNIQUE (access_key_id)
 );
 CREATE INDEX IF NOT EXISTS api_keys_user_id_idx ON api_keys (user_id);
 

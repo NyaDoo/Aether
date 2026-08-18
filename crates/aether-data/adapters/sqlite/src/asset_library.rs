@@ -10,7 +10,7 @@ use crate::SqlitePool;
 
 const GROUP_COLUMNS: &str = r#"
 SELECT id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       account_binding, project, group_type, name, description, status,
+       group_type, name, description, status,
        created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
 FROM asset_groups
 "#;
@@ -26,7 +26,7 @@ FROM assets
 
 const SESSION_COLUMNS: &str = r#"
 SELECT id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       account_binding, project, byted_token_hash, encrypted_byted_token,
+       byted_token_hash, encrypted_byted_token,
        callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
        group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
 FROM ark_visual_validation_sessions
@@ -195,17 +195,13 @@ impl AssetLibraryReadRepository for SqliteAssetLibraryRepository {
     async fn find_group_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         upstream_group_id: &str,
     ) -> Result<Option<StoredAssetGroup>, DataLayerError> {
         map_optional_group(
             sqlx::query(&format!(
-                "{GROUP_COLUMNS} WHERE provider_id = ? AND account_binding = ? AND COALESCE(project, '') = ? AND upstream_group_id = ? LIMIT 1"
+                "{GROUP_COLUMNS} WHERE provider_id = ? AND upstream_group_id = ? LIMIT 1"
             ))
             .bind(provider_id)
-            .bind(account_binding)
-            .bind(project.unwrap_or_default())
             .bind(upstream_group_id)
             .fetch_optional(&self.pool)
             .await
@@ -340,17 +336,13 @@ impl AssetLibraryReadRepository for SqliteAssetLibraryRepository {
     async fn find_visual_validation_session_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         session_id: &str,
     ) -> Result<Option<StoredArkVisualValidationSession>, DataLayerError> {
         map_optional_session(
             sqlx::query(&format!(
-                "{SESSION_COLUMNS} WHERE provider_id = ? AND account_binding = ? AND COALESCE(project, '') = ? AND session_id = ? LIMIT 1"
+                "{SESSION_COLUMNS} WHERE provider_id = ? AND session_id = ? LIMIT 1"
             ))
             .bind(provider_id)
-            .bind(account_binding)
-            .bind(project.unwrap_or_default())
             .bind(session_id)
             .fetch_optional(&self.pool)
             .await
@@ -398,7 +390,6 @@ impl AssetLibraryWriteRepository for SqliteAssetLibraryRepository {
         record.validate()?;
         let id = record.id.clone();
         let immutable_record = record.clone();
-        let project = storage_project(record.project.clone());
         let mut tx = self.pool.begin().await.map_sql_err()?;
         lock_active_catalog_binding(
             &mut tx,
@@ -424,13 +415,11 @@ impl AssetLibraryWriteRepository for SqliteAssetLibraryRepository {
             r#"
 INSERT INTO asset_groups (
   id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  account_binding, project, group_type, name, description, status,
+  group_type, name, description, status,
   created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
   api_key_id = excluded.api_key_id,
-  endpoint_id = excluded.endpoint_id,
-  key_id = excluded.key_id,
   name = excluded.name,
   description = excluded.description,
   status = excluded.status,
@@ -438,8 +427,6 @@ ON CONFLICT(id) DO UPDATE SET
 WHERE asset_groups.upstream_group_id IS excluded.upstream_group_id
   AND asset_groups.user_id = excluded.user_id
   AND asset_groups.provider_id = excluded.provider_id
-  AND asset_groups.account_binding = excluded.account_binding
-  AND asset_groups.project = excluded.project
   AND asset_groups.group_type = excluded.group_type
   AND asset_groups.deleted_at_unix_secs IS excluded.deleted_at_unix_secs
   AND (asset_groups.deleted_at_unix_secs IS NULL OR asset_groups.status = excluded.status)
@@ -452,8 +439,6 @@ WHERE asset_groups.upstream_group_id IS excluded.upstream_group_id
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
-        .bind(record.account_binding)
-        .bind(project)
         .bind(record.group_type)
         .bind(record.name)
         .bind(record.description)
@@ -682,8 +667,8 @@ WHERE assets.upstream_asset_id IS excluded.upstream_asset_id
         let id = record.id.clone();
         let group_id = record.group_id.clone();
         let user_id = record.user_id.clone();
+        let provider_id = record.provider_id.clone();
         let immutable_record = record.clone();
-        let project = storage_project(record.project.clone());
         let mut tx = self.pool.begin().await.map_sql_err()?;
         lock_active_catalog_binding(
             &mut tx,
@@ -699,21 +684,18 @@ WHERE assets.upstream_asset_id IS excluded.upstream_asset_id
                 .await
                 .map_sql_err()?;
             let valid_group = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM asset_groups WHERE id = ? AND user_id = ? AND provider_id = ? AND account_binding = ? AND project = ? AND deleted_at_unix_secs IS NULL",
+                "SELECT id FROM asset_groups WHERE id = ? AND user_id = ? AND provider_id = ? AND deleted_at_unix_secs IS NULL",
             )
             .bind(group_id)
             .bind(&record.user_id)
             .bind(&record.provider_id)
-            .bind(&record.account_binding)
-            .bind(&project)
             .fetch_optional(&mut *tx)
             .await
             .map_sql_err()?
             .is_some();
             if !valid_group {
                 return Err(DataLayerError::InvalidInput(
-                    "validation session group owner, account, or project binding is invalid"
-                        .to_string(),
+                    "validation session group owner or provider binding is invalid".to_string(),
                 ));
             }
         }
@@ -738,18 +720,16 @@ WHERE assets.upstream_asset_id IS excluded.upstream_asset_id
             r#"
 INSERT INTO ark_visual_validation_sessions (
   id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  account_binding, project, byted_token_hash, encrypted_byted_token,
+  byted_token_hash, encrypted_byted_token,
   callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
   group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
-) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
    WHERE ? IS NULL OR EXISTS (
      SELECT 1 FROM asset_groups
-      WHERE id = ? AND user_id = ? AND deleted_at_unix_secs IS NULL
+      WHERE id = ? AND user_id = ? AND provider_id = ? AND deleted_at_unix_secs IS NULL
    )
 ON CONFLICT(id) DO UPDATE SET
   api_key_id = excluded.api_key_id,
-  endpoint_id = excluded.endpoint_id,
-  key_id = excluded.key_id,
   status = excluded.status,
   consumed_at_unix_secs = excluded.consumed_at_unix_secs,
   group_id = COALESCE(ark_visual_validation_sessions.group_id, excluded.group_id),
@@ -759,8 +739,6 @@ WHERE ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
   AND ark_visual_validation_sessions.session_id = excluded.session_id
   AND ark_visual_validation_sessions.user_id = excluded.user_id
   AND ark_visual_validation_sessions.provider_id = excluded.provider_id
-  AND ark_visual_validation_sessions.account_binding = excluded.account_binding
-  AND ark_visual_validation_sessions.project = excluded.project
   AND ark_visual_validation_sessions.byted_token_hash = excluded.byted_token_hash
   AND ark_visual_validation_sessions.encrypted_byted_token = excluded.encrypted_byted_token
   AND ark_visual_validation_sessions.callback_state_hash = excluded.callback_state_hash
@@ -775,8 +753,6 @@ WHERE ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
-        .bind(record.account_binding)
-        .bind(project)
         .bind(record.byted_token_hash)
         .bind(record.encrypted_byted_token)
         .bind(record.callback_state_hash)
@@ -802,6 +778,7 @@ WHERE ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
         .bind(&group_id)
         .bind(&group_id)
         .bind(&user_id)
+        .bind(&provider_id)
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
@@ -1022,8 +999,6 @@ fn map_group(row: &SqliteRow) -> Result<StoredAssetGroup, DataLayerError> {
         provider_id: row.try_get("provider_id").map_sql_err()?,
         endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
         key_id: row.try_get("key_id").map_sql_err()?,
-        account_binding: row.try_get("account_binding").map_sql_err()?,
-        project: read_project(row.try_get("project").map_sql_err()?),
         group_type: row.try_get("group_type").map_sql_err()?,
         name: row.try_get("name").map_sql_err()?,
         description: row.try_get("description").map_sql_err()?,
@@ -1082,8 +1057,6 @@ fn map_session(row: &SqliteRow) -> Result<StoredArkVisualValidationSession, Data
         provider_id: row.try_get("provider_id").map_sql_err()?,
         endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
         key_id: row.try_get("key_id").map_sql_err()?,
-        account_binding: row.try_get("account_binding").map_sql_err()?,
-        project: read_project(row.try_get("project").map_sql_err()?),
         byted_token_hash: row.try_get("byted_token_hash").map_sql_err()?,
         encrypted_byted_token: row.try_get("encrypted_byted_token").map_sql_err()?,
         callback_state_hash: row.try_get("callback_state_hash").map_sql_err()?,
@@ -1178,14 +1151,6 @@ fn trimmed(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn storage_project(project: Option<String>) -> String {
-    project.unwrap_or_default()
-}
-
-fn read_project(project: String) -> Option<String> {
-    (!project.is_empty()).then_some(project)
-}
-
 fn reference_count(value: i64, table: &str) -> Result<u64, DataLayerError> {
     u64::try_from(value).map_err(|_| {
         DataLayerError::UnexpectedValue(format!(
@@ -1255,8 +1220,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: Some("account-1".to_string()),
-            project: Some("project-1".to_string()),
             group_type: "AIGC".to_string(),
             name: "Portraits".to_string(),
             description: Some("Face references".to_string()),
@@ -1324,8 +1287,6 @@ mod tests {
                 provider_id: "provider-1".to_string(),
                 endpoint_id: "endpoint-1".to_string(),
                 key_id: "key-1".to_string(),
-                account_binding: Some("account-1".to_string()),
-                project: Some("project-1".to_string()),
                 byted_token_hash: "token-hash".to_string(),
                 encrypted_byted_token: "encrypted-token".to_string(),
                 callback_state_hash: "state-hash".to_string(),
@@ -1359,8 +1320,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: Some("account-1".to_string()),
-            project: Some("project-1".to_string()),
             byted_token_hash: "token-hash".to_string(),
             encrypted_byted_token: "encrypted-token".to_string(),
             callback_state_hash: "state-hash".to_string(),
@@ -1468,8 +1427,6 @@ mod tests {
                 provider_id: "provider-1".to_string(),
                 endpoint_id: "endpoint-1".to_string(),
                 key_id: "key-1".to_string(),
-                account_binding: Some("account-1".to_string()),
-                project: Some("project-1".to_string()),
                 byted_token_hash: "token-hash".to_string(),
                 encrypted_byted_token: "encrypted-token".to_string(),
                 callback_state_hash: "state-hash".to_string(),
@@ -1532,12 +1489,7 @@ mod tests {
         assert!(repository.upsert_group(duplicate).await.is_err());
 
         let group = repository
-            .find_group_by_canonical_upstream(
-                "provider-1",
-                "account-1",
-                Some("project-1"),
-                "up-group-1",
-            )
+            .find_group_by_canonical_upstream("provider-1", "up-group-1")
             .await
             .expect("canonical lookup")
             .expect("canonical group");
@@ -1643,8 +1595,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: Some("account-1".to_string()),
-            project: Some("project-1".to_string()),
             byted_token_hash: "token-hash-inactive-provider".to_string(),
             encrypted_byted_token: "encrypted-token-inactive-provider".to_string(),
             callback_state_hash: "state-hash-inactive-provider".to_string(),

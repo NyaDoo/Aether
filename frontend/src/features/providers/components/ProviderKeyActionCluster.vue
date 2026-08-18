@@ -42,6 +42,27 @@
     </Button>
 
     <Button
+      v-if="showAssetLibraryTest"
+      variant="ghost"
+      size="icon"
+      class="h-7 w-7"
+      :disabled="assetLibraryTesting || assetLibraryTestDisabled"
+      :title="legacyT(assetLibraryTestTitle)"
+      :aria-label="legacyT(assetLibraryTestTitle)"
+      data-testid="provider-key-asset-library-test"
+      @click="$emit('testAssetLibrary')"
+    >
+      <Loader2
+        v-if="assetLibraryTesting"
+        class="w-3.5 h-3.5 animate-spin"
+      />
+      <Activity
+        v-else
+        class="w-3.5 h-3.5"
+      />
+    </Button>
+
+    <Button
       variant="ghost"
       size="icon"
       class="h-7 w-7"
@@ -148,9 +169,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import {
+  Activity,
   BarChart3,
   Edit,
   Globe,
+  Loader2,
   Power,
   RefreshCw,
   Shield,
@@ -176,6 +199,10 @@ const props = withDefaults(defineProps<{
   proxyNodeName?: string
   savingProxy?: boolean
   toggling?: boolean
+  showAssetLibraryTest?: boolean
+  assetLibraryTesting?: boolean
+  assetLibraryTestDisabled?: boolean
+  assetLibraryTestTitle?: string
 }>(), {
   providerType: null,
   recoverable: false,
@@ -188,10 +215,15 @@ const props = withDefaults(defineProps<{
   proxyNodeName: '',
   savingProxy: false,
   toggling: false,
+  showAssetLibraryTest: false,
+  assetLibraryTesting: false,
+  assetLibraryTestDisabled: false,
+  assetLibraryTestTitle: '测试素材库连接',
 })
 
 defineEmits<{
   (e: 'recover'): void
+  (e: 'testAssetLibrary'): void
   (e: 'permissions'): void
   (e: 'update:proxyPopoverOpen', value: boolean): void
   (e: 'clearProxy'): void

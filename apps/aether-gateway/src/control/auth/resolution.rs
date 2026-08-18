@@ -762,6 +762,26 @@ pub(crate) async fn refresh_execution_runtime_auth_context(
     .map(|(auth_context, _)| auth_context)
 }
 
+pub(crate) async fn resolve_verified_api_key_snapshot_auth_context(
+    state: &AppState,
+    snapshot: crate::data::auth::GatewayAuthApiKeySnapshot,
+    auth_endpoint_signature: &str,
+) -> Result<GatewayControlAuthContext, GatewayError> {
+    state
+        .touch_auth_api_key_last_used_best_effort(&snapshot.api_key_id)
+        .await;
+    let wallet_access = resolve_wallet_auth_gate_uncached(state, &snapshot).await?;
+    Ok(build_data_backed_auth_context(
+        state,
+        snapshot,
+        auth_endpoint_signature,
+        None,
+        None,
+        wallet_access,
+    )
+    .await)
+}
+
 /// Strongly refreshes the long-lived execution authorization context and
 /// returns the exact API-key snapshot that produced it.
 ///

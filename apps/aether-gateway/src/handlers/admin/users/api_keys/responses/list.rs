@@ -1,5 +1,5 @@
 use super::super::super::build_admin_users_bad_request_response;
-use super::super::helpers::{format_optional_unix_secs_iso8601, masked_user_api_key_display};
+use super::super::helpers::{format_optional_unix_secs_iso8601, user_api_key_display};
 use super::super::paths::admin_user_id_from_api_keys_path;
 
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
@@ -56,7 +56,9 @@ pub(crate) async fn build_admin_list_user_api_keys_response(
             json!({
                 "id": record.api_key_id,
                 "name": record.name,
-                "key_display": masked_user_api_key_display(state, record.key_encrypted.as_deref()),
+                "credential_type": record.credential_type,
+                "access_key_id": record.access_key_id,
+                "key_display": user_api_key_display(state, &record),
                 "is_active": record.is_active,
                 "is_locked": is_locked,
                 "total_requests": record.total_requests,

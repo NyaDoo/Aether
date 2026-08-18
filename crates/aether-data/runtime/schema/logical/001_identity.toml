@@ -301,6 +301,18 @@ type = "long_text"
 nullable = true
 
 [[table.api_keys.columns]]
+name = "credential_type"
+type = "text"
+length = 32
+default = "api_key"
+
+[[table.api_keys.columns]]
+name = "access_key_id"
+type = "text"
+length = 128
+nullable = true
+
+[[table.api_keys.columns]]
 name = "name"
 type = "text"
 length = 255
@@ -420,6 +432,10 @@ type = "unix_seconds"
 [[table.api_keys.uniques]]
 name = "api_keys_key_hash_key"
 columns = ["key_hash"]
+
+[[table.api_keys.uniques]]
+name = "api_keys_access_key_id_key"
+columns = ["access_key_id"]
 
 [[table.api_keys.indexes]]
 name = "api_keys_user_id_idx"

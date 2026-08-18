@@ -350,6 +350,14 @@ impl<'a> AdminAppState<'a> {
         let mut payload = serde_json::Map::from_iter([
             ("api_key_id".to_string(), json!(key.api_key_id.clone())),
             ("key_hash".to_string(), json!(key.key_hash.clone())),
+            (
+                "credential_type".to_string(),
+                json!(key.credential_type.clone()),
+            ),
+            (
+                "access_key_id".to_string(),
+                json!(key.access_key_id.clone()),
+            ),
             ("name".to_string(), json!(key.name.clone())),
             (
                 "allowed_providers".to_string(),
@@ -393,14 +401,16 @@ impl<'a> AdminAppState<'a> {
             ),
         ]);
 
-        if let Some(ciphertext) = key.key_encrypted.as_deref() {
-            if let Some(plaintext) = decrypt_admin_system_export_secret(self, ciphertext) {
-                payload.insert("key".to_string(), serde_json::Value::String(plaintext));
-            } else {
-                payload.insert(
-                    "key_encrypted".to_string(),
-                    serde_json::Value::String(ciphertext.to_string()),
-                );
+        if key.credential_type != "volc_aksk" {
+            if let Some(ciphertext) = key.key_encrypted.as_deref() {
+                if let Some(plaintext) = decrypt_admin_system_export_secret(self, ciphertext) {
+                    payload.insert("key".to_string(), serde_json::Value::String(plaintext));
+                } else {
+                    payload.insert(
+                        "key_encrypted".to_string(),
+                        serde_json::Value::String(ciphertext.to_string()),
+                    );
+                }
             }
         }
 

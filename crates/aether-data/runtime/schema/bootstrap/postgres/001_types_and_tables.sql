@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS public.api_key_provider_mappings (
 CREATE TABLE IF NOT EXISTS public.api_keys (
     id character varying(36) NOT NULL,
     user_id character varying(36) NOT NULL,
-    key_hash character varying(64) NOT NULL,
+    key_hash character varying(255) NOT NULL,
     key_encrypted text,
     name character varying(100),
     key_prefix character varying(64),

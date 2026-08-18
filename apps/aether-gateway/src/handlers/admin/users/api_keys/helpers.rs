@@ -29,6 +29,19 @@ pub(crate) fn masked_user_api_key_display(
     masked_gateway_api_key_display(Some(full_key.as_str()))
 }
 
+pub(crate) fn user_api_key_display(
+    state: &AdminAppState<'_>,
+    record: &aether_data::repository::auth::StoredAuthApiKeyExportRecord,
+) -> String {
+    if record.credential_type == "volc_aksk" {
+        return record
+            .access_key_id
+            .clone()
+            .unwrap_or_else(|| "AKLT****".to_string());
+    }
+    masked_user_api_key_display(state, record.key_encrypted.as_deref())
+}
+
 pub(super) fn build_admin_user_api_key_detail_payload(
     state: &AdminAppState<'_>,
     record: &aether_data::repository::auth::StoredAuthApiKeyExportRecord,
@@ -37,7 +50,9 @@ pub(super) fn build_admin_user_api_key_detail_payload(
     json!({
         "id": record.api_key_id,
         "name": record.name,
-        "key_display": masked_user_api_key_display(state, record.key_encrypted.as_deref()),
+        "credential_type": record.credential_type,
+        "access_key_id": record.access_key_id,
+        "key_display": user_api_key_display(state, record),
         "is_active": record.is_active,
         "is_locked": is_locked,
         "total_requests": record.total_requests,

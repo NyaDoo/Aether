@@ -837,6 +837,12 @@ const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
         aliases: &["gemini_video", "veo"],
     },
     AdminApiFormatDefinition {
+        value: "gemini:files",
+        label: "Gemini Files",
+        default_path: "/v1beta/files",
+        aliases: &["gemini_files"],
+    },
+    AdminApiFormatDefinition {
         value: "jina:embedding",
         label: "Jina Embedding",
         default_path: "/v1/embeddings",

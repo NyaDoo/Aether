@@ -163,7 +163,12 @@
                         :proxy-node-name="getKeyProxyNodeName(key)"
                         :saving-proxy="savingProxyKeyId === key.id"
                         :toggling="togglingKeyId === key.id"
+                        :show-asset-library-test="keySupportsAssetLibrary(key)"
+                        :asset-library-testing="testingAssetLibraryKeyIds.has(key.id)"
+                        :asset-library-test-disabled="isAssetLibraryTestDisabled(key)"
+                        :asset-library-test-title="getAssetLibraryTestTitle(key)"
                         @recover="handleRecoverKey(key)"
+                        @test-asset-library="handleTestAssetLibrary(key)"
                         @permissions="handleKeyPermissions(key)"
                         @update:proxy-popover-open="(v: boolean) => handleProxyPopoverToggle(key.id, v)"
                         @clear-proxy="clearKeyProxy(key)"
@@ -838,6 +843,18 @@
     @saved="handleKeyChanged"
   />
 
+  <AssetLibraryConnectionTestDialog
+    v-if="open && assetLibraryTestDialogOpen && assetLibraryTestKey"
+    :open="assetLibraryTestDialogOpen"
+    :endpoints="assetLibraryTestEndpoints"
+    :key-name="assetLibraryTestKey.name"
+    :selected-endpoint-id="selectedAssetLibraryTestEndpointId"
+    :testing="testingAssetLibraryKeyIds.has(assetLibraryTestKey.id)"
+    @update:open="assetLibraryTestDialogOpen = $event"
+    @update:selected-endpoint-id="selectedAssetLibraryTestEndpointId = $event"
+    @test="confirmAssetLibraryConnectionTest"
+  />
+
   <ProviderKeyBatchImportDialog
     v-if="open && keyBatchImportDialogOpen && provider?.provider_type === 'custom'"
     :open="keyBatchImportDialogOpen"
@@ -979,6 +996,7 @@ import AntigravityQuotaDialog from '@/features/providers/components/AntigravityQ
 import FailoverRulesDialog from '@/features/providers/components/FailoverRulesDialog.vue'
 import ProviderDetailHeader from '@/features/providers/components/ProviderDetailHeader.vue'
 import ProviderKeyBatchImportDialog from '@/features/providers/components/ProviderKeyBatchImportDialog.vue'
+import AssetLibraryConnectionTestDialog from '@/features/providers/components/AssetLibraryConnectionTestDialog.vue'
 import ProviderKeyActionCluster from '@/features/providers/components/ProviderKeyActionCluster.vue'
 import ProviderKeyIdentityBlock from '@/features/providers/components/ProviderKeyIdentityBlock.vue'
 import ProviderMonthlyQuotaCard from '@/features/providers/components/ProviderMonthlyQuotaCard.vue'
@@ -999,12 +1017,14 @@ import {
   exportKey,
   refreshProviderOAuth,
   refreshProviderQuota,
+  testAssetLibraryConnection,
   consumeCodexResetCredit,
   clearOAuthInvalid,
   type ProviderEndpoint,
   type EndpointAPIKey,
   type Model,
   API_FORMAT_ORDER,
+  API_FORMATS,
   sortApiFormats,
 } from '@/api/endpoints'
 import type {
@@ -1019,7 +1039,7 @@ import type {
   QuotaStatusSnapshot,
   QuotaWindowSnapshot,
 } from '@/api/endpoints/types'
-import { formatApiFormatShort } from '@/api/endpoints/types/api-format'
+import { formatApiFormatShort, normalizeApiFormatAlias } from '@/api/endpoints/types/api-format'
 import { isOAuthAccountProviderType, isKeyManagedProviderType } from '../utils/providerTypeUtils'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
 import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
@@ -1046,6 +1066,7 @@ import {
 } from '@/utils/providerKeyStatus'
 import { getGeminiCliAccountCreditsText } from '@/utils/providerKeyQuota'
 import {
+  clearPendingCodexResetCreditIdempotencyKey,
   clearPendingCodexResetCreditIdempotencyKeyForOutcome,
   createCodexResetCreditIdempotencyKey,
   formatCodexResetCreditCount as formatCodexResetCreditCountLabel,
@@ -1136,6 +1157,16 @@ const editingKey = ref<EndpointAPIKey | null>(null)
 const deleteKeyConfirmOpen = ref(false)
 const keyToDelete = ref<EndpointAPIKey | null>(null)
 const togglingKeyId = ref<string | null>(null)
+const testingAssetLibraryKeyIds = ref<Set<string>>(new Set())
+const assetLibraryTestAbortControllers = new Map<string, AbortController>()
+const assetLibraryTestDialogOpen = ref(false)
+const assetLibraryTestKey = ref<EndpointAPIKey | null>(null)
+const selectedAssetLibraryTestEndpointId = ref('')
+const assetLibraryTestEndpoints = computed(() => (
+  assetLibraryTestKey.value
+    ? compatibleAssetLibraryEndpoints(assetLibraryTestKey.value)
+    : []
+))
 
 // 密钥显示状态：key_id -> 完整密钥
 const revealedKeys = ref<Map<string, string>>(new Map())
@@ -1219,6 +1250,7 @@ const hasBlockingDialogOpen = computed(() =>
   keyFormDialogOpen.value ||
   keyBatchImportDialogOpen.value ||
   keyPermissionsDialogOpen.value ||
+  assetLibraryTestDialogOpen.value ||
   oauthAccountDialogOpen.value ||
   oauthKeyEditDialogOpen.value ||
   deleteKeyConfirmOpen.value ||
@@ -1370,6 +1402,11 @@ watch(
       keyFormDialogOpen.value = false
       keyBatchImportDialogOpen.value = false
       keyPermissionsDialogOpen.value = false
+      assetLibraryTestDialogOpen.value = false
+      assetLibraryTestKey.value = null
+      selectedAssetLibraryTestEndpointId.value = ''
+      assetLibraryTestAbortControllers.forEach(controller => controller.abort())
+      assetLibraryTestAbortControllers.clear()
       oauthAccountDialogOpen.value = false
       oauthKeyEditDialogOpen.value = false
       deleteKeyConfirmOpen.value = false
@@ -1381,6 +1418,7 @@ watch(
       currentEndpoint.value = null
       editingKey.value = null
       keyToDelete.value = null
+      testingAssetLibraryKeyIds.value = new Set()
 
       // 清除已显示的密钥（安全考虑）
       revealedKeys.value.clear()
@@ -1491,6 +1529,118 @@ function handleAddKeyToFirstEndpoint() {
   } else {
     // 密钥型提供商（custom/vertex_ai）：打开密钥表单对话框
     handleAddKey(endpoints.value[0])
+  }
+}
+
+function keySupportsAssetLibrary(key: EndpointAPIKey): boolean {
+  const formats = key.api_formats || []
+  if (formats.length === 0) return true
+  return formats.some(
+    format => normalizeApiFormatAlias(format) === API_FORMATS.DOUBAO_ASSET_LIBRARY,
+  )
+}
+
+function compatibleAssetLibraryEndpoints(key: EndpointAPIKey): ProviderEndpointWithKeys[] {
+  if (!keySupportsAssetLibrary(key)) return []
+  return endpoints.value.filter(endpoint => (
+    endpoint.is_active
+    && normalizeApiFormatAlias(endpoint.api_format) === API_FORMATS.DOUBAO_ASSET_LIBRARY
+  ))
+}
+
+function isAssetLibraryTestDisabled(key: EndpointAPIKey): boolean {
+  return !provider.value?.is_active
+    || !key.is_active
+    || compatibleAssetLibraryEndpoints(key).length === 0
+    || testingAssetLibraryKeyIds.value.has(key.id)
+}
+
+function getAssetLibraryTestTitle(key: EndpointAPIKey): string {
+  if (testingAssetLibraryKeyIds.value.has(key.id)) return '正在测试素材库连接'
+  if (!provider.value?.is_active) return '提供商已停用'
+  if (!key.is_active) return '密钥已停用'
+  const endpointCount = compatibleAssetLibraryEndpoints(key).length
+  if (endpointCount === 0) return '未配置可用的素材库端点'
+  return endpointCount > 1 ? '选择素材库端点并测试' : '测试素材库连接'
+}
+
+function setAssetLibraryTestPending(keyId: string, pending: boolean): void {
+  const next = new Set(testingAssetLibraryKeyIds.value)
+  if (pending) next.add(keyId)
+  else next.delete(keyId)
+  testingAssetLibraryKeyIds.value = next
+}
+
+function handleTestAssetLibrary(key: EndpointAPIKey): void {
+  if (testingAssetLibraryKeyIds.value.has(key.id)) return
+  const compatibleEndpoints = compatibleAssetLibraryEndpoints(key)
+  if (compatibleEndpoints.length === 0) {
+    showError(legacyT('请先配置并启用素材库端点'), legacyT('连接测试失败'))
+    return
+  }
+  if (compatibleEndpoints.length === 1) {
+    void runAssetLibraryConnectionTest(key, compatibleEndpoints[0])
+    return
+  }
+
+  assetLibraryTestKey.value = key
+  selectedAssetLibraryTestEndpointId.value = compatibleEndpoints[0].id
+  assetLibraryTestDialogOpen.value = true
+}
+
+async function confirmAssetLibraryConnectionTest(): Promise<void> {
+  const key = assetLibraryTestKey.value
+  const endpoint = assetLibraryTestEndpoints.value.find(
+    item => item.id === selectedAssetLibraryTestEndpointId.value,
+  )
+  if (!key || !endpoint) return
+  const succeeded = await runAssetLibraryConnectionTest(key, endpoint)
+  if (succeeded) {
+    assetLibraryTestDialogOpen.value = false
+    assetLibraryTestKey.value = null
+    selectedAssetLibraryTestEndpointId.value = ''
+  }
+}
+
+async function runAssetLibraryConnectionTest(
+  key: EndpointAPIKey,
+  endpoint: ProviderEndpoint,
+): Promise<boolean> {
+  if (testingAssetLibraryKeyIds.value.has(key.id)) return false
+  const abortController = new AbortController()
+  assetLibraryTestAbortControllers.set(key.id, abortController)
+  setAssetLibraryTestPending(key.id, true)
+  try {
+    const result = await testAssetLibraryConnection(key.id, endpoint.id, {
+      signal: abortController.signal,
+    })
+    if (!result.success) {
+      const diagnostic = [
+        result.error_message || legacyT('素材库连接测试失败'),
+        result.error_code || null,
+        result.status_code ? `HTTP ${result.status_code}` : null,
+      ].filter(Boolean).join(' · ')
+      showError(diagnostic, legacyT('连接测试失败'))
+      return false
+    }
+
+    const summary = [
+      legacyT('素材库连接正常'),
+      result.status_code ? `HTTP ${result.status_code}` : null,
+      `${Math.max(0, Math.round(result.latency_ms))} ms`,
+      typeof result.total === 'number' ? `${result.total} ${legacyT('个素材组')}` : null,
+    ].filter(Boolean).join(' · ')
+    showSuccess(summary, legacyT('连接测试成功'))
+    return true
+  } catch (err: unknown) {
+    if (abortController.signal.aborted) return false
+    showError(localizedApiError(err, '素材库连接测试失败'), legacyT('连接测试失败'))
+    return false
+  } finally {
+    if (assetLibraryTestAbortControllers.get(key.id) === abortController) {
+      assetLibraryTestAbortControllers.delete(key.id)
+    }
+    setAssetLibraryTestPending(key.id, false)
   }
 }
 

@@ -151,6 +151,8 @@ mod tests {
     use sqlx::migrate::{AppliedMigration, Migrate, MigrateError};
 
     const ASSET_LIBRARY_MIGRATION_VERSION: i64 = 20260818000000;
+    const PROVIDER_BOUND_ASSETS_MIGRATION_VERSION: i64 = 20260818010000;
+    const USER_AKSK_MIGRATION_VERSION: i64 = 20260818020000;
 
     #[tokio::test]
     async fn migrates_empty_database_and_clears_pending_set() {
@@ -240,6 +242,140 @@ WHERE type = 'table'
         assert!(migration_applied);
     }
 
+    #[tokio::test]
+    async fn provider_binding_migration_preserves_old_asset_data() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        let mut conn = pool.acquire().await.expect("sqlite connection");
+        conn.ensure_migrations_table()
+            .await
+            .expect("migration table should create");
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= ASSET_LIBRARY_MIGRATION_VERSION)
+        {
+            conn.apply(migration)
+                .await
+                .expect("migration through legacy asset schema should apply");
+        }
+        drop(conn);
+
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, is_active, created_at, updated_at) VALUES ('user-assets', 'user-assets', 'hash', 'user', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("user seed");
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, enabled, is_active, created_at, updated_at) VALUES ('provider-assets', 'provider-assets', 'custom', 1, 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("provider seed");
+        sqlx::query(
+            "INSERT INTO provider_endpoints (id, provider_id, name, base_url, enabled, is_active, created_at, updated_at) VALUES ('endpoint-assets', 'provider-assets', 'assets', 'https://example.com', 1, 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("endpoint seed");
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, encrypted_key, is_active, created_at, updated_at) VALUES ('key-assets', 'provider-assets', 'assets', 'encrypted', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("provider key seed");
+        sqlx::query(
+            r#"INSERT INTO asset_groups (
+                id, upstream_group_id, user_id, provider_id, endpoint_id, key_id,
+                account_binding, project, group_type, name, status,
+                created_at_unix_secs, updated_at_unix_secs
+            ) VALUES (
+                'group-assets', 'upstream-group', 'user-assets', 'provider-assets',
+                'endpoint-assets', 'key-assets', 'legacy-account', 'legacy-project',
+                'AIGC', 'Legacy group', 'Active', 1, 1
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy group seed");
+        sqlx::query(
+            r#"INSERT INTO assets (
+                id, upstream_asset_id, group_id, user_id, asset_type, name, status,
+                is_deleted, created_at_unix_secs, updated_at_unix_secs
+            ) VALUES (
+                'asset-assets', 'upstream-asset', 'group-assets', 'user-assets',
+                'Image', 'Legacy asset', 'Active', 0, 1, 1
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy asset seed");
+        sqlx::query(
+            r#"INSERT INTO ark_visual_validation_sessions (
+                id, session_id, user_id, provider_id, endpoint_id, key_id,
+                account_binding, project, byted_token_hash, encrypted_byted_token,
+                callback_state_hash, status, expires_at_unix_secs, group_id,
+                created_at_unix_secs, updated_at_unix_secs
+            ) VALUES (
+                'session-assets', 'upstream-session', 'user-assets', 'provider-assets',
+                'endpoint-assets', 'key-assets', 'legacy-account', 'legacy-project',
+                'token-hash-assets', 'encrypted-token', 'state-hash-assets', 'Pending',
+                100, 'group-assets', 1, 1
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy validation session seed");
+
+        let mut conn = pool.acquire().await.expect("sqlite connection");
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == PROVIDER_BOUND_ASSETS_MIGRATION_VERSION)
+            .expect("provider-bound asset migration should be embedded");
+        conn.apply(migration)
+            .await
+            .expect("provider-bound asset migration should apply");
+        drop(conn);
+
+        for table in ["asset_groups", "ark_visual_validation_sessions"] {
+            let legacy_columns: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name IN ('account_binding', 'project')"
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("asset table columns should be inspectable");
+            assert_eq!(legacy_columns, 0, "{table}");
+        }
+        let preserved_asset: String =
+            sqlx::query_scalar("SELECT id FROM assets WHERE id = 'asset-assets'")
+                .fetch_one(&pool)
+                .await
+                .expect("asset should survive table rebuild");
+        assert_eq!(preserved_asset, "asset-assets");
+        let preserved_group: String = sqlx::query_scalar(
+            "SELECT group_id FROM ark_visual_validation_sessions WHERE id = 'session-assets'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("validation group reference should survive table rebuild");
+        assert_eq!(preserved_group, "group-assets");
+        assert!(sqlx::query(
+            r#"INSERT INTO asset_groups (
+                id, upstream_group_id, user_id, provider_id, endpoint_id, key_id,
+                group_type, name, status, created_at_unix_secs, updated_at_unix_secs
+            ) VALUES (
+                'group-duplicate', 'upstream-group', 'user-assets', 'provider-assets',
+                'endpoint-assets', 'key-assets', 'AIGC', 'Duplicate', 'Active', 1, 1
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+
     #[test]
     fn rejects_applied_migration_versions_unknown_to_this_binary() {
         let version = MIGRATOR
@@ -299,6 +435,9 @@ WHERE type = 'table'
         assert!(MIGRATOR
             .iter()
             .any(|migration| migration.version == 20260725010000));
+        assert!(MIGRATOR
+            .iter()
+            .any(|migration| migration.version == USER_AKSK_MIGRATION_VERSION));
 
         let parity_table_count: i64 = sqlx::query_scalar(
             r#"

@@ -1773,6 +1773,21 @@ impl GatewayDataState {
             .await
     }
 
+    pub(crate) async fn read_auth_api_key_snapshot_by_access_key_id(
+        &self,
+        access_key_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<Option<GatewayAuthApiKeySnapshot>, DataLayerError> {
+        let snapshot = crate::request_diagnostics::observe_db_operation(
+            "auth_api_key_snapshot_by_access_key_id",
+            self.database_pool_summary(),
+            self.find_stored_auth_api_key_snapshot(AuthApiKeyLookupKey::AccessKeyId(access_key_id)),
+        )
+        .await?;
+        self.apply_user_group_effective_policies(snapshot, now_unix_secs)
+            .await
+    }
+
     async fn apply_user_group_effective_policies(
         &self,
         snapshot: Option<StoredAuthApiKeySnapshot>,

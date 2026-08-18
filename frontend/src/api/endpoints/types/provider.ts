@@ -235,8 +235,6 @@ export type ProviderKeyAuthType = 'api_key' | 'service_account' | 'oauth' | 'bea
 export type ArkApiKeyHeader = 'x-api-key' | 'api-key'
 
 export interface ProviderKeyAuthConfig extends Record<string, unknown> {
-  account_id?: string
-  project?: string
   api_key_header?: ArkApiKeyHeader
   access_key_id?: string
   secret_access_key?: string

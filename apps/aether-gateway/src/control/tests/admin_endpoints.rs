@@ -321,6 +321,47 @@ fn classifies_admin_batch_delete_keys_as_admin_proxy_route() {
 }
 
 #[test]
+fn classifies_admin_asset_library_connection_test_as_admin_proxy_route() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/admin/endpoints/keys/key-ark/asset-library/test"
+        .parse()
+        .expect("uri should parse");
+    let decision = classify_control_route(&http::Method::POST, &uri, &headers)
+        .expect("decision should resolve");
+
+    assert_eq!(decision.route_class.as_deref(), Some("admin_proxy"));
+    assert_eq!(decision.route_family.as_deref(), Some("endpoints_manage"));
+    assert_eq!(
+        decision.route_kind.as_deref(),
+        Some("test_asset_library_connection")
+    );
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("admin:endpoints_manage")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
+fn admin_asset_library_connection_test_buffers_endpoint_selection_body() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/admin/endpoints/keys/key-ark/asset-library/test"
+        .parse()
+        .expect("uri should parse");
+    let decision = classify_control_route(&http::Method::POST, &uri, &headers)
+        .expect("decision should resolve");
+    let context = GatewayPublicRequestContext::from_request_parts(
+        "trace-asset-library-test",
+        &http::Method::POST,
+        &uri,
+        &headers,
+        Some(decision),
+    );
+
+    assert!(local_proxy_route_requires_buffered_body(&context));
+}
+
+#[test]
 fn classifies_admin_clear_oauth_invalid_as_admin_proxy_route() {
     let headers = http::HeaderMap::new();
     let uri: Uri = "/api/admin/endpoints/keys/key-openai/clear-oauth-invalid"

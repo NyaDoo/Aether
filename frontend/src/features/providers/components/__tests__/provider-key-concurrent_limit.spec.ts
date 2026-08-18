@@ -327,30 +327,29 @@ describe('provider key concurrent_limit form behavior', () => {
     await settle()
 
     expect(root.querySelector('[data-select]')?.getAttribute('data-value')).toBe('api_key')
+    expect(root.querySelector('[data-provider-auth-layout]')?.getAttribute('data-provider-auth-layout')).toBe('inline')
     const akSkOption = root.querySelector<HTMLButtonElement>('[data-select-item="volc_aksk"]')
     expect(akSkOption).not.toBeNull()
     akSkOption?.click()
     await settle()
 
+    expect(root.querySelector('[data-provider-auth-layout]')?.getAttribute('data-provider-auth-layout')).toBe('stacked')
+
     const nameInput = root.querySelector<HTMLInputElement>('input[placeholder="例如：主 Key、备用 Key 1"]')
     const accessKeyInput = root.querySelector<HTMLInputElement>('input[id^="volc-access-key-id-"]')
     const secretKeyInput = root.querySelector<HTMLInputElement>('input[id^="volc-secret-access-key-"]')
     const securityTokenInput = root.querySelector<HTMLInputElement>('input[id^="volc-security-token-"]')
-    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
-    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
     expect(nameInput).not.toBeNull()
     expect(accessKeyInput).not.toBeNull()
     expect(secretKeyInput).not.toBeNull()
     expect(securityTokenInput).not.toBeNull()
-    expect(accountIdInput).not.toBeNull()
-    expect(projectInput).not.toBeNull()
+    expect(root.querySelector('input[id^="ark-account-id-"]')).toBeNull()
+    expect(root.querySelector('input[id^="ark-project-"]')).toBeNull()
 
     updateInput(nameInput as HTMLInputElement, 'Ark asset signer')
     updateInput(accessKeyInput as HTMLInputElement, 'AKLT-example')
     updateInput(secretKeyInput as HTMLInputElement, 'secret-example')
     updateInput(securityTokenInput as HTMLInputElement, 'session-token')
-    updateInput(accountIdInput as HTMLInputElement, 'ark-account-1')
-    updateInput(projectInput as HTMLInputElement, 'video-project')
     await submit(root)
 
     expect(endpointMocks.addProviderKey).toHaveBeenCalledWith(
@@ -360,8 +359,6 @@ describe('provider key concurrent_limit form behavior', () => {
         api_key: '',
         api_formats: ['doubao:asset_library'],
         auth_config: {
-          account_id: 'ark-account-1',
-          project: 'video-project',
           access_key_id: 'AKLT-example',
           secret_access_key: 'secret-example',
           security_token: 'session-token',
@@ -387,11 +384,9 @@ describe('provider key concurrent_limit form behavior', () => {
     })
     await settle()
 
-    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
-    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
-    expect(accountIdInput?.value).toBe('')
-    expect(projectInput?.value).toBe('')
-    expect(root.textContent).toContain('留空表示保留现有值')
+    expect(root.querySelector('input[id^="ark-account-id-"]')).toBeNull()
+    expect(root.querySelector('input[id^="ark-project-"]')).toBeNull()
+    expect(root.textContent).toContain('AK 与 SK 留空表示保持原凭据')
 
     await submit(root)
 
@@ -402,7 +397,7 @@ describe('provider key concurrent_limit form behavior', () => {
     expect(payload).not.toHaveProperty('auth_config')
   })
 
-  it('creates Bearer credentials with Ark account and project binding', async () => {
+  it('creates Bearer credentials without Ark account or project binding', async () => {
     const root = mountDialog(KeyFormDialog, {
       open: true,
       endpoint: null,
@@ -418,18 +413,16 @@ describe('provider key concurrent_limit form behavior', () => {
     bearerOption?.click()
     await settle()
 
+    expect(root.querySelector('[data-provider-auth-layout]')?.getAttribute('data-provider-auth-layout')).toBe('inline')
+
     const nameInput = root.querySelector<HTMLInputElement>('input[placeholder="例如：主 Key、备用 Key 1"]')
     const secretInput = root.querySelector<HTMLInputElement>('input[id^="api-key-"]')
-    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
-    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
     expect(nameInput).not.toBeNull()
     expect(secretInput).not.toBeNull()
-    expect(accountIdInput).not.toBeNull()
-    expect(projectInput).not.toBeNull()
+    expect(root.querySelector('input[id^="ark-account-id-"]')).toBeNull()
+    expect(root.querySelector('input[id^="ark-project-"]')).toBeNull()
     updateInput(nameInput as HTMLInputElement, 'Relay bearer')
     updateInput(secretInput as HTMLInputElement, 'relay-token')
-    updateInput(accountIdInput as HTMLInputElement, 'relay-account')
-    updateInput(projectInput as HTMLInputElement, 'relay-project')
     await submit(root)
 
     expect(endpointMocks.addProviderKey).toHaveBeenCalledWith(
@@ -437,12 +430,9 @@ describe('provider key concurrent_limit form behavior', () => {
       expect.objectContaining({
         auth_type: 'bearer',
         api_key: 'relay-token',
-        auth_config: {
-          account_id: 'relay-account',
-          project: 'relay-project',
-        },
       }),
     )
+    expect(endpointMocks.addProviderKey.mock.calls[0][1].auth_config).toBeUndefined()
   })
 
   it('selects the upstream header for an Ark asset-library API Key', async () => {
@@ -516,7 +506,7 @@ describe('provider key concurrent_limit form behavior', () => {
     })
   })
 
-  it('creates API Key credentials with Ark binding for Doubao video', async () => {
+  it('creates API Key credentials for Doubao video without Ark binding', async () => {
     const root = mountDialog(KeyFormDialog, {
       open: true,
       endpoint: null,
@@ -529,15 +519,11 @@ describe('provider key concurrent_limit form behavior', () => {
 
     const nameInput = root.querySelector<HTMLInputElement>('input[placeholder="例如：主 Key、备用 Key 1"]')
     const secretInput = root.querySelector<HTMLInputElement>('input[id^="api-key-"]')
-    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
-    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
-    expect(accountIdInput).not.toBeNull()
-    expect(projectInput).not.toBeNull()
+    expect(root.querySelector('input[id^="ark-account-id-"]')).toBeNull()
+    expect(root.querySelector('input[id^="ark-project-"]')).toBeNull()
 
     updateInput(nameInput as HTMLInputElement, 'Doubao video relay')
     updateInput(secretInput as HTMLInputElement, 'video-api-key')
-    updateInput(accountIdInput as HTMLInputElement, 'video-account')
-    updateInput(projectInput as HTMLInputElement, 'video-project')
     await submit(root)
 
     expect(endpointMocks.addProviderKey).toHaveBeenCalledWith(
@@ -546,15 +532,12 @@ describe('provider key concurrent_limit form behavior', () => {
         auth_type: 'api_key',
         api_key: 'video-api-key',
         api_formats: ['doubao:video'],
-        auth_config: {
-          account_id: 'video-account',
-          project: 'video-project',
-        },
       }),
     )
+    expect(endpointMocks.addProviderKey.mock.calls[0][1].auth_config).toBeUndefined()
   })
 
-  it('preserves blank Ark binding values and only updates explicitly entered fields', async () => {
+  it('does not expose or submit Ark account and project fields when editing', async () => {
     const root = mountDialog(KeyFormDialog, {
       open: true,
       endpoint: null,
@@ -569,19 +552,13 @@ describe('provider key concurrent_limit form behavior', () => {
     })
     await settle()
 
-    const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
-    const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
-    expect(accountIdInput?.value).toBe('')
-    expect(projectInput?.value).toBe('')
-    expect(accountIdInput?.placeholder).toBe('留空表示保留原值')
-    expect(projectInput?.placeholder).toBe('留空表示保留原值')
-
-    updateInput(accountIdInput as HTMLInputElement, 'updated-account')
+    expect(root.querySelector('input[id^="ark-account-id-"]')).toBeNull()
+    expect(root.querySelector('input[id^="ark-project-"]')).toBeNull()
     await submit(root)
 
     const payload = lastUpdatePayload()
     expect(payload).not.toHaveProperty('api_key')
-    expect(payload.auth_config).toEqual({ account_id: 'updated-account' })
+    expect(payload).not.toHaveProperty('auth_config')
   })
 
   it.each([
@@ -609,10 +586,8 @@ describe('provider key concurrent_limit form behavior', () => {
       nextAuthTypeOption?.click()
       await settle()
 
-      const accountIdInput = root.querySelector<HTMLInputElement>('input[id^="ark-account-id-"]')
-      const projectInput = root.querySelector<HTMLInputElement>('input[id^="ark-project-"]')
-      expect(accountIdInput?.value).toBe('')
-      expect(projectInput?.value).toBe('')
+      expect(root.querySelector('input[id^="ark-account-id-"]')).toBeNull()
+      expect(root.querySelector('input[id^="ark-project-"]')).toBeNull()
       if (nextAuthType === 'api_key') {
         expect(root.querySelector('[data-ark-api-key-header]')?.getAttribute('data-value')).toBe('')
       }
@@ -625,6 +600,34 @@ describe('provider key concurrent_limit form behavior', () => {
       expect(payload).not.toHaveProperty('auth_config')
     },
   )
+
+  it('uses the existing flat section style and responsive grids', async () => {
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: null,
+      providerId: 'provider-volcengine',
+      providerType: 'custom',
+      availableApiFormats: ['doubao:asset_library'],
+    })
+    await settle()
+
+    const sectionNames = Array.from(
+      root.querySelectorAll<HTMLElement>('[data-provider-key-section]'),
+      section => section.dataset.providerKeySection,
+    )
+    expect(sectionNames).toEqual([
+      'basic',
+      'authentication',
+      'api-formats',
+      'advanced-authentication',
+      'scheduling',
+    ])
+    expect(root.querySelector('[data-provider-scheduling-grid]')?.className).toContain('sm:grid-cols-2')
+    expect(root.querySelector('[data-provider-scheduling-grid]')?.className).toContain('xl:grid-cols-5')
+    expect(root.innerHTML).not.toContain('bg-amber-500/[0.04]')
+    expect(root.innerHTML).not.toContain('bg-sky-500/[0.04]')
+  })
 
   it('lets Vertex AI keys switch to Service Account JSON and submit auth_config', async () => {
     const root = mountDialog(KeyFormDialog, {

@@ -462,12 +462,29 @@ pub fn check_required_tables(
     schema: &LogicalSchema,
     sql_paths: &[PathBuf],
 ) -> Result<(), SchemaError> {
+    let mut sources = Vec::with_capacity(sql_paths.len());
     for path in sql_paths {
         let text = fs::read_to_string(path).map_err(|source| SchemaError::Read {
             path: path.clone(),
             source,
         })?;
-        let required = extract_table_shapes(&text);
+        sources.push((path, text));
+    }
+    for (source_index, (path, text)) in sources.iter().enumerate() {
+        let later_sources = sources
+            .iter()
+            .skip(source_index + 1)
+            .filter(|(later_path, _)| later_path.parent() == path.parent())
+            .collect::<Vec<_>>();
+        let dropped_columns = later_sources
+            .iter()
+            .flat_map(|(_, later_text)| extract_dropped_columns(later_text))
+            .collect::<BTreeSet<_>>();
+        let replacement_shapes = later_sources
+            .iter()
+            .flat_map(|(_, later_text)| extract_table_replacement_shapes(later_text))
+            .collect::<BTreeMap<_, _>>();
+        let required = extract_required_table_shapes(text);
         let mut missing_tables = Vec::new();
         let mut missing_columns = Vec::new();
         for (table_name, required_columns) in required {
@@ -482,7 +499,13 @@ pub fn check_required_tables(
                 .collect::<BTreeSet<_>>();
             let missing = required_columns
                 .iter()
-                .filter(|column| !defined_columns.contains(column.as_str()))
+                .filter(|column| {
+                    !defined_columns.contains(column.as_str())
+                        && !dropped_columns.contains(&(table_name.clone(), (*column).clone()))
+                        && !replacement_shapes
+                            .get(&table_name)
+                            .is_some_and(|columns| !columns.contains(*column))
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
@@ -507,19 +530,104 @@ pub fn check_required_tables(
     Ok(())
 }
 
+fn extract_required_table_shapes(sql: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut tables = extract_table_shapes(sql);
+    for (source_table, target_table) in extract_table_renames(sql) {
+        if let Some(columns) = tables.remove(&source_table) {
+            tables.insert(target_table, columns);
+        }
+    }
+    tables
+}
+
+fn extract_table_replacement_shapes(sql: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let tables = extract_table_shapes(sql);
+    extract_table_renames(sql)
+        .into_iter()
+        .filter_map(|(source_table, target_table)| {
+            tables
+                .get(&source_table)
+                .cloned()
+                .map(|columns| (target_table, columns))
+        })
+        .collect()
+}
+
+fn extract_table_renames(sql: &str) -> Vec<(String, String)> {
+    sql.lines().filter_map(parse_alter_table_rename).collect()
+}
+
+fn parse_alter_table_rename(line: &str) -> Option<(String, String)> {
+    let tokens = line.trim().split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 6
+        || !tokens[0].eq_ignore_ascii_case("ALTER")
+        || !tokens[1].eq_ignore_ascii_case("TABLE")
+        || !tokens[3].eq_ignore_ascii_case("RENAME")
+        || !tokens[4].eq_ignore_ascii_case("TO")
+    {
+        return None;
+    }
+    Some((
+        normalize_table_token(tokens[2])?,
+        normalize_table_token(tokens[5])?,
+    ))
+}
+
+fn extract_dropped_columns(sql: &str) -> BTreeSet<(String, String)> {
+    let mut dropped = BTreeSet::new();
+    let mut altered_table = None::<String>;
+
+    for line in sql.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("ALTER TABLE ") {
+            altered_table = trimmed
+                .split_whitespace()
+                .nth(2)
+                .and_then(normalize_table_token);
+        }
+
+        if let Some(table_name) = altered_table.as_ref() {
+            let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+            if let Some(drop_index) = tokens.windows(2).position(|tokens| {
+                tokens[0].eq_ignore_ascii_case("DROP") && tokens[1].eq_ignore_ascii_case("COLUMN")
+            }) {
+                let mut column_index = drop_index + 2;
+                if tokens
+                    .get(column_index)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+                {
+                    column_index += 2;
+                }
+                if let Some(column_name) = tokens
+                    .get(column_index)
+                    .and_then(|token| normalize_identifier_token(token))
+                {
+                    dropped.insert((table_name.clone(), column_name));
+                }
+            }
+        }
+
+        if trimmed.ends_with(';') {
+            altered_table = None;
+        }
+    }
+
+    dropped
+}
+
 pub fn extract_create_table_names(sql: &str) -> BTreeSet<String> {
     extract_table_shapes(sql).into_keys().collect()
 }
 
 pub fn extract_table_shapes(sql: &str) -> BTreeMap<String, BTreeSet<String>> {
-    const PREFIX: &str = "CREATE TABLE IF NOT EXISTS ";
     let mut tables = BTreeMap::<String, BTreeSet<String>>::new();
     let mut current_table = None::<String>;
     let mut skipping_table_constraint = false;
     for line in sql.lines() {
         let trimmed = line.trim_start();
         let upper = trimmed.to_ascii_uppercase();
-        if !upper.starts_with(PREFIX) {
+        if !upper.starts_with("CREATE TABLE ") {
             if let Some(table_name) = &current_table {
                 if trimmed.starts_with(");") || (trimmed.starts_with(')') && trimmed.ends_with(';'))
                 {
@@ -546,18 +654,33 @@ pub fn extract_table_shapes(sql: &str) -> BTreeMap<String, BTreeSet<String>> {
             }
             continue;
         }
-        let rest = &trimmed[PREFIX.len()..];
-        if let Some(table) = rest
-            .split_whitespace()
-            .next()
-            .and_then(normalize_table_token)
-        {
+        if let Some(table) = parse_create_table_name(trimmed) {
             tables.entry(table.clone()).or_default();
             current_table = Some(table);
             skipping_table_constraint = false;
         }
     }
     tables
+}
+
+fn parse_create_table_name(line: &str) -> Option<String> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 3
+        || !tokens[0].eq_ignore_ascii_case("CREATE")
+        || !tokens[1].eq_ignore_ascii_case("TABLE")
+    {
+        return None;
+    }
+    let table_index = if tokens.get(2..5).is_some_and(|tokens| {
+        tokens[0].eq_ignore_ascii_case("IF")
+            && tokens[1].eq_ignore_ascii_case("NOT")
+            && tokens[2].eq_ignore_ascii_case("EXISTS")
+    }) {
+        5
+    } else {
+        2
+    };
+    normalize_table_token(tokens.get(table_index)?)
 }
 
 fn is_table_constraint_start(line: &str) -> bool {
@@ -977,6 +1100,56 @@ ALTER TABLE users ADD COLUMN ldap_dn VARCHAR(1024);
             .expect_err("missing required column should fail");
         std::fs::remove_file(&path).expect("fixture should be removable");
         assert!(err.to_string().contains("announcements.title"));
+    }
+
+    #[test]
+    fn required_table_check_allows_columns_removed_by_later_migrations() {
+        let schema = announcements_schema();
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let create_path = manifest_dir.join("target/required-dropped-column-create.sql");
+        let drop_path = manifest_dir.join("target/required-dropped-column-drop.sql");
+        std::fs::create_dir_all(create_path.parent().expect("fixture should have parent"))
+            .expect("fixture dir should be writable");
+        std::fs::write(
+            &create_path,
+            "CREATE TABLE IF NOT EXISTS announcements (\n    id TEXT PRIMARY KEY,\n    legacy_title TEXT\n);\n",
+        )
+        .expect("fixture should be writable");
+        std::fs::write(
+            &drop_path,
+            "ALTER TABLE announcements\n    DROP COLUMN IF EXISTS legacy_title;\n",
+        )
+        .expect("fixture should be writable");
+
+        check_required_tables(&schema, &[create_path.clone(), drop_path.clone()])
+            .expect("later DROP COLUMN should describe the final schema");
+        std::fs::remove_file(create_path).expect("fixture should be removable");
+        std::fs::remove_file(drop_path).expect("fixture should be removable");
+    }
+
+    #[test]
+    fn required_table_check_understands_sqlite_table_rebuilds() {
+        let schema = announcements_schema();
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let create_path = manifest_dir.join("target/required-rebuilt-table-create.sql");
+        let rebuild_path = manifest_dir.join("target/required-rebuilt-table-rebuild.sql");
+        std::fs::create_dir_all(create_path.parent().expect("fixture should have parent"))
+            .expect("fixture dir should be writable");
+        std::fs::write(
+            &create_path,
+            "CREATE TABLE IF NOT EXISTS announcements (\n    id TEXT PRIMARY KEY,\n    legacy_title TEXT\n);\n",
+        )
+        .expect("fixture should be writable");
+        std::fs::write(
+            &rebuild_path,
+            "CREATE TABLE announcements_rebuilt (\n    id TEXT PRIMARY KEY\n);\nDROP TABLE announcements;\nALTER TABLE announcements_rebuilt RENAME TO announcements;\n",
+        )
+        .expect("fixture should be writable");
+
+        check_required_tables(&schema, &[create_path.clone(), rebuild_path.clone()])
+            .expect("replacement table should describe the final schema");
+        std::fs::remove_file(create_path).expect("fixture should be removable");
+        std::fs::remove_file(rebuild_path).expect("fixture should be removable");
     }
 
     #[test]

@@ -1449,10 +1449,22 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   'POST /api/users/me/api-keys': async (config) => {
     await delay()
     const body = JSON.parse(config.data || '{}')
+    const credentialType = body.credential_type === 'volc_aksk' ? 'volc_aksk' : 'api_key'
+    const credentialSuffix = Math.random().toString(36).substring(2, 15)
     const newKey = {
       id: `key-demo-${Date.now()}`,
-      key: `sk-aether-demo-${Math.random().toString(36).substring(2, 15)}`,
-      key_display: 'sk-ae...demo',
+      credential_type: credentialType,
+      ...(credentialType === 'volc_aksk'
+        ? {
+            access_key_id: `AKLTDEMO${credentialSuffix.toUpperCase()}`,
+            secret_access_key: `demo-secret-${credentialSuffix}`,
+            key_display: '',
+          }
+        : {
+            access_key_id: null,
+            key: `sk-aether-demo-${credentialSuffix}`,
+            key_display: 'sk-ae...demo',
+          }),
       name: body.name || '新密钥（演示）',
       created_at: new Date().toISOString(),
       is_active: true,

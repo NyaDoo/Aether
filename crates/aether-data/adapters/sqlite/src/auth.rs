@@ -47,6 +47,8 @@ SELECT
   api_keys.id AS api_key_id,
   api_keys.key_hash,
   api_keys.key_encrypted,
+  api_keys.credential_type,
+  api_keys.access_key_id,
   api_keys.name,
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
@@ -114,19 +116,21 @@ impl SqliteAuthApiKeyReadRepository {
         sqlx::query(
             r#"
 INSERT INTO api_keys (
-  id, user_id, key_hash, key_encrypted, name, allowed_providers,
+  id, user_id, key_hash, key_encrypted, credential_type, access_key_id, name, allowed_providers,
   allowed_api_formats, allowed_models, ip_rules, rate_limit, concurrent_limit,
   force_capabilities, feature_settings, is_active, expires_at, auto_delete_on_expiry,
   total_requests, total_tokens, total_cost_usd, is_standalone,
   created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&record.api_key_id)
         .bind(&record.user_id)
         .bind(&record.key_hash)
         .bind(&record.key_encrypted)
+        .bind(&record.credential_type)
+        .bind(&record.access_key_id)
         .bind(&record.name)
         .bind(json_string_from_string_list(
             record.allowed_providers.as_ref(),
@@ -178,6 +182,8 @@ struct CreateApiKeyInsertRecord {
     api_key_id: String,
     key_hash: String,
     key_encrypted: Option<String>,
+    credential_type: String,
+    access_key_id: Option<String>,
     name: Option<String>,
     allowed_providers: Option<Vec<String>>,
     allowed_api_formats: Option<Vec<String>>,
@@ -206,7 +212,14 @@ impl AuthApiKeyReadRepository for SqliteAuthApiKeyReadRepository {
             AuthApiKeyLookupKey::KeyHash(key_hash) => {
                 builder
                     .push(" WHERE api_keys.key_hash = ")
-                    .push_bind(key_hash);
+                    .push_bind(key_hash)
+                    .push(" AND api_keys.credential_type = 'api_key'");
+            }
+            AuthApiKeyLookupKey::AccessKeyId(access_key_id) => {
+                builder
+                    .push(" WHERE api_keys.access_key_id = ")
+                    .push_bind(access_key_id)
+                    .push(" AND api_keys.credential_type = 'volc_aksk'");
             }
             AuthApiKeyLookupKey::ApiKeyId(api_key_id) => {
                 builder.push(" WHERE api_keys.id = ").push_bind(api_key_id);
@@ -421,6 +434,8 @@ WHERE id = ?
             api_key_id: record.api_key_id,
             key_hash: record.key_hash,
             key_encrypted: record.key_encrypted,
+            credential_type: record.credential_type,
+            access_key_id: record.access_key_id,
             name: record.name,
             allowed_providers: record.allowed_providers,
             allowed_api_formats: record.allowed_api_formats,
@@ -449,6 +464,8 @@ WHERE id = ?
             api_key_id: record.api_key_id,
             key_hash: record.key_hash,
             key_encrypted: record.key_encrypted,
+            credential_type: "api_key".to_string(),
+            access_key_id: None,
             name: record.name,
             allowed_providers: record.allowed_providers,
             allowed_api_formats: record.allowed_api_formats,
@@ -987,11 +1004,13 @@ fn map_auth_api_key_export_row(
         row.try_get("feature_settings").map_sql_err()?,
         "api_keys.feature_settings",
     )?;
-    StoredAuthApiKeyExportRecord::new(
+    StoredAuthApiKeyExportRecord::new_with_credential(
         row.try_get("user_id").map_sql_err()?,
         row.try_get("api_key_id").map_sql_err()?,
         row.try_get("key_hash").map_sql_err()?,
         row.try_get("key_encrypted").map_sql_err()?,
+        row.try_get("credential_type").map_sql_err()?,
+        row.try_get("access_key_id").map_sql_err()?,
         row.try_get("name").map_sql_err()?,
         optional_json_from_string(
             row.try_get("allowed_providers").map_sql_err()?,
@@ -1137,6 +1156,8 @@ mod tests {
                 api_key_id: "key-created-user".to_string(),
                 key_hash: "hash-created-user".to_string(),
                 key_encrypted: Some("enc-user".to_string()),
+                credential_type: "api_key".to_string(),
+                access_key_id: None,
                 name: Some("Created User".to_string()),
                 allowed_providers: Some(vec!["openai".to_string()]),
                 allowed_api_formats: Some(vec!["openai:chat".to_string()]),

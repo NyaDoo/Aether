@@ -12,6 +12,7 @@ export type MaterialAssetStatus =
 
 export type MaterialAssetMediaType = 'image' | 'video' | 'audio' | 'file' | 'unknown'
 export type ArkMaterialAssetType = 'Image' | 'Video' | 'Audio'
+export type ArkCreatableMaterialAssetType = 'Image'
 
 export interface MaterialAssetError {
   code?: string | null
@@ -95,7 +96,7 @@ export interface CreateMaterialAssetFromUrlRequest {
   url: string
   name?: string
   group_id: string
-  asset_type: ArkMaterialAssetType
+  asset_type: ArkCreatableMaterialAssetType
   user_id?: string
 }
 
@@ -114,7 +115,7 @@ export interface MaterialAssetVerificationSession {
 }
 
 export interface CreateMaterialAssetVerificationSessionRequest {
-  return_url?: string
+  callback_url: string
   user_id?: string
 }
 

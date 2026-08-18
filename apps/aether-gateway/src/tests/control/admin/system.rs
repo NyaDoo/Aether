@@ -1452,6 +1452,19 @@ async fn gateway_handles_admin_system_api_formats_locally_with_trusted_admin_pri
     assert!(formats.iter().any(|item| item["value"] == "jina:embedding"));
     assert!(formats.iter().any(|item| item["value"] == "jina:rerank"));
     assert!(formats.iter().any(|item| item["value"] == "gemini:video"));
+    let gemini_files = formats
+        .iter()
+        .find(|item| item["value"] == "gemini:files")
+        .expect("gemini files format should exist");
+    assert_eq!(gemini_files["default_path"], "/v1beta/files");
+    let ark_asset_library = formats
+        .iter()
+        .find(|item| item["value"] == "doubao:asset_library")
+        .expect("Ark asset-library format should exist");
+    assert_eq!(
+        ark_asset_library["default_path"],
+        "/?Action={action}&Version=2024-01-01"
+    );
     let gemini_interactions = formats
         .iter()
         .find(|item| item["value"] == "gemini:interactions")

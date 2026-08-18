@@ -12,9 +12,9 @@ use super::{
 };
 use crate::DataLayerError;
 
-type GroupUpstreamKey = (String, String, String, String);
+type GroupUpstreamKey = (String, String);
 type AssetUpstreamKey = (String, String);
-type SessionUpstreamKey = (String, String, String, String);
+type SessionUpstreamKey = (String, String);
 
 #[derive(Debug, Default)]
 struct MemoryAssetLibraryIndex {
@@ -35,14 +35,10 @@ pub struct InMemoryAssetLibraryRepository {
 
 impl InMemoryAssetLibraryRepository {
     fn group_upstream_key(group: &StoredAssetGroup) -> Option<GroupUpstreamKey> {
-        group.upstream_group_id.as_ref().map(|upstream_group_id| {
-            (
-                group.provider_id.clone(),
-                group.account_binding.clone().unwrap_or_default(),
-                group.project.clone().unwrap_or_default(),
-                upstream_group_id.clone(),
-            )
-        })
+        group
+            .upstream_group_id
+            .as_ref()
+            .map(|upstream_group_id| (group.provider_id.clone(), upstream_group_id.clone()))
     }
 
     fn asset_upstream_key(asset: &StoredAsset) -> Option<AssetUpstreamKey> {
@@ -53,12 +49,7 @@ impl InMemoryAssetLibraryRepository {
     }
 
     fn session_upstream_key(session: &StoredArkVisualValidationSession) -> SessionUpstreamKey {
-        (
-            session.provider_id.clone(),
-            session.account_binding.clone().unwrap_or_default(),
-            session.project.clone().unwrap_or_default(),
-            session.session_id.clone(),
-        )
+        (session.provider_id.clone(), session.session_id.clone())
     }
 
     fn ensure_unclaimed(
@@ -223,19 +214,12 @@ impl AssetLibraryReadRepository for InMemoryAssetLibraryRepository {
     async fn find_group_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         upstream_group_id: &str,
     ) -> Result<Option<StoredAssetGroup>, DataLayerError> {
         let index = self.index.read().expect("asset library repository lock");
         Ok(index
             .group_upstream_to_id
-            .get(&(
-                provider_id.to_string(),
-                account_binding.to_string(),
-                project.unwrap_or_default().to_string(),
-                upstream_group_id.to_string(),
-            ))
+            .get(&(provider_id.to_string(), upstream_group_id.to_string()))
             .and_then(|id| index.groups_by_id.get(id))
             .cloned())
     }
@@ -388,19 +372,12 @@ impl AssetLibraryReadRepository for InMemoryAssetLibraryRepository {
     async fn find_visual_validation_session_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         session_id: &str,
     ) -> Result<Option<StoredArkVisualValidationSession>, DataLayerError> {
         let index = self.index.read().expect("asset library repository lock");
         Ok(index
             .session_upstream_to_id
-            .get(&(
-                provider_id.to_string(),
-                account_binding.to_string(),
-                project.unwrap_or_default().to_string(),
-                session_id.to_string(),
-            ))
+            .get(&(provider_id.to_string(), session_id.to_string()))
             .and_then(|id| index.sessions_by_id.get(id))
             .cloned())
     }
@@ -584,13 +561,10 @@ impl AssetLibraryWriteRepository for InMemoryAssetLibraryRepository {
             };
             if group.user_id != record.user_id
                 || group.provider_id != record.provider_id
-                || group.account_binding != record.account_binding
-                || group.project != record.project
                 || group.deleted_at_unix_secs.is_some()
             {
                 return Err(DataLayerError::InvalidInput(
-                    "validation session group owner, account, or project binding is invalid"
-                        .to_string(),
+                    "validation session group owner or provider binding is invalid".to_string(),
                 ));
             }
         }
@@ -697,8 +671,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: Some("account-1".to_string()),
-            project: Some("project-1".to_string()),
             group_type: "face".to_string(),
             name: format!("Group {id}"),
             description: None,
@@ -743,8 +715,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: Some("account-1".to_string()),
-            project: Some("project-1".to_string()),
             byted_token_hash: "token-hash".to_string(),
             encrypted_byted_token: "encrypted-token".to_string(),
             callback_state_hash: "state-hash".to_string(),
@@ -934,12 +904,7 @@ mod tests {
         assert!(repository.upsert_group(duplicate).await.is_err());
         assert_eq!(
             repository
-                .find_group_by_canonical_upstream(
-                    "provider-1",
-                    "account-1",
-                    Some("project-1"),
-                    "upstream-group-1",
-                )
+                .find_group_by_canonical_upstream("provider-1", "upstream-group-1",)
                 .await?
                 .expect("canonical group")
                 .id,
@@ -997,16 +962,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_group_must_match_account_and_project() -> Result<(), DataLayerError> {
+    async fn validation_group_must_match_provider() -> Result<(), DataLayerError> {
         let repository = InMemoryAssetLibraryRepository::default();
         repository
             .upsert_group(group_record("group-1", "user-1"))
             .await?;
 
-        let mut wrong_account = validation_record();
-        wrong_account.account_binding = Some("account-2".to_string());
+        let mut wrong_provider = validation_record();
+        wrong_provider.provider_id = "provider-2".to_string();
         assert!(repository
-            .upsert_visual_validation_session(wrong_account)
+            .upsert_visual_validation_session(wrong_provider)
             .await
             .is_err());
         Ok(())

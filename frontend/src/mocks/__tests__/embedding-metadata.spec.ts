@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
+import { API_FORMATS } from '@/api/endpoints/types'
 import { MOCK_API_FORMATS, MOCK_GLOBAL_MODELS } from '../data'
 
 describe('embedding mock metadata', () => {
+  it('keeps the mock API format catalog aligned with frontend format declarations', () => {
+    expect(new Set(MOCK_API_FORMATS.formats.map(format => format.value))).toEqual(
+      new Set(Object.values(API_FORMATS)),
+    )
+  })
+
   it('exposes embedding model metadata to frontend code without chat treatment', () => {
     const model = MOCK_GLOBAL_MODELS.find(item => item.name === 'text-embedding-3-small')
 

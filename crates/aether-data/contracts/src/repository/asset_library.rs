@@ -6,8 +6,6 @@ const UPSTREAM_ID_MAX_LEN: usize = 255;
 const NAME_MAX_LEN: usize = 512;
 const TYPE_MAX_LEN: usize = 64;
 const STATUS_MAX_LEN: usize = 64;
-const ACCOUNT_BINDING_MAX_LEN: usize = 128;
-const PROJECT_MAX_LEN: usize = 255;
 const HASH_MAX_LEN: usize = 128;
 const ERROR_CODE_MAX_LEN: usize = 128;
 
@@ -20,8 +18,6 @@ pub struct StoredAssetGroup {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
-    pub account_binding: Option<String>,
-    pub project: Option<String>,
     pub group_type: String,
     pub name: String,
     pub description: Option<String>,
@@ -40,8 +36,6 @@ pub struct UpsertAssetGroupRecord {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
-    pub account_binding: Option<String>,
-    pub project: Option<String>,
     pub group_type: String,
     pub name: String,
     pub description: Option<String>,
@@ -68,26 +62,6 @@ impl UpsertAssetGroupRecord {
         validate_required_text("asset_groups.provider_id", &self.provider_id, ID_MAX_LEN)?;
         validate_required_text("asset_groups.endpoint_id", &self.endpoint_id, ID_MAX_LEN)?;
         validate_required_text("asset_groups.key_id", &self.key_id, ID_MAX_LEN)?;
-        validate_optional_text(
-            "asset_groups.account_binding",
-            self.account_binding.as_deref(),
-            ACCOUNT_BINDING_MAX_LEN,
-        )?;
-        validate_optional_text(
-            "asset_groups.project",
-            self.project.as_deref(),
-            PROJECT_MAX_LEN,
-        )?;
-        validate_canonical_optional_binding(
-            "asset_groups.account_binding",
-            self.account_binding.as_deref(),
-        )?;
-        validate_canonical_optional_binding("asset_groups.project", self.project.as_deref())?;
-        if self.account_binding.is_none() {
-            return Err(crate::DataLayerError::InvalidInput(
-                "asset_groups.account_binding is required".to_string(),
-            ));
-        }
         validate_required_text("asset_groups.group_type", &self.group_type, TYPE_MAX_LEN)?;
         validate_required_text("asset_groups.name", &self.name, NAME_MAX_LEN)?;
         validate_required_text("asset_groups.status", &self.status, STATUS_MAX_LEN)?;
@@ -108,8 +82,6 @@ impl UpsertAssetGroupRecord {
             provider_id: self.provider_id,
             endpoint_id: self.endpoint_id,
             key_id: self.key_id,
-            account_binding: self.account_binding,
-            project: self.project,
             group_type: self.group_type,
             name: self.name,
             description: self.description,
@@ -125,8 +97,8 @@ impl UpsertAssetGroupRecord {
             && self.upstream_group_id == stored.upstream_group_id
             && self.user_id == stored.user_id
             && self.provider_id == stored.provider_id
-            && self.account_binding == stored.account_binding
-            && self.project == stored.project
+            && self.endpoint_id == stored.endpoint_id
+            && self.key_id == stored.key_id
             && self.group_type == stored.group_type
             && self.deleted_at_unix_secs == stored.deleted_at_unix_secs
             && (stored.deleted_at_unix_secs.is_none() || self.status == stored.status)
@@ -339,8 +311,6 @@ pub struct StoredArkVisualValidationSession {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
-    pub account_binding: Option<String>,
-    pub project: Option<String>,
     pub byted_token_hash: String,
     pub encrypted_byted_token: String,
     pub callback_state_hash: String,
@@ -362,8 +332,6 @@ pub struct UpsertArkVisualValidationSessionRecord {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
-    pub account_binding: Option<String>,
-    pub project: Option<String>,
     pub byted_token_hash: String,
     pub encrypted_byted_token: String,
     pub callback_state_hash: String,
@@ -409,29 +377,6 @@ impl UpsertArkVisualValidationSessionRecord {
             &self.key_id,
             ID_MAX_LEN,
         )?;
-        validate_optional_text(
-            "ark_visual_validation_sessions.account_binding",
-            self.account_binding.as_deref(),
-            ACCOUNT_BINDING_MAX_LEN,
-        )?;
-        validate_optional_text(
-            "ark_visual_validation_sessions.project",
-            self.project.as_deref(),
-            PROJECT_MAX_LEN,
-        )?;
-        validate_canonical_optional_binding(
-            "ark_visual_validation_sessions.account_binding",
-            self.account_binding.as_deref(),
-        )?;
-        validate_canonical_optional_binding(
-            "ark_visual_validation_sessions.project",
-            self.project.as_deref(),
-        )?;
-        if self.account_binding.is_none() {
-            return Err(crate::DataLayerError::InvalidInput(
-                "ark_visual_validation_sessions.account_binding is required".to_string(),
-            ));
-        }
         validate_required_text(
             "ark_visual_validation_sessions.byted_token_hash",
             &self.byted_token_hash,
@@ -483,8 +428,6 @@ impl UpsertArkVisualValidationSessionRecord {
             provider_id: self.provider_id,
             endpoint_id: self.endpoint_id,
             key_id: self.key_id,
-            account_binding: self.account_binding,
-            project: self.project,
             byted_token_hash: self.byted_token_hash,
             encrypted_byted_token: self.encrypted_byted_token,
             callback_state_hash: self.callback_state_hash,
@@ -503,8 +446,8 @@ impl UpsertArkVisualValidationSessionRecord {
             && self.session_id == stored.session_id
             && self.user_id == stored.user_id
             && self.provider_id == stored.provider_id
-            && self.account_binding == stored.account_binding
-            && self.project == stored.project
+            && self.endpoint_id == stored.endpoint_id
+            && self.key_id == stored.key_id
             && self.byted_token_hash == stored.byted_token_hash
             && self.encrypted_byted_token == stored.encrypted_byted_token
             && self.callback_state_hash == stored.callback_state_hash
@@ -580,8 +523,6 @@ pub trait AssetLibraryReadRepository: Send + Sync {
     async fn find_group_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         upstream_group_id: &str,
     ) -> Result<Option<StoredAssetGroup>, crate::DataLayerError>;
 
@@ -633,8 +574,6 @@ pub trait AssetLibraryReadRepository: Send + Sync {
     async fn find_visual_validation_session_by_canonical_upstream(
         &self,
         provider_id: &str,
-        account_binding: &str,
-        project: Option<&str>,
         session_id: &str,
     ) -> Result<Option<StoredArkVisualValidationSession>, crate::DataLayerError>;
 
@@ -721,18 +660,6 @@ fn validate_optional_text(
     Ok(())
 }
 
-fn validate_canonical_optional_binding(
-    field: &str,
-    value: Option<&str>,
-) -> Result<(), crate::DataLayerError> {
-    if value.is_some_and(|value| value != value.trim()) {
-        return Err(crate::DataLayerError::InvalidInput(format!(
-            "{field} must not contain surrounding whitespace"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_optional_json_object(
     field: &str,
     value: Option<&Value>,
@@ -782,8 +709,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: Some("a".repeat(128)),
-            project: Some("p".repeat(255)),
             group_type: "face".to_string(),
             name: "group".to_string(),
             description: None,
@@ -792,20 +717,6 @@ mod tests {
             updated_at_unix_secs: 1,
             deleted_at_unix_secs: None,
         }
-    }
-
-    #[test]
-    fn canonical_identity_lengths_fit_mysql_utf8mb4_unique_keys() {
-        let record = valid_group();
-        assert!(record.validate().is_ok());
-
-        let mut oversized_account = record.clone();
-        oversized_account.account_binding = Some("a".repeat(129));
-        assert!(oversized_account.validate().is_err());
-
-        let mut oversized_project = record;
-        oversized_project.project = Some("p".repeat(256));
-        assert!(oversized_project.validate().is_err());
     }
 
     #[test]
@@ -867,8 +778,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
-            account_binding: None,
-            project: None,
             byted_token_hash: "hash".to_string(),
             encrypted_byted_token: "encrypted".to_string(),
             callback_state_hash: "state-hash".to_string(),

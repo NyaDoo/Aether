@@ -12,8 +12,8 @@ use serde_json::json;
 use crate::handlers::shared::{
     api_key_placeholder_display, deserialize_optional_json_patch,
     deserialize_optional_string_list_patch, generate_gateway_api_key_plaintext,
-    masked_gateway_api_key_display, normalize_feature_settings, normalize_ip_rules,
-    normalize_optional_api_key_concurrent_limit,
+    generate_gateway_secret_plaintext, masked_gateway_api_key_display, normalize_feature_settings,
+    normalize_ip_rules, normalize_optional_api_key_concurrent_limit,
 };
 
 use super::{
@@ -25,10 +25,24 @@ use super::{
 };
 
 const USERS_ME_API_KEY_WRITE_UNAVAILABLE_DETAIL: &str = "用户 API 密钥写入暂不可用";
+const USERS_ME_API_KEY_FEATURE_SETTINGS_WARNING: &str =
+    "凭据已创建，但附加功能配置未应用；请立即保存凭据并稍后重试配置";
+
+fn preserve_created_credential_after_feature_settings<T, E>(
+    created: T,
+    result: Result<Option<T>, E>,
+) -> (T, Option<&'static str>) {
+    match result {
+        Ok(Some(updated)) => (updated, None),
+        Ok(None) | Err(_) => (created, Some(USERS_ME_API_KEY_FEATURE_SETTINGS_WARNING)),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct UsersMeCreateApiKeyRequest {
     name: String,
+    #[serde(default)]
+    credential_type: Option<String>,
     #[serde(default)]
     rate_limit: Option<i32>,
     #[serde(default)]
@@ -143,6 +157,19 @@ fn users_me_masked_api_key_display(state: &AppState, ciphertext: Option<&str>) -
     masked_gateway_api_key_display(Some(full_key.as_str()))
 }
 
+fn users_me_api_key_display(
+    state: &AppState,
+    record: &aether_data::repository::auth::StoredAuthApiKeyExportRecord,
+) -> String {
+    if record.credential_type == "volc_aksk" {
+        return record
+            .access_key_id
+            .clone()
+            .unwrap_or_else(|| "AKLT****".to_string());
+    }
+    users_me_masked_api_key_display(state, record.key_encrypted.as_deref())
+}
+
 fn build_users_me_api_key_writer_unavailable_response() -> Response<Body> {
     build_auth_error_response(
         http::StatusCode::SERVICE_UNAVAILABLE,
@@ -159,7 +186,9 @@ fn build_users_me_api_key_list_payload(
     json!({
         "id": record.api_key_id,
         "name": record.name,
-        "key_display": users_me_masked_api_key_display(state, record.key_encrypted.as_deref()),
+        "credential_type": record.credential_type,
+        "access_key_id": record.access_key_id,
+        "key_display": users_me_api_key_display(state, record),
         "is_active": record.is_active,
         "is_locked": is_locked,
         "last_used_at": format_users_me_optional_unix_secs_iso8601(record.last_used_at_unix_secs),
@@ -183,7 +212,9 @@ fn build_users_me_api_key_detail_payload(
     json!({
         "id": record.api_key_id,
         "name": record.name,
-        "key_display": users_me_masked_api_key_display(state, record.key_encrypted.as_deref()),
+        "credential_type": record.credential_type,
+        "access_key_id": record.access_key_id,
+        "key_display": users_me_api_key_display(state, record),
         "is_active": record.is_active,
         "is_locked": is_locked,
         "allowed_providers": record.allowed_providers,
@@ -399,6 +430,13 @@ pub(super) async fn handle_users_me_api_key_detail_get(
     };
 
     if include_key {
+        if record.credential_type == "volc_aksk" {
+            return build_auth_error_response(
+                http::StatusCode::BAD_REQUEST,
+                "AK/SK 的 Secret Access Key 仅在创建时展示一次",
+                false,
+            );
+        }
         let Some(ciphertext) = record.key_encrypted.as_deref().map(str::trim) else {
             return build_auth_error_response(
                 http::StatusCode::BAD_REQUEST,
@@ -564,8 +602,28 @@ pub(super) async fn handle_users_me_api_key_create(
         }
     };
 
-    let plaintext_key = generate_users_me_api_key_plaintext();
-    let Some(key_encrypted) = encrypt_catalog_secret_with_fallbacks(state, &plaintext_key) else {
+    let credential_type = payload
+        .credential_type
+        .as_deref()
+        .unwrap_or("api_key")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(credential_type.as_str(), "api_key" | "volc_aksk") {
+        return build_auth_error_response(
+            http::StatusCode::BAD_REQUEST,
+            "credential_type 仅支持 api_key 或 volc_aksk",
+            false,
+        );
+    }
+    let access_key_id =
+        (credential_type == "volc_aksk").then(|| generate_gateway_secret_plaintext("AKLT", ""));
+    let plaintext_secret = if credential_type == "volc_aksk" {
+        generate_gateway_secret_plaintext("AETHER", "")
+    } else {
+        generate_users_me_api_key_plaintext()
+    };
+    let Some(key_encrypted) = encrypt_catalog_secret_with_fallbacks(state, &plaintext_secret)
+    else {
         return build_auth_error_response(
             http::StatusCode::INTERNAL_SERVER_ERROR,
             "API密钥加密失败",
@@ -575,8 +633,14 @@ pub(super) async fn handle_users_me_api_key_create(
     let record = aether_data::repository::auth::CreateUserApiKeyRecord {
         user_id: auth.user.id.clone(),
         api_key_id: uuid::Uuid::new_v4().to_string(),
-        key_hash: hash_users_me_api_key(&plaintext_key),
+        key_hash: if let Some(access_key_id) = access_key_id.as_deref() {
+            format!("aksk:{}", hash_users_me_api_key(access_key_id))
+        } else {
+            hash_users_me_api_key(&plaintext_secret)
+        },
         key_encrypted: Some(key_encrypted),
+        credential_type: credential_type.clone(),
+        access_key_id: access_key_id.clone(),
         name: Some(name.clone()),
         allowed_providers: None,
         allowed_api_formats: None,
@@ -604,34 +668,35 @@ pub(super) async fn handle_users_me_api_key_create(
     }) else {
         return build_users_me_api_key_writer_unavailable_response();
     };
-    let created = if feature_settings.is_some() {
-        match state
+    let (created, feature_settings_warning) = if feature_settings.is_some() {
+        let result = state
             .set_user_api_key_feature_settings(
                 &auth.user.id,
                 &created.api_key_id,
                 feature_settings.clone(),
             )
-            .await
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => return build_users_me_api_key_writer_unavailable_response(),
-            Err(err) => {
-                return build_auth_error_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("user api key feature settings update failed: {err:?}"),
-                    false,
-                )
-            }
+            .await;
+        if let Err(error) = &result {
+            tracing::warn!(
+                event_name = "user_api_key_feature_settings_apply_failed",
+                log_type = "ops",
+                user_id = %auth.user.id,
+                api_key_id = %created.api_key_id,
+                error = ?error,
+                "API credential was created but its feature settings could not be applied"
+            );
         }
+        preserve_created_credential_after_feature_settings(created, result)
     } else {
-        created
+        (created, None)
     };
 
-    Json(json!({
+    let mut response = json!({
         "id": created.api_key_id,
         "name": created.name,
-        "key": plaintext_key,
-        "key_display": users_me_masked_api_key_display(state, created.key_encrypted.as_deref()),
+        "credential_type": created.credential_type,
+        "access_key_id": created.access_key_id,
+        "key_display": users_me_api_key_display(state, &created),
         "is_active": created.is_active,
         "is_locked": false,
         "rate_limit": created.rate_limit,
@@ -643,8 +708,16 @@ pub(super) async fn handle_users_me_api_key_create(
         "total_requests": created.total_requests,
         "total_cost_usd": created.total_cost_usd,
         "message": "API密钥创建成功",
-    }))
-    .into_response()
+    });
+    if credential_type == "volc_aksk" {
+        response["secret_access_key"] = json!(plaintext_secret);
+    } else {
+        response["key"] = json!(plaintext_secret);
+    }
+    if let Some(warning) = feature_settings_warning {
+        response["warning"] = json!(warning);
+    }
+    Json(response).into_response()
 }
 
 pub(super) async fn handle_users_me_api_key_update(
@@ -1093,7 +1166,10 @@ pub(super) async fn handle_users_me_api_key_capabilities_put(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_users_me_ip_rules, UsersMeUpdateApiKeyRequest};
+    use super::{
+        normalize_users_me_ip_rules, preserve_created_credential_after_feature_settings,
+        UsersMeUpdateApiKeyRequest, USERS_ME_API_KEY_FEATURE_SETTINGS_WARNING,
+    };
     use serde_json::json;
 
     #[test]
@@ -1143,5 +1219,29 @@ mod tests {
                 "10.0.0.0/24".to_string(),
             ])),
         );
+    }
+
+    #[test]
+    fn created_credential_is_always_delivered_after_feature_settings_failure() {
+        let (created, warning) = preserve_created_credential_after_feature_settings(
+            "created",
+            Result::<Option<&str>, &str>::Ok(None),
+        );
+        assert_eq!(created, "created");
+        assert_eq!(warning, Some(USERS_ME_API_KEY_FEATURE_SETTINGS_WARNING));
+
+        let (created, warning) = preserve_created_credential_after_feature_settings(
+            "created",
+            Result::<Option<&str>, &str>::Err("writer failed"),
+        );
+        assert_eq!(created, "created");
+        assert_eq!(warning, Some(USERS_ME_API_KEY_FEATURE_SETTINGS_WARNING));
+
+        let (created, warning) = preserve_created_credential_after_feature_settings(
+            "created",
+            Result::<Option<&str>, &str>::Ok(Some("updated")),
+        );
+        assert_eq!(created, "updated");
+        assert_eq!(warning, None);
     }
 }

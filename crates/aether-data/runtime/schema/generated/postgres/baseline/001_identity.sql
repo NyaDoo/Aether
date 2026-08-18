@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS public.api_keys (
     user_id character varying(64) NOT NULL,
     key_hash character varying(255) NOT NULL,
     key_encrypted text,
+    credential_type character varying(32) DEFAULT 'api_key' NOT NULL,
+    access_key_id character varying(128),
     name character varying(255),
     key_prefix character varying(64),
     status character varying(64) DEFAULT 'active' NOT NULL,
@@ -99,6 +101,7 @@ CREATE TABLE IF NOT EXISTS public.api_keys (
 
 ALTER TABLE ONLY public.api_keys ADD CONSTRAINT api_keys_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY public.api_keys ADD CONSTRAINT api_keys_key_hash_key UNIQUE (key_hash);
+ALTER TABLE ONLY public.api_keys ADD CONSTRAINT api_keys_access_key_id_key UNIQUE (access_key_id);
 CREATE INDEX IF NOT EXISTS api_keys_user_id_idx ON public.api_keys USING btree (user_id);
 
 CREATE TABLE IF NOT EXISTS public.audit_logs (

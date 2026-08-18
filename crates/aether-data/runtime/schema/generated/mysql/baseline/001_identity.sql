@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     `user_id` VARCHAR(64) NOT NULL,
     `key_hash` VARCHAR(255) NOT NULL,
     `key_encrypted` LONGTEXT,
+    `credential_type` VARCHAR(32) NOT NULL DEFAULT 'api_key',
+    `access_key_id` VARCHAR(128),
     `name` VARCHAR(255),
     `key_prefix` VARCHAR(64),
     `status` VARCHAR(64) NOT NULL DEFAULT 'active',
@@ -94,6 +96,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     `updated_at` BIGINT NOT NULL,
     PRIMARY KEY (`id`),
     UNIQUE KEY api_keys_key_hash_key (`key_hash`),
+    UNIQUE KEY api_keys_access_key_id_key (`access_key_id`),
     KEY api_keys_user_id_idx (`user_id`)
 );
 

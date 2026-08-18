@@ -578,6 +578,13 @@ pub(super) async fn handle_users_me_api_key_install_session_create(
     else {
         return build_auth_error_response(http::StatusCode::NOT_FOUND, "API密钥不存在", false);
     };
+    if record.credential_type == "volc_aksk" {
+        return build_auth_error_response(
+            http::StatusCode::BAD_REQUEST,
+            "AK/SK 凭据不支持客户端安装会话",
+            false,
+        );
+    }
     let Some(ciphertext) = record
         .key_encrypted
         .as_deref()

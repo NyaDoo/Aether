@@ -66,6 +66,7 @@ function apiKey(overrides: Record<string, unknown> = {}) {
     id: 'user-key-1',
     name: 'primary',
     key_display: 'sk-user...live',
+    credential_type: 'api_key',
     is_active: true,
     is_locked: false,
     created_at: '2026-05-29T00:00:00+00:00',
@@ -131,6 +132,32 @@ afterEach(() => {
 })
 
 describe('MyApiKeys CC Switch import', () => {
+  it('shows an AK/SK credential without full-key, install, or CC Switch actions', async () => {
+    meApiMock.getApiKeys.mockResolvedValue([
+      apiKey({
+        id: 'user-aksk-1',
+        name: 'ark signer',
+        credential_type: 'volc_aksk',
+        access_key_id: 'AKLTEXAMPLE',
+        key_display: '',
+      }),
+    ])
+
+    await mountMyApiKeys()
+
+    expect(document.querySelector('[data-testid="credential-display-user-aksk-1"]')?.textContent).toContain('AKLTEXAMPLE')
+    expect(document.querySelector('[data-testid="credential-display-mobile-user-aksk-1"]')?.textContent).toContain('AKLTEXAMPLE')
+    expect(document.body.textContent).toContain('AK/SK')
+    expect(document.querySelector('[data-testid="copy-full-key-user-aksk-1"]')).toBeNull()
+    expect(document.querySelector('[data-testid="copy-full-key-mobile-user-aksk-1"]')).toBeNull()
+    expect(document.querySelector('[data-testid="ccswitch-open-user-aksk-1"]')).toBeNull()
+    expect(document.querySelector('[data-testid="ccswitch-open-mobile-user-aksk-1"]')).toBeNull()
+    expect(document.querySelector('[data-testid="install-open-user-aksk-1"]')).toBeNull()
+    expect(document.querySelector('[data-testid="install-open-mobile-user-aksk-1"]')).toBeNull()
+    expect(meApiMock.getFullApiKey).not.toHaveBeenCalled()
+    expect(meApiMock.createApiKeyInstallSession).not.toHaveBeenCalled()
+  })
+
   it('opens the import dialog for an existing key without fetching the full key immediately', async () => {
     meApiMock.getApiKeys.mockResolvedValue([apiKey()])
 
@@ -223,6 +250,127 @@ describe('MyApiKeys CC Switch import', () => {
 
     expect(meApiMock.getFullApiKey).not.toHaveBeenCalled()
     expect(document.body.textContent).toContain('导入到 CC Switch')
+  })
+
+  it('creates AK/SK credentials and reveals the AK and SK only in the success dialog', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText },
+      configurable: true,
+    })
+    Object.defineProperty(window, 'isSecureContext', {
+      value: true,
+      configurable: true,
+    })
+    Object.defineProperty(HTMLElement.prototype, 'hasPointerCapture', {
+      value: () => false,
+      configurable: true,
+    })
+    Object.defineProperty(HTMLElement.prototype, 'setPointerCapture', {
+      value: () => undefined,
+      configurable: true,
+    })
+    Object.defineProperty(HTMLElement.prototype, 'releasePointerCapture', {
+      value: () => undefined,
+      configurable: true,
+    })
+    const createdAksk = apiKey({
+      id: 'created-aksk-1',
+      name: 'ark signer',
+      credential_type: 'volc_aksk',
+      access_key_id: 'AKLT-CREATED',
+      key_display: '',
+      secret_access_key: 'SK-CREATED-ONCE',
+    })
+    meApiMock.getApiKeys
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        apiKey({
+          id: 'created-aksk-1',
+          name: 'ark signer',
+          credential_type: 'volc_aksk',
+          access_key_id: 'AKLT-CREATED',
+          key_display: '',
+        }),
+      ])
+    meApiMock.createApiKey.mockResolvedValue(createdAksk)
+
+    await mountMyApiKeys()
+    document.querySelector<HTMLButtonElement>('[title="创建新 API Key"]')?.click()
+    await flushPromises()
+
+    const credentialTypeSelect = document.querySelector<HTMLElement>('[data-testid="credential-type-select"]')
+    credentialTypeSelect?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+    credentialTypeSelect?.click()
+    await flushPromises()
+    document.querySelector<HTMLElement>('[data-testid="credential-type-volc-aksk"]')
+      ?.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }))
+    await flushPromises()
+
+    const nameInput = document.querySelector<HTMLInputElement>('#key-name')
+    nameInput!.value = 'ark signer'
+    nameInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    await flushPromises()
+
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '创建')
+      ?.click()
+    await flushPromises()
+
+    expect(meApiMock.createApiKey).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'ark signer',
+      credential_type: 'volc_aksk',
+    }))
+    expect(document.querySelector<HTMLInputElement>('[data-testid="created-access-key-id"]')?.value).toBe('AKLT-CREATED')
+    expect(document.querySelector<HTMLInputElement>('[data-testid="created-secret-access-key"]')?.value).toBe('SK-CREATED-ONCE')
+    expect(document.body.textContent).toContain('Secret Access Key 仅在此处显示一次')
+    expect(document.querySelector('[data-testid="ccswitch-open-created-key"]')).toBeNull()
+
+    document.querySelector<HTMLButtonElement>('[data-testid="copy-created-access-key-id"]')?.click()
+    document.querySelector<HTMLButtonElement>('[data-testid="copy-created-secret-access-key"]')?.click()
+    await flushPromises()
+    expect(writeText).toHaveBeenNthCalledWith(1, 'AKLT-CREATED')
+    expect(writeText).toHaveBeenNthCalledWith(2, 'SK-CREATED-ONCE')
+
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '确定')
+      ?.click()
+    await flushPromises()
+
+    expect(document.body.textContent).not.toContain('SK-CREATED-ONCE')
+    expect(meApiMock.createApiKeyInstallSession).not.toHaveBeenCalled()
+
+    document.querySelector<HTMLButtonElement>('[title="创建新 API Key"]')?.click()
+    await flushPromises()
+    expect(document.body.textContent).not.toContain('SK-CREATED-ONCE')
+  })
+
+  it('does not send credential_type while editing an AK/SK credential', async () => {
+    meApiMock.getApiKeys.mockResolvedValue([
+      apiKey({
+        id: 'user-aksk-1',
+        name: 'ark signer',
+        credential_type: 'volc_aksk',
+        access_key_id: 'AKLTEXAMPLE',
+        key_display: '',
+      }),
+    ])
+    meApiMock.updateApiKey.mockResolvedValue({ id: 'user-aksk-1' })
+
+    await mountMyApiKeys()
+    document.querySelector<HTMLButtonElement>('[title="编辑"]')?.click()
+    await flushPromises()
+
+    expect(document.querySelector<HTMLButtonElement>('[data-testid="credential-type-select"]')?.disabled).toBe(true)
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')
+      ?.click()
+    await flushPromises()
+
+    expect(meApiMock.updateApiKey).toHaveBeenCalledWith(
+      'user-aksk-1',
+      expect.not.objectContaining({ credential_type: expect.anything() }),
+    )
   })
 
   it('sends the desired inactive state when disabling an active key', async () => {

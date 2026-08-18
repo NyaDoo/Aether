@@ -130,7 +130,7 @@ describe('material assets API', () => {
     })
   })
 
-  it('starts real-person verification without binding it to an existing asset', async () => {
+  it('uses the official callback_url field for real-person verification', async () => {
     postMock.mockResolvedValue({
       data: {
         id: 'session-1',
@@ -140,11 +140,12 @@ describe('material assets API', () => {
     })
 
     await createMaterialAssetsApi('user').createVerificationSession({
-      return_url: 'https://aether.example.test/dashboard/material-assets',
+      callback_url: 'https://aether.example.test/api/material-assets/verification-callback',
+      user_id: 'other-user',
     })
 
     expect(postMock).toHaveBeenCalledWith('/api/material-assets/verification-sessions', {
-      return_url: 'https://aether.example.test/dashboard/material-assets',
+      callback_url: 'https://aether.example.test/api/material-assets/verification-callback',
     })
   })
 

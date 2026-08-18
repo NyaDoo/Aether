@@ -18,8 +18,8 @@ pub(crate) use internal_forward::{
 };
 pub(crate) use resolution::{
     refresh_execution_runtime_auth_context, refresh_execution_runtime_auth_context_with_snapshot,
-    resolve_execution_runtime_auth_context, GatewayAdminPrincipalContext,
-    GatewayControlAuthContext,
+    resolve_execution_runtime_auth_context, resolve_verified_api_key_snapshot_auth_context,
+    GatewayAdminPrincipalContext, GatewayControlAuthContext,
 };
 pub(super) use resolution::{resolve_control_decision_auth, ControlDecisionAuthResolution};
 pub(crate) use types::GatewayCredentialCarrier;

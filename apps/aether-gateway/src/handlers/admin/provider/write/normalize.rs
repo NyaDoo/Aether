@@ -175,12 +175,13 @@ pub(crate) fn normalize_volc_aksk_auth_config(
     value: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     const REQUIRED_FIELDS: &[&str] = &["access_key_id", "secret_access_key"];
-    const OPTIONAL_FIELDS: &[&str] = &[
+    const OPTIONAL_FIELDS: &[&str] = &["security_token", "region", "service"];
+    const ALLOWED_FIELDS: &[&str] = &[
+        "access_key_id",
+        "secret_access_key",
         "security_token",
         "region",
         "service",
-        "account_id",
-        "project",
     ];
 
     let Some(serde_json::Value::Object(mut config)) = value else {
@@ -191,6 +192,12 @@ pub(crate) fn normalize_volc_aksk_auth_config(
             "Volcengine AK/SK auth_config 不允许包含 api_key、Bearer 或 Authorization 凭据"
                 .to_string(),
         );
+    }
+    if let Some(field) = config
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(format!("Volcengine AK/SK auth_config 不支持字段 {field}"));
     }
 
     for field in REQUIRED_FIELDS {
@@ -220,6 +227,52 @@ pub(crate) fn normalize_volc_aksk_auth_config(
     }
 
     Ok(serde_json::Value::Object(config))
+}
+
+pub(crate) fn validate_asset_library_auth_config(
+    api_formats: &[String],
+    value: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    if !api_formats.iter().any(|format| {
+        crate::ai_serving::api_format_alias_matches(
+            format,
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+        )
+    }) {
+        return Ok(());
+    }
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if let Some(field) = find_asset_identity_binding_field(value) {
+        return Err(format!(
+            "素材库仅按 Provider 区分和路由，auth_config 不支持 {field}"
+        ));
+    }
+    Ok(())
+}
+
+fn find_asset_identity_binding_field(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::Object(object) => object.iter().find_map(|(key, value)| {
+            let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
+            if matches!(
+                normalized.as_str(),
+                "account_id"
+                    | "account_binding"
+                    | "asset_account_binding"
+                    | "project"
+                    | "project_id"
+                    | "project_name"
+            ) {
+                Some(key.as_str())
+            } else {
+                find_asset_identity_binding_field(value)
+            }
+        }),
+        serde_json::Value::Array(items) => items.iter().find_map(find_asset_identity_binding_field),
+        _ => None,
+    }
 }
 
 fn volc_aksk_auth_config_contains_raw_secret(value: &serde_json::Value) -> bool {
@@ -481,18 +534,14 @@ mod tests {
                 "secret_access_key": " secret-example ",
                 "security_token": " ",
                 "region": " cn-beijing ",
-                "service": " ark ",
-                "account_id": " account-1 ",
-                "project": " project-1 "
+                "service": " ark "
             })))
             .expect("valid AK/SK config should normalize"),
             json!({
                 "access_key_id": "AKLT-example",
                 "secret_access_key": "secret-example",
                 "region": "cn-beijing",
-                "service": "ark",
-                "account_id": "account-1",
-                "project": "project-1"
+                "service": "ark"
             })
         );
     }
@@ -510,6 +559,16 @@ mod tests {
                 "access_key_id": "AKLT-example",
                 "secret_access_key": "secret-example",
                 "headers": {"authorization": "Bearer relay-secret"}
+            })),
+            Some(json!({
+                "access_key_id": "AKLT-example",
+                "secret_access_key": "secret-example",
+                "account_id": "legacy-binding"
+            })),
+            Some(json!({
+                "access_key_id": "AKLT-example",
+                "secret_access_key": "secret-example",
+                "project": "legacy-project"
             })),
         ] {
             assert!(normalize_volc_aksk_auth_config(config).is_err());

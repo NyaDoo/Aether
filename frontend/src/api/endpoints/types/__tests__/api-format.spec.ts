@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   API_FORMATS,
+  API_FORMAT_KIND_LABELS,
+  API_FORMAT_LABELS,
+  API_FORMAT_ORDER,
+  API_FORMAT_SHORT,
   apiFormatPermissionCovers,
   formatApiFormat,
   formatApiFormatShort,
@@ -25,6 +29,7 @@ describe('api format display helpers', () => {
     expect(normalizeApiFormatAlias('JINA_EMBEDDING')).toBe(API_FORMATS.JINA_EMBEDDING)
     expect(normalizeApiFormatAlias('JINA_RERANK')).toBe(API_FORMATS.JINA_RERANK)
     expect(normalizeApiFormatAlias('DOUBAO_EMBEDDING')).toBe(API_FORMATS.DOUBAO_EMBEDDING)
+    expect(normalizeApiFormatAlias('DOUBAO_ASSET_LIBRARY')).toBe(API_FORMATS.DOUBAO_ASSET_LIBRARY)
     expect(normalizeApiFormatAlias('ALIYUN_MULTIMODAL_EMBEDDING')).toBe(API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING)
     expect(normalizeApiFormatAlias('dashscope:multimodal_embedding')).toBe(API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING)
   })
@@ -72,24 +77,43 @@ describe('api format display helpers', () => {
     expect(formatApiFormatShort(API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING)).toBe('AE')
   })
 
+  it('formats the Ark asset-library endpoint with a stable abbreviation', () => {
+    expect(formatApiFormat(API_FORMATS.DOUBAO_ASSET_LIBRARY)).toBe('Ark Asset Library')
+    expect(formatApiFormatShort(API_FORMATS.DOUBAO_ASSET_LIBRARY)).toBe('DAL')
+    expect(formatApiFormatShort('DOUBAO_ASSET_LIBRARY')).toBe('DAL')
+  })
+
+  it('keeps display metadata complete for every declared api format', () => {
+    const formats = [...new Set(Object.values(API_FORMATS))]
+
+    for (const format of formats) {
+      const kind = format.slice(format.indexOf(':') + 1)
+      expect(API_FORMAT_LABELS, `${format} is missing a display label`).toHaveProperty(format)
+      expect(API_FORMAT_SHORT, `${format} is missing a short label`).toHaveProperty(format)
+      expect(API_FORMAT_ORDER, `${format} is missing a sort position`).toContain(format)
+      expect(API_FORMAT_KIND_LABELS, `${format} is missing a kind label`).toHaveProperty(kind)
+    }
+  })
+
   it('does not remap retired api format ids', () => {
     expect(normalizeApiFormatAlias('openai:cli')).toBe('openai:cli')
     expect(formatApiFormat('openai:cli')).toBe('openai:cli')
-    expect(formatApiFormatShort('openai:cli')).toBe('op')
+    expect(formatApiFormatShort('openai:cli')).toBe('OCL')
 
     expect(normalizeApiFormatAlias('openai:compact')).toBe('openai:compact')
     expect(formatApiFormat('openai:compact')).toBe('openai:compact')
-    expect(formatApiFormatShort('openai:compact')).toBe('op')
+    expect(formatApiFormatShort('openai:compact')).toBe('OCO')
   })
 
   it('does not remap retired enum-style aliases', () => {
     expect(normalizeApiFormatAlias('OPENAI_CLI')).toBe('openai_cli')
     expect(formatApiFormat('OPENAI_CLI')).toBe('openai_cli')
-    expect(formatApiFormatShort('OPENAI_CLI')).toBe('op')
+    expect(formatApiFormatShort('OPENAI_CLI')).toBe('OCL')
 
     expect(normalizeApiFormatAlias('OPENAI_COMPACT')).toBe('openai_compact')
     expect(formatApiFormat('OPENAI_COMPACT')).toBe('openai_compact')
-    expect(formatApiFormatShort('OPENAI_COMPACT')).toBe('op')
+    expect(formatApiFormatShort('OPENAI_COMPACT')).toBe('OCO')
+    expect(formatApiFormatShort('vendor:future_multi_word')).toBe('VFMW')
   })
 
   it('sorts only current canonical formats into known slots', () => {

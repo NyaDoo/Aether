@@ -3,8 +3,8 @@ mod local;
 mod websocket;
 
 use self::body_buffer::{
-    buffer_and_normalize_request_body, build_request_body_buffer_error_response,
-    RequestBodyBufferError, RequestBodyBufferPolicy,
+    buffer_and_normalize_request_body, buffer_wire_request_body,
+    build_request_body_buffer_error_response, RequestBodyBufferError, RequestBodyBufferPolicy,
 };
 use self::local::{
     maybe_build_local_admin_proxy_response, maybe_build_local_internal_proxy_response,
@@ -1293,7 +1293,7 @@ async fn proxy_request_inner(
     let method = request_context.request_method.clone();
     let request_path_and_query = request_context.request_path_and_query();
     let path_and_query = request_path_and_query.as_str();
-    let control_decision = request_context.control_decision.as_ref();
+    let control_decision_before_body_auth = request_context.control_decision.as_ref();
     if let Some(response) = maybe_build_local_internal_proxy_response(
         &state,
         &request_context,
@@ -1428,7 +1428,7 @@ async fn proxy_request_inner(
     if let Some(buffered_body) = local_proxy_body {
         request_body = Some(Body::from(buffered_body));
     }
-    let should_try_control_execute = control_decision
+    let should_try_control_execute = control_decision_before_body_auth
         .map(|decision| {
             decision.is_execution_runtime_candidate()
                 && decision.route_class.as_deref() == Some("ai_public")
@@ -1437,35 +1437,57 @@ async fn proxy_request_inner(
     let should_buffer_for_local_ai_public =
         super::public::ai_public_local_requires_buffered_body(&request_context);
     let should_buffer_for_local_auth =
-        should_buffer_request_for_local_auth(control_decision, &parts.headers);
+        should_buffer_request_for_local_auth(control_decision_before_body_auth, &parts.headers);
+    let uses_aether_aksk = crate::material_assets::authorization_uses_aether_aksk(&parts.headers);
     let should_buffer_body = should_try_control_execute
         || should_buffer_for_local_auth
-        || should_buffer_for_local_ai_public;
+        || should_buffer_for_local_ai_public
+        || uses_aether_aksk;
 
     let allow_control_execute_fallback = should_try_control_execute
-        && control_decision.is_some_and(allows_control_execute_emergency)
+        && control_decision_before_body_auth.is_some_and(allows_control_execute_emergency)
         && request_enables_control_execute(&parts.headers);
 
-    let buffered_body = if should_buffer_body {
+    let mut signed_wire_body = None;
+    let mut buffered_body = if should_buffer_body {
         let body_buffer_policy = RequestBodyBufferPolicy::from_state(&state);
         let stage_started_at = Instant::now();
-        let body = buffer_and_normalize_request_body(
-            &mut request_body,
-            &mut parts.headers,
-            "buffered auth/execution runtime path should own request body",
-            &trace_id,
-            &parts.method,
-            &request_context.request_path_and_query(),
-            "auth_execution",
-            body_buffer_policy,
-        )
-        .await;
+        let body = if uses_aether_aksk {
+            buffer_wire_request_body(
+                &mut request_body,
+                &parts.headers,
+                "AK/SK wire body buffering should own request body",
+                &trace_id,
+                &parts.method,
+                &request_context.request_path_and_query(),
+                "aksk_wire_auth",
+                body_buffer_policy,
+            )
+            .await
+            .map(|body| {
+                signed_wire_body = Some(body);
+                None
+            })
+        } else {
+            buffer_and_normalize_request_body(
+                &mut request_body,
+                &mut parts.headers,
+                "buffered auth/execution runtime path should own request body",
+                &trace_id,
+                &parts.method,
+                &request_context.request_path_and_query(),
+                "auth_execution",
+                body_buffer_policy,
+            )
+            .await
+            .map(Some)
+        };
         observe_gateway_stage_ms(
             "frontdoor_body_buffer",
             stage_started_at.elapsed().as_millis() as u64,
         );
         match body {
-            Ok(body) => Some(body),
+            Ok(body) => body,
             Err(err) => {
                 return finalize_request_body_buffer_rejection(
                     &state,
@@ -1481,6 +1503,79 @@ async fn proxy_request_inner(
     } else {
         None
     };
+
+    if uses_aether_aksk {
+        let wire_body = signed_wire_body.as_ref().ok_or_else(|| {
+            GatewayError::Internal("AK/SK request wire body was not buffered".to_string())
+        })?;
+        if let Some(auth_context) = crate::material_assets::resolve_aether_aksk_auth_context(
+            &state,
+            &request_context,
+            &parts.method,
+            &parts.uri,
+            &parts.headers,
+            wire_body.bytes(),
+        )
+        .await?
+        {
+            let decision = request_context.control_decision.as_mut().ok_or_else(|| {
+                GatewayError::Internal(
+                    "verified Aether AK/SK request is missing its control decision".to_string(),
+                )
+            })?;
+            decision.local_auth_rejection = auth_context.local_rejection.clone();
+            decision.auth_context = Some(auth_context);
+        }
+
+        let normalized_body = signed_wire_body
+            .take()
+            .ok_or_else(|| {
+                GatewayError::Internal("AK/SK request wire body was not buffered".to_string())
+            })?
+            .normalize(&mut parts.headers);
+        buffered_body = match normalized_body {
+            Ok(body) => Some(body),
+            Err(err) => {
+                return finalize_request_body_buffer_rejection(
+                    &state,
+                    &request_context,
+                    &remote_addr,
+                    &started_at,
+                    &trace_id,
+                    request_permit.take(),
+                    &err,
+                );
+            }
+        };
+
+        if let Some(auth_context) = request_context
+            .control_decision
+            .as_ref()
+            .and_then(|decision| decision.auth_context.as_ref())
+        {
+            if !api_key_remote_ip_allowed(auth_context.ip_rules.as_deref(), client_ip) {
+                let rejection = crate::control::GatewayLocalAuthRejection::IpNotAllowed {
+                    remote_ip: client_ip.to_string(),
+                };
+                let response = build_local_auth_rejection_response(
+                    &trace_id,
+                    request_context.control_decision.as_ref(),
+                    &rejection,
+                )?;
+                return Ok(finalize_gateway_response_with_context(
+                    &state,
+                    response,
+                    &remote_addr,
+                    &request_context,
+                    EXECUTION_PATH_LOCAL_AUTH_DENIED,
+                    &started_at,
+                    request_permit.take(),
+                ));
+            }
+        }
+    }
+
+    let control_decision = request_context.control_decision.as_ref();
 
     let owner_forward_started_at = Instant::now();
     let owner_forward_response = maybe_forward_public_request_to_tunnel_owner(
@@ -2428,7 +2523,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        api_key_remote_ip_allowed, buffer_and_normalize_request_body,
+        api_key_remote_ip_allowed, buffer_and_normalize_request_body, buffer_wire_request_body,
         diagnostic_is_auth_api_key_concurrency_limited, local_execution_runtime_miss_detail,
         owner_forward_request_is_stream, restore_redacted_stream_execution_response,
         restore_redacted_sync_execution_response, routing_overlay_allows_affinity_target,
@@ -2437,7 +2532,9 @@ mod tests {
     };
     use axum::body::{to_bytes, Body, Bytes};
     use axum::http::{header, HeaderMap, HeaderValue, Method, Response};
+    use flate2::{write::GzEncoder, Compression};
     use serde_json::json;
+    use std::io::Write;
     use tokio::sync::Semaphore;
 
     #[test]
@@ -2803,6 +2900,115 @@ mod tests {
                 requested_bytes: 2,
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn wire_body_buffer_preserves_gzip_bytes_until_post_auth_normalization() {
+        let payload = br#"{"action":"CreateMaterial"}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).expect("gzip body should write");
+        let encoded = Bytes::from(encoder.finish().expect("gzip body should finish"));
+        let mut body = Some(Body::from(encoded.clone()));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&encoded.len().to_string()).expect("length should be valid"),
+        );
+
+        let wire = buffer_wire_request_body(
+            &mut body,
+            &headers,
+            "test owns wire body",
+            "trace-aksk-gzip",
+            &Method::POST,
+            "/?Action=CreateMaterial&Version=2024-01-01",
+            "test",
+            RequestBodyBufferPolicy::for_tests(1024, Duration::from_secs(1)),
+        )
+        .await
+        .expect("wire body should buffer");
+
+        assert_eq!(wire.bytes(), &encoded);
+        assert_eq!(
+            headers.get(header::CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("gzip"))
+        );
+        let normalized = wire
+            .normalize(&mut headers)
+            .expect("verified wire body should normalize");
+        assert_eq!(normalized.as_ref(), payload);
+        assert!(headers.get(header::CONTENT_ENCODING).is_none());
+        assert!(headers.get(header::CONTENT_LENGTH).is_none());
+    }
+
+    #[tokio::test]
+    async fn wire_body_buffer_preserves_zstd_bytes_until_post_auth_normalization() {
+        let payload = br#"{"action":"ListMaterial"}"#;
+        let encoded = Bytes::from(
+            zstd::stream::encode_all(payload.as_slice(), 0).expect("zstd body should encode"),
+        );
+        let mut body = Some(Body::from(encoded.clone()));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+
+        let wire = buffer_wire_request_body(
+            &mut body,
+            &headers,
+            "test owns wire body",
+            "trace-aksk-zstd",
+            &Method::POST,
+            "/?Action=ListMaterial&Version=2024-01-01",
+            "test",
+            RequestBodyBufferPolicy::for_tests(1024, Duration::from_secs(1)),
+        )
+        .await
+        .expect("wire body should buffer");
+
+        assert_eq!(wire.bytes(), &encoded);
+        let normalized = wire
+            .normalize(&mut headers)
+            .expect("verified wire body should normalize");
+        assert_eq!(normalized.as_ref(), payload);
+        assert!(headers.get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn wire_body_normalization_enforces_decompressed_size_limit() {
+        let payload = vec![b'a'; 2048];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&payload).expect("gzip body should write");
+        let encoded = Bytes::from(encoder.finish().expect("gzip body should finish"));
+        assert!(encoded.len() < 1024);
+        let mut body = Some(Body::from(encoded));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let wire = buffer_wire_request_body(
+            &mut body,
+            &headers,
+            "test owns wire body",
+            "trace-aksk-compression-limit",
+            &Method::POST,
+            "/?Action=CreateMaterial&Version=2024-01-01",
+            "test",
+            RequestBodyBufferPolicy::for_tests(1024, Duration::from_secs(1)),
+        )
+        .await
+        .expect("compressed wire body should fit the ingress limit");
+
+        let error = wire
+            .normalize(&mut headers)
+            .expect_err("decompressed body must still obey the body limit");
+        assert!(matches!(
+            error,
+            RequestBodyBufferError::Normalization(
+                crate::headers::RequestBodyNormalizationError::DecompressedBodyTooLarge {
+                    limit_bytes: 1024,
+                    ..
+                }
+            )
         ));
     }
 

@@ -123,10 +123,22 @@
               <!-- 密钥显示 -->
               <TableCell class="py-4">
                 <div class="flex items-center gap-1.5">
-                  <code class="text-xs font-mono text-muted-foreground bg-muted/30 px-2 py-1 rounded">
-                    {{ apiKey.key_display || 'sk-••••••••' }}
+                  <code
+                    :data-testid="`credential-display-${apiKey.id}`"
+                    class="text-xs font-mono text-muted-foreground bg-muted/30 px-2 py-1 rounded"
+                  >
+                    {{ credentialDisplay(apiKey) }}
                   </code>
+                  <Badge
+                    v-if="isVolcAksk(apiKey)"
+                    variant="outline"
+                    class="h-5 px-2 py-0 text-[10px] font-medium"
+                  >
+                    AK/SK
+                  </Badge>
                   <Button
+                    v-if="!isVolcAksk(apiKey)"
+                    :data-testid="`copy-full-key-${apiKey.id}`"
                     variant="ghost"
                     size="icon"
                     class="h-6 w-6"
@@ -195,6 +207,7 @@
               <TableCell class="py-4">
                 <div class="flex justify-center gap-1">
                   <Button
+                    v-if="!isVolcAksk(apiKey)"
                     :data-testid="`ccswitch-open-${apiKey.id}`"
                     variant="ghost"
                     size="icon"
@@ -205,6 +218,8 @@
                     <Download class="h-4 w-4" />
                   </Button>
                   <Button
+                    v-if="!isVolcAksk(apiKey)"
+                    :data-testid="`install-open-${apiKey.id}`"
                     variant="ghost"
                     size="icon"
                     class="h-8 w-8"
@@ -296,6 +311,7 @@
               </div>
               <div class="flex items-center gap-0.5 flex-shrink-0">
                 <Button
+                  v-if="!isVolcAksk(apiKey)"
                   :data-testid="`ccswitch-open-mobile-${apiKey.id}`"
                   variant="ghost"
                   size="icon"
@@ -306,6 +322,8 @@
                   <Download class="h-3.5 w-3.5" />
                 </Button>
                 <Button
+                  v-if="!isVolcAksk(apiKey)"
+                  :data-testid="`install-open-mobile-${apiKey.id}`"
                   variant="ghost"
                   size="icon"
                   class="h-7 w-7"
@@ -325,6 +343,8 @@
                   <SquarePen class="h-3.5 w-3.5" />
                 </Button>
                 <Button
+                  v-if="!isVolcAksk(apiKey)"
+                  :data-testid="`copy-full-key-mobile-${apiKey.id}`"
                   variant="ghost"
                   size="icon"
                   class="h-7 w-7"
@@ -359,7 +379,17 @@
             <!-- 第二行：密钥、时间、统计 -->
             <div class="space-y-1.5">
               <div class="flex items-center gap-2 text-xs">
-                <code class="font-mono text-muted-foreground">{{ apiKey.key_display || 'sk-••••••••' }}</code>
+                <Badge
+                  v-if="isVolcAksk(apiKey)"
+                  variant="outline"
+                  class="px-1.5 py-0 text-[10px] font-medium"
+                >
+                  AK/SK
+                </Badge>
+                <code
+                  :data-testid="`credential-display-mobile-${apiKey.id}`"
+                  class="font-mono text-muted-foreground"
+                >{{ credentialDisplay(apiKey) }}</code>
                 <span class="text-muted-foreground">•</span>
                 <span class="text-muted-foreground">
                   {{ apiKey.last_used_at ? formatRelativeTime(apiKey.last_used_at) : '从未使用' }}
@@ -434,6 +464,42 @@
           />
           <p class="text-xs text-muted-foreground">
             给密钥起一个有意义的名称方便识别
+          </p>
+        </div>
+
+        <div class="space-y-2">
+          <Label
+            for="credential-type"
+            class="text-sm font-semibold"
+          >凭据类型</Label>
+          <Select
+            v-model="newCredentialType"
+            :disabled="Boolean(editingApiKey)"
+          >
+            <SelectTrigger
+              id="credential-type"
+              data-testid="credential-type-select"
+              class="h-11 border-border/60"
+            >
+              <SelectValue placeholder="选择凭据类型" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem
+                value="api_key"
+                data-testid="credential-type-api-key"
+              >
+                API Key
+              </SelectItem>
+              <SelectItem
+                value="volc_aksk"
+                data-testid="credential-type-volc-aksk"
+              >
+                火山引擎 AK/SK
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <p class="text-xs text-muted-foreground">
+            {{ editingApiKey ? '凭据类型创建后不可更改' : 'API Key 用于标准客户端；AK/SK 用于火山引擎签名认证' }}
           </p>
         </div>
 
@@ -591,7 +657,64 @@
         </div>
       </template>
 
-      <div class="space-y-4">
+      <div
+        v-if="createdCredentialIsAksk"
+        class="space-y-4"
+      >
+        <div
+          role="alert"
+          class="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm text-foreground"
+        >
+          Secret Access Key 仅在此处显示一次。关闭后将无法再次查看，请立即复制并妥善保存。
+        </div>
+        <div class="space-y-2">
+          <Label class="text-sm font-medium">Access Key ID (AK)</Label>
+          <div class="flex items-center gap-2">
+            <Input
+              type="text"
+              :value="createdApiKey?.access_key_id || ''"
+              readonly
+              data-testid="created-access-key-id"
+              class="flex-1 font-mono text-sm bg-muted/50 h-11"
+              @click="($event.target as HTMLInputElement)?.select()"
+            />
+            <Button
+              class="h-11"
+              :disabled="!createdApiKey?.access_key_id"
+              data-testid="copy-created-access-key-id"
+              @click="copyCreatedCredential(createdApiKey?.access_key_id || '', 'Access Key ID')"
+            >
+              复制 AK
+            </Button>
+          </div>
+        </div>
+        <div class="space-y-2">
+          <Label class="text-sm font-medium">Secret Access Key (SK)</Label>
+          <div class="flex items-center gap-2">
+            <Input
+              type="text"
+              :value="newSecretAccessKey"
+              readonly
+              data-testid="created-secret-access-key"
+              class="flex-1 font-mono text-sm bg-muted/50 h-11"
+              @click="($event.target as HTMLInputElement)?.select()"
+            />
+            <Button
+              class="h-11"
+              :disabled="!newSecretAccessKey"
+              data-testid="copy-created-secret-access-key"
+              @click="copyCreatedCredential(newSecretAccessKey, 'Secret Access Key')"
+            >
+              复制 SK
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div
+        v-else
+        class="space-y-4"
+      >
         <div class="space-y-2">
           <Label class="text-sm font-medium">API 密钥</Label>
           <div class="flex items-center gap-2">
@@ -614,6 +737,7 @@
 
       <template #footer>
         <Button
+          v-if="!createdCredentialIsAksk"
           data-testid="ccswitch-open-created-key"
           variant="outline"
           class="h-10 px-5 gap-2"
@@ -913,7 +1037,14 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, computed, watch, reactive } from 'vue'
-import { meApi, type ApiKey, type InstallSessionTargetSystem, type InstallTargetCli, type ApiKeyInstallSession } from '@/api/me'
+import {
+  meApi,
+  type ApiKey,
+  type ApiKeyCredentialType,
+  type ApiKeyInstallSession,
+  type InstallSessionTargetSystem,
+  type InstallTargetCli,
+} from '@/api/me'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
@@ -1002,6 +1133,7 @@ const showInstallDialog = ref(false)
 const showCcSwitchDialog = ref(false)
 
 const newKeyName = ref('')
+const newCredentialType = ref<ApiKeyCredentialType>('api_key')
 const newKeyRateLimit = ref<number | undefined>(undefined)
 const newKeyConcurrentLimit = ref<number | undefined>(undefined)
 const newKeyIpRulesText = ref('')
@@ -1009,6 +1141,7 @@ const keyRedactionMode = ref<'inherit' | 'custom'>('inherit')
 const newKeyRedactionEnabled = ref(false)
 const newKeyRedactionInjectNotice = ref(true)
 const newKeyValue = ref('')
+const newSecretAccessKey = ref('')
 const createdApiKey = ref<ApiKey | null>(null)
 const keyToDelete = ref<ApiKey | null>(null)
 const editingApiKey = ref<ApiKey | null>(null)
@@ -1036,6 +1169,10 @@ const ccSwitchBaseUrl = ref('')
 const ccSwitchAvailableModels = ref<string[]>([])
 const ccSwitchPreparing = ref(false)
 const ccSwitchLoading = ref(false)
+
+const createdCredentialIsAksk = computed(() =>
+  createdApiKey.value?.credential_type === 'volc_aksk',
+)
 
 const installCommand = computed(() => {
   if (!installSession.value) return ''
@@ -1103,8 +1240,8 @@ watch(showInstallDialog, (isOpen) => {
 })
 
 watch(showKeyDialog, (isOpen) => {
-  if (!isOpen && pendingFirstInstallApiKey.value) {
-    closeCreatedKeyDialog()
+  if (!isOpen && createdApiKey.value) {
+    finalizeCreatedKeyDialog()
   }
 })
 
@@ -1143,6 +1280,7 @@ function openEditApiKeyDialog(apiKey: ApiKey) {
   const hasRedactionFeature = hasChatPiiRedactionFeatureSettings(apiKey.feature_settings)
   const redactionFeature = readChatPiiRedactionFeatureSettings(apiKey.feature_settings)
   editingApiKey.value = apiKey
+  newCredentialType.value = apiKey.credential_type
   newKeyName.value = apiKey.name || ''
   newKeyRateLimit.value = apiKey.rate_limit ?? undefined
   newKeyConcurrentLimit.value = apiKey.concurrent_limit ?? undefined
@@ -1156,6 +1294,9 @@ function openEditApiKeyDialog(apiKey: ApiKey) {
 function openCreateApiKeyDialog() {
   editingApiKey.value = null
   createdApiKey.value = null
+  newKeyValue.value = ''
+  newSecretAccessKey.value = ''
+  newCredentialType.value = 'api_key'
   newKeyName.value = ''
   newKeyRateLimit.value = undefined
   newKeyConcurrentLimit.value = undefined
@@ -1175,6 +1316,8 @@ function detectCurrentSystem(): InstallSessionTargetSystem {
 }
 
 async function openInstallDialog(apiKey: ApiKey) {
+  if (isVolcAksk(apiKey)) return
+
   selectedInstallApiKey.value = apiKey
   installSession.value = null
   resetInstallCopiedState()
@@ -1343,6 +1486,8 @@ async function prepareCcSwitchDialog() {
 }
 
 async function openCcSwitchImportDialog(apiKey: ApiKey, plainApiKey = '') {
+  if (isVolcAksk(apiKey)) return
+
   selectedCcSwitchApiKey.value = apiKey
   ccSwitchPlainApiKey.value = plainApiKey
   ccSwitchTargetApp.value = 'claude'
@@ -1358,7 +1503,7 @@ async function openCcSwitchImportDialog(apiKey: ApiKey, plainApiKey = '') {
 }
 
 async function openCcSwitchImportDialogForCreatedKey() {
-  if (!createdApiKey.value || !newKeyValue.value) return
+  if (!createdApiKey.value || isVolcAksk(createdApiKey.value) || !newKeyValue.value) return
   pendingFirstInstallApiKey.value = null
   showKeyDialog.value = false
   await openCcSwitchImportDialog(createdApiKey.value, newKeyValue.value)
@@ -1423,14 +1568,20 @@ async function confirmCcSwitchImport() {
   }
 }
 
-function closeCreatedKeyDialog() {
-  showKeyDialog.value = false
+function finalizeCreatedKeyDialog() {
   const pending = pendingFirstInstallApiKey.value
   pendingFirstInstallApiKey.value = null
   createdApiKey.value = null
+  newKeyValue.value = ''
+  newSecretAccessKey.value = ''
   if (pending) {
     void openInstallDialog(pending)
   }
+}
+
+function closeCreatedKeyDialog() {
+  showKeyDialog.value = false
+  finalizeCreatedKeyDialog()
 }
 
 function closeApiKeyDialog() {
@@ -1440,6 +1591,7 @@ function closeApiKeyDialog() {
     createdApiKey.value = null
   }
   newKeyName.value = ''
+  newCredentialType.value = 'api_key'
   newKeyRateLimit.value = undefined
   newKeyConcurrentLimit.value = undefined
   newKeyIpRulesText.value = ''
@@ -1475,6 +1627,7 @@ async function saveApiKey() {
     } else {
       const newKey = await meApi.createApiKey({
         name: newKeyName.value,
+        credential_type: newCredentialType.value,
         rate_limit: newKeyRateLimit.value ?? 0,
         concurrent_limit: newKeyConcurrentLimit.value,
         ip_rules: ipRules,
@@ -1487,10 +1640,12 @@ async function saveApiKey() {
             }
           : {}),
       })
-      newKeyValue.value = newKey.key || ''
-      createdApiKey.value = newKey
-      if (isCreatingFirstApiKey) {
-        pendingFirstInstallApiKey.value = newKey
+      const { secret_access_key: secretAccessKey, ...createdKey } = newKey
+      newKeyValue.value = createdKey.key || ''
+      newSecretAccessKey.value = secretAccessKey || ''
+      createdApiKey.value = createdKey
+      if (isCreatingFirstApiKey && !isVolcAksk(createdKey)) {
+        pendingFirstInstallApiKey.value = createdKey
       }
       showKeyDialog.value = true
       success('API 密钥创建成功')
@@ -1543,6 +1698,8 @@ async function toggleApiKey(apiKey: ApiKey) {
 }
 
 async function copyApiKey(apiKey: ApiKey) {
+  if (isVolcAksk(apiKey)) return
+
   try {
     // 调用后端 API 获取完整密钥
     const response = await meApi.getFullApiKey(apiKey.id)
@@ -1554,6 +1711,24 @@ async function copyApiKey(apiKey: ApiKey) {
     log.error('复制密钥失败:', error)
     showError('复制失败，请重试')
   }
+}
+
+async function copyCreatedCredential(value: string, label: string) {
+  const copied = await copyTextToClipboard(value, false)
+  if (copied) {
+    success(`${label} 已复制到剪贴板`)
+  }
+}
+
+function isVolcAksk(apiKey: ApiKey): boolean {
+  return apiKey.credential_type === 'volc_aksk'
+}
+
+function credentialDisplay(apiKey: ApiKey): string {
+  if (isVolcAksk(apiKey)) {
+    return apiKey.access_key_id || '—'
+  }
+  return apiKey.key_display || 'sk-••••••••'
 }
 
 async function copyTextToClipboard(text: string, showToast: boolean = true): Promise<boolean> {

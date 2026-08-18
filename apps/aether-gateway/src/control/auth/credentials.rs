@@ -586,6 +586,31 @@ mod tests {
     }
 
     #[test]
+    fn selects_material_assets_api_key_from_all_supported_headers() {
+        for (header, carrier) in [
+            ("x-api-key", GatewayCredentialCarrier::XApiKey),
+            ("api-key", GatewayCredentialCarrier::ApiKey),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header, "sk-material-assets".parse().unwrap());
+
+            let extracted = extract_request_credentials(
+                &headers,
+                &http::Method::GET,
+                &uri("/api/material-assets/assets"),
+                crate::material_assets::ARK_ASSET_API_FORMAT,
+            );
+            assert_eq!(
+                extracted.primary,
+                Some(GatewayPrimaryCredential::ProviderApiKey {
+                    raw: "sk-material-assets".to_string(),
+                    carrier,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn defers_aether_session_token_for_material_assets() {
         let token = crate::local_auth_token::sign_for_tests(
             "access",

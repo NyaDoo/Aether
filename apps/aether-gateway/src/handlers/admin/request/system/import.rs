@@ -2939,6 +2939,19 @@ impl<'a> AdminAppState<'a> {
                     Ok(value) => value,
                     Err(detail) => return Ok(Err(invalid_request(detail))),
                 };
+                let credential_type =
+                    invalid_value!(imported_optional_string(key.get("credential_type")))
+                        .unwrap_or_else(|| "api_key".to_string())
+                        .trim()
+                        .to_ascii_lowercase();
+                if credential_type != "api_key" {
+                    stats.api_keys.skipped += 1;
+                    stats.errors.push(format!(
+                        "跳过不支持导入的 AK/SK 凭据: 用户 '{}'",
+                        email.clone().unwrap_or(username.clone())
+                    ));
+                    continue;
+                }
                 let Some((key_hash, key_encrypted)) =
                     invalid_value!(self.resolve_imported_system_user_api_key_material(key))
                 else {
@@ -3116,6 +3129,8 @@ impl<'a> AdminAppState<'a> {
                         api_key_id: Uuid::new_v4().to_string(),
                         key_hash: key_hash.clone(),
                         key_encrypted,
+                        credential_type: "api_key".to_string(),
+                        access_key_id: None,
                         name,
                         allowed_providers,
                         allowed_api_formats,

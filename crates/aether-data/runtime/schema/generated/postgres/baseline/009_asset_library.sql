@@ -9,8 +9,6 @@ CREATE TABLE IF NOT EXISTS public.asset_groups (
     provider_id character varying(64) NOT NULL,
     endpoint_id character varying(64) NOT NULL,
     key_id character varying(64) NOT NULL,
-    account_binding character varying(128) NOT NULL,
-    project character varying(255) DEFAULT '' NOT NULL,
     group_type character varying(64) NOT NULL,
     name character varying(512) NOT NULL,
     description text,
@@ -21,7 +19,7 @@ CREATE TABLE IF NOT EXISTS public.asset_groups (
 );
 
 ALTER TABLE ONLY public.asset_groups ADD CONSTRAINT asset_groups_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY public.asset_groups ADD CONSTRAINT uq_asset_groups_upstream UNIQUE (provider_id, account_binding, project, upstream_group_id);
+ALTER TABLE ONLY public.asset_groups ADD CONSTRAINT uq_asset_groups_upstream UNIQUE (provider_id, upstream_group_id);
 CREATE INDEX IF NOT EXISTS idx_asset_groups_user_deleted_created ON public.asset_groups USING btree (user_id, deleted_at_unix_secs, created_at_unix_secs);
 CREATE INDEX IF NOT EXISTS idx_asset_groups_user_type_status ON public.asset_groups USING btree (user_id, group_type, status);
 ALTER TABLE ONLY public.asset_groups ADD CONSTRAINT fk_asset_groups_user FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
@@ -70,8 +68,6 @@ CREATE TABLE IF NOT EXISTS public.ark_visual_validation_sessions (
     provider_id character varying(64) NOT NULL,
     endpoint_id character varying(64) NOT NULL,
     key_id character varying(64) NOT NULL,
-    account_binding character varying(128) NOT NULL,
-    project character varying(255) DEFAULT '' NOT NULL,
     byted_token_hash character varying(128) NOT NULL,
     encrypted_byted_token text NOT NULL,
     callback_state_hash character varying(128) NOT NULL,
@@ -85,7 +81,7 @@ CREATE TABLE IF NOT EXISTS public.ark_visual_validation_sessions (
 );
 
 ALTER TABLE ONLY public.ark_visual_validation_sessions ADD CONSTRAINT ark_visual_validation_sessions_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY public.ark_visual_validation_sessions ADD CONSTRAINT uq_ark_validation_upstream UNIQUE (provider_id, account_binding, project, session_id);
+ALTER TABLE ONLY public.ark_visual_validation_sessions ADD CONSTRAINT uq_ark_validation_upstream UNIQUE (provider_id, session_id);
 ALTER TABLE ONLY public.ark_visual_validation_sessions ADD CONSTRAINT uq_ark_validation_callback_state UNIQUE (callback_state_hash);
 ALTER TABLE ONLY public.ark_visual_validation_sessions ADD CONSTRAINT uq_ark_validation_byted_token_hash UNIQUE (byted_token_hash);
 CREATE INDEX IF NOT EXISTS idx_ark_validation_user_status_expiry ON public.ark_visual_validation_sessions USING btree (user_id, status, expires_at_unix_secs);

@@ -8,232 +8,173 @@
     @update:model-value="handleDialogUpdate"
   >
     <form
-      class="space-y-3"
+      class="space-y-5"
       autocomplete="off"
       @submit.prevent="handleSave"
     >
       <!-- 基本信息 -->
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <Label :for="keyNameInputId">{{ legacyT('密钥名称 *') }}</Label>
-          <Input
-            :id="keyNameInputId"
-            v-model="form.name"
-            :name="keyNameFieldName"
-            required
-            :placeholder="legacyT('例如：主 Key、备用 Key 1')"
-            maxlength="100"
-            autocomplete="off"
-            autocapitalize="none"
-            autocorrect="off"
-            spellcheck="false"
-            data-form-type="other"
-            data-lpignore="true"
-            data-1p-ignore="true"
-          />
-        </div>
-        <div v-if="showAuthTypeSelector">
-          <Label :for="authTypeSelectId">{{ legacyT('认证类型') }}</Label>
-          <Select v-model="form.auth_type">
-            <SelectTrigger :id="authTypeSelectId">
-              <SelectValue :placeholder="legacyT('选择认证类型')" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem
-                v-for="option in authTypeOptions"
-                :key="option.value"
-                :value="option.value"
-              >
-                {{ option.label }}
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div
-          v-if="form.auth_type === 'volc_aksk'"
-          class="col-span-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.04] p-3"
-        >
-          <div class="mb-3 flex items-start justify-between gap-3">
-            <div>
-              <p class="text-sm font-medium text-foreground">
-                Volcengine AK/SK
-              </p>
-              <p class="mt-0.5 text-xs leading-5 text-muted-foreground">
-                {{ volcAkSkDescription }}
-              </p>
-            </div>
-            <span class="rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-              HMAC-SHA256
-            </span>
-          </div>
-          <div class="grid gap-3 sm:grid-cols-2">
-            <div>
-              <Label :for="volcAccessKeyIdInputId">Access Key ID {{ volcAkSkRequiredMark }}</Label>
-              <Input
-                :id="volcAccessKeyIdInputId"
-                v-model="form.volc_access_key_id"
-                :name="volcAccessKeyIdFieldName"
-                masked
-                :placeholder="editingKey ? '留空表示不修改' : 'AKLT...'"
-              />
-            </div>
-            <div>
-              <Label :for="volcSecretAccessKeyInputId">Secret Access Key {{ volcAkSkRequiredMark }}</Label>
-              <Input
-                :id="volcSecretAccessKeyInputId"
-                v-model="form.volc_secret_access_key"
-                :name="volcSecretAccessKeyFieldName"
-                masked
-                :placeholder="editingKey ? '留空表示不修改' : '请输入 SK'"
-              />
-            </div>
-            <div>
-              <Label :for="volcSecurityTokenInputId">Security Token</Label>
-              <Input
-                :id="volcSecurityTokenInputId"
-                v-model="form.volc_security_token"
-                masked
-                placeholder="可选，临时凭据时填写"
-              />
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-              <div>
-                <Label :for="volcRegionInputId">Region</Label>
-                <Input
-                  :id="volcRegionInputId"
-                  v-model="form.volc_region"
-                  placeholder="cn-beijing"
-                />
-              </div>
-              <div>
-                <Label :for="volcServiceInputId">Service</Label>
-                <Input
-                  :id="volcServiceInputId"
-                  v-model="form.volc_service"
-                  placeholder="ark"
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-        <div
-          v-else
-          :class="showAuthTypeSelector ? 'col-span-2' : undefined"
-        >
-          <Label :for="apiKeyInputId">
-            {{ authSecretLabel }}
-            {{ authSecretRequiredMark }}
-          </Label>
-          <template v-if="form.auth_type === 'service_account'">
-            <JsonImportInput
-              v-model="form.auth_config_text"
-              :disabled="saving"
-              :reset-key="formNonce"
-              accept=".json,.txt,application/json,text/plain"
-              :multiple="false"
-              :drop-title="legacyT('拖入 Service Account JSON 或点击选择')"
-              :drop-hint="legacyT('支持 .json / .txt，单文件导入')"
-              :manual-placeholder="legacyT(editingKey ? '留空表示不修改，或粘贴完整的 Service Account JSON' : '粘贴完整的 Service Account JSON')"
-              :manual-description="serviceAccountDescription"
-              textarea-class="min-h-[160px] font-mono text-xs break-all !rounded-xl"
-              @error="handleServiceAccountImportError"
-            />
-          </template>
-          <template v-else>
-            <Input
-              :id="apiKeyInputId"
-              v-model="form.api_key"
-              :name="apiKeyFieldName"
-              masked
-              :required="false"
-              :placeholder="editingKey ? editingKey.api_key_masked : authSecretPlaceholder"
-            />
-          </template>
-          <p
-            v-if="editingKey && isRawSecretAuthType(form.auth_type)"
-            class="text-xs text-muted-foreground mt-1"
-          >
-            {{ legacyT('留空表示不修改') }}
-          </p>
-        </div>
-      </div>
-
-      <div
-        v-if="showArkAccountBindingFields"
-        class="rounded-xl border border-sky-500/25 bg-sky-500/[0.04] p-3"
+      <section
+        class="space-y-3"
+        data-provider-key-section="basic"
       >
-        <div class="mb-3 flex items-start justify-between gap-3">
-          <div>
-            <p class="text-sm font-medium text-foreground">
-              {{ legacyT('Ark 账号与项目') }}
-            </p>
-            <p class="mt-0.5 text-xs leading-5 text-muted-foreground">
-              {{ arkAccountBindingDescription }}
-            </p>
-          </div>
-          <span class="rounded-full border border-sky-500/25 bg-sky-500/10 px-2 py-0.5 font-mono text-[10px] font-medium text-sky-700 dark:text-sky-300">
-            auth_config
-          </span>
-        </div>
+        <h3 class="border-b pb-2 text-sm font-medium">
+          {{ legacyT('基本信息') }}
+        </h3>
         <div class="grid gap-3 sm:grid-cols-2">
-          <div>
-            <Label :for="arkAccountIdInputId">Ark Account ID (account_id)</Label>
+          <div class="space-y-1.5">
+            <Label :for="keyNameInputId">{{ legacyT('密钥名称 *') }}</Label>
             <Input
-              :id="arkAccountIdInputId"
-              v-model="form.ark_account_id"
+              :id="keyNameInputId"
+              v-model="form.name"
+              :name="keyNameFieldName"
+              required
+              :placeholder="legacyT('例如：主 Key、备用 Key 1')"
+              maxlength="100"
               autocomplete="off"
-              :placeholder="editingKey ? legacyT('留空表示保留原值') : legacyT('请输入 Ark Account ID')"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
+              data-form-type="other"
+              data-lpignore="true"
+              data-1p-ignore="true"
             />
           </div>
-          <div>
-            <Label :for="arkProjectInputId">Ark Project (project)</Label>
+          <div class="space-y-1.5">
+            <Label for="note">{{ legacyT('备注') }}</Label>
             <Input
-              :id="arkProjectInputId"
-              v-model="form.ark_project"
-              autocomplete="off"
-              :placeholder="editingKey ? legacyT('留空表示保留原值') : legacyT('请输入 Ark Project')"
+              id="note"
+              v-model="form.note"
+              :placeholder="legacyT('可选的备注信息')"
             />
           </div>
+        </div>
+      </section>
+
+      <!-- 上游认证 -->
+      <section
+        class="space-y-3"
+        data-provider-key-section="authentication"
+      >
+        <h3 class="border-b pb-2 text-sm font-medium">
+          {{ legacyT('上游认证') }}
+        </h3>
+
+        <div
+          :class="form.auth_type === 'volc_aksk'
+            ? 'space-y-3'
+            : 'grid grid-cols-2 items-start gap-3'"
+          :data-provider-auth-layout="form.auth_type === 'volc_aksk' ? 'stacked' : 'inline'"
+        >
           <div
-            v-if="showArkApiKeyHeaderField"
-            class="sm:col-span-2"
+            v-if="showAuthTypeSelector"
+            class="min-w-0 space-y-1.5"
           >
-            <Label :for="arkApiKeyHeaderSelectId">{{ legacyT('上游 API Key 请求头') }}</Label>
-            <Select
-              v-model="form.ark_api_key_header"
-              data-ark-api-key-header
-            >
-              <SelectTrigger :id="arkApiKeyHeaderSelectId">
-                <SelectValue :placeholder="legacyT('留空表示保留原值')" />
+            <Label :for="authTypeSelectId">{{ legacyT('认证类型') }}</Label>
+            <Select v-model="form.auth_type">
+              <SelectTrigger :id="authTypeSelectId">
+                <SelectValue :placeholder="legacyT('选择认证类型')" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="x-api-key">
-                  X-Api-Key
-                </SelectItem>
-                <SelectItem value="api-key">
-                  Api-Key
+                <SelectItem
+                  v-for="option in authTypeOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
                 </SelectItem>
               </SelectContent>
             </Select>
-            <p class="mt-1 text-xs leading-5 text-muted-foreground">
-              {{ legacyT('仅用于 doubao:asset_library 的第三方 API Key 中转。') }}
+          </div>
+
+          <div
+            v-if="form.auth_type === 'volc_aksk'"
+            class="space-y-2"
+            data-provider-auth-fields="volc-aksk"
+          >
+            <div class="grid gap-3 sm:grid-cols-2">
+              <div class="space-y-1.5">
+                <Label :for="volcAccessKeyIdInputId">
+                  {{ legacyT('访问密钥 ID (AK)') }} {{ volcAkSkRequiredMark }}
+                </Label>
+                <Input
+                  :id="volcAccessKeyIdInputId"
+                  v-model="form.volc_access_key_id"
+                  :name="volcAccessKeyIdFieldName"
+                  masked
+                  :placeholder="editingKey ? legacyT('留空表示不修改') : 'AKLT...'"
+                />
+              </div>
+              <div class="space-y-1.5">
+                <Label :for="volcSecretAccessKeyInputId">
+                  {{ legacyT('访问密钥 Secret (SK)') }} {{ volcAkSkRequiredMark }}
+                </Label>
+                <Input
+                  :id="volcSecretAccessKeyInputId"
+                  v-model="form.volc_secret_access_key"
+                  :name="volcSecretAccessKeyFieldName"
+                  masked
+                  :placeholder="editingKey ? legacyT('留空表示不修改') : legacyT('请输入 SK')"
+                />
+              </div>
+            </div>
+            <p class="text-xs leading-5 text-muted-foreground">
+              {{ volcAkSkDescription }}
+            </p>
+          </div>
+          <div
+            v-else
+            class="min-w-0 space-y-1.5"
+            :class="{ 'col-span-2': !showAuthTypeSelector }"
+            data-provider-auth-fields="raw-secret"
+          >
+            <Label :for="apiKeyInputId">
+              {{ authSecretLabel }}
+              {{ authSecretRequiredMark }}
+            </Label>
+            <template v-if="form.auth_type === 'service_account'">
+              <JsonImportInput
+                v-model="form.auth_config_text"
+                :disabled="saving"
+                :reset-key="formNonce"
+                accept=".json,.txt,application/json,text/plain"
+                :multiple="false"
+                :drop-title="legacyT('拖入 Service Account JSON 或点击选择')"
+                :drop-hint="legacyT('支持 .json / .txt，单文件导入')"
+                :manual-placeholder="legacyT(editingKey ? '留空表示不修改，或粘贴完整的 Service Account JSON' : '粘贴完整的 Service Account JSON')"
+                :manual-description="serviceAccountDescription"
+                textarea-class="min-h-[160px] font-mono text-xs break-all !rounded-xl"
+                @error="handleServiceAccountImportError"
+              />
+            </template>
+            <template v-else>
+              <Input
+                :id="apiKeyInputId"
+                v-model="form.api_key"
+                :name="apiKeyFieldName"
+                masked
+                :required="false"
+                :placeholder="editingKey ? editingKey.api_key_masked : authSecretPlaceholder"
+              />
+            </template>
+            <p
+              v-if="editingKey && isRawSecretAuthType(form.auth_type)"
+              class="mt-1 text-xs text-muted-foreground"
+            >
+              {{ legacyT('留空表示不修改') }}
             </p>
           </div>
         </div>
-      </div>
-
-      <!-- 备注 -->
-      <div>
-        <Label for="note">{{ legacyT('备注') }}</Label>
-        <Input
-          id="note"
-          v-model="form.note"
-          :placeholder="legacyT('可选的备注信息')"
-        />
-      </div>
+      </section>
 
       <!-- API 格式 & 认证方式 -->
-      <div v-if="visibleApiFormats.length > 0">
+      <section
+        v-if="visibleApiFormats.length > 0"
+        class="space-y-3"
+        data-provider-key-section="api-formats"
+      >
+        <h3 class="border-b pb-2 text-sm font-medium">
+          {{ legacyT('API 格式') }}
+        </h3>
         <div class="flex items-center gap-1 mb-1.5">
           <Label>{{ legacyT('支持的 API 格式 *') }}</Label>
           <span
@@ -329,148 +270,231 @@
             </div>
           </div>
         </div>
-      </div>
+      </section>
+
+      <!-- 高级认证参数 -->
+      <section
+        v-if="showAdvancedAuthParameters"
+        class="space-y-3"
+        data-provider-key-section="advanced-authentication"
+      >
+        <h3 class="border-b pb-2 text-sm font-medium">
+          {{ legacyT('高级认证参数') }}
+        </h3>
+        <div class="grid gap-3 sm:grid-cols-2">
+          <div
+            v-if="form.auth_type === 'volc_aksk'"
+            class="space-y-1.5 sm:col-span-2"
+          >
+            <Label :for="volcSecurityTokenInputId">{{ legacyT('临时安全令牌') }}</Label>
+            <Input
+              :id="volcSecurityTokenInputId"
+              v-model="form.volc_security_token"
+              masked
+              :placeholder="legacyT('可选，使用临时凭据时填写')"
+            />
+          </div>
+          <div
+            v-if="form.auth_type === 'volc_aksk'"
+            class="space-y-1.5"
+          >
+            <Label :for="volcRegionInputId">{{ legacyT('区域') }}</Label>
+            <Input
+              :id="volcRegionInputId"
+              v-model="form.volc_region"
+              placeholder="cn-beijing"
+            />
+          </div>
+          <div
+            v-if="form.auth_type === 'volc_aksk'"
+            class="space-y-1.5"
+          >
+            <Label :for="volcServiceInputId">{{ legacyT('服务') }}</Label>
+            <Input
+              :id="volcServiceInputId"
+              v-model="form.volc_service"
+              placeholder="ark"
+            />
+          </div>
+          <div
+            v-if="showArkApiKeyHeaderField"
+            class="space-y-1.5 sm:col-span-2"
+          >
+            <Label :for="arkApiKeyHeaderSelectId">{{ legacyT('上游 API Key 请求头') }}</Label>
+            <Select
+              v-model="form.ark_api_key_header"
+              data-ark-api-key-header
+            >
+              <SelectTrigger :id="arkApiKeyHeaderSelectId">
+                <SelectValue :placeholder="legacyT('留空表示保留原值')" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="x-api-key">
+                  X-Api-Key
+                </SelectItem>
+                <SelectItem value="api-key">
+                  Api-Key
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p class="text-xs leading-5 text-muted-foreground">
+              {{ legacyT('仅用于 doubao:asset_library 的第三方 API Key 中转。') }}
+            </p>
+          </div>
+        </div>
+      </section>
 
       <!-- 配置项 -->
-      <div class="grid grid-cols-4 gap-3">
-        <div>
-          <Label
-            for="internal_priority"
-            class="text-xs"
-          >{{ legacyT('优先级') }}</Label>
-          <Input
-            id="internal_priority"
-            v-model.number="form.internal_priority"
-            type="number"
-            min="0"
-            class="h-8"
-          />
-          <p class="text-xs text-muted-foreground mt-0.5">
-            {{ legacyT('越小越优先') }}
-          </p>
-        </div>
-        <div>
-          <Label
-            for="rpm_limit"
-            class="text-xs"
-          >{{ legacyT('RPM 限制') }}</Label>
-          <Input
-            id="rpm_limit"
-            :model-value="form.rpm_limit ?? ''"
-            type="number"
-            min="1"
-            max="10000"
-            :placeholder="legacyT('自适应')"
-            class="h-8"
-            @update:model-value="(v) => form.rpm_limit = parseNullableNumberInput(v, { min: 1, max: 10000 })"
-          />
-          <p class="text-xs text-muted-foreground mt-0.5">
-            {{ legacyT('留空自适应') }}
-          </p>
-        </div>
-        <div>
-          <Label
-            for="concurrent_limit"
-            class="text-xs"
-          >{{ legacyT('并发请求上限') }}</Label>
-          <Input
-            id="concurrent_limit"
-            :model-value="form.concurrent_limit ?? ''"
-            type="number"
-            min="0"
-            :placeholder="legacyT('不限制')"
-            class="h-8"
-            @update:model-value="(v) => form.concurrent_limit = parseNullableNumberInput(v, { min: 0 })"
-          />
-          <p class="text-xs text-muted-foreground mt-0.5">
-            {{ legacyT('留空或 0 表示不限制') }}
-          </p>
-        </div>
-        <div>
-          <Label
-            for="cache_ttl_minutes"
-            class="text-xs"
-          >{{ legacyT('缓存 TTL') }}</Label>
-          <Input
-            id="cache_ttl_minutes"
-            :model-value="form.cache_ttl_minutes ?? ''"
-            type="number"
-            min="0"
-            max="60"
-            class="h-8"
-            @update:model-value="(v) => form.cache_ttl_minutes = parseNumberInput(v, { min: 0, max: 60 }) ?? 5"
-          />
-          <p class="text-xs text-muted-foreground mt-0.5">
-            {{ legacyT('分钟，0禁用') }}
-          </p>
-        </div>
-        <div>
-          <Label
-            for="max_probe_interval_minutes"
-            class="text-xs"
-          >{{ legacyT('熔断探测') }}</Label>
-          <Input
-            id="max_probe_interval_minutes"
-            :model-value="form.max_probe_interval_minutes ?? ''"
-            type="number"
-            min="0"
-            max="32"
-            placeholder="32"
-            class="h-8"
-            @update:model-value="(v) => form.max_probe_interval_minutes = parseNumberInput(v, { min: 0, max: 32 }) ?? 32"
-          />
-          <p class="text-xs text-muted-foreground mt-0.5">
-            {{ legacyT('分钟，0-32') }}
-          </p>
-        </div>
-      </div>
-
-      <!-- 自动获取模型 -->
-      <div class="space-y-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30">
-        <div class="flex items-center justify-between">
-          <div class="space-y-0.5">
-            <Label class="text-sm font-medium">{{ legacyT('自动获取上游可用模型') }}</Label>
-            <p class="text-xs text-muted-foreground">
-              {{ legacyT('定时更新上游模型, 配合模型映射使用') }}
-            </p>
-            <p
-              v-if="showAutoFetchWarning"
-              class="text-xs text-amber-600 dark:text-amber-400"
-            >
-              {{ autoFetchWarningMessage }}
-            </p>
-          </div>
-          <Switch v-model="form.auto_fetch_models" />
-        </div>
-
-        <!-- 模型过滤规则（仅当开启自动获取时显示） -->
+      <section
+        class="space-y-3"
+        data-provider-key-section="scheduling"
+      >
+        <h3 class="border-b pb-2 text-sm font-medium">
+          {{ legacyT('调度配置') }}
+        </h3>
         <div
-          v-if="form.auto_fetch_models"
-          class="space-y-2 pt-2 border-t border-border/40"
+          class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5"
+          data-provider-scheduling-grid
         >
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <Label class="text-xs">{{ legacyT('包含规则') }}</Label>
-              <Input
-                v-model="form.model_include_patterns_text"
-                :placeholder="legacyT('gpt-*, claude-*, 留空包含全部')"
-                class="h-8 text-sm"
-              />
-            </div>
-            <div>
-              <Label class="text-xs">{{ legacyT('排除规则') }}</Label>
-              <Input
-                v-model="form.model_exclude_patterns_text"
-                placeholder="*-preview, *-beta"
-                class="h-8 text-sm"
-              />
-            </div>
+          <div>
+            <Label
+              for="internal_priority"
+              class="text-xs"
+            >{{ legacyT('优先级') }}</Label>
+            <Input
+              id="internal_priority"
+              v-model.number="form.internal_priority"
+              type="number"
+              min="0"
+              class="h-8"
+            />
+            <p class="text-xs text-muted-foreground mt-0.5">
+              {{ legacyT('越小越优先') }}
+            </p>
           </div>
-          <p class="text-xs text-muted-foreground">
-            {{ legacyT('逗号分隔，支持 * ? 通配符，不区分大小写') }}
-          </p>
+          <div>
+            <Label
+              for="rpm_limit"
+              class="text-xs"
+            >{{ legacyT('RPM 限制') }}</Label>
+            <Input
+              id="rpm_limit"
+              :model-value="form.rpm_limit ?? ''"
+              type="number"
+              min="1"
+              max="10000"
+              :placeholder="legacyT('自适应')"
+              class="h-8"
+              @update:model-value="(v) => form.rpm_limit = parseNullableNumberInput(v, { min: 1, max: 10000 })"
+            />
+            <p class="text-xs text-muted-foreground mt-0.5">
+              {{ legacyT('留空自适应') }}
+            </p>
+          </div>
+          <div>
+            <Label
+              for="concurrent_limit"
+              class="text-xs"
+            >{{ legacyT('并发请求上限') }}</Label>
+            <Input
+              id="concurrent_limit"
+              :model-value="form.concurrent_limit ?? ''"
+              type="number"
+              min="0"
+              :placeholder="legacyT('不限制')"
+              class="h-8"
+              @update:model-value="(v) => form.concurrent_limit = parseNullableNumberInput(v, { min: 0 })"
+            />
+            <p class="text-xs text-muted-foreground mt-0.5">
+              {{ legacyT('留空或 0 表示不限制') }}
+            </p>
+          </div>
+          <div>
+            <Label
+              for="cache_ttl_minutes"
+              class="text-xs"
+            >{{ legacyT('缓存 TTL') }}</Label>
+            <Input
+              id="cache_ttl_minutes"
+              :model-value="form.cache_ttl_minutes ?? ''"
+              type="number"
+              min="0"
+              max="60"
+              class="h-8"
+              @update:model-value="(v) => form.cache_ttl_minutes = parseNumberInput(v, { min: 0, max: 60 }) ?? 5"
+            />
+            <p class="text-xs text-muted-foreground mt-0.5">
+              {{ legacyT('分钟，0禁用') }}
+            </p>
+          </div>
+          <div>
+            <Label
+              for="max_probe_interval_minutes"
+              class="text-xs"
+            >{{ legacyT('熔断探测') }}</Label>
+            <Input
+              id="max_probe_interval_minutes"
+              :model-value="form.max_probe_interval_minutes ?? ''"
+              type="number"
+              min="0"
+              max="32"
+              placeholder="32"
+              class="h-8"
+              @update:model-value="(v) => form.max_probe_interval_minutes = parseNumberInput(v, { min: 0, max: 32 }) ?? 32"
+            />
+            <p class="text-xs text-muted-foreground mt-0.5">
+              {{ legacyT('分钟，0-32') }}
+            </p>
+          </div>
         </div>
-      </div>
+
+        <!-- 自动获取模型 -->
+        <div class="space-y-3 rounded-md border border-border/60 bg-muted/30 px-3 py-2">
+          <div class="flex items-center justify-between">
+            <div class="space-y-0.5">
+              <Label class="text-sm font-medium">{{ legacyT('自动获取上游可用模型') }}</Label>
+              <p class="text-xs text-muted-foreground">
+                {{ legacyT('定时更新上游模型, 配合模型映射使用') }}
+              </p>
+              <p
+                v-if="showAutoFetchWarning"
+                class="text-xs text-amber-600 dark:text-amber-400"
+              >
+                {{ autoFetchWarningMessage }}
+              </p>
+            </div>
+            <Switch v-model="form.auto_fetch_models" />
+          </div>
+
+          <!-- 模型过滤规则（仅当开启自动获取时显示） -->
+          <div
+            v-if="form.auto_fetch_models"
+            class="space-y-2 pt-2 border-t border-border/40"
+          >
+            <div class="grid gap-3 sm:grid-cols-2">
+              <div>
+                <Label class="text-xs">{{ legacyT('包含规则') }}</Label>
+                <Input
+                  v-model="form.model_include_patterns_text"
+                  :placeholder="legacyT('gpt-*, claude-*, 留空包含全部')"
+                  class="h-8 text-sm"
+                />
+              </div>
+              <div>
+                <Label class="text-xs">{{ legacyT('排除规则') }}</Label>
+                <Input
+                  v-model="form.model_exclude_patterns_text"
+                  placeholder="*-preview, *-beta"
+                  class="h-8 text-sm"
+                />
+              </div>
+            </div>
+            <p class="text-xs text-muted-foreground">
+              {{ legacyT('逗号分隔，支持 * ? 通配符，不区分大小写') }}
+            </p>
+          </div>
+        </div>
+      </section>
     </form>
 
     <template #footer>
@@ -574,15 +598,15 @@ function providerSupportsVolcAkSk(): boolean {
   return props.availableApiFormats.some(format => normalizeApiFormat(format) === API_FORMATS.DOUBAO_ASSET_LIBRARY)
 }
 
-function isArkAccountBindingFormat(format: string): boolean {
+function isArkAuthFormat(format: string): boolean {
   const normalized = normalizeApiFormat(format)
   return normalized === API_FORMATS.DOUBAO_ASSET_LIBRARY
     || normalized === API_FORMATS.DOUBAO_VIDEO
 }
 
-function providerSupportsArkAccountBinding(): boolean {
-  return props.availableApiFormats.some(isArkAccountBindingFormat)
-    || Boolean(props.editingKey?.api_formats?.some(isArkAccountBindingFormat))
+function providerSupportsArkAuthentication(): boolean {
+  return props.availableApiFormats.some(isArkAuthFormat)
+    || Boolean(props.editingKey?.api_formats?.some(isArkAuthFormat))
 }
 
 function getAuthTypeOptions(providerType: ProviderType | null): AuthTypeOption[] {
@@ -699,16 +723,15 @@ const authTypeOptions = computed(() => getAuthTypeOptions(props.providerType))
 const rawSecretAuthTypeOptions = computed(() => authTypeOptions.value.filter(
   (option): option is AuthTypeOption & { value: RawSecretAuthType } => isRawSecretAuthType(option.value),
 ))
-const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai' || providerSupportsArkAccountBinding())
-const showArkAccountBindingFields = computed(() =>
-  (isRawSecretAuthType(form.value.auth_type) || form.value.auth_type === 'volc_aksk')
-  && form.value.api_formats.some(isArkAccountBindingFormat)
-)
+const showAuthTypeSelector = computed(() => props.providerType === 'vertex_ai' || providerSupportsArkAuthentication())
 const showArkApiKeyHeaderField = computed(() =>
   form.value.api_formats.some(format =>
     normalizeApiFormat(format) === API_FORMATS.DOUBAO_ASSET_LIBRARY
     && getFormatAuthType(format) === 'api_key'
   )
+)
+const showAdvancedAuthParameters = computed(() =>
+  form.value.auth_type === 'volc_aksk' || showArkApiKeyHeaderField.value
 )
 
 const apiFormatHelpOpen = ref(false)
@@ -752,13 +775,8 @@ const volcAkSkRequiresCredentials = computed(() => !props.editingKey || switchin
 const volcAkSkRequiredMark = computed(() => volcAkSkRequiresCredentials.value ? '*' : '')
 const volcAkSkDescription = computed(() => legacyT(
   props.editingKey && !switchingToVolcAkSk.value
-    ? 'AK 与 SK 留空表示保持原凭据；填写时必须成对更新。Region 默认 cn-beijing，Service 默认 ark。'
-    : '用于火山方舟素材库请求签名。AK 与 SK 必须成对填写；临时凭据可附带 Security Token。',
-))
-const arkAccountBindingDescription = computed(() => legacyT(
-  props.editingKey
-    ? '用于关联 Ark 素材与 Doubao 视频凭据；留空表示保留现有值，仅填写的字段会更新。'
-    : '用于关联 Ark 素材与 Doubao 视频凭据；填写后将保存到 auth_config。',
+    ? 'AK 与 SK 留空表示保持原凭据；填写时必须成对更新。'
+    : '用于火山方舟素材库请求签名，AK 与 SK 必须成对填写。',
 ))
 
 
@@ -906,8 +924,6 @@ const volcSecretAccessKeyInputId = computed(() => `volc-secret-access-key-${form
 const volcSecurityTokenInputId = computed(() => `volc-security-token-${formNonce.value}`)
 const volcRegionInputId = computed(() => `volc-region-${formNonce.value}`)
 const volcServiceInputId = computed(() => `volc-service-${formNonce.value}`)
-const arkAccountIdInputId = computed(() => `ark-account-id-${formNonce.value}`)
-const arkProjectInputId = computed(() => `ark-project-${formNonce.value}`)
 const arkApiKeyHeaderSelectId = computed(() => `ark-api-key-header-${formNonce.value}`)
 const volcAccessKeyIdFieldName = computed(() => `volc-access-key-id-field-${formNonce.value}`)
 const volcSecretAccessKeyFieldName = computed(() => `volc-secret-access-key-field-${formNonce.value}`)
@@ -927,8 +943,6 @@ const form = ref({
   volc_security_token: '',
   volc_region: 'cn-beijing',
   volc_service: 'ark',
-  ark_account_id: '',
-  ark_project: '',
   ark_api_key_header: 'x-api-key' as ArkApiKeyHeader | '',
   api_formats: [] as string[],  // 支持的 API 格式列表
   rate_multipliers: {} as Record<string, number>,  // 按 API 格式的成本倍率
@@ -1034,8 +1048,6 @@ function resetForm() {
     volc_security_token: '',
     volc_region: 'cn-beijing',
     volc_service: 'ark',
-    ark_account_id: '',
-    ark_project: '',
     ark_api_key_header: 'x-api-key',
     api_formats: defaultApiFormats,
     rate_multipliers: {},
@@ -1061,8 +1073,6 @@ function clearForNextAdd() {
   form.value.volc_access_key_id = ''
   form.value.volc_secret_access_key = ''
   form.value.volc_security_token = ''
-  form.value.ark_account_id = ''
-  form.value.ark_project = ''
   form.value.ark_api_key_header = 'x-api-key'
   form.value.auth_type_by_format = sanitizeAuthTypeByFormat(form.value.auth_type_by_format)
   form.value.allow_auth_channel_mismatch_formats = sanitizeAllowAuthChannelMismatchFormats(
@@ -1093,8 +1103,6 @@ function loadKeyData() {
     volc_security_token: '',
     volc_region: 'cn-beijing',
     volc_service: 'ark',
-    ark_account_id: '',
-    ark_project: '',
     ark_api_key_header: '',
     api_formats: props.editingKey.api_formats?.length > 0
       ? sanitizeApiFormats(
@@ -1154,27 +1162,20 @@ function parseAuthConfig(): ProviderKeyAuthConfig | null {
     }
   }
 
-  const arkAccountBinding: ProviderKeyAuthConfig = {}
-  if (showArkAccountBindingFields.value) {
-    const accountId = form.value.ark_account_id.trim()
-    const project = form.value.ark_project.trim()
-    if (accountId) arkAccountBinding.account_id = accountId
-    if (project) arkAccountBinding.project = project
-  }
+  const authConfig: ProviderKeyAuthConfig = {}
   if (showArkApiKeyHeaderField.value && form.value.ark_api_key_header) {
-    arkAccountBinding.api_key_header = form.value.ark_api_key_header
+    authConfig.api_key_header = form.value.ark_api_key_header
   }
 
   if (form.value.auth_type !== 'volc_aksk') {
-    return Object.keys(arkAccountBinding).length > 0 ? arkAccountBinding : null
+    return Object.keys(authConfig).length > 0 ? authConfig : null
   }
   const accessKeyId = form.value.volc_access_key_id.trim()
   const secretAccessKey = form.value.volc_secret_access_key.trim()
   if (!accessKeyId && !secretAccessKey) {
-    return Object.keys(arkAccountBinding).length > 0 ? arkAccountBinding : null
+    return null
   }
   return {
-    ...arkAccountBinding,
     access_key_id: accessKeyId,
     secret_access_key: secretAccessKey,
     ...(form.value.volc_security_token.trim()

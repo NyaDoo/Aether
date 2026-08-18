@@ -470,25 +470,61 @@ fn create_table_names(sql: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn apply_table_shape_changes(sql: &str, tables: &mut BTreeSet<String>) {
+    tables.extend(create_table_names(sql));
+    for line in sql.lines() {
+        let tokens = line
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if tokens.len() >= 3
+            && tokens[0].eq_ignore_ascii_case("DROP")
+            && tokens[1].eq_ignore_ascii_case("TABLE")
+        {
+            let table_index = if tokens.get(2..4).is_some_and(|tokens| {
+                tokens[0].eq_ignore_ascii_case("IF") && tokens[1].eq_ignore_ascii_case("EXISTS")
+            }) {
+                4
+            } else {
+                2
+            };
+            if let Some(table) = tokens.get(table_index) {
+                tables.remove(table.trim_matches(|ch| ch == '"' || ch == '`'));
+            }
+        }
+        if tokens.len() >= 6
+            && tokens[0].eq_ignore_ascii_case("ALTER")
+            && tokens[1].eq_ignore_ascii_case("TABLE")
+            && tokens[3].eq_ignore_ascii_case("RENAME")
+            && tokens[4].eq_ignore_ascii_case("TO")
+        {
+            let source = tokens[2].trim_matches(|ch| ch == '"' || ch == '`');
+            let target = tokens[5].trim_matches(|ch| ch == '"' || ch == '`');
+            tables.remove(source);
+            tables.insert(target.to_string());
+        }
+    }
+}
+
+fn final_migration_table_names(migrator: &sqlx::migrate::Migrator) -> BTreeSet<String> {
+    let mut tables = BTreeSet::new();
+    for migration in migrator
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        apply_table_shape_changes(migration.sql.as_ref(), &mut tables);
+    }
+    tables
+}
+
 #[test]
 fn portable_driver_migrations_create_the_postgres_table_set() {
-    let mut postgres_tables = POSTGRES_MIGRATOR
-        .iter()
-        .filter(|migration| migration.migration_type.is_up_migration())
-        .flat_map(|migration| create_table_names(migration.sql.as_ref()))
-        .collect::<BTreeSet<_>>();
+    let mut postgres_tables = final_migration_table_names(&POSTGRES_MIGRATOR);
     postgres_tables.remove("schema_backfills");
 
-    let mysql_tables = super::mysql::MIGRATOR
-        .iter()
-        .filter(|migration| migration.migration_type.is_up_migration())
-        .flat_map(|migration| create_table_names(migration.sql.as_ref()))
-        .collect::<BTreeSet<_>>();
-    let sqlite_tables = super::sqlite::MIGRATOR
-        .iter()
-        .filter(|migration| migration.migration_type.is_up_migration())
-        .flat_map(|migration| create_table_names(migration.sql.as_ref()))
-        .collect::<BTreeSet<_>>();
+    let mysql_tables = final_migration_table_names(&super::mysql::MIGRATOR);
+    let sqlite_tables = final_migration_table_names(&super::sqlite::MIGRATOR);
 
     assert_eq!(mysql_tables, postgres_tables, "MySQL table set drifted");
     assert_eq!(sqlite_tables, postgres_tables, "SQLite table set drifted");
@@ -1069,6 +1105,9 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260727000000,
             20260731000000,
             20260813000000,
+            20260818000000,
+            20260818010000,
+            20260818020000,
         ]
     );
     assert_eq!(
@@ -1104,6 +1143,9 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260727000000,
             20260731000000,
             20260813000000,
+            20260818000000,
+            20260818010000,
+            20260818020000,
         ]
     );
 }
@@ -2211,6 +2253,9 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260727000000,
             20260731000000,
             20260813000000,
+            20260818000000,
+            20260818010000,
+            20260818020000,
         ]
     );
 }
@@ -2235,7 +2280,15 @@ fn pending_migrations_from_applied_leaves_new_outcome_migration_after_empty_data
     // The snapshot is intentionally stamped at the last schema version that
     // predates request-outcome metrics.  The new additive migration must stay
     // pending so startup applies the columns without rewriting historical rows.
-    assert_eq!(pending_versions, vec![20260813000000]);
+    assert_eq!(
+        pending_versions,
+        vec![
+            20260813000000,
+            20260818000000,
+            20260818010000,
+            20260818020000,
+        ]
+    );
 }
 
 #[tokio::test]

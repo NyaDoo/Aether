@@ -366,6 +366,7 @@ export const MOCK_USER_API_KEYS = [
   {
     id: 'key-uuid-001',
     key_display: 'sk-ae...x7f9',
+    credential_type: 'api_key',
     name: '开发环境',
     created_at: '2024-06-15T00:00:00Z',
     last_used_at: new Date().toISOString(),
@@ -378,6 +379,7 @@ export const MOCK_USER_API_KEYS = [
   {
     id: 'key-uuid-002',
     key_display: 'sk-ae...m2k8',
+    credential_type: 'api_key',
     name: '生产环境',
     created_at: '2024-07-01T00:00:00Z',
     last_used_at: new Date().toISOString(),
@@ -390,6 +392,7 @@ export const MOCK_USER_API_KEYS = [
   {
     id: 'key-uuid-003',
     key_display: 'sk-ae...p9q1',
+    credential_type: 'api_key',
     name: '测试用途',
     created_at: '2024-08-01T00:00:00Z',
     is_active: false,
@@ -1244,9 +1247,12 @@ export const MOCK_API_FORMATS = {
     { value: 'gemini:interactions', label: 'Gemini Interactions', default_path: '/v1/interactions', aliases: [] },
     { value: 'gemini:embedding', label: 'Gemini Embedding', default_path: '/v1beta/models/{model}:embedContent', aliases: [] },
     { value: 'gemini:video', label: 'Gemini Video', default_path: '/v1beta/models/{model}:predictLongRunning', aliases: [] },
+    { value: 'gemini:files', label: 'Gemini Files', default_path: '/v1beta/files', aliases: ['gemini_files'] },
     { value: 'jina:embedding', label: 'Jina Embedding', default_path: '/v1/embeddings', aliases: [] },
     { value: 'jina:rerank', label: 'Jina Rerank', default_path: '/v1/rerank', aliases: [] },
     { value: 'doubao:embedding', label: 'Doubao Embedding', default_path: '/embeddings/multimodal', aliases: [] },
+    { value: 'doubao:video', label: 'Doubao Video', default_path: '/v3/contents/generations/tasks', aliases: ['doubao_video', 'seedance', 'ark_video'] },
+    { value: 'doubao:asset_library', label: 'Ark Asset Library', default_path: '/?Action={action}&Version=2024-01-01', aliases: ['doubao_asset_library', 'ark_assets', 'ark_materials'] },
     {
       value: 'aliyun:multimodal_embedding',
       label: 'Aliyun Multimodal Embedding',

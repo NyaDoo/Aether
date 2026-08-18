@@ -69,6 +69,7 @@ export const API_FORMAT_LABELS: Record<string, string> = {
   JINA_RERANK: 'Jina Rerank',
   DOUBAO_EMBEDDING: 'Doubao Embedding',
   DOUBAO_VIDEO: 'Doubao Video',
+  DOUBAO_ASSET_LIBRARY: 'Ark Asset Library',
   ALIYUN_MULTIMODAL_EMBEDDING: 'Aliyun Multimodal Embedding',
 }
 
@@ -92,6 +93,7 @@ export const API_FORMAT_SHORT: Record<string, string> = {
   [API_FORMATS.JINA_RERANK]: 'JR',
   [API_FORMATS.DOUBAO_EMBEDDING]: 'DE',
   [API_FORMATS.DOUBAO_VIDEO]: 'DV',
+  [API_FORMATS.DOUBAO_ASSET_LIBRARY]: 'DAL',
   [API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING]: 'AE',
   OPENAI: 'O',
   OPENAI_RESPONSES: 'OR',
@@ -113,6 +115,7 @@ export const API_FORMAT_SHORT: Record<string, string> = {
   JINA_RERANK: 'JR',
   DOUBAO_EMBEDDING: 'DE',
   DOUBAO_VIDEO: 'DV',
+  DOUBAO_ASSET_LIBRARY: 'DAL',
   ALIYUN_MULTIMODAL_EMBEDDING: 'AE',
 }
 
@@ -136,6 +139,7 @@ export const API_FORMAT_ORDER: string[] = [
   API_FORMATS.JINA_RERANK,
   API_FORMATS.DOUBAO_EMBEDDING,
   API_FORMATS.DOUBAO_VIDEO,
+  API_FORMATS.DOUBAO_ASSET_LIBRARY,
   API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING,
 ]
 
@@ -163,6 +167,8 @@ export const API_FORMAT_KIND_LABELS: Record<string, string> = {
   files: 'Files',
   embedding: 'Embedding',
   rerank: 'Rerank',
+  asset_library: 'Asset Library',
+  multimodal_embedding: 'Multimodal Embedding',
 }
 
 // Family 排序顺序
@@ -219,6 +225,8 @@ export function normalizeApiFormatAlias(format: string | null | undefined): stri
       return API_FORMATS.DOUBAO_EMBEDDING
     case 'DOUBAO_VIDEO':
       return API_FORMATS.DOUBAO_VIDEO
+    case 'DOUBAO_ASSET_LIBRARY':
+      return API_FORMATS.DOUBAO_ASSET_LIBRARY
     case 'ALIYUN_MULTIMODAL_EMBEDDING':
     case 'ALIYUN_EMBEDDING':
     case 'DASHSCOPE_MULTIMODAL_EMBEDDING':
@@ -301,7 +309,18 @@ export function formatApiFormatShort(format: string | null | undefined): string 
   return API_FORMAT_SHORT[normalized]
     || API_FORMAT_SHORT[normalized.toLowerCase()]
     || API_FORMAT_SHORT[upper]
-    || normalized.substring(0, 2)
+    || deriveApiFormatShort(normalized)
+}
+
+function deriveApiFormatShort(format: string): string {
+  const segments = format.split(/[:_-]+/).filter(Boolean)
+  if (segments.length <= 1) return format.substring(0, 2).toUpperCase()
+
+  const [family, ...kindSegments] = segments
+  const kindShort = kindSegments.length === 1
+    ? kindSegments[0].substring(0, 2)
+    : kindSegments.map(segment => segment[0]).join('').substring(0, 3)
+  return `${family[0]}${kindShort}`.toUpperCase()
 }
 
 // 工具函数：按标准顺序排序 API 格式数组

@@ -104,6 +104,9 @@ impl CachedAuthApiKeyReadRepository {
             AuthApiKeyLookupKey::KeyHash(value) => {
                 AuthApiKeySnapshotCacheKey::KeyHash(value.to_string())
             }
+            AuthApiKeyLookupKey::AccessKeyId(value) => {
+                AuthApiKeySnapshotCacheKey::AccessKeyId(value.to_string())
+            }
             AuthApiKeyLookupKey::ApiKeyId(value) => {
                 AuthApiKeySnapshotCacheKey::ApiKeyId(value.to_string())
             }
@@ -164,11 +167,25 @@ impl super::GatewayDataState {
             )
             .await
     }
+
+    pub(crate) async fn read_auth_api_key_snapshot_by_access_key_id_strong(
+        &self,
+        access_key_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<Option<crate::data::auth::GatewayAuthApiKeySnapshot>, DataLayerError> {
+        AUTH_API_KEY_READ_CACHE_BYPASS
+            .scope(
+                (),
+                self.read_auth_api_key_snapshot_by_access_key_id(access_key_id, now_unix_secs),
+            )
+            .await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum AuthApiKeySnapshotCacheKey {
     KeyHash(String),
+    AccessKeyId(String),
     ApiKeyId(String),
     UserApiKeyIds { user_id: String, api_key_id: String },
 }
