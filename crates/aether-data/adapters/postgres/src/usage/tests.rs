@@ -20,10 +20,57 @@ use super::{
 };
 use crate::{PostgresPoolConfig, PostgresPoolFactory};
 use aether_data_contracts::repository::usage::{
-    UpsertUsageRecord, UsageAuditListQuery, UsageBodyCaptureState, UsageBodyField,
-    UsageCostSavingsSummaryQuery, UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery,
-    UsageProviderPerformanceQuery, UsageTimeSeriesGranularity, UsageWriteRepository,
+    ProviderApiKeyUsageDelta, UpsertUsageRecord, UsageAuditListQuery, UsageBodyCaptureState,
+    UsageBodyField, UsageCostSavingsSummaryQuery, UsageDashboardDailyBreakdownQuery,
+    UsageDashboardSummaryQuery, UsageProviderPerformanceQuery, UsageTimeSeriesGranularity,
+    UsageWriteRepository,
 };
+
+fn postgres_parameter_count(sql: &str) -> usize {
+    sql.as_bytes()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| {
+            (*byte == b'$').then(|| {
+                sql[index + 1..]
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .fold(0usize, |value, digit| {
+                        value * 10 + usize::from(digit - b'0')
+                    })
+            })
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+#[test]
+fn provider_api_key_usage_delta_query_binds_every_postgres_parameter() {
+    use sqlx::{Arguments, Execute};
+
+    let delta = ProviderApiKeyUsageDelta {
+        request_count: 1,
+        sla_eligible_count: 2,
+        success_count: 3,
+        error_count: 4,
+        user_error_count: 5,
+        total_tokens: 6,
+        total_cost_usd: 7.0,
+        total_response_time_ms: 8,
+        candidate_last_used_at_unix_secs: Some(9),
+        removed_last_used_at_unix_secs: Some(10),
+        usage_created_at_unix_secs: None,
+    };
+    let mut query = super::provider_api_key_usage_delta_query("provider-key", &delta);
+    let parameter_count = postgres_parameter_count(query.sql());
+    let arguments = query
+        .take_arguments()
+        .expect("provider key query arguments should encode")
+        .expect("provider key query should have arguments");
+
+    assert_eq!(parameter_count, 11);
+    assert_eq!(arguments.len(), parameter_count);
+}
 
 fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")

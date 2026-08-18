@@ -11664,6 +11664,17 @@ async fn apply_provider_api_key_main_usage_delta_in_tx(
         return Ok(());
     }
 
+    provider_api_key_usage_delta_query(key_id, delta)
+        .execute(&mut **tx)
+        .await
+        .map_postgres_err()?;
+    Ok(())
+}
+
+fn provider_api_key_usage_delta_query<'a>(
+    key_id: &'a str,
+    delta: &'a ProviderApiKeyUsageDelta,
+) -> Query<'a, Postgres, PgArguments> {
     let total_cost_usd_delta = if delta.total_cost_usd.is_finite() {
         delta.total_cost_usd
     } else {
@@ -11673,8 +11684,10 @@ async fn apply_provider_api_key_main_usage_delta_in_tx(
     sqlx::query(APPLY_PROVIDER_API_KEY_USAGE_DELTA_SQL)
         .bind(key_id)
         .bind(delta.request_count)
+        .bind(delta.sla_eligible_count)
         .bind(delta.success_count)
         .bind(delta.error_count)
+        .bind(delta.user_error_count)
         .bind(delta.total_tokens)
         .bind(total_cost_usd_delta)
         .bind(delta.total_response_time_ms)
@@ -11688,10 +11701,6 @@ async fn apply_provider_api_key_main_usage_delta_in_tx(
                 .removed_last_used_at_unix_secs
                 .map(|value| value as f64),
         )
-        .execute(&mut **tx)
-        .await
-        .map_postgres_err()?;
-    Ok(())
 }
 
 async fn apply_provider_monthly_usage_delta_in_tx(
