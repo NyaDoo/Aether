@@ -3,6 +3,7 @@ pub(crate) mod api;
 mod finalize;
 mod planner;
 mod pure;
+mod response_history;
 pub(crate) mod transport;
 
 use axum::body::Body;
@@ -51,19 +52,25 @@ pub(crate) use self::planner::{
     build_standard_family_sync_plan_and_reports, build_standard_stream_plan_from_decision,
     build_standard_sync_plan_from_decision, candidate_auth_channel_skip_reason,
     codex_model_capabilities_for_transport, extract_pool_sticky_session_token,
-    maybe_build_stream_decision_payload, maybe_build_stream_plan_payload,
-    maybe_build_sync_decision_payload, maybe_build_sync_plan_payload,
-    planner_is_matching_stream_request, provider_key_pool_score_id, provider_key_pool_score_scope,
-    read_candidate_transport_snapshot, record_local_runtime_candidate_skip_reason,
+    maybe_build_responses_websocket_decision, maybe_build_stream_decision_payload,
+    maybe_build_stream_plan_payload, maybe_build_sync_decision_payload,
+    maybe_build_sync_plan_payload, planner_is_matching_stream_request, provider_key_pool_score_id,
+    provider_key_pool_score_scope, read_candidate_transport_snapshot,
+    record_local_runtime_candidate_skip_reason, resolve_provider_chat_pii_redaction,
     resolve_tunnel_scheduler_affinity_context, resolve_upstream_is_stream_for_provider,
     set_local_openai_chat_execution_exhausted_diagnostic,
     set_local_openai_image_execution_exhausted_diagnostic, validate_final_openai_provider_request,
     CandidateFailureDiagnostic, CandidateFailureDiagnosticKind, EligibleLocalExecutionCandidate,
     GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalExecutionAttemptSource,
     LocalExecutionCandidateKind, LocalResolvedOAuthRequestAuth, PlannerAppState,
-    SkippedLocalExecutionCandidate,
+    ResponsesWebSocketBodyNormalization, ResponsesWebSocketDecision,
+    ResponsesWebSocketPinnedCandidate, SkippedLocalExecutionCandidate,
 };
 pub(crate) use self::pure::*;
+pub(crate) use self::response_history::{
+    hydrate_openai_response_history, persist_converted_response_history,
+    persist_response_history_record,
+};
 pub(crate) use self::transport::{
     append_transport_diagnostics_to_value, build_request_trace_proxy_value,
     candidate_common_transport_skip_reason, candidate_transport_pair_skip_reason,

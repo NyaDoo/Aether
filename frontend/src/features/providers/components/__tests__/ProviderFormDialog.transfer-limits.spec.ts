@@ -204,21 +204,23 @@ describe('ProviderFormDialog transfer limits', () => {
     )
   })
 
-  it('hides the controls when creating while still sending zero defaults', async () => {
+  it('allows configuring transfer limits when creating', async () => {
     mountDialog(null)
     await settle()
 
-    expect(document.body.querySelector('#max-transfer-count')).toBeNull()
-    expect(document.body.querySelector('#max-transfer-timeout-seconds')).toBeNull()
+    expect(document.body.querySelector<HTMLInputElement>('#max-transfer-count')?.value).toBe('')
+    expect(document.body.querySelector<HTMLInputElement>('#max-transfer-timeout-seconds')?.value).toBe('')
 
     await setInput('#name', 'New Provider')
+    await setInput('#max-transfer-count', '8')
+    await setInput('#max-transfer-timeout-seconds', '30')
     clickButton('创建')
     await settle()
 
     expect(endpointMocks.createProvider).toHaveBeenCalledWith(
       expect.objectContaining({
-        max_transfer_count: 0,
-        max_transfer_timeout_seconds: 0,
+        max_transfer_count: 8,
+        max_transfer_timeout_seconds: 30,
       }),
     )
   })
@@ -253,5 +255,94 @@ describe('ProviderFormDialog provider types', () => {
         provider_type: 'claude_code',
       }),
     )
+  })
+
+  it('shows fingerprint convergence only for Codex and submits the enabled setting', async () => {
+    mountDialog(null)
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="codex-fingerprint-convergence-setting"]')).toBeNull()
+
+    const providerTypeSelect = [...document.body.querySelectorAll<HTMLSelectElement>('select')]
+      .find(select => select.querySelector('option[value="codex"]'))
+    if (!providerTypeSelect) throw new Error('Missing provider type select')
+
+    providerTypeSelect.value = 'codex'
+    providerTypeSelect.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+
+    const convergenceSwitch = document.body.querySelector<HTMLButtonElement>(
+      '#codex-fingerprint-convergence',
+    )
+    expect(convergenceSwitch).not.toBeNull()
+    expect(convergenceSwitch?.getAttribute('aria-checked')).toBe('false')
+
+    convergenceSwitch?.click()
+    await nextTick()
+    expect(convergenceSwitch?.getAttribute('aria-checked')).toBe('true')
+
+    await setInput('#name', 'Codex Provider')
+    clickButton('创建')
+    await settle()
+
+    expect(endpointMocks.createProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'Codex Provider',
+        provider_type: 'codex',
+        codex_fingerprint_convergence_enabled: true,
+      }),
+    )
+  })
+
+  it('loads and can disable fingerprint convergence for an existing Codex provider', async () => {
+    mountDialog(makeProvider({
+      provider_type: 'codex',
+      codex_fingerprint_convergence_enabled: true,
+    }))
+    await settle()
+
+    const convergenceSwitch = document.body.querySelector<HTMLButtonElement>(
+      '#codex-fingerprint-convergence',
+    )
+    expect(convergenceSwitch?.getAttribute('aria-checked')).toBe('true')
+
+    convergenceSwitch?.click()
+    clickButton('保存')
+    await settle()
+
+    expect(endpointMocks.updateProvider).toHaveBeenCalledWith(
+      'provider-1',
+      expect.objectContaining({
+        provider_type: 'codex',
+        codex_fingerprint_convergence_enabled: false,
+      }),
+    )
+  })
+
+  it('clears and does not submit the setting after switching away from Codex', async () => {
+    mountDialog(null)
+    await settle()
+
+    const providerTypeSelect = [...document.body.querySelectorAll<HTMLSelectElement>('select')]
+      .find(select => select.querySelector('option[value="codex"]'))
+    if (!providerTypeSelect) throw new Error('Missing provider type select')
+
+    providerTypeSelect.value = 'codex'
+    providerTypeSelect.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    document.body.querySelector<HTMLButtonElement>('#codex-fingerprint-convergence')?.click()
+    await nextTick()
+
+    providerTypeSelect.value = 'custom'
+    providerTypeSelect.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    expect(document.body.querySelector('[data-testid="codex-fingerprint-convergence-setting"]')).toBeNull()
+
+    await setInput('#name', 'Custom Provider')
+    clickButton('创建')
+    await settle()
+
+    const payload = endpointMocks.createProvider.mock.calls[0]?.[0]
+    expect(payload).not.toHaveProperty('codex_fingerprint_convergence_enabled')
   })
 })

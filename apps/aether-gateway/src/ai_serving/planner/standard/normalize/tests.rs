@@ -153,6 +153,43 @@ fn local_openai_responses_wrapper_preserves_body_order_after_edits() {
 }
 
 #[test]
+fn local_openai_responses_wrapper_strips_foreign_reasoning_item_ids() {
+    let body_json = json!({
+        "model": "gpt-5.4",
+        "input": [
+            {"type": "reasoning", "id": "rs_provider_123", "summary": []},
+            {
+                "type": "reasoning",
+                "id": "item_72d3bd8d367d01977ace23f1",
+                "summary": []
+            },
+            {"type": "message", "role": "user", "content": "continue"}
+        ]
+    });
+
+    let provider_request_body = build_local_openai_responses_request_body(
+        &body_json,
+        "gpt-5.4",
+        false,
+        false,
+        "codex",
+        "openai:responses",
+        None,
+        None,
+        &http::HeaderMap::new(),
+        false,
+    )
+    .expect("local OpenAI Responses body should build");
+
+    let input = provider_request_body["input"]
+        .as_array()
+        .expect("input array");
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[0]["id"], "rs_provider_123");
+    assert_eq!(input[1]["type"], "message");
+}
+
+#[test]
 fn local_openai_responses_compact_wrapper_strips_store_for_same_format_requests() {
     let body_json = json!({
         "model": "gpt-5.4",
@@ -315,7 +352,7 @@ fn final_openai_provider_contract_uses_the_mapped_model_for_reasoning() {
         false,
     )
     .is_some());
-    assert!(build_local_openai_responses_request_body(
+    let remapped = build_local_openai_responses_request_body(
         &alias,
         "gpt-5.4",
         false,
@@ -327,14 +364,15 @@ fn final_openai_provider_contract_uses_the_mapped_model_for_reasoning() {
         &http::HeaderMap::new(),
         false,
     )
-    .is_none());
+    .expect("explicit reasoning effort should pass through to the mapped model");
+    assert_eq!(remapped["reasoning"]["effort"], "max");
 
     let minimal = json!({
         "model": "deployment-alias",
         "messages": [{"role": "user", "content": "hello"}],
         "reasoning_effort": "minimal"
     });
-    assert!(build_local_openai_chat_request_body(
+    let minimal = build_local_openai_chat_request_body(
         &minimal,
         "gpt-5.6-terra",
         false,
@@ -343,7 +381,8 @@ fn final_openai_provider_contract_uses_the_mapped_model_for_reasoning() {
         &http::HeaderMap::new(),
         false,
     )
-    .is_none());
+    .expect("explicit chat reasoning effort should be validated by the upstream");
+    assert_eq!(minimal["reasoning_effort"], "minimal");
 
     let opaque_mapping = json!({
         "model": "gpt-5.6-sol-max",
@@ -389,7 +428,7 @@ fn final_openai_provider_contract_validates_body_rule_output() {
     let model_override = json!([
         {"action":"set","path":"model","value":"gpt-5.4"}
     ]);
-    assert!(build_local_openai_responses_request_body(
+    let provider_request = build_local_openai_responses_request_body(
         &body,
         "gpt-5.6-sol",
         false,
@@ -401,7 +440,9 @@ fn final_openai_provider_contract_validates_body_rule_output() {
         &http::HeaderMap::new(),
         false,
     )
-    .is_none());
+    .expect("body rule output should preserve explicit reasoning effort");
+    assert_eq!(provider_request["model"], "gpt-5.4");
+    assert_eq!(provider_request["reasoning"]["effort"], "max");
 
     let cache_override = json!([
         {"action":"set","path":"prompt_cache_options.ttl","value":"1h"}

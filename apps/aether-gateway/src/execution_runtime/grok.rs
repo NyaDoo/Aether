@@ -26,6 +26,7 @@ use crate::ai_serving::api::{
     CanonicalContentPart, CanonicalStreamEvent, CanonicalStreamFrame, ClaudeClientEmitter,
     OpenAIChatClientEmitter, OpenAIResponsesClientEmitter, StreamingCanonicalUsage,
 };
+use crate::ai_serving::openai_responses_synthetic_reasoning_item_id;
 use crate::clock::current_unix_secs;
 use crate::execution_runtime::ndjson::encode_stream_frame_ndjson;
 use crate::execution_runtime::transport::{
@@ -840,6 +841,7 @@ fn encode_grok_headers_frame(
         payload: StreamFramePayload::Headers {
             status_code,
             headers,
+            response_observation: None,
         },
     })
 }
@@ -2156,6 +2158,7 @@ fn grok_execution_result(
         candidate_id: plan.candidate_id.clone(),
         status_code,
         headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        response_observation: None,
         body: Some(ResponseBody {
             json_body: Some(body_json),
             body_bytes_b64: None,
@@ -2219,6 +2222,7 @@ fn grok_collected_frame_stream(
                         "application/json".to_string()
                     },
                 )]),
+                response_observation: None,
             },
         },
         StreamFrame {
@@ -2705,7 +2709,7 @@ fn openai_responses_body(
     let mut output = Vec::new();
     if !collected.thinking.trim().is_empty() {
         output.push(json!({
-            "id": format!("{response_id}_rs_0"),
+            "id": openai_responses_synthetic_reasoning_item_id(&response_id, 0),
             "type": "reasoning",
             "status": "completed",
             "summary": [{

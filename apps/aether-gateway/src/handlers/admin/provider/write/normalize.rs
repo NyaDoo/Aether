@@ -111,25 +111,49 @@ pub(crate) fn normalize_allow_auth_channel_mismatch_formats(
     field_name: &str,
     api_formats: &[String],
 ) -> Result<Option<serde_json::Value>, String> {
-    let Some(values) = values else {
+    let Some(values) = canonical_allow_auth_channel_mismatch_formats(values) else {
         return Ok(None);
     };
     let allowed = api_formats.iter().cloned().collect::<BTreeSet<_>>();
-    let mut seen = BTreeSet::new();
-    let mut normalized = Vec::new();
-    for value in values {
-        let canonical = crate::ai_serving::normalize_api_format_alias(&value);
-        if canonical.is_empty() {
-            continue;
-        }
-        if !allowed.is_empty() && !allowed.contains(&canonical) {
-            return Err(format!("{field_name} 包含未选择的 API 格式: {canonical}"));
-        }
-        if seen.insert(canonical.clone()) {
-            normalized.push(serde_json::Value::String(canonical));
+    for value in &values {
+        if !allowed.is_empty() && !allowed.contains(value) {
+            return Err(format!("{field_name} 包含未选择的 API 格式: {value}"));
         }
     }
-    Ok(Some(serde_json::Value::Array(normalized)))
+    Ok(Some(json_string_array(values)))
+}
+
+pub(crate) fn reconcile_allow_auth_channel_mismatch_formats(
+    values: Option<Vec<String>>,
+    api_formats: &[String],
+) -> Option<serde_json::Value> {
+    let values = canonical_allow_auth_channel_mismatch_formats(values)?;
+    let allowed = api_formats.iter().cloned().collect::<BTreeSet<_>>();
+    Some(json_string_array(
+        values
+            .into_iter()
+            .filter(|value| allowed.contains(value))
+            .collect(),
+    ))
+}
+
+fn canonical_allow_auth_channel_mismatch_formats(
+    values: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let values = values?;
+    let mut seen = BTreeSet::new();
+    Some(
+        values
+            .into_iter()
+            .map(|value| crate::ai_serving::normalize_api_format_alias(&value))
+            .filter(|value| !value.is_empty())
+            .filter(|value| seen.insert(value.clone()))
+            .collect(),
+    )
+}
+
+fn json_string_array(values: Vec<String>) -> serde_json::Value {
+    serde_json::Value::Array(values.into_iter().map(serde_json::Value::String).collect())
 }
 
 pub(crate) fn normalize_auth_type(value: Option<&str>) -> Result<String, String> {
@@ -184,6 +208,53 @@ pub(crate) fn normalize_chat_pii_redaction_config(
     }
 }
 
+pub(crate) fn set_responses_websocket_enabled(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut responses = match config.remove("responses_websocket") {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(config)) => config,
+        Some(_) => return Err("config.responses_websocket 必须是 JSON 对象".to_string()),
+    };
+    responses.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+    config.insert(
+        "responses_websocket".to_string(),
+        serde_json::Value::Object(responses),
+    );
+    Ok(())
+}
+
+pub(crate) fn remove_responses_websocket_enabled(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(serde_json::Value::Object(responses)) = config.get_mut("responses_websocket") else {
+        return;
+    };
+    responses.remove("enabled");
+    if responses.is_empty() {
+        config.remove("responses_websocket");
+    }
+}
+
+pub(crate) fn validate_responses_websocket_config(
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Some(value) = config.get("responses_websocket") {
+        let responses = value
+            .as_object()
+            .ok_or_else(|| "config.responses_websocket 必须是 JSON 对象".to_string())?;
+        let enabled = responses
+            .get("enabled")
+            .ok_or_else(|| "config.responses_websocket.enabled 为必填布尔值".to_string())?;
+        if !enabled.is_boolean() {
+            return Err("config.responses_websocket.enabled 必须是布尔值".to_string());
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn validate_vertex_api_formats(
     provider_type: &str,
     auth_type: &str,
@@ -233,7 +304,10 @@ mod tests {
         normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
         normalize_chat_pii_redaction_config, normalize_pool_advanced_config,
-        normalize_provider_type_input, normalize_rate_multipliers, validate_vertex_api_formats,
+        normalize_provider_type_input, normalize_rate_multipliers,
+        reconcile_allow_auth_channel_mismatch_formats, remove_responses_websocket_enabled,
+        set_responses_websocket_enabled, validate_responses_websocket_config,
+        validate_vertex_api_formats,
     };
     use serde_json::json;
 
@@ -290,6 +364,21 @@ mod tests {
             normalize_chat_pii_redaction_config(Some(json!({ "enabled": "yes" }))).unwrap_err(),
             "chat_pii_redaction.enabled 必须是布尔值"
         );
+    }
+
+    #[test]
+    fn responses_websocket_setting_is_available_to_explicitly_enabled_providers() {
+        let mut config = serde_json::Map::new();
+        set_responses_websocket_enabled(&mut config, true)
+            .expect("Responses setting should be accepted");
+        assert_eq!(
+            config.get("responses_websocket"),
+            Some(&json!({"enabled": true}))
+        );
+        validate_responses_websocket_config(&config).expect("Responses setting should validate");
+
+        remove_responses_websocket_enabled(&mut config);
+        assert!(config.get("responses_websocket").is_none());
     }
 
     #[test]
@@ -402,6 +491,28 @@ mod tests {
             )
             .expect("format list should normalize"),
             Some(json!(["claude:messages"]))
+        );
+    }
+
+    #[test]
+    fn reconcile_allow_auth_channel_mismatch_formats_keeps_only_selected_formats() {
+        assert_eq!(
+            reconcile_allow_auth_channel_mismatch_formats(
+                Some(vec![
+                    "OPENAI:EMBEDDING".to_string(),
+                    "gemini:generate_content".to_string(),
+                    " GEMINI:GENERATE_CONTENT ".to_string(),
+                ]),
+                &["gemini:generate_content".to_string()],
+            ),
+            Some(json!(["gemini:generate_content"]))
+        );
+        assert_eq!(
+            reconcile_allow_auth_channel_mismatch_formats(
+                Some(vec!["openai:embedding".to_string()]),
+                &["gemini:generate_content".to_string()],
+            ),
+            Some(json!([]))
         );
     }
 

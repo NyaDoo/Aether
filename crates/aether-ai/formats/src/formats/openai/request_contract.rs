@@ -76,12 +76,11 @@ pub fn finalize_openai_provider_request_with_codex_model_capabilities(
             )
         }
     }
-    super::responses::codex::normalize_codex_openai_reasoning_wire_effort(
+    super::responses::codex::apply_openai_responses_compact_special_body_edits(
         body,
-        finalization.provider_type,
         finalization.provider_api_format,
     );
-    super::responses::codex::apply_openai_responses_compact_special_body_edits(
+    super::responses::strip_incompatible_openai_responses_reasoning_items(
         body,
         finalization.provider_api_format,
     );
@@ -104,12 +103,11 @@ pub fn finalize_openai_provider_request_with_codex_model_capabilities(
         finalization.provider_api_format,
     )
     .map_err(OpenAiProviderRequestContractViolation::CodexCompact)?;
-    validate_openai_provider_request_contract_with_codex_model_capabilities(
+    validate_final_openai_provider_request_contract(
         finalization.provider_api_format,
         provider_model,
         finalization.source_model,
         body,
-        model_capabilities,
     )
 }
 
@@ -119,21 +117,19 @@ pub fn validate_openai_provider_request_contract(
     source_model: &str,
     body: &Value,
 ) -> Result<(), OpenAiProviderRequestContractViolation> {
-    validate_openai_provider_request_contract_with_codex_model_capabilities(
+    validate_final_openai_provider_request_contract(
         provider_api_format,
         provider_model,
         source_model,
         body,
-        None,
     )
 }
 
-fn validate_openai_provider_request_contract_with_codex_model_capabilities(
+fn validate_final_openai_provider_request_contract(
     provider_api_format: &str,
     provider_model: &str,
     source_model: &str,
     body: &Value,
-    model_capabilities: Option<&super::responses::codex::CodexResponsesModelCapabilities>,
 ) -> Result<(), OpenAiProviderRequestContractViolation> {
     super::responses::request::validate_openai_responses_request_contract(
         body,
@@ -153,7 +149,6 @@ fn validate_openai_provider_request_contract_with_codex_model_capabilities(
         provider_model,
         source_model,
         body,
-        model_capabilities.map(|capabilities| capabilities.supported_reasoning_efforts.as_slice()),
         None,
     )
     .map_err(OpenAiProviderRequestContractViolation::Reasoning)
@@ -220,14 +215,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_finalization_enforces_model_card_reasoning_efforts() {
+    fn codex_finalization_defers_explicit_reasoning_effort_to_upstream() {
         let mut body = json!({
             "model": "gpt-5.6-sol",
             "input": [],
             "reasoning": {"effort": "minimal"}
         });
 
-        let error = finalize_openai_provider_request(
+        finalize_openai_provider_request(
             &mut body,
             OpenAiProviderRequestFinalization {
                 source_api_format: "openai:responses",
@@ -240,17 +235,35 @@ mod tests {
                 require_body_stream_field: true,
             },
         )
-        .expect_err("GPT-5.6 Codex model card should reject minimal");
+        .expect("explicit reasoning effort support should be validated by the upstream");
 
-        assert!(matches!(
-            error,
-            super::OpenAiProviderRequestContractViolation::Reasoning(
-                super::OpenAiReasoningContractViolation {
-                    kind: crate::formats::openai::reasoning::OpenAiReasoningViolationKind::UnsupportedForModel,
-                    ..
-                }
-            )
-        ));
+        assert_eq!(body["reasoning"]["effort"], "minimal");
+    }
+
+    #[test]
+    fn codex_finalization_accepts_none_for_gpt_5_4_mini() {
+        let mut body = json!({
+            "model": "gpt-5.4-mini",
+            "input": [{"role": "user", "content": "hello"}],
+            "reasoning": {"effort": "none"}
+        });
+
+        finalize_openai_provider_request(
+            &mut body,
+            OpenAiProviderRequestFinalization {
+                source_api_format: "openai:responses",
+                provider_api_format: "openai:responses",
+                provider_type: "codex",
+                provider_model: "gpt-5.4-mini",
+                source_model: "gpt-5.4-mini",
+                body_rules: None,
+                upstream_is_stream: false,
+                require_body_stream_field: true,
+            },
+        )
+        .expect("GPT-5.4 mini should accept the official none reasoning effort");
+
+        assert_eq!(body["reasoning"]["effort"], "none");
     }
 
     #[test]
@@ -297,6 +310,42 @@ mod tests {
     }
 
     #[test]
+    fn finalization_strips_non_replayable_responses_reasoning_history() {
+        let mut body = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "reasoning", "id": "rs_provider_123", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "item_72d3bd8d367d01977ace23f1",
+                    "summary": []
+                },
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+
+        finalize_openai_provider_request(
+            &mut body,
+            OpenAiProviderRequestFinalization {
+                source_api_format: "openai:responses",
+                provider_api_format: "openai:responses",
+                provider_type: "openai",
+                provider_model: "gpt-5.4",
+                source_model: "gpt-5.4",
+                body_rules: None,
+                upstream_is_stream: false,
+                require_body_stream_field: false,
+            },
+        )
+        .expect("foreign reasoning history should be sanitized before validation");
+
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["id"], "rs_provider_123");
+        assert_eq!(input[1]["type"], "message");
+    }
+
+    #[test]
     fn non_responses_sources_receive_codex_responses_reasoning_defaults() {
         for source_api_format in ["openai:chat", "claude:messages", "gemini:generate_content"] {
             let mut body = json!({
@@ -324,17 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_ultra_preset_uses_max_for_every_codex_model_on_the_wire() {
-        let mut sol = json!({
-            "model": "gpt-5.6-sol",
-            "input": [],
-            "reasoning": {"effort": "ultra"}
-        });
-        let mut luna = json!({
-            "model": "gpt-5.6-luna",
-            "input": [],
-            "reasoning": {"effort": "ultra"}
-        });
+    fn codex_finalization_preserves_explicit_reasoning_effort() {
         let finalization_for = |model| OpenAiProviderRequestFinalization {
             source_api_format: "openai:responses",
             provider_api_format: "openai:responses",
@@ -346,17 +385,20 @@ mod tests {
             require_body_stream_field: true,
         };
 
-        finalize_openai_provider_request(&mut sol, finalization_for("gpt-5.6-sol"))
-            .expect("Sol ultra preset should map to the OpenAI wire contract");
-        assert_eq!(sol["reasoning"]["effort"], "max");
-
-        finalize_openai_provider_request(&mut luna, finalization_for("gpt-5.6-luna"))
-            .expect("Luna ultra preset should map to the OpenAI wire contract");
-        assert_eq!(luna["reasoning"]["effort"], "max");
+        for (model, effort) in [("gpt-5.6-sol", "max"), ("gpt-5.6-luna", "ultra")] {
+            let mut body = json!({
+                "model": model,
+                "input": [],
+                "reasoning": {"effort": effort}
+            });
+            finalize_openai_provider_request(&mut body, finalization_for(model))
+                .expect("explicit effort support should be validated by the upstream");
+            assert_eq!(body["reasoning"]["effort"], effort);
+        }
     }
 
     #[test]
-    fn dynamic_codex_card_controls_default_effort_and_keeps_mode_model_specific() {
+    fn dynamic_codex_card_preserves_default_effort_and_keeps_mode_model_specific() {
         let finalization = OpenAiProviderRequestFinalization {
             source_api_format: "openai:responses",
             provider_api_format: "openai:responses",
@@ -385,8 +427,8 @@ mod tests {
             finalization,
             Some(&capabilities),
         )
-        .expect("card default ultra should use the max wire effort");
-        assert_eq!(default_body["reasoning"]["effort"], "max");
+        .expect("card default effort should be preserved for the upstream");
+        assert_eq!(default_body["reasoning"]["effort"], "ultra");
 
         let mut mode_body = json!({
             "model": "gpt-5.7-sol",
@@ -418,12 +460,12 @@ mod tests {
             finalization,
             Some(&ultra_only),
         )
-        .expect("Codex maps the Ultra preset to max without card-list wire validation");
-        assert_eq!(ultra_only_body["reasoning"]["effort"], "max");
+        .expect("explicit effort support should be validated by the upstream");
+        assert_eq!(ultra_only_body["reasoning"]["effort"], "ultra");
     }
 
     #[test]
-    fn codex_search_normalizes_reasoning_and_projects_the_typed_request() {
+    fn codex_search_projects_wire_reasoning_and_the_typed_request() {
         let finalization = OpenAiProviderRequestFinalization {
             source_api_format: "openai:search",
             provider_api_format: "openai:search",
@@ -438,7 +480,7 @@ mod tests {
             "id": "session-1",
             "model": "gpt-5.6-sol",
             "reasoning": {
-                "effort": "ultra",
+                "effort": "max",
                 "summary": "auto",
                 "context": "current_turn",
                 "future_reasoning_field": true
@@ -465,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_search_validates_reasoning_effort_against_model_card() {
+    fn codex_search_defers_explicit_reasoning_effort_to_upstream() {
         let finalization = OpenAiProviderRequestFinalization {
             source_api_format: "openai:search",
             provider_api_format: "openai:search",
@@ -484,17 +526,14 @@ mod tests {
         finalize_openai_provider_request(&mut supported, finalization)
             .expect("published Search effort should pass");
 
-        let mut unsupported = json!({
+        let mut unpublished = json!({
             "id": "session-1",
             "model": "gpt-5.6-sol",
             "reasoning": {"effort": "none"}
         });
-        let error = finalize_openai_provider_request(&mut unsupported, finalization)
-            .expect_err("unpublished Search effort should be rejected");
-        assert!(matches!(
-            error,
-            super::OpenAiProviderRequestContractViolation::Reasoning(_)
-        ));
+        finalize_openai_provider_request(&mut unpublished, finalization)
+            .expect("unpublished Search effort support should be validated by the upstream");
+        assert_eq!(unpublished["reasoning"]["effort"], "none");
     }
 
     #[test]
@@ -535,32 +574,26 @@ mod tests {
             "input": [],
             "reasoning": {"effort": "vendoreffortx"}
         });
-        let error = finalize_openai_provider_request_with_codex_model_capabilities(
+        finalize_openai_provider_request_with_codex_model_capabilities(
             &mut custom,
             finalization,
             Some(&capabilities),
         )
-        .expect_err("custom reasoning efforts should match the model card exactly");
-        assert!(matches!(
-            error,
-            super::OpenAiProviderRequestContractViolation::Reasoning(_)
-        ));
+        .expect("explicit custom effort support should be validated by the upstream");
+        assert_eq!(custom["reasoning"]["effort"], "vendoreffortx");
 
         let mut ultra = json!({
             "model": "codex-custom",
             "input": [],
             "reasoning": {"effort": "ultra"}
         });
-        let error = finalize_openai_provider_request_with_codex_model_capabilities(
+        finalize_openai_provider_request_with_codex_model_capabilities(
             &mut ultra,
             finalization,
             Some(&capabilities),
         )
-        .expect_err("ultra should require model-card support before mapping to max");
-        assert!(matches!(
-            error,
-            super::OpenAiProviderRequestContractViolation::Reasoning(_)
-        ));
+        .expect("explicit effort support should be validated by the upstream");
+        assert_eq!(ultra["reasoning"]["effort"], "ultra");
     }
 
     #[test]

@@ -2,11 +2,14 @@ use super::{AdminAppState, ADMIN_SYSTEM_DATA_EXPORT_VERSION};
 use crate::ai_serving::build_provider_key_pool_score_upsert;
 use crate::api::ai::admin_endpoint_signature_parts;
 use crate::handlers::admin::admin_provider_pool_config;
+use crate::handlers::admin::model::ADMIN_EXTERNAL_MODELS_PROXY_NODE_CONFIG_KEY;
 use crate::handlers::admin::provider::endpoints_admin::payloads::AdminProviderEndpointUpdatePatch;
+use crate::handlers::admin::provider::oauth::provisioning::ensure_codex_credential_generation_rotated;
 use crate::handlers::admin::provider::shared::payloads::{
     AdminProviderCreateRequest, AdminProviderKeyCreateRequest, AdminProviderKeyUpdatePatch,
     AdminProviderUpdatePatch,
 };
+use crate::handlers::admin::provider::write::keys::build_provider_catalog_key_admin_cas_update;
 use crate::handlers::admin::shared::{
     normalize_json_array, normalize_json_object, normalize_string_list,
 };
@@ -59,6 +62,15 @@ fn invalid_request(detail: impl Into<String>) -> (http::StatusCode, Value) {
         http::StatusCode::BAD_REQUEST,
         json!({ "detail": detail.into() }),
     )
+}
+
+fn normalize_imported_system_config_key(key: &str) -> String {
+    let normalized = normalize_admin_system_config_key(key);
+    if normalized.eq_ignore_ascii_case(ADMIN_EXTERNAL_MODELS_PROXY_NODE_CONFIG_KEY) {
+        ADMIN_EXTERNAL_MODELS_PROXY_NODE_CONFIG_KEY.to_string()
+    } else {
+        normalized
+    }
 }
 
 fn build_admin_system_data_import_part_body(
@@ -367,10 +379,14 @@ fn normalize_import_key_raw_payload(
 
 fn apply_imported_oauth_key_credentials(
     state: &AdminAppState<'_>,
+    provider_type: &str,
+    previous_codex_credential_generation: Option<&str>,
     raw_key: &Map<String, Value>,
     normalized_auth_config: Option<&Value>,
     record: &mut aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
 ) -> Result<bool, String> {
+    let previous_encrypted_api_key = record.encrypted_api_key.clone();
+    let previous_encrypted_auth_config = record.encrypted_auth_config.clone();
     let mut credentials_supplied = false;
     let mut api_key_supplied = false;
     if let Some(api_key_value) = raw_key.get("api_key") {
@@ -414,9 +430,18 @@ fn apply_imported_oauth_key_credentials(
         api_key_supplied,
     );
 
+    let credential_material_changed = record.encrypted_api_key != previous_encrypted_api_key
+        || record.encrypted_auth_config != previous_encrypted_auth_config;
     if credentials_supplied {
         record.oauth_invalid_at_unix_secs = None;
         record.oauth_invalid_reason = None;
+    }
+    if credential_material_changed {
+        ensure_codex_credential_generation_rotated(
+            record,
+            provider_type,
+            previous_codex_credential_generation,
+        );
     }
 
     Ok(credentials_supplied)
@@ -1301,6 +1326,82 @@ impl<'a> AdminAppState<'a> {
 
         let mut stats = AdminSystemConfigImportStats::default();
 
+        // Proxy nodes are deployment-local resources and are intentionally not imported by the
+        // Rust admin backend. Apply the external catalog selector before importing any other
+        // object, and turn a non-empty exported node reference into direct mode. This keeps a
+        // clean-environment restore portable and prevents a late selector validation failure from
+        // leaving the rest of the document partially imported.
+        let (imported_external_models_configs, imported_system_configs): (Vec<_>, Vec<_>) =
+            imported_system_configs.into_iter().partition(|item| {
+                normalize_imported_system_config_key(&item.value.key)
+                    == ADMIN_EXTERNAL_MODELS_PROXY_NODE_CONFIG_KEY
+            });
+        let mut existing_system_config_keys = self
+            .list_system_config_entries()
+            .await?
+            .into_iter()
+            .map(|entry| normalize_imported_system_config_key(&entry.key))
+            .collect::<BTreeSet<_>>();
+        for imported_config_item in imported_external_models_configs {
+            let (_, system_config) = imported_config_item.into_parts();
+            let exists =
+                existing_system_config_keys.contains(ADMIN_EXTERNAL_MODELS_PROXY_NODE_CONFIG_KEY);
+            match (exists, merge_mode) {
+                (true, AdminImportMergeMode::Skip) => {
+                    stats.system_configs.skipped += 1;
+                    continue;
+                }
+                (true, AdminImportMergeMode::Error) => {
+                    return Ok(Err(invalid_request(format!(
+                        "SystemConfig '{ADMIN_EXTERNAL_MODELS_PROXY_NODE_CONFIG_KEY}' 已存在"
+                    ))));
+                }
+                _ => {}
+            }
+
+            let imported_proxy_node_id = match system_config.value {
+                Value::Null => None,
+                Value::String(value) => {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return Ok(Err(invalid_request(
+                            "external_models_proxy_node_id 不能为空",
+                        )));
+                    }
+                    Some(value.to_string())
+                }
+                _ => {
+                    return Ok(Err(invalid_request(
+                        "external_models_proxy_node_id 必须是字符串或 null",
+                    )))
+                }
+            };
+            let request_bytes = Bytes::from(
+                serde_json::to_vec(&json!({ "proxy_node_id": null }))
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?,
+            );
+            match self
+                .apply_admin_external_models_config_update(&request_bytes)
+                .await?
+            {
+                Ok(_) => {
+                    if exists {
+                        stats.system_configs.updated += 1;
+                    } else {
+                        stats.system_configs.created += 1;
+                        existing_system_config_keys
+                            .insert(ADMIN_EXTERNAL_MODELS_PROXY_NODE_CONFIG_KEY.to_string());
+                    }
+                    if let Some(node_id) = imported_proxy_node_id {
+                        stats.errors.push(format!(
+                            "外部模型目录代理节点 '{node_id}' 是当前部署的本地引用；代理节点未导入，已切换为直连"
+                        ));
+                    }
+                }
+                Err((status, payload)) => return Ok(Err((status, payload))),
+            }
+        }
+
         let mut global_models_by_name = self
             .list_admin_global_models(&AdminGlobalModelListQuery {
                 offset: 0,
@@ -1777,6 +1878,15 @@ impl<'a> AdminAppState<'a> {
 
                 if let Some(existing_index) = existing_key_index {
                     let existing_key = existing_keys[existing_index].clone();
+                    let previous_codex_credential_generation = existing_key
+                        .upstream_metadata
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .and_then(|metadata| metadata.get("codex"))
+                        .and_then(|codex| {
+                            aether_admin::provider::quota::codex_credential_generation(Some(codex))
+                        })
+                        .map(ToOwned::to_owned);
                     match merge_mode {
                         AdminImportMergeMode::Skip => {
                             stats.keys.skipped += 1;
@@ -1806,6 +1916,8 @@ impl<'a> AdminAppState<'a> {
                             let oauth_credentials_supplied = if auth_type == "oauth" {
                                 invalid!(apply_imported_oauth_key_credentials(
                                     self,
+                                    &provider.provider_type,
+                                    previous_codex_credential_generation.as_deref(),
                                     &raw_key,
                                     normalized_auth_config.as_ref(),
                                     &mut updated,
@@ -1819,8 +1931,31 @@ impl<'a> AdminAppState<'a> {
                                 imported_key.fingerprint.clone(),
                                 "fingerprint",
                             ));
-                            let Some(mut persisted) =
-                                self.update_provider_catalog_key(&updated).await?
+                            let admin_update = build_provider_catalog_key_admin_cas_update(
+                                &existing_key,
+                                updated.clone(),
+                                &provider.provider_type,
+                            );
+                            if !self
+                                .compare_and_update_provider_catalog_key_admin_state(&admin_update)
+                                .await?
+                            {
+                                return Ok(Err((
+                                    http::StatusCode::CONFLICT,
+                                    json!({
+                                        "detail": format!(
+                                            "Provider '{provider_name}' 的 Key 已被其他请求更新，请重试"
+                                        )
+                                    }),
+                                )));
+                            }
+                            let Some(mut persisted) = self
+                                .read_provider_catalog_keys_by_ids(std::slice::from_ref(
+                                    &updated.id,
+                                ))
+                                .await?
+                                .into_iter()
+                                .next()
                             else {
                                 return Ok(Err(invalid_request(format!(
                                     "更新 Provider '{provider_name}' 的 Key 失败"
@@ -1842,16 +1977,15 @@ impl<'a> AdminAppState<'a> {
                                 persisted = reloaded;
                             }
                             if oauth_credentials_supplied {
-                                if !self
-                                    .clear_provider_catalog_key_oauth_invalid_marker(&updated.id)
-                                    .await?
-                                {
-                                    return Ok(Err(invalid_request(format!(
-                                        "更新 Provider '{provider_name}' 的 Key 失败"
-                                    ))));
-                                }
                                 let Some(reloaded) = self
-                                    .reset_provider_catalog_key_recovery_state(&updated.id)
+                                    .reset_provider_catalog_key_recovery_state_fenced(
+                                        &updated.id,
+                                        updated.encrypted_auth_config.as_deref().ok_or_else(|| {
+                                            GatewayError::Internal(format!(
+                                                "OAuth Provider '{provider_name}' imported without auth_config"
+                                            ))
+                                        })?,
+                                    )
                                     .await?
                                 else {
                                     return Ok(Err(invalid_request(format!(
@@ -1891,6 +2025,8 @@ impl<'a> AdminAppState<'a> {
                 let oauth_credentials_supplied = if auth_type == "oauth" {
                     invalid!(apply_imported_oauth_key_credentials(
                         self,
+                        &provider.provider_type,
+                        None,
                         &raw_key,
                         normalized_auth_config.as_ref(),
                         &mut record,
@@ -2233,15 +2369,14 @@ impl<'a> AdminAppState<'a> {
             }
         }
 
-        let mut existing_system_config_keys = self
-            .list_system_config_entries()
-            .await?
-            .into_iter()
-            .map(|entry| normalize_admin_system_config_key(&entry.key))
-            .collect::<BTreeSet<_>>();
         for imported_config_item in imported_system_configs {
             let (_, system_config) = imported_config_item.into_parts();
-            let normalized_key = normalize_admin_system_config_key(&system_config.key);
+            let ImportedSystemConfig {
+                key,
+                value,
+                description,
+            } = system_config;
+            let normalized_key = normalize_imported_system_config_key(&key);
             let exists = existing_system_config_keys.contains(&normalized_key);
             match (exists, merge_mode) {
                 (true, AdminImportMergeMode::Skip) => {
@@ -2258,13 +2393,14 @@ impl<'a> AdminAppState<'a> {
 
             let request_bytes = Bytes::from(
                 serde_json::to_vec(&json!({
-                    "value": system_config.value,
-                    "description": system_config.description,
+                    "value": value,
+                    "description": description,
                 }))
                 .map_err(|err| GatewayError::Internal(err.to_string()))?,
             );
-            match apply_admin_system_config_update(self, &system_config.key, &request_bytes).await?
-            {
+            let update_result =
+                apply_admin_system_config_update(self, &key, &request_bytes).await?;
+            match update_result {
                 Ok(_) => {
                     if exists {
                         stats.system_configs.updated += 1;

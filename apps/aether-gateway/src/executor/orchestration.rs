@@ -1704,6 +1704,7 @@ mod tests {
                 CONTENT_TYPE.as_str().to_string(),
                 "application/json".to_string(),
             )]),
+            response_observation: None,
             body: Some(aether_contracts::ResponseBody {
                 json_body: Some(body_json),
                 body_bytes_b64: None,

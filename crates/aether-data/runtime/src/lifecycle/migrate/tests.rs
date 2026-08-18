@@ -410,6 +410,7 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260718010000,
             20260720000000,
             20260727000000,
+            20260731000000,
         ]
     );
 }
@@ -984,6 +985,43 @@ fn mysql_and_sqlite_migrations_do_not_use_postgres_jsonb() {
 }
 
 #[test]
+fn worker_boot_cleanup_migration_is_enabled_for_every_driver() {
+    const VERSION: i64 = 20260731000000;
+
+    for (driver, migrator) in [
+        ("postgres", &POSTGRES_MIGRATOR),
+        ("mysql", &super::mysql::MIGRATOR),
+        ("sqlite", &super::sqlite::MIGRATOR),
+    ] {
+        let migration = migrator
+            .iter()
+            .find(|migration| migration.version == VERSION)
+            .unwrap_or_else(|| panic!("{driver} worker boot cleanup migration should be embedded"));
+        let sql = migration.sql.as_ref();
+
+        for required in [
+            "DELETE FROM background_task_events",
+            "DELETE FROM background_task_runs",
+            "id LIKE 'boot:%'",
+            "owner_instance IS NOT NULL",
+            "created_by = 'system'",
+            "progress_message = 'worker booted'",
+        ] {
+            assert!(
+                sql.contains(required),
+                "{driver} worker boot cleanup migration is missing {required}"
+            );
+        }
+
+        assert!(
+            sql.find("DELETE FROM background_task_events")
+                < sql.find("DELETE FROM background_task_runs"),
+            "{driver} must delete child events before worker boot runs"
+        );
+    }
+}
+
+#[test]
 fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
     let mysql_versions = super::mysql::MIGRATOR
         .iter()
@@ -1023,9 +1061,10 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260528020000,
             20260725010000,
             20260725020000,
-            20260725030000,
-            20260727000000,
-            20260813000000,
+             20260725030000,
+             20260727000000,
+            20260731000000,
+             20260813000000,
         ]
     );
     assert_eq!(
@@ -1057,9 +1096,10 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260725010000,
             20260725020000,
             20260725030000,
-            20260725040000,
-            20260727000000,
-            20260813000000,
+             20260725040000,
+             20260727000000,
+            20260731000000,
+             20260813000000,
         ]
     );
 }
@@ -2163,9 +2203,10 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260716000000,
             20260718000000,
             20260718010000,
-            20260720000000,
-            20260727000000,
-            20260813000000,
+             20260720000000,
+             20260727000000,
+            20260731000000,
+             20260813000000,
         ]
     );
 }

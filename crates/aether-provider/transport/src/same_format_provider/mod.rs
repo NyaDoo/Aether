@@ -436,6 +436,21 @@ fn build_same_format_provider_request_body_inner(
             ),
         );
     }
+    let stripped_reasoning_items =
+        aether_ai_formats::strip_incompatible_openai_responses_reasoning_items(
+            &mut provider_request_body,
+            input.provider_api_format,
+        );
+    if stripped_reasoning_items > 0 {
+        record_compatibility_edit(
+            &mut compatibility_edits,
+            "input[].id",
+            SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite,
+            format!(
+                "stripped {stripped_reasoning_items} non-replayable OpenAI Responses reasoning item(s)"
+            ),
+        );
+    }
     let provider_model = provider_request_body
         .get("model")
         .and_then(Value::as_str)
@@ -443,6 +458,14 @@ fn build_same_format_provider_request_body_inner(
         .filter(|value| !value.is_empty())
         .unwrap_or(input.mapped_model)
         .to_string();
+    if !same_format_reasoning_effort_supported(
+        &provider_request_body,
+        input.provider_api_format,
+        &provider_model,
+        input.source_model.unwrap_or(input.mapped_model),
+    ) {
+        return None;
+    }
     if aether_ai_formats::finalize_openai_provider_request(
         &mut provider_request_body,
         aether_ai_formats::OpenAiProviderRequestFinalization {
@@ -461,6 +484,35 @@ fn build_same_format_provider_request_body_inner(
         return None;
     }
     Some(provider_request_body)
+}
+
+fn same_format_reasoning_effort_supported(
+    body: &Value,
+    provider_api_format: &str,
+    provider_model: &str,
+    source_model: &str,
+) -> bool {
+    let provider_api_format = aether_ai_formats::normalize_api_format_alias(provider_api_format);
+    let effort = match provider_api_format.as_str() {
+        "openai:chat" => body.get("reasoning_effort"),
+        "openai:responses" | "openai:responses:compact" | "openai:search" => body
+            .get("reasoning")
+            .and_then(Value::as_object)
+            .and_then(|reasoning| reasoning.get("effort")),
+        _ => return true,
+    };
+    let Some(effort) = effort.and_then(Value::as_str) else {
+        return true;
+    };
+    let Some(effort) = aether_ai_formats::ReasoningEffort::parse(effort) else {
+        return true;
+    };
+    aether_ai_formats::reasoning_effort_supported_for_model(
+        provider_api_format.as_str(),
+        provider_model,
+        source_model,
+        effort,
+    )
 }
 
 fn record_compatibility_edit(
@@ -2000,6 +2052,50 @@ mod tests {
                 && edit.action
                     == SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite
                 && edit.detail.contains("2")
+        }));
+    }
+
+    #[test]
+    fn same_format_responses_body_strips_foreign_reasoning_ids_and_reports_the_edit() {
+        let request_body = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "reasoning", "id": "rs_provider_123", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "item_72d3bd8d367d01977ace23f1",
+                    "summary": []
+                },
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+        let output = build_same_format_provider_request_body_with_compatibility_report(
+            SameFormatProviderRequestBodyInput {
+                body_json: &request_body,
+                mapped_model: "gpt-5.4",
+                client_api_format: "openai:responses",
+                provider_api_format: "openai:responses",
+                source_model: Some("gpt-5.4"),
+                family: SameFormatProviderFamily::Standard,
+                body_rules: None,
+                request_headers: None,
+                upstream_is_stream: false,
+                force_body_stream_field: false,
+                kiro_auth_config: None,
+                is_claude_code: false,
+                enable_model_directives: false,
+            },
+        )
+        .expect("same-format Responses body should build");
+
+        let input = output.body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["id"], "rs_provider_123");
+        assert_eq!(input[1]["type"], "message");
+        assert!(output.compatibility_edits.iter().any(|edit| {
+            edit.field == "input[].id"
+                && edit.action
+                    == SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite
         }));
     }
 

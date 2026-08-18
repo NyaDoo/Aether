@@ -350,13 +350,22 @@ async fn gateway_imports_admin_system_config_locally_and_persists_data_impl() {
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let client = reqwest::Client::new();
+    let mut import_payload = sample_system_import_payload();
+    import_payload["system_configs"]
+        .as_array_mut()
+        .expect("system configs should be an array")
+        .push(json!({
+            "key": "external_models_proxy_node_id",
+            "value": null,
+            "description": "External models proxy"
+        }));
     let response = client
         .post(format!("{gateway_url}/api/admin/system/config/import"))
         .header(GATEWAY_HEADER, "rust-phase3b")
         .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
-        .json(&sample_system_import_payload())
+        .json(&import_payload)
         .send()
         .await
         .expect("request should succeed");
@@ -372,7 +381,7 @@ async fn gateway_imports_admin_system_config_locally_and_persists_data_impl() {
     assert_eq!(payload["stats"]["models"]["created"], json!(1));
     assert_eq!(payload["stats"]["ldap"]["created"], json!(1));
     assert_eq!(payload["stats"]["oauth"]["created"], json!(1));
-    assert_eq!(payload["stats"]["system_configs"]["created"], json!(2));
+    assert_eq!(payload["stats"]["system_configs"]["created"], json!(3));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let global_models = global_model_repository
@@ -531,8 +540,16 @@ async fn gateway_imports_admin_system_config_locally_and_persists_data_impl() {
         .iter()
         .find(|entry| entry["key"] == "smtp_password")
         .expect("smtp_password should exist");
+    let exported_external_models_proxy = exported_system_configs
+        .iter()
+        .find(|entry| entry["key"] == "external_models_proxy_node_id")
+        .expect("external models proxy should exist");
     assert_eq!(exported_site_name["value"], "Imported Aether");
     assert_eq!(exported_smtp_password["value"], "smtp-secret");
+    assert_eq!(
+        exported_external_models_proxy["value"],
+        serde_json::Value::Null
+    );
 
     gateway_handle.abort();
     upstream_handle.abort();
@@ -2300,6 +2317,17 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
         )
         .expect("auth config should encrypt"),
     );
+    existing_key.upstream_metadata = Some(json!({
+        "codex": {
+            "credential_generation": "generation-before-import",
+            "primary_used_percent": 90.0,
+        },
+        "unrelated": {"preserved": true},
+    }));
+    existing_key.status_snapshot = Some(json!({
+        "oauth": {"status": "invalid"},
+        "quota": {"used_ratio": 0.9},
+    }));
 
     let score_identity =
         PoolMemberIdentity::provider_api_key("provider-codex-existing", "key-codex-existing");
@@ -2400,6 +2428,31 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
     assert_eq!(key.error_count, Some(0));
     assert_eq!(key.health_by_format, Some(json!({})));
     assert_eq!(key.circuit_breaker_by_format, Some(json!({})));
+    let codex = key
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("codex"))
+        .and_then(Value::as_object)
+        .expect("Codex metadata should exist");
+    assert_eq!(codex.len(), 1);
+    assert_ne!(
+        codex
+            .get(aether_admin::provider::quota::CODEX_CREDENTIAL_GENERATION_KEY)
+            .and_then(Value::as_str),
+        Some("generation-before-import")
+    );
+    assert_eq!(
+        key.upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/unrelated/preserved")),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        key.status_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("quota")),
+        Some(&Value::Null)
+    );
     assert_eq!(
         decrypt_python_fernet_ciphertext(
             DEVELOPMENT_ENCRYPTION_KEY,
@@ -2459,10 +2512,11 @@ fn gateway_skips_proxy_nodes_during_admin_system_config_import() {
 }
 
 async fn gateway_skips_proxy_nodes_during_admin_system_config_import_impl() {
+    let data_state = build_empty_admin_system_data_state();
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
-            .with_data_state_for_tests(build_empty_admin_system_data_state()),
+            .with_data_state_for_tests(data_state.clone()),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -2482,6 +2536,11 @@ async fn gateway_skips_proxy_nodes_during_admin_system_config_import_impl() {
                 "name": "Legacy Node",
                 "ip": "127.0.0.1",
                 "port": 8080
+            }],
+            "system_configs": [{
+                "key": "external_models_proxy_node_id",
+                "value": "legacy-node-1",
+                "description": "External models proxy"
             }]
         }))
         .send()
@@ -2491,6 +2550,7 @@ async fn gateway_skips_proxy_nodes_during_admin_system_config_import_impl() {
     assert_eq!(response.status(), StatusCode::OK);
     let payload: Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["stats"]["proxy_nodes"]["skipped"], json!(1));
+    assert_eq!(payload["stats"]["system_configs"]["created"], json!(1));
     assert!(payload["stats"]["errors"]
         .as_array()
         .expect("errors should be an array")
@@ -2498,6 +2558,20 @@ async fn gateway_skips_proxy_nodes_during_admin_system_config_import_impl() {
         .any(|item| item
             .as_str()
             .is_some_and(|value| value.contains("暂不支持导入代理节点"))));
+    assert!(payload["stats"]["errors"]
+        .as_array()
+        .expect("errors should be an array")
+        .iter()
+        .any(|item| item
+            .as_str()
+            .is_some_and(|value| value.contains("已切换为直连"))));
+    assert_eq!(
+        data_state
+            .find_system_config_value("external_models_proxy_node_id")
+            .await
+            .expect("external models proxy config lookup should succeed"),
+        Some(Value::Null)
+    );
 
     gateway_handle.abort();
 }

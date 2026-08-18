@@ -9,6 +9,9 @@ use crate::formats::openai::chat::stream::{
     OpenAIResponsesProviderState,
 };
 use crate::formats::openai::image::stream::OpenAiImageStreamTerminalState;
+use crate::formats::openai::responses::history::{
+    record_converted_response_history, ResponseHistoryRecord,
+};
 use crate::formats::shared::error_body::{
     build_core_error_body_for_client_format, LocalCoreSyncErrorKind,
 };
@@ -24,7 +27,10 @@ pub struct StreamingStandardFormatMatrix {
     provider: Option<ProviderStreamParser>,
     client: Option<ClientStreamEmitter>,
     propagated_actual_service_tier: Option<String>,
+    pending_sse_event: Option<String>,
     terminated: bool,
+    history_recorded: bool,
+    pending_history_record: Option<ResponseHistoryRecord>,
 }
 
 impl StreamingStandardFormatMatrix {
@@ -37,6 +43,7 @@ impl StreamingStandardFormatMatrix {
             return Ok(Vec::new());
         }
         self.ensure_initialized(report_context);
+        let line = self.apply_sse_event_type(line);
         if let Some(error_body) = build_client_error_body_for_line(report_context, &line) {
             self.terminated = true;
             return self.emit_error(error_body);
@@ -56,7 +63,11 @@ impl StreamingStandardFormatMatrix {
                 client.set_actual_service_tier(propagated_actual_service_tier.as_deref());
             }
         }
-        self.emit_frames(frames)
+        self.emit_frames(report_context, frames)
+    }
+
+    fn apply_sse_event_type(&mut self, line: Vec<u8>) -> Vec<u8> {
+        apply_sse_event_type(&mut self.pending_sse_event, line)
     }
 
     pub fn finish(&mut self, report_context: &Value) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
@@ -79,10 +90,11 @@ impl StreamingStandardFormatMatrix {
                 client.set_actual_service_tier(propagated_actual_service_tier.as_deref());
             }
         }
-        let mut out = self.emit_frames(frames)?;
+        let mut out = self.emit_frames(report_context, frames)?;
         if let Some(client) = self.client.as_mut() {
             out.extend(client.finish()?);
         }
+        self.record_response_history(report_context);
         Ok(out)
     }
 
@@ -100,6 +112,7 @@ impl StreamingStandardFormatMatrix {
 
     fn emit_frames(
         &mut self,
+        report_context: &Value,
         frames: Vec<CanonicalStreamFrame>,
     ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
         let Some(client) = self.client.as_mut() else {
@@ -133,7 +146,28 @@ impl StreamingStandardFormatMatrix {
             }
             out.extend(client.emit(frame)?);
         }
+        self.record_response_history(report_context);
         Ok(out)
+    }
+
+    fn record_response_history(&mut self, report_context: &Value) {
+        if self.history_recorded {
+            return;
+        }
+        let Some(response) = self.client.as_ref().and_then(|client| match client {
+            ClientStreamEmitter::OpenAIResponses(emitter) => {
+                emitter.completed_response_for_history()
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        self.pending_history_record = record_converted_response_history(report_context, response);
+        self.history_recorded = true;
+    }
+
+    pub fn take_response_history_record(&mut self) -> Option<ResponseHistoryRecord> {
+        self.pending_history_record.take()
     }
 
     fn emit_error(&mut self, error_body: Value) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
@@ -144,10 +178,46 @@ impl StreamingStandardFormatMatrix {
     }
 }
 
+fn apply_sse_event_type(pending_sse_event: &mut Option<String>, line: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(&line) else {
+        return line;
+    };
+    let trimmed = text.trim_matches('\r').trim();
+    if let Some(event) = trimmed.strip_prefix("event:").map(str::trim) {
+        *pending_sse_event = (!event.is_empty()).then(|| event.to_string());
+        return line;
+    }
+    if trimmed.is_empty() {
+        *pending_sse_event = None;
+        return line;
+    }
+    if !trimmed.starts_with("data:") {
+        return line;
+    }
+    let Some(event) = pending_sse_event.take() else {
+        return line;
+    };
+    let Some(mut payload) = decode_json_data_line(&line) else {
+        return line;
+    };
+    let Some(payload) = payload.as_object_mut() else {
+        return line;
+    };
+    if payload.contains_key("type") {
+        return line;
+    }
+    payload.insert("type".to_string(), Value::String(event));
+    let mut normalized = b"data: ".to_vec();
+    normalized.extend(serde_json::to_vec(&payload).expect("JSON value serialization cannot fail"));
+    normalized.push(b'\n');
+    normalized
+}
+
 #[derive(Default)]
 pub struct StreamingStandardTerminalObserver {
     provider: Option<TerminalStreamParser>,
     latest_summary: Option<ExecutionStreamTerminalSummary>,
+    pending_sse_event: Option<String>,
 }
 
 impl StreamingStandardTerminalObserver {
@@ -157,6 +227,7 @@ impl StreamingStandardTerminalObserver {
         line: Vec<u8>,
     ) -> Result<(), AiSurfaceFinalizeError> {
         self.ensure_initialized(report_context);
+        let line = apply_sse_event_type(&mut self.pending_sse_event, line);
         let Some(provider) = self.provider.as_mut() else {
             return Ok(());
         };
@@ -175,6 +246,44 @@ impl StreamingStandardTerminalObserver {
                 if let Some(summary) = provider.push_line(report_context, line)? {
                     self.latest_summary = Some(summary);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// 结构化入口：给已经持有解析好的协议事件的传输用（Responses WebSocket），
+    /// 避免为了复用 [`Self::push_line`] 把事件重新拼成 `data: {json}` 再解析回来。
+    ///
+    /// 只要 provider 的协议状态机本身接受结构化事件，这条路径与 `push_line`
+    /// 完全等价——`push_line` 现在就是「解码 + `push_event`」。
+    ///
+    /// `openai:image` 的终态状态机没有结构化入口（它按 SSE 行做增量解析），
+    /// 这里返回 `Err`，由调用方 `disable_with_error` 把摘要标成 parser_error，
+    /// 而不是静默丢事件。
+    pub fn push_event(
+        &mut self,
+        report_context: &Value,
+        event: &Value,
+    ) -> Result<(), AiSurfaceFinalizeError> {
+        self.ensure_initialized(report_context);
+        let Some(provider) = self.provider.as_mut() else {
+            return Ok(());
+        };
+        match provider {
+            TerminalStreamParser::Standard(provider) => {
+                let frames = provider.push_event(report_context, event)?;
+                let actual_service_tier = provider.actual_service_tier().map(ToOwned::to_owned);
+                self.observe_frames(frames);
+                if let Some(actual_service_tier) = actual_service_tier {
+                    self.latest_summary
+                        .get_or_insert_with(ExecutionStreamTerminalSummary::default)
+                        .provider_actual_service_tier = Some(actual_service_tier);
+                }
+            }
+            TerminalStreamParser::OpenAIImage(_) => {
+                return Err(AiSurfaceFinalizeError::new(
+                    "openai:image terminal observation has no structured event entry",
+                ));
             }
         }
         Ok(())
@@ -330,6 +439,24 @@ impl ProviderStreamParser {
             ProviderStreamParser::OpenAIResponses(state) => state.push_line(report_context, line),
             ProviderStreamParser::Claude(state) => state.push_line(report_context, line),
             ProviderStreamParser::Gemini(state) => state.push_line(report_context, line),
+        }
+    }
+
+    /// 结构化入口。目前只有 `openai:responses` 有传输会走它（Responses
+    /// WebSocket）；其余格式的协议状态机同样可以按「解码 + push_event」机械拆分，
+    /// 等到真有非 SSE 传输需要时再拆，不做无调用方的接口。
+    fn push_event(
+        &mut self,
+        report_context: &Value,
+        event: &Value,
+    ) -> Result<Vec<CanonicalStreamFrame>, AiSurfaceFinalizeError> {
+        match self {
+            ProviderStreamParser::OpenAIResponses(state) => state.push_event(report_context, event),
+            ProviderStreamParser::OpenAIChat(_)
+            | ProviderStreamParser::Claude(_)
+            | ProviderStreamParser::Gemini(_) => Err(AiSurfaceFinalizeError::new(
+                "this provider stream parser has no structured event entry",
+            )),
         }
     }
 
@@ -619,6 +746,7 @@ fn parse_gemini_error(payload: &Value) -> Option<(String, Option<String>, LocalC
 #[cfg(test)]
 mod tests {
     use super::{StreamingStandardFormatMatrix, StreamingStandardTerminalObserver};
+    use crate::formats::{context::FormatContext, registry::convert_request};
     use serde_json::{json, Value};
 
     fn report_context(provider_api_format: &str, client_api_format: &str) -> Value {
@@ -640,6 +768,187 @@ mod tests {
             .filter(|payload| *payload != "[DONE]")
             .filter_map(|payload| serde_json::from_str(payload).ok())
             .collect()
+    }
+
+    fn event_only_line(event: &str) -> Vec<u8> {
+        format!("event: {event}\n").into_bytes()
+    }
+
+    #[test]
+    fn event_only_stream_types_convert_across_standard_formats() {
+        let responses_payload = json!({
+            "response": {
+                "id": "resp_event_only_123",
+                "model": "gpt-5.4",
+                "status": "in_progress",
+                "output": [],
+            },
+        });
+
+        let mut claude_matrix = StreamingStandardFormatMatrix::default();
+        let claude_context = report_context("openai:responses", "claude:messages");
+        assert!(claude_matrix
+            .transform_line(&claude_context, event_only_line("response.created"))
+            .expect("event should parse")
+            .is_empty());
+        let claude_output = claude_matrix
+            .transform_line(&claude_context, data_line(responses_payload))
+            .expect("response.created should convert to Claude");
+        assert!(String::from_utf8_lossy(&claude_output).contains("event: message_start"));
+
+        let mut gemini_matrix = StreamingStandardFormatMatrix::default();
+        let gemini_context = report_context("openai:responses", "gemini:generate_content");
+        gemini_matrix
+            .transform_line(
+                &gemini_context,
+                event_only_line("response.output_text.delta"),
+            )
+            .expect("event should parse");
+        let gemini_output = gemini_matrix
+            .transform_line(
+                &gemini_context,
+                data_line(json!({
+                    "response_id": "resp_event_only_123",
+                    "delta": "hello",
+                })),
+            )
+            .expect("text delta should convert to Gemini");
+        assert!(String::from_utf8_lossy(&gemini_output).contains("\"text\":\"hello\""));
+
+        let mut chat_matrix = StreamingStandardFormatMatrix::default();
+        let chat_context = report_context("claude:messages", "openai:chat");
+        chat_matrix
+            .transform_line(&chat_context, event_only_line("message_start"))
+            .expect("event should parse");
+        let chat_output = chat_matrix
+            .transform_line(
+                &chat_context,
+                data_line(json!({
+                    "message": {
+                        "id": "msg_event_only_123",
+                        "model": "claude-sonnet-4-5",
+                    },
+                })),
+            )
+            .expect("message_start should convert to Chat");
+        assert!(
+            String::from_utf8_lossy(&chat_output).contains("\"delta\":{\"role\":\"assistant\"}")
+        );
+    }
+
+    #[test]
+    fn streamed_chat_tool_call_records_responses_continuation_history() {
+        let report_context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "mapped_model": "deepseek-v4-flash",
+            "needs_conversion": true,
+            "original_request_body": {
+                "model": "deepseek-v4-flash",
+                "input": [{"role": "user", "content": "perform a deep scan"}]
+            }
+        });
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "id": "chatcmpl_history_stream_test_1",
+                    "model": "deepseek-v4-flash",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_history_stream_test_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "create_discovery_manifest",
+                                    "arguments": "{\"root\":"
+                                }
+                            }]
+                        },
+                        "finish_reason": Value::Null
+                    }]
+                })),
+            )
+            .expect("tool start should convert");
+        matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "id": "chatcmpl_history_stream_test_1",
+                    "model": "deepseek-v4-flash",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "function": {"arguments": "\"src\"}"}
+                            }]
+                        },
+                        "finish_reason": Value::Null
+                    }]
+                })),
+            )
+            .expect("tool arguments should convert");
+        let terminal = matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "id": "chatcmpl_history_stream_test_1",
+                    "model": "deepseek-v4-flash",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 4,
+                        "total_tokens": 14
+                    }
+                })),
+            )
+            .expect("tool finish should convert");
+        let terminal_sse = String::from_utf8(terminal).expect("SSE should be utf8");
+        assert!(terminal_sse.contains("event: response.function_call_arguments.done"));
+        assert!(terminal_sse.contains("event: response.output_item.done"));
+        assert!(terminal_sse.contains("event: response.completed"));
+        let persisted = matrix
+            .take_response_history_record()
+            .expect("completed stream should expose one persistence record");
+        assert!(persisted
+            .storage_key
+            .starts_with("ai:responses:history:v1:"));
+        assert!(persisted.payload.contains("resp_history_stream_test_1"));
+        assert!(matrix.take_response_history_record().is_none());
+
+        let continuation = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &json!({
+                "model": "deepseek-v4-flash",
+                "previous_response_id": "resp_history_stream_test_1",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_history_stream_test_1",
+                    "output": "manifest-created"
+                }]
+            }),
+            &FormatContext::default(),
+        )
+        .expect("streamed response history should restore the next Chat request");
+        assert_eq!(continuation["messages"][1]["role"], "assistant");
+        assert_eq!(
+            continuation["messages"][1]["tool_calls"][0]["id"],
+            "call_history_stream_test_1"
+        );
+        assert_eq!(continuation["messages"][2]["role"], "tool");
+        assert_eq!(
+            continuation["messages"][2]["tool_call_id"],
+            "call_history_stream_test_1"
+        );
     }
 
     #[test]
@@ -1840,6 +2149,48 @@ mod tests {
     }
 
     #[test]
+    fn terminal_observer_uses_event_type_when_data_omits_type() {
+        let report_context = report_context("openai:responses", "openai:chat");
+        let mut observer = StreamingStandardTerminalObserver::default();
+
+        observer
+            .push_line(&report_context, event_only_line("response.completed"))
+            .expect("event should parse");
+        observer
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "response": {
+                        "id": "resp_terminal_event_only_123",
+                        "model": "gpt-5.4",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 3,
+                            "total_tokens": 5,
+                        },
+                    },
+                })),
+            )
+            .expect("response.completed should parse");
+
+        let summary = observer.latest_summary().expect("summary should exist");
+        assert!(summary.observed_finish);
+        assert_eq!(
+            summary.response_id.as_deref(),
+            Some("resp_terminal_event_only_123")
+        );
+        assert_eq!(
+            summary
+                .standardized_usage
+                .as_ref()
+                .map(|usage| usage.input_tokens),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn terminal_observer_does_not_infer_provider_stream_event_api_format() {
         let report_context = report_context("openai:chat", "openai:responses");
         let mut observer = StreamingStandardTerminalObserver::default();
@@ -2193,5 +2544,262 @@ mod tests {
             usage.dimensions.get("image_quality"),
             Some(&json!("medium"))
         );
+    }
+}
+
+#[cfg(test)]
+mod structured_entry_tests {
+    use super::StreamingStandardTerminalObserver;
+    use aether_contracts::ExecutionStreamTerminalSummary;
+    use serde_json::{json, Value};
+
+    fn report_context() -> Value {
+        json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+            "mapped_model": "gpt-5-codex",
+        })
+    }
+
+    /// 用 SSE 入口观测一组事件。这是 C5 之前 WebSocket 走的路径：把结构化事件
+    /// 拼成 `data: {json}` 再交给解析器。
+    fn summary_via_push_line(events: &[Value]) -> ExecutionStreamTerminalSummary {
+        let context = report_context();
+        let mut observer = StreamingStandardTerminalObserver::default();
+        for event in events {
+            observer
+                .push_line(&context, format!("data: {event}\n\n").into_bytes())
+                .expect("the SSE entry must accept these events");
+        }
+        observer
+            .finish(&context)
+            .expect("the observer must finish")
+            .unwrap_or_default()
+    }
+
+    /// 用结构化入口观测同一组事件。这是 C5 之后的路径。
+    fn summary_via_push_event(events: &[Value]) -> ExecutionStreamTerminalSummary {
+        let context = report_context();
+        let mut observer = StreamingStandardTerminalObserver::default();
+        for event in events {
+            observer
+                .push_event(&context, event)
+                .expect("the structured entry must accept these events");
+        }
+        observer
+            .finish(&context)
+            .expect("the observer must finish")
+            .unwrap_or_default()
+    }
+
+    fn assert_entries_agree(label: &str, events: &[Value]) {
+        let via_line = summary_via_push_line(events);
+        let via_event = summary_via_push_event(events);
+        assert_eq!(
+            via_line, via_event,
+            "the SSE entry and the structured entry must produce identical summaries for {label}"
+        );
+    }
+
+    fn created() -> Value {
+        json!({"type": "response.created", "response": {"id": "resp_diff", "model": "gpt-5-codex"}})
+    }
+
+    fn text_delta(piece: &str) -> Value {
+        json!({
+            "type": "response.output_text.delta",
+            "item_id": "msg_diff",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": piece,
+        })
+    }
+
+    /// 批量事件：WS 一帧可以带多个协议事件，逐个喂入的结果必须和逐行喂入一致。
+    #[test]
+    fn a_batched_delta_sequence_agrees_across_both_entries() {
+        let events = vec![
+            created(),
+            text_delta("he"),
+            text_delta("ll"),
+            text_delta("o"),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_diff",
+                    "model": "gpt-5-codex",
+                    "status": "completed",
+                    "usage": {"input_tokens": 11, "output_tokens": 3, "total_tokens": 14},
+                },
+            }),
+        ];
+        assert_entries_agree("a batched delta sequence", &events);
+        let summary = summary_via_push_event(&events);
+        assert!(summary.observed_finish);
+        assert_eq!(summary.response_id.as_deref(), Some("resp_diff"));
+        let usage = summary
+            .standardized_usage
+            .as_ref()
+            .expect("completed carries usage");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 3);
+    }
+
+    /// 合法 `response.incomplete`：C1 定过的语义（终态、可计费），两条入口必须
+    /// 得到同一个摘要，尤其是 finish_reason 与 parser_error 的取值。
+    #[test]
+    fn a_legitimate_incomplete_agrees_across_both_entries() {
+        let events = vec![
+            created(),
+            text_delta("partial"),
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_diff",
+                    "model": "gpt-5-codex",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12},
+                },
+            }),
+        ];
+        assert_entries_agree("a legitimate incomplete", &events);
+        let summary = summary_via_push_event(&events);
+        assert!(summary.observed_finish);
+        assert!(
+            summary.parser_error.is_none(),
+            "a legitimate incomplete is not a parser error: {:?}",
+            summary.parser_error
+        );
+    }
+
+    #[test]
+    fn a_terminal_error_agrees_across_both_entries() {
+        let events = vec![
+            created(),
+            json!({
+                "type": "error",
+                "error": {"type": "server_error", "message": "upstream exploded"},
+            }),
+        ];
+        assert_entries_agree("a terminal error", &events);
+        let summary = summary_via_push_event(&events);
+        assert!(summary.observed_finish);
+        assert_eq!(summary.finish_reason.as_deref(), Some("error"));
+        assert!(summary.parser_error.is_some());
+    }
+
+    #[test]
+    fn a_response_failed_event_agrees_across_both_entries() {
+        assert_entries_agree(
+            "a response.failed event",
+            &[
+                created(),
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_diff",
+                        "model": "gpt-5-codex",
+                        "status": "failed",
+                        "error": {"type": "server_error", "message": "generation failed"},
+                    },
+                }),
+            ],
+        );
+    }
+
+    /// 未知事件只增计数、不改终态判定，两条入口的计数必须一致。
+    #[test]
+    fn unknown_events_agree_across_both_entries() {
+        let events = vec![
+            created(),
+            json!({"type": "response.some_future_event", "payload": {"anything": true}}),
+            json!({"type": "response.another_future_event"}),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_diff",
+                    "model": "gpt-5-codex",
+                    "status": "completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            }),
+        ];
+        assert_entries_agree("unknown events", &events);
+        let summary = summary_via_push_event(&events);
+        assert!(summary.observed_finish);
+        assert!(
+            summary.unknown_event_count > 0,
+            "unknown events are counted"
+        );
+    }
+
+    /// 供应商声明的 service tier 通过两条入口都要落到摘要上。
+    #[test]
+    fn a_service_tier_agrees_across_both_entries() {
+        assert_entries_agree(
+            "a declared service tier",
+            &[
+                json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_diff",
+                        "model": "gpt-5-codex",
+                        "service_tier": "priority",
+                    },
+                }),
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_diff",
+                        "model": "gpt-5-codex",
+                        "status": "completed",
+                        "service_tier": "priority",
+                        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+                    },
+                }),
+            ],
+        );
+    }
+
+    /// 没有任何供应商终态事件。注意 `finish()` 会补一个 `stop`（这是 HTTP 与
+    /// WebSocket 共享的既有行为，C5 不改），所以 `observed_finish` 为真而 usage
+    /// 缺失——真正的「缺终态」判定看的是 usage 与被捕获的 body。这里要钉住的是
+    /// 两条入口在这种不完整序列上仍然给出同一个摘要。
+    #[test]
+    fn a_missing_terminal_agrees_across_both_entries() {
+        let events = vec![created(), text_delta("truncated")];
+        assert_entries_agree("a missing terminal", &events);
+        let summary = summary_via_push_event(&events);
+        assert_eq!(summary.finish_reason.as_deref(), Some("stop"));
+        assert!(
+            summary.standardized_usage.is_none(),
+            "a synthesized finish carries no usage"
+        );
+    }
+
+    /// `openai:image` 没有结构化入口：必须显式报错，让调用方标记 parser_error，
+    /// 而不是静默丢掉事件、把摘要留成「未观察到终态」。
+    #[test]
+    fn the_image_format_rejects_the_structured_entry() {
+        let context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:image",
+            "mapped_model": "gpt-image-1",
+        });
+        let mut observer = StreamingStandardTerminalObserver::default();
+        let error = observer
+            .push_event(&context, &json!({"type": "image_generation.completed"}))
+            .expect_err("openai:image has no structured entry");
+        assert!(
+            error.to_string().contains("structured event entry"),
+            "the error must name the missing entry: {error}"
+        );
+
+        observer.disable_with_error(error.to_string());
+        let summary = observer
+            .latest_summary()
+            .expect("disable_with_error records a summary");
+        assert!(summary.parser_error.is_some());
     }
 }

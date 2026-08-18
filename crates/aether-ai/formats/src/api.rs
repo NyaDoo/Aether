@@ -75,6 +75,10 @@ pub use crate::formats::openai::{
         validate_openai_provider_request_contract, OpenAiProviderRequestContractViolation,
         OpenAiProviderRequestFinalization,
     },
+    responses::{
+        openai_responses_synthetic_reasoning_item_id,
+        strip_incompatible_openai_responses_reasoning_items,
+    },
 };
 pub use crate::formats::shared::error_body::{
     build_core_error_body_for_client_format, is_core_error_finalize_kind, LocalCoreSyncErrorKind,
@@ -184,11 +188,15 @@ pub use crate::formats::{
                 apply_codex_openai_special_headers,
                 apply_openai_responses_compact_special_body_edits,
                 build_codex_model_catalog_metadata, parse_codex_auth_identity,
-                resolve_codex_responses_model_capabilities, CodexAuthIdentity,
-                CodexResponsesModelCapabilities, CODEX_OPENAI_IMAGE_DEFAULT_MODEL,
-                CODEX_OPENAI_IMAGE_DEFAULT_OUTPUT_FORMAT,
+                project_codex_catalog_model_card, resolve_codex_responses_model_capabilities,
+                CodexAuthIdentity, CodexResponsesModelCapabilities,
+                CODEX_OPENAI_IMAGE_DEFAULT_MODEL, CODEX_OPENAI_IMAGE_DEFAULT_OUTPUT_FORMAT,
                 CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_MODEL,
                 CODEX_OPENAI_IMAGE_DEFAULT_VARIATION_PROMPT, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
+            },
+            history::{
+                hydrate_response_history, record_converted_response_history,
+                response_history_is_loaded, response_history_storage_key, ResponseHistoryRecord,
             },
             spec::{
                 resolve_stream_spec as resolve_openai_responses_stream_spec,
@@ -207,6 +215,7 @@ pub use crate::formats::{
             build_cross_format_openai_chat_request_body_with_model_directives,
             build_cross_format_openai_responses_request_body,
             build_cross_format_openai_responses_request_body_with_model_directives,
+            build_cross_format_openai_responses_request_body_with_model_directives_and_history_scope,
             build_local_openai_chat_request_body,
             build_local_openai_chat_request_body_with_model_directives,
             build_local_openai_responses_request_body,
@@ -269,7 +278,9 @@ pub use aether_ai_formats::formats::conversion::request::{
     convert_openai_chat_request_to_openai_responses_request, extract_openai_text_content,
     normalize_claude_request_to_openai_chat_request,
     normalize_gemini_request_to_openai_chat_request,
-    normalize_openai_responses_request_to_openai_chat_request, parse_openai_tool_result_content,
+    normalize_openai_responses_request_to_openai_chat_request,
+    normalize_openai_responses_request_to_openai_chat_request_with_history_scope,
+    parse_openai_tool_result_content,
 };
 pub use aether_ai_formats::formats::conversion::response::{
     build_openai_responses_response, build_openai_responses_response_with_content,

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::formats::openai::image::stream::{OpenAiImageChatStreamState, OpenAiImageStreamState};
+use crate::formats::openai::responses::history::ResponseHistoryRecord;
 use crate::formats::openai::responses::response::ensure_modern_openai_responses_response_fields;
 use crate::formats::shared::model_directives::model_directive_display_model_from_report_context;
 use crate::formats::shared::response::{
@@ -342,6 +343,16 @@ impl AiSurfaceStreamRewriter<'_> {
                 }
                 Ok(output)
             }
+        }
+    }
+
+    pub fn take_response_history_record(&mut self) -> Option<ResponseHistoryRecord> {
+        match &mut self.state {
+            AiSurfaceStreamRewriteState::Standard(state) => state.take_response_history_record(),
+            AiSurfaceStreamRewriteState::KiroToClaudeCliThenStandard { standard, .. } => {
+                standard.take_response_history_record()
+            }
+            _ => None,
         }
     }
 
@@ -1043,6 +1054,32 @@ data: {\"type\":\"response.reasoning_summary_text.delta\",\"response_id\":\"resp
         assert!(output.contains("\"reasoning_content\":\"Need to inspect first.\""));
         assert!(!output.contains("\"content\""));
         assert!(!output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn standard_rewriter_converts_event_only_response_created_to_chat_role_chunk() {
+        let report_context = json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:chat",
+            "needs_conversion": true,
+        });
+        let mut rewriter = maybe_build_ai_surface_stream_rewriter(Some(&report_context))
+            .expect("rewriter should exist");
+        let event_output = rewriter
+            .push_chunk(b"event: response.created\n")
+            .expect("event line should be buffered");
+        assert!(event_output.is_empty());
+        let output = rewriter
+            .push_chunk(
+                b"data: {\"response\":{\"id\":\"resp_created_123\",\"model\":\"gpt-5.4\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            )
+            .expect("rewrite should succeed");
+        let output = String::from_utf8(output).expect("output should be utf8");
+
+        assert!(output.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(output.contains("\"id\":\"resp_created_123\""));
+        assert!(output.contains("\"model\":\"gpt-5.4\""));
+        assert!(output.contains("\"delta\":{\"role\":\"assistant\"}"));
     }
 
     #[test]
