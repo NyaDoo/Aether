@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${AETHER_REPO:-fawney19/Aether}"
-SOURCE_REF="${AETHER_SOURCE_REF:-main}"
+REPO="${AETHER_REPO:-NyaDoo/Aether}"
+SOURCE_REF="${AETHER_SOURCE_REF:-synvoe}"
 VERSION="${AETHER_VERSION:-}"
 CHANNEL="${AETHER_CHANNEL:-stable}"
 CHANNEL_EXPLICIT="false"
@@ -21,7 +21,7 @@ COMPOSE_DIR_EXPLICIT="false"
 if [[ -n "${AETHER_COMPOSE_DIR:-}" ]]; then
     COMPOSE_DIR_EXPLICIT="true"
 fi
-IMAGE_REPO="${AETHER_IMAGE_REPO:-ghcr.io/fawney19/aether}"
+IMAGE_REPO="${AETHER_IMAGE_REPO:-ghcr.io/nyadoo/aether}"
 APP_IMAGE="${AETHER_APP_IMAGE:-}"
 SERVICE_USER_EXPLICIT="false"
 SERVICE_GROUP_EXPLICIT="false"
@@ -78,9 +78,10 @@ Options:
                       stable/latest resolves the latest stable tag (default)
                       rc resolves the latest tag like v0.7.0-rc.1
                       beta resolves the latest tag like v0.7.0-beta.1
+                      Compose modes default to the synvoe image when neither option is set
   --version VERSION    Exact release tag to install, for example v0.7.0-rc.1
-  --repo OWNER/REPO    GitHub repository to download from (default: fawney19/Aether)
-  --source-ref REF     Source branch/tag used for compose templates (default: main)
+  --repo OWNER/REPO    GitHub repository to download from (default: NyaDoo/Aether)
+  --source-ref REF     Source branch/tag used for compose templates (default: synvoe)
   --archive PATH       Install from a local release tarball instead of downloading
   --download-url URL   Download the release archive from this URL instead of GitHub
   --env-file PATH      Use an existing aether-gateway.env file
@@ -378,6 +379,13 @@ service_manager_name() {
 
 select_version() {
     if [[ -n "${VERSION}" || -n "${ARCHIVE_PATH}" || "${CHANNEL_EXPLICIT}" == "true" ]]; then
+        return
+    fi
+
+    if [[ "${MODE}" == "compose" || "${MODE}" == "compose-single-node" ]]; then
+        if [[ -z "${APP_IMAGE}" ]]; then
+            VERSION="synvoe"
+        fi
         return
     fi
 
@@ -2164,8 +2172,8 @@ main() {
     select_language
     require_supported_os
     apply_platform_defaults
-    select_version
     select_mode
+    select_version
 
     if [[ "${MODE}" == "compose" ]]; then
         install_compose_mode
