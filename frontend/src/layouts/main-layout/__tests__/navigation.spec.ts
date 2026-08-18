@@ -35,6 +35,7 @@ describe('main layout navigation builder', () => {
       'tx:nav.group.account',
     ])
     expect(navigation.flatMap(group => group.items.map(item => item.name))).toContain('tx:nav.myReferral')
+    expect(navigation.flatMap(group => group.items.map(item => item.href))).toContain('/dashboard/material-assets')
   })
 
   it('builds admin navigation with dynamic module menu items sorted by menu order', () => {
@@ -67,6 +68,7 @@ describe('main layout navigation builder', () => {
     expect(managementItems.findIndex(item => item.name === 'Second module')).toBeLessThan(
       managementItems.findIndex(item => item.name === 'First module')
     )
+    expect(managementItems.map(item => item.href)).toContain('/admin/material-assets')
   })
 
   it('builds translated breadcrumbs for settings and routing detail pages', () => {

@@ -50,9 +50,16 @@ pub const ADMIN_SYSTEM_USERS_EXPORT_VERSION: &str = "1.5";
 pub const ADMIN_SYSTEM_USERS_SUPPORTED_VERSIONS: &[&str] =
     &["1.3", "1.4", ADMIN_SYSTEM_USERS_EXPORT_VERSION];
 pub const ADMIN_SYSTEM_PROVIDER_OPS_SENSITIVE_CREDENTIAL_FIELDS: &[&str] = &[
+    "access_key",
+    "access_key_id",
+    "ak",
     "api_key",
     "password",
     "refresh_token",
+    "secret_access_key",
+    "secret_key",
+    "security_token",
+    "sk",
     "session_token",
     "session_cookie",
     "token_cookie",
@@ -852,6 +859,12 @@ const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
         label: "Doubao Video",
         default_path: "/v3/contents/generations/tasks",
         aliases: &["doubao_video", "seedance", "ark_video"],
+    },
+    AdminApiFormatDefinition {
+        value: "doubao:asset_library",
+        label: "Ark Asset Library",
+        default_path: "/?Action={action}&Version=2024-01-01",
+        aliases: &["doubao_asset_library", "ark_assets", "ark_materials"],
     },
     AdminApiFormatDefinition {
         value: "aliyun:multimodal_embedding",

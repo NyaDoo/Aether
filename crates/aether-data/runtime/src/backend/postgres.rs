@@ -7,6 +7,9 @@ use crate::driver::postgres::{
 use crate::repository::announcements::{
     AnnouncementReadRepository, AnnouncementWriteRepository, SqlxAnnouncementReadRepository,
 };
+use crate::repository::asset_library::{
+    AssetLibraryReadRepository, AssetLibraryWriteRepository, SqlxAssetLibraryRepository,
+};
 use crate::repository::audit::{AuditLogReadRepository, PostgresAuditLogReadRepository};
 use crate::repository::auth::{
     AuthApiKeyReadRepository, AuthApiKeyWriteRepository, SqlxAuthApiKeySnapshotReadRepository,
@@ -97,6 +100,14 @@ impl PostgresBackend {
 
     pub fn auth_api_key_read_repository(&self) -> Arc<dyn AuthApiKeyReadRepository> {
         Arc::new(SqlxAuthApiKeySnapshotReadRepository::new(self.pool_clone()))
+    }
+
+    pub fn asset_library_read_repository(&self) -> Arc<dyn AssetLibraryReadRepository> {
+        Arc::new(SqlxAssetLibraryRepository::new(self.pool_clone()))
+    }
+
+    pub fn asset_library_write_repository(&self) -> Arc<dyn AssetLibraryWriteRepository> {
+        Arc::new(SqlxAssetLibraryRepository::new(self.pool_clone()))
     }
 
     pub fn announcement_read_repository(&self) -> Arc<dyn AnnouncementReadRepository> {

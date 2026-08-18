@@ -1,0 +1,437 @@
+[table.asset_groups]
+domain = "asset_library"
+order = 10
+primary_key = ["id"]
+
+[[table.asset_groups.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.asset_groups.columns]]
+name = "upstream_group_id"
+type = "text"
+length = 255
+nullable = true
+
+[[table.asset_groups.columns]]
+name = "user_id"
+type = "text_id"
+length = 64
+
+[[table.asset_groups.columns]]
+name = "api_key_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.asset_groups.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.asset_groups.columns]]
+name = "endpoint_id"
+type = "text_id"
+length = 64
+
+[[table.asset_groups.columns]]
+name = "key_id"
+type = "text_id"
+length = 64
+
+[[table.asset_groups.columns]]
+name = "account_binding"
+type = "text"
+length = 255
+
+[[table.asset_groups.columns]]
+name = "project"
+type = "text"
+length = 255
+default = ""
+
+[[table.asset_groups.columns]]
+name = "group_type"
+type = "text"
+length = 64
+
+[[table.asset_groups.columns]]
+name = "name"
+type = "text"
+length = 512
+
+[[table.asset_groups.columns]]
+name = "description"
+type = "long_text"
+nullable = true
+
+[[table.asset_groups.columns]]
+name = "status"
+type = "text"
+length = 64
+
+[[table.asset_groups.columns]]
+name = "created_at_unix_secs"
+type = "unix_seconds"
+
+[[table.asset_groups.columns]]
+name = "updated_at_unix_secs"
+type = "unix_seconds"
+
+[[table.asset_groups.columns]]
+name = "deleted_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.asset_groups.uniques]]
+name = "uq_asset_groups_upstream"
+columns = ["provider_id", "account_binding", "project", "upstream_group_id"]
+
+[[table.asset_groups.indexes]]
+name = "idx_asset_groups_user_deleted_created"
+columns = ["user_id", "deleted_at_unix_secs", "created_at_unix_secs"]
+
+[[table.asset_groups.indexes]]
+name = "idx_asset_groups_user_type_status"
+columns = ["user_id", "group_type", "status"]
+
+[[table.asset_groups.foreign_keys]]
+name = "fk_asset_groups_user"
+columns = ["user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.asset_groups.foreign_keys]]
+name = "fk_asset_groups_api_key"
+columns = ["api_key_id"]
+references_table = "api_keys"
+references_columns = ["id"]
+on_delete = "set_null"
+
+[[table.asset_groups.foreign_keys]]
+name = "fk_asset_groups_provider"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "restrict"
+
+[[table.asset_groups.foreign_keys]]
+name = "fk_asset_groups_endpoint"
+columns = ["endpoint_id"]
+references_table = "provider_endpoints"
+references_columns = ["id"]
+on_delete = "restrict"
+
+[[table.asset_groups.foreign_keys]]
+name = "fk_asset_groups_key"
+columns = ["key_id"]
+references_table = "provider_api_keys"
+references_columns = ["id"]
+on_delete = "restrict"
+
+[table.assets]
+domain = "asset_library"
+order = 20
+primary_key = ["id"]
+
+[[table.assets.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.assets.columns]]
+name = "upstream_asset_id"
+type = "text"
+length = 255
+nullable = true
+
+[[table.assets.columns]]
+name = "group_id"
+type = "text_id"
+length = 64
+
+[[table.assets.columns]]
+name = "user_id"
+type = "text_id"
+length = 64
+
+[[table.assets.columns]]
+name = "api_key_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.assets.columns]]
+name = "asset_type"
+type = "text"
+length = 64
+
+[[table.assets.columns]]
+name = "name"
+type = "text"
+length = 512
+
+[[table.assets.columns]]
+name = "status"
+type = "text"
+length = 64
+
+[[table.assets.columns]]
+name = "error_code"
+type = "text"
+length = 128
+nullable = true
+
+[[table.assets.columns]]
+name = "error_message"
+type = "long_text"
+nullable = true
+
+[[table.assets.columns]]
+name = "moderation"
+type = "json"
+nullable = true
+
+[[table.assets.columns]]
+name = "last_inference_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.assets.columns]]
+name = "source_url_fingerprint"
+type = "text"
+length = 128
+nullable = true
+
+[[table.assets.columns]]
+name = "provider_url"
+type = "long_text"
+nullable = true
+
+[[table.assets.columns]]
+name = "provider_url_expires_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.assets.columns]]
+name = "sanitized_metadata"
+type = "json"
+nullable = true
+
+[[table.assets.columns]]
+name = "is_deleted"
+type = "bool"
+default = false
+
+[[table.assets.columns]]
+name = "deleted_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.assets.columns]]
+name = "created_at_unix_secs"
+type = "unix_seconds"
+
+[[table.assets.columns]]
+name = "updated_at_unix_secs"
+type = "unix_seconds"
+
+[[table.assets.uniques]]
+name = "uq_assets_group_upstream"
+columns = ["group_id", "upstream_asset_id"]
+
+[[table.assets.indexes]]
+name = "idx_assets_group_deleted_created"
+columns = ["group_id", "is_deleted", "created_at_unix_secs"]
+
+[[table.assets.indexes]]
+name = "idx_assets_user_type_status"
+columns = ["user_id", "asset_type", "status"]
+
+[[table.assets.indexes]]
+name = "idx_assets_user_deleted_created"
+columns = ["user_id", "is_deleted", "created_at_unix_secs"]
+
+[[table.assets.foreign_keys]]
+name = "fk_assets_group"
+columns = ["group_id"]
+references_table = "asset_groups"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.assets.foreign_keys]]
+name = "fk_assets_user"
+columns = ["user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.assets.foreign_keys]]
+name = "fk_assets_api_key"
+columns = ["api_key_id"]
+references_table = "api_keys"
+references_columns = ["id"]
+on_delete = "set_null"
+
+[table.ark_visual_validation_sessions]
+domain = "asset_library"
+order = 30
+primary_key = ["id"]
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "session_id"
+type = "text"
+length = 255
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "user_id"
+type = "text_id"
+length = 64
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "api_key_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "endpoint_id"
+type = "text_id"
+length = 64
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "key_id"
+type = "text_id"
+length = 64
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "account_binding"
+type = "text"
+length = 255
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "project"
+type = "text"
+length = 255
+default = ""
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "byted_token_hash"
+type = "text"
+length = 128
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "encrypted_byted_token"
+type = "long_text"
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "callback_state_hash"
+type = "text"
+length = 128
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "status"
+type = "text"
+length = 64
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "expires_at_unix_secs"
+type = "unix_seconds"
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "consumed_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "group_id"
+type = "text_id"
+length = 64
+nullable = true
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "sanitized_result"
+type = "json"
+nullable = true
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "created_at_unix_secs"
+type = "unix_seconds"
+
+[[table.ark_visual_validation_sessions.columns]]
+name = "updated_at_unix_secs"
+type = "unix_seconds"
+
+[[table.ark_visual_validation_sessions.uniques]]
+name = "uq_ark_validation_upstream"
+columns = ["provider_id", "account_binding", "project", "session_id"]
+
+[[table.ark_visual_validation_sessions.uniques]]
+name = "uq_ark_validation_callback_state"
+columns = ["callback_state_hash"]
+
+[[table.ark_visual_validation_sessions.uniques]]
+name = "uq_ark_validation_byted_token_hash"
+columns = ["byted_token_hash"]
+
+[[table.ark_visual_validation_sessions.indexes]]
+name = "idx_ark_validation_user_status_expiry"
+columns = ["user_id", "status", "expires_at_unix_secs"]
+
+[[table.ark_visual_validation_sessions.indexes]]
+name = "idx_ark_validation_group"
+columns = ["group_id"]
+
+[[table.ark_visual_validation_sessions.foreign_keys]]
+name = "fk_ark_validation_user"
+columns = ["user_id"]
+references_table = "users"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.ark_visual_validation_sessions.foreign_keys]]
+name = "fk_ark_validation_api_key"
+columns = ["api_key_id"]
+references_table = "api_keys"
+references_columns = ["id"]
+on_delete = "set_null"
+
+[[table.ark_visual_validation_sessions.foreign_keys]]
+name = "fk_ark_validation_provider"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "restrict"
+
+[[table.ark_visual_validation_sessions.foreign_keys]]
+name = "fk_ark_validation_endpoint"
+columns = ["endpoint_id"]
+references_table = "provider_endpoints"
+references_columns = ["id"]
+on_delete = "restrict"
+
+[[table.ark_visual_validation_sessions.foreign_keys]]
+name = "fk_ark_validation_key"
+columns = ["key_id"]
+references_table = "provider_api_keys"
+references_columns = ["id"]
+on_delete = "restrict"
+
+[[table.ark_visual_validation_sessions.foreign_keys]]
+name = "fk_ark_validation_group"
+columns = ["group_id"]
+references_table = "asset_groups"
+references_columns = ["id"]
+on_delete = "set_null"

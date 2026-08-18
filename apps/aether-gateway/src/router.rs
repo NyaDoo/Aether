@@ -86,6 +86,7 @@ fn frontend_path_bypasses_static(path: &str) -> bool {
     ) || path.starts_with("/api/")
         || path.starts_with("/v1/")
         || path.starts_with("/v1beta/")
+        || path.starts_with("/v3/")
         || path.starts_with("/upload/")
         || path.starts_with("/_gateway/")
         || path.starts_with("/.well-known/")
@@ -150,4 +151,23 @@ pub async fn serve_tcp(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frontend_path_bypasses_static;
+
+    #[test]
+    fn v3_api_routes_bypass_the_static_frontend() {
+        for path in [
+            "/v3/asset-library",
+            "/v3/asset-library/ListAssets",
+            "/v3/contents/generations/tasks/task-1",
+        ] {
+            assert!(
+                frontend_path_bypasses_static(path),
+                "API path should bypass frontend fallback: {path}"
+            );
+        }
+    }
 }

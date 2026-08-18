@@ -50,7 +50,7 @@ use crate::executor::{
     LocalExecutionRequestOutcome,
 };
 use crate::frontdoor_loop_guard::{
-    frontdoor_self_loop_public_ai_path, request_has_execution_runtime_loop_guard,
+    frontdoor_self_loop_public_ai_target, request_has_execution_runtime_loop_guard,
 };
 use crate::handlers::shared::{
     build_admin_proxy_auth_required_response, build_unhandled_admin_proxy_response, ip_rules_allow,
@@ -199,7 +199,7 @@ fn local_execution_outcome_label(outcome: &LocalExecutionRequestOutcome) -> &'st
 
 fn request_hits_execution_loop_guard(parts: &http::request::Parts) -> bool {
     request_has_execution_runtime_loop_guard(&parts.headers)
-        && frontdoor_self_loop_public_ai_path(parts.uri.path())
+        && frontdoor_self_loop_public_ai_target(parts.uri.path(), parts.uri.query())
 }
 
 fn execution_runtime_candidate_header_value(decision: &GatewayControlDecision) -> &'static str {
@@ -1619,6 +1619,7 @@ async fn proxy_request_inner(
     let local_ai_public_response = super::public::maybe_build_local_ai_public_response(
         &state,
         &request_context,
+        &parts.headers,
         buffered_body.as_ref(),
     )
     .await;

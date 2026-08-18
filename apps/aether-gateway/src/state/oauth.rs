@@ -1,8 +1,9 @@
 use super::{
     provider_transport_snapshot_looks_refreshed, AppState, CachedProviderTransportSnapshot,
-    GatewayError, ProviderTransportSnapshotCacheKey, ProviderTransportSnapshotFlight,
-    ProviderTransportSnapshotFlightResult, PROVIDER_TRANSPORT_SNAPSHOT_CACHE_MAX_ENTRIES,
-    PROVIDER_TRANSPORT_SNAPSHOT_CACHE_STALE_TTL, PROVIDER_TRANSPORT_SNAPSHOT_CACHE_TTL,
+    GatewayError, ProviderCatalogKeyDeleteOutcome, ProviderTransportSnapshotCacheKey,
+    ProviderTransportSnapshotFlight, ProviderTransportSnapshotFlightResult,
+    PROVIDER_TRANSPORT_SNAPSHOT_CACHE_MAX_ENTRIES, PROVIDER_TRANSPORT_SNAPSHOT_CACHE_STALE_TTL,
+    PROVIDER_TRANSPORT_SNAPSHOT_CACHE_TTL,
 };
 use crate::handlers::shared::{
     decrypt_catalog_secret_with_fallbacks, default_provider_key_status_snapshot,
@@ -2040,15 +2041,17 @@ impl AppState {
         key_id: &str,
         expected: &ProviderTransportCredentialFence,
     ) -> Result<bool, GatewayError> {
-        let deleted = self
-            .compare_and_delete_provider_catalog_key_oauth_credential(
+        let deleted = matches!(
+            self.compare_and_delete_provider_catalog_key_oauth_credential_if_unreferenced(
                 &ProviderCatalogKeyOAuthCredentialCasDelete {
                     key_id: key_id.to_string(),
                     expected_encrypted_auth_config: Some(expected.encrypted_auth_config.clone()),
                     expected_credential: expected.credential.clone(),
                 },
             )
-            .await?;
+            .await?,
+            ProviderCatalogKeyDeleteOutcome::Deleted
+        );
         if !deleted {
             return Ok(false);
         }
@@ -2563,7 +2566,11 @@ impl AppState {
             .eq_ignore_ascii_case("codex")
         {
             self.clear_provider_transport_snapshot_cache();
-            if self.delete_provider_catalog_key(key_id).await? {
+            if matches!(
+                self.delete_provider_catalog_key_if_unreferenced(key_id)
+                    .await?,
+                ProviderCatalogKeyDeleteOutcome::Deleted
+            ) {
                 let deleted_key_ids = [key_id.to_string()];
                 self.cleanup_deleted_provider_catalog_refs(
                     &transport.provider.id,

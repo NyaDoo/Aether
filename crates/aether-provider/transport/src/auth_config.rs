@@ -21,8 +21,11 @@ const UNSAFE_AUTH_CONFIG_QUERY_NAMES: &[&str] = &[
     "token",
 ];
 const SENSITIVE_AUTH_CONFIG_KEYS: &[&str] = &[
+    "access_key",
+    "access_key_id",
     "access_token",
     "agent_private_key",
+    "ak",
     "api_key",
     "apikey",
     "authorization",
@@ -34,14 +37,22 @@ const SENSITIVE_AUTH_CONFIG_KEYS: &[&str] = &[
     "key",
     "private_key",
     "refresh_token",
+    "secret_access_key",
+    "secret_key",
+    "security_token",
+    "session_token",
     "service_account",
+    "sk",
     "token",
     "token_uri",
 ];
 const IGNORABLE_AUTH_CONFIG_METADATA_KEYS: &[&str] = &[
     "account_id",
+    "account_binding",
     "account_name",
     "account_user_id",
+    "asset_account_binding",
+    "api_key_header",
     "auth_method",
     "access_token_import_temporary",
     "email",
@@ -50,7 +61,9 @@ const IGNORABLE_AUTH_CONFIG_METADATA_KEYS: &[&str] = &[
     "model_regions",
     "organizations",
     "plan_type",
+    "project",
     "project_id",
+    "project_name",
     "provider_type",
     "refresh_token_import_error",
     "region",
@@ -140,7 +153,7 @@ pub fn absorb_local_auth_config_safe_subset(
         Ok(subset) => subset,
         Err(()) => return LocalAuthConfigAbsorption::Unsupported,
     };
-    if subset.is_empty() {
+    if subset.is_empty() && extract_local_auth_config_safe_metadata(raw_auth_config).is_none() {
         return LocalAuthConfigAbsorption::Unsupported;
     }
     let header_rules = match merge_auth_config_header_rules(header_rules, &subset.headers) {
@@ -161,6 +174,34 @@ pub fn absorb_local_auth_config_safe_subset(
         header_rules,
         custom_path,
     }
+}
+
+pub fn extract_local_auth_config_safe_metadata(raw_auth_config: &str) -> Option<Value> {
+    let object = serde_json::from_str::<Value>(raw_auth_config)
+        .ok()?
+        .as_object()?
+        .clone();
+    let mut metadata = serde_json::Map::new();
+    for (key, value) in object {
+        let normalized = key.trim().to_ascii_lowercase();
+        let canonical = match normalized.as_str() {
+            "account_id" | "asset_account_binding" | "account_binding" => "account_id",
+            "api_key_header" | "apikeyheader" => "api_key_header",
+            "project" | "project_id" | "project_name" => "project",
+            _ => continue,
+        };
+        let value = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        if canonical == "api_key_header"
+            && !matches!(value.to_ascii_lowercase().as_str(), "api-key" | "x-api-key")
+        {
+            return None;
+        }
+        metadata.insert(canonical.to_string(), Value::String(value.to_string()));
+    }
+    (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
 
 fn parse_local_auth_config_safe_subset(raw: &str) -> Result<LocalAuthConfigSafeSubset, ()> {
@@ -481,7 +522,7 @@ mod tests {
 
     use super::{
         absorb_local_auth_config_safe_subset, apply_local_auth_config_header_overrides,
-        LocalAuthConfigAbsorption,
+        extract_local_auth_config_safe_metadata, LocalAuthConfigAbsorption,
     };
 
     #[test]
@@ -802,6 +843,67 @@ mod tests {
                 ),
             ),
             LocalAuthConfigAbsorption::Unsupported
+        );
+    }
+
+    #[test]
+    fn rejects_volc_aksk_fields_from_local_auth_config_absorption() {
+        for field in [
+            "access_key",
+            "access_key_id",
+            "ak",
+            "secret_access_key",
+            "secret_key",
+            "security_token",
+            "session_token",
+            "sk",
+        ] {
+            let mut object =
+                serde_json::Map::from_iter([("headers".to_string(), json!({"x-org-id": "org-1"}))]);
+            object.insert(field.to_string(), json!("must-not-be-absorbed"));
+            let raw = serde_json::Value::Object(object).to_string();
+            assert_eq!(
+                absorb_local_auth_config_safe_subset(
+                    "https://api.openai.example/v1",
+                    None,
+                    None,
+                    Some(&raw),
+                ),
+                LocalAuthConfigAbsorption::Unsupported,
+                "{field} must stay encrypted in auth_config"
+            );
+        }
+    }
+
+    #[test]
+    fn absorbs_and_canonicalizes_account_binding_metadata_only_config() {
+        let raw = r#"{
+            "account_binding": " account-1 ",
+            "project_name": " project-1 ",
+            "api_key_header": "api-key"
+        }"#;
+        let result = absorb_local_auth_config_safe_subset(
+            "https://ark.cn-beijing.volcengineapi.com",
+            None,
+            None,
+            Some(raw),
+        );
+
+        assert_eq!(
+            result,
+            LocalAuthConfigAbsorption::Absorbed {
+                base_url: "https://ark.cn-beijing.volcengineapi.com".to_string(),
+                header_rules: None,
+                custom_path: None,
+            }
+        );
+        assert_eq!(
+            extract_local_auth_config_safe_metadata(raw),
+            Some(json!({
+                "account_id": "account-1",
+                "project": "project-1",
+                "api_key_header": "api-key"
+            }))
         );
     }
 

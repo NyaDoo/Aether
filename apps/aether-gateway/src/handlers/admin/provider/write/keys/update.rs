@@ -2,7 +2,8 @@ use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyUpdatePa
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    normalize_max_probe_interval_minutes, normalize_rate_multipliers, validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, normalize_rate_multipliers,
+    normalize_volc_aksk_auth_config, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -72,7 +73,32 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
         .map(str::trim)
         .map(ToOwned::to_owned);
     let auth_config_present = fields.contains("auth_config");
-    let auth_config = normalize_json_object(payload.auth_config, "auth_config")?;
+    let mut auth_config = normalize_json_object(payload.auth_config, "auth_config")?;
+    let raw_to_raw_auth_switch = auth_type_switch
+        && raw_secret_auth_type(&current_auth_type)
+        && raw_secret_auth_type(&target_auth_type);
+    if auth_config_present && (!auth_type_switch || raw_to_raw_auth_switch) {
+        let mut merged = parse_catalog_auth_config_json(state, existing).unwrap_or_default();
+        if let Some(patch) = auth_config
+            .take()
+            .and_then(|value| value.as_object().cloned())
+        {
+            merged.extend(patch);
+        }
+        auth_config = Some(serde_json::Value::Object(merged));
+    }
+    if target_auth_type == "volc_aksk" && auth_config_present {
+        auth_config = Some(normalize_volc_aksk_auth_config(auth_config)?);
+    } else if target_auth_type == "volc_aksk" && auth_type_switch {
+        return Err("切换到 Volcengine AK/SK 认证模式时，必须提供 auth_config".to_string());
+    } else if target_auth_type == "volc_aksk" {
+        let existing_config = parse_catalog_auth_config_json(state, existing)
+            .map(serde_json::Value::Object)
+            .ok_or_else(|| {
+                "现有 Volcengine AK/SK auth_config 缺失或无法解密，请重新填写".to_string()
+            })?;
+        normalize_volc_aksk_auth_config(Some(existing_config))?;
+    }
     let auth_config_object = auth_config
         .as_ref()
         .and_then(serde_json::Value::as_object)
@@ -125,7 +151,18 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
             } else if api_key_present {
                 updated.encrypted_api_key = None;
             }
-            updated.encrypted_auth_config = None;
+            if auth_config_present {
+                updated.encrypted_auth_config = auth_config
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|err| err.to_string())?
+                    .map(|plaintext| {
+                        encrypt_catalog_secret_with_fallbacks(state, &plaintext)
+                            .ok_or_else(|| "gateway 未配置 provider key 加密密钥".to_string())
+                    })
+                    .transpose()?;
+            }
         }
         "service_account" => {
             if auth_type_switch && auth_config_object.is_none() {
@@ -178,6 +215,29 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
                     }
                 }
             }
+            if auth_config_present {
+                updated.encrypted_auth_config = auth_config
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|err| err.to_string())?
+                    .map(|plaintext| {
+                        encrypt_catalog_secret_with_fallbacks(state, &plaintext)
+                            .ok_or_else(|| "gateway 未配置 provider key 加密密钥".to_string())
+                    })
+                    .transpose()?;
+            }
+        }
+        "volc_aksk" => {
+            if api_key_present
+                && !matches!(
+                    api_key_value.as_deref(),
+                    None | Some("") | Some("__placeholder__")
+                )
+            {
+                return Err("Volcengine AK/SK 认证模式下不允许直接填写 api_key".to_string());
+            }
+            updated.encrypted_api_key = None;
             if auth_config_present {
                 updated.encrypted_auth_config = auth_config
                     .as_ref()
@@ -314,6 +374,22 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
     if fields.contains("capabilities") {
         updated.capabilities = normalize_json_object(payload.capabilities, "capabilities")?;
     }
+    if effective_api_formats.iter().any(|format| {
+        crate::ai_serving::api_format_alias_matches(
+            format,
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+        )
+    }) {
+        updated
+            .capabilities
+            .get_or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| "capabilities 必须是 JSON 对象".to_string())?
+            .insert(
+                crate::material_assets::ARK_ASSET_REQUIRED_CAPABILITY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+    }
     if let Some(cache_ttl_minutes) = payload.cache_ttl_minutes {
         updated.cache_ttl_minutes = cache_ttl_minutes;
     }
@@ -390,4 +466,379 @@ fn raw_secret_auth_type(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "api_key" | "bearer"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_admin_update_provider_key_record_with_existing_keys;
+    use crate::data::GatewayDataState;
+    use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyUpdatePatch;
+    use crate::handlers::admin::request::AdminAppState;
+    use crate::AppState;
+    use aether_crypto::{
+        decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext,
+        DEVELOPMENT_ENCRYPTION_KEY,
+    };
+    use aether_data_contracts::repository::provider_catalog::{
+        StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use serde_json::json;
+
+    fn test_app() -> AppState {
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
+    fn sample_provider() -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            "provider-ark".to_string(),
+            "Ark".to_string(),
+            Some("https://www.volcengine.com".to_string()),
+            "custom".to_string(),
+        )
+        .expect("provider should build")
+    }
+
+    fn sample_key(auth_type: &str) -> StoredProviderCatalogKey {
+        StoredProviderCatalogKey::new(
+            "key-ark".to_string(),
+            "provider-ark".to_string(),
+            "ark-key".to_string(),
+            auth_type.to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+    }
+
+    fn patch(value: serde_json::Value) -> AdminProviderKeyUpdatePatch {
+        AdminProviderKeyUpdatePatch::from_object(
+            value
+                .as_object()
+                .cloned()
+                .expect("update patch should be an object"),
+        )
+        .expect("update patch should parse")
+    }
+
+    #[test]
+    fn switches_raw_secret_key_to_canonical_volc_aksk_config() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let mut existing = sample_key("bearer");
+        existing.encrypted_api_key = Some(
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "stale-relay-secret")
+                .expect("raw secret should encrypt"),
+        );
+
+        let updated = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &sample_provider(),
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({
+                "auth_type": "aksk",
+                "auth_config": {
+                    "access_key_id": " AKLT-new ",
+                    "secret_access_key": " secret-new ",
+                    "service": " ark "
+                }
+            })),
+        )
+        .expect("valid AK/SK switch should succeed");
+
+        assert_eq!(updated.auth_type, "volc_aksk");
+        assert!(updated.encrypted_api_key.is_none());
+        let plaintext = decrypt_python_fernet_ciphertext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            updated
+                .encrypted_auth_config
+                .as_deref()
+                .expect("updated config should be encrypted"),
+        )
+        .expect("updated config should decrypt");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plaintext)
+                .expect("updated config should be JSON"),
+            json!({
+                "access_key_id": "AKLT-new",
+                "secret_access_key": "secret-new",
+                "service": "ark"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_raw_secret_mixed_volc_aksk_update() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let existing = sample_key("api_key");
+        let provider = sample_provider();
+
+        let missing = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &provider,
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({"auth_type": "volc_aksk"})),
+        )
+        .expect_err("switching to AK/SK must require config");
+        assert!(missing.contains("必须提供 auth_config"));
+
+        let mixed = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &provider,
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({
+                "auth_type": "volc_aksk",
+                "api_key": "relay-api-key",
+                "auth_config": {
+                    "access_key_id": "AKLT-new",
+                    "secret_access_key": "secret-new"
+                }
+            })),
+        )
+        .expect_err("raw secret and AK/SK must be mutually exclusive");
+        assert!(mixed.contains("不允许直接填写 api_key"));
+    }
+
+    #[test]
+    fn preserves_existing_volc_aksk_config_for_non_credential_update() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let mut existing = sample_key("volc_aksk");
+        existing.encrypted_auth_config = Some(
+            encrypt_python_fernet_plaintext(
+                DEVELOPMENT_ENCRYPTION_KEY,
+                &json!({
+                    "access_key_id": "AKLT-existing",
+                    "secret_access_key": "secret-existing"
+                })
+                .to_string(),
+            )
+            .expect("AK/SK config should encrypt"),
+        );
+        let original_ciphertext = existing.encrypted_auth_config.clone();
+
+        let updated = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &sample_provider(),
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({"name": "renamed-ark-key"})),
+        )
+        .expect("non-credential update should preserve AK/SK config");
+
+        assert_eq!(updated.name, "renamed-ark-key");
+        assert_eq!(updated.encrypted_auth_config, original_ciphertext);
+        assert!(updated.encrypted_api_key.is_none());
+    }
+
+    #[test]
+    fn merges_bearer_binding_patch_without_clearing_raw_secret() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let mut existing = sample_key("bearer");
+        existing.encrypted_api_key = Some(
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
+                .expect("raw secret should encrypt"),
+        );
+        existing.encrypted_auth_config = Some(
+            encrypt_python_fernet_plaintext(
+                DEVELOPMENT_ENCRYPTION_KEY,
+                &json!({
+                    "account_id": "account-existing",
+                    "project": "project-existing"
+                })
+                .to_string(),
+            )
+            .expect("binding config should encrypt"),
+        );
+        let original_secret = existing.encrypted_api_key.clone();
+
+        let updated = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &sample_provider(),
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({
+                "auth_config": {
+                    "project": "project-updated"
+                }
+            })),
+        )
+        .expect("binding-only bearer update should succeed");
+
+        assert_eq!(updated.auth_type, "bearer");
+        assert_eq!(updated.encrypted_api_key, original_secret);
+        let plaintext = decrypt_python_fernet_ciphertext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            updated
+                .encrypted_auth_config
+                .as_deref()
+                .expect("merged binding config should be encrypted"),
+        )
+        .expect("merged binding config should decrypt");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plaintext)
+                .expect("merged binding config should be JSON"),
+            json!({
+                "account_id": "account-existing",
+                "project": "project-updated"
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_binding_when_switching_between_raw_auth_types() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let mut existing = sample_key("api_key");
+        existing.encrypted_api_key = Some(
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
+                .expect("raw secret should encrypt"),
+        );
+        existing.encrypted_auth_config = Some(
+            encrypt_python_fernet_plaintext(
+                DEVELOPMENT_ENCRYPTION_KEY,
+                &json!({
+                    "account_id": "account-existing",
+                    "project": "project-existing",
+                    "api_key_header": "api-key"
+                })
+                .to_string(),
+            )
+            .expect("binding config should encrypt"),
+        );
+        let original_config = existing.encrypted_auth_config.clone();
+
+        let updated = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &sample_provider(),
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({"auth_type": "bearer"})),
+        )
+        .expect("raw auth type switch should preserve binding metadata");
+
+        assert_eq!(updated.auth_type, "bearer");
+        assert_eq!(updated.encrypted_auth_config, original_config);
+    }
+
+    #[test]
+    fn merges_partial_binding_when_switching_between_raw_auth_types() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let mut existing = sample_key("api_key");
+        existing.encrypted_api_key = Some(
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
+                .expect("raw secret should encrypt"),
+        );
+        existing.encrypted_auth_config = Some(
+            encrypt_python_fernet_plaintext(
+                DEVELOPMENT_ENCRYPTION_KEY,
+                &json!({
+                    "account_id": "account-existing",
+                    "project": "project-existing",
+                    "api_key_header": "api-key"
+                })
+                .to_string(),
+            )
+            .expect("binding config should encrypt"),
+        );
+
+        let updated = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &sample_provider(),
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({
+                "auth_type": "bearer",
+                "auth_config": {"account_id": "account-updated"}
+            })),
+        )
+        .expect("partial raw auth switch should merge binding metadata");
+        let plaintext = decrypt_python_fernet_ciphertext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            updated
+                .encrypted_auth_config
+                .as_deref()
+                .expect("auth config"),
+        )
+        .expect("auth config decrypts");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plaintext).expect("auth config JSON"),
+            json!({
+                "account_id": "account-updated",
+                "project": "project-existing",
+                "api_key_header": "api-key"
+            })
+        );
+    }
+
+    #[test]
+    fn merges_volc_aksk_binding_patch_without_clearing_credentials() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let mut existing = sample_key("volc_aksk");
+        existing.encrypted_auth_config = Some(
+            encrypt_python_fernet_plaintext(
+                DEVELOPMENT_ENCRYPTION_KEY,
+                &json!({
+                    "access_key_id": "AKLT-existing",
+                    "secret_access_key": "secret-existing",
+                    "security_token": "token-existing",
+                    "region": "cn-beijing",
+                    "service": "ark",
+                    "account_id": "account-existing",
+                    "project": "project-existing"
+                })
+                .to_string(),
+            )
+            .expect("AK/SK config should encrypt"),
+        );
+
+        let updated = build_admin_update_provider_key_record_with_existing_keys(
+            &state,
+            &sample_provider(),
+            &existing,
+            std::slice::from_ref(&existing),
+            patch(json!({
+                "auth_config": {
+                    "account_id": "account-updated",
+                    "project": "project-updated"
+                }
+            })),
+        )
+        .expect("binding-only AK/SK update should preserve credentials");
+
+        assert_eq!(updated.auth_type, "volc_aksk");
+        assert!(updated.encrypted_api_key.is_none());
+        let plaintext = decrypt_python_fernet_ciphertext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            updated
+                .encrypted_auth_config
+                .as_deref()
+                .expect("merged AK/SK config should be encrypted"),
+        )
+        .expect("merged AK/SK config should decrypt");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plaintext)
+                .expect("merged AK/SK config should be JSON"),
+            json!({
+                "access_key_id": "AKLT-existing",
+                "secret_access_key": "secret-existing",
+                "security_token": "token-existing",
+                "region": "cn-beijing",
+                "service": "ark",
+                "account_id": "account-updated",
+                "project": "project-updated"
+            })
+        );
+    }
 }

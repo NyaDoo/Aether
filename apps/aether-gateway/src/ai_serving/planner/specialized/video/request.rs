@@ -11,7 +11,9 @@ use crate::ai_serving::transport::{
     resolve_video_create_auth, video_create_transport_unsupported_reason,
     ProviderVideoCreateFamily, ProviderVideoCreateHeadersInput,
 };
-use crate::ai_serving::{CandidateFailureDiagnostic, GatewayProviderTransportSnapshot};
+use crate::ai_serving::{
+    CandidateFailureDiagnostic, CandidateFailureDiagnosticKind, GatewayProviderTransportSnapshot,
+};
 use crate::AppState;
 
 use super::support::{
@@ -171,6 +173,39 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
         )
         .await;
         return None;
+    };
+    let provider_request_body = match crate::material_assets::project_video_asset_references(
+        state,
+        &input.auth_context.user_id,
+        transport,
+        &provider_request_body,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(message) => {
+            mark_skipped_local_video_candidate_with_failure_diagnostic(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                "material_asset_reference_invalid",
+                CandidateFailureDiagnostic::new(
+                    CandidateFailureDiagnosticKind::RequestConversion,
+                    "$.content",
+                    message,
+                )
+                .formats(
+                    spec_metadata.api_format,
+                    attempt.eligible.provider_api_format.as_str(),
+                )
+                .source("material_asset_reference_projection"),
+            )
+            .await;
+            return None;
+        }
     };
 
     let Some(provider_request_headers) =

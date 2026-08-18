@@ -2,6 +2,9 @@ mod decision;
 mod request;
 mod support;
 
+#[cfg(test)]
+mod tests;
+
 use async_trait::async_trait;
 use tracing::warn;
 

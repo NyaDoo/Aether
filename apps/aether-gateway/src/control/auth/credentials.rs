@@ -222,6 +222,14 @@ fn select_primary_credential(
     bundle: &GatewayCredentialBundle,
 ) -> Option<GatewayPrimaryCredential> {
     let signature = auth_endpoint_signature.trim().to_ascii_lowercase();
+    if signature == crate::material_assets::ARK_ASSET_API_FORMAT
+        && bundle
+            .authorization_bearer
+            .as_deref()
+            .is_some_and(crate::local_auth_token::is_aether_access_token)
+    {
+        return first_bearer_token(bundle);
+    }
     if signature.starts_with("gemini:") {
         return select_gemini_credential(bundle);
     }
@@ -243,7 +251,6 @@ fn select_primary_credential(
     if signature.starts_with("aether:") {
         return select_openai_credential(bundle);
     }
-
     select_generic_credential(bundle)
 }
 
@@ -550,6 +557,57 @@ mod tests {
             extracted.primary,
             Some(GatewayPrimaryCredential::ProviderApiKey {
                 raw: "sk-openai".to_string(),
+                carrier: GatewayCredentialCarrier::AuthorizationBearer,
+            })
+        );
+    }
+
+    #[test]
+    fn selects_material_assets_bearer_as_provider_api_key() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer sk-material-assets".parse().unwrap(),
+        );
+
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::GET,
+            &uri("/api/material-assets/assets"),
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+        );
+        assert_eq!(
+            extracted.primary,
+            Some(GatewayPrimaryCredential::ProviderApiKey {
+                raw: "sk-material-assets".to_string(),
+                carrier: GatewayCredentialCarrier::AuthorizationBearer,
+            })
+        );
+    }
+
+    #[test]
+    fn defers_aether_session_token_for_material_assets() {
+        let token = crate::local_auth_token::sign_for_tests(
+            "access",
+            serde_json::Map::from_iter([("user_id".to_string(), serde_json::json!("user-1"))]),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+
+        let extracted = extract_request_credentials(
+            &headers,
+            &http::Method::GET,
+            &uri("/api/material-assets/assets"),
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+        );
+        assert_eq!(
+            extracted.primary,
+            Some(GatewayPrimaryCredential::BearerToken {
+                raw: token,
                 carrier: GatewayCredentialCarrier::AuthorizationBearer,
             })
         );

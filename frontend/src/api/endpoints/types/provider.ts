@@ -220,6 +220,20 @@ export interface ProviderEndpoint {
  */
 export type AllowedModels = string[] | null
 
+export type ProviderKeyAuthType = 'api_key' | 'service_account' | 'oauth' | 'bearer' | 'volc_aksk'
+export type ArkApiKeyHeader = 'x-api-key' | 'api-key'
+
+export interface ProviderKeyAuthConfig extends Record<string, unknown> {
+  account_id?: string
+  project?: string
+  api_key_header?: ArkApiKeyHeader
+  access_key_id?: string
+  secret_access_key?: string
+  security_token?: string
+  region?: string
+  service?: string
+}
+
 // AllowedModels 类型守卫函数
 export function isAllowedModelsList(value: AllowedModels): value is string[] {
   return Array.isArray(value)
@@ -231,11 +245,11 @@ export interface EndpointAPIKey {
   api_formats: string[]  // 支持的 endpoint signature 列表（如 "openai:chat"）
   api_key_masked: string
   api_key_plain?: string | null
-  auth_type: 'api_key' | 'service_account' | 'oauth' | 'bearer'  // 认证类型（必返回）
+  auth_type: ProviderKeyAuthType  // 认证类型（必返回）
   auth_type_by_format?: Record<string, 'api_key' | 'bearer'> | null
   allow_auth_channel_mismatch_formats?: string[] | null
-  credential_kind?: 'raw_secret' | 'oauth_session' | 'service_account' | string | null
-  runtime_auth_kind?: 'api_key' | 'bearer' | 'service_account' | 'mixed' | 'unknown' | string | null
+  credential_kind?: 'raw_secret' | 'oauth_session' | 'service_account' | 'volc_aksk' | string | null
+  runtime_auth_kind?: 'api_key' | 'bearer' | 'service_account' | 'volc_aksk' | 'mixed' | 'unknown' | string | null
   oauth_managed?: boolean
   agent_identity?: boolean
   oauth_header_auth?: boolean
@@ -531,10 +545,10 @@ export interface EndpointAPIKeyUpdate {
   api_formats?: string[]  // 支持的 API 格式列表
   name?: string
   api_key?: string  // 仅在需要更新时提供
-  auth_type?: 'api_key' | 'service_account' | 'oauth' | 'bearer'  // 认证类型
+  auth_type?: ProviderKeyAuthType  // 认证类型
   auth_type_by_format?: Record<string, 'api_key' | 'bearer'> | null
   allow_auth_channel_mismatch_formats?: string[] | null
-  auth_config?: Record<string, unknown>  // 认证配置（Vertex AI Service Account JSON）
+  auth_config?: ProviderKeyAuthConfig  // Service Account、Ark 中转或 Volcengine AK/SK 认证配置
   rate_multipliers?: Record<string, number> | null  // 按 API 格式的成本倍率
   internal_priority?: number
   global_priority_by_format?: Record<string, number> | null  // 按 API 格式的全局优先级

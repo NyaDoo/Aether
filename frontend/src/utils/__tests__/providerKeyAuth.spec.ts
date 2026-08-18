@@ -62,4 +62,15 @@ describe('providerKeyAuth', () => {
     expect(getProviderMaskedSecretLabel(input, 'codex')).toBe('[Agent Identity]')
     expect(getProviderAuthLabel(input)).toBe('Agent Identity')
   })
+
+  it('renders Volcengine signing credentials distinctly from relay secrets', () => {
+    const input = {
+      auth_type: 'volc_aksk',
+      credential_kind: 'volc_aksk',
+      runtime_auth_kind: 'volc_aksk',
+    }
+
+    expect(getProviderAuthLabel(input)).toBe('Volcengine AK/SK')
+    expect(getProviderMaskedSecretLabel(input)).toBe('[Volcengine AK/SK]')
+  })
 })

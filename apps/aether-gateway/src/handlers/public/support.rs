@@ -60,9 +60,11 @@ use self::support_announcements::{
 use self::support_auth::auth_registration::{
     auth_password_policy_level, validate_auth_register_password,
 };
+pub(crate) use self::support_auth::auth_session::{
+    bearer_is_aether_access_token, resolve_authenticated_local_user,
+};
 use self::support_auth::auth_session::{
-    build_auth_wallet_summary_payload, handle_auth_me, resolve_authenticated_local_user,
-    AuthenticatedLocalUserContext,
+    build_auth_wallet_summary_payload, handle_auth_me, AuthenticatedLocalUserContext,
 };
 use self::support_auth::{
     build_auth_error_response, build_auth_json_response, build_auth_registration_settings_payload,
@@ -124,6 +126,16 @@ pub(crate) async fn maybe_build_local_public_support_response(
     let decision = request_context.control_decision.as_ref()?;
     if decision.route_class.as_deref() != Some("public_support") {
         return None;
+    }
+
+    if decision.route_family.as_deref() == Some("material_assets") {
+        return crate::material_assets::maybe_handle_user_asset_request(
+            state,
+            request_context,
+            headers,
+            request_body,
+        )
+        .await;
     }
 
     if decision.route_family.as_deref() == Some("auth") {

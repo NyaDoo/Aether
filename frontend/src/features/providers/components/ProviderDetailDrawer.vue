@@ -1517,8 +1517,8 @@ async function copyFullKey(key: EndpointAPIKey) {
     const result = await revealEndpointKey(key.id)
     let textToCopy: string
 
-    if (result.auth_type === 'service_account' && result.auth_config) {
-      // Service Account 类型：复制 auth_config JSON
+    if (['service_account', 'volc_aksk'].includes(result.auth_type) && result.auth_config) {
+      // 结构化凭据类型：复制 auth_config JSON
       textToCopy = typeof result.auth_config === 'string'
         ? result.auth_config
         : JSON.stringify(result.auth_config, null, 2)

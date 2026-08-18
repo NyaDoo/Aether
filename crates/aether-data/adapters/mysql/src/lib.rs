@@ -1,6 +1,7 @@
 //! MySQL pool adapter primitives.
 
 mod announcements;
+mod asset_library;
 mod audit;
 mod auth;
 mod auth_modules;
@@ -28,6 +29,7 @@ mod wallet;
 
 pub use aether_data_contracts::{DataLayerError, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
 pub use announcements::MysqlAnnouncementRepository;
+pub use asset_library::MysqlAssetLibraryRepository;
 pub use audit::MysqlAuditLogReadRepository;
 pub use auth::MysqlAuthApiKeyReadRepository;
 pub use auth_modules::{MysqlAuthModuleReadRepository, MysqlAuthModuleRepository};

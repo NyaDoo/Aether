@@ -324,6 +324,65 @@ pub(crate) async fn resolve_authenticated_local_user(
     })
 }
 
+pub(crate) fn bearer_is_aether_access_token(headers: &http::HeaderMap) -> bool {
+    extract_bearer_token(headers)
+        .as_deref()
+        .is_some_and(crate::local_auth_token::is_aether_access_token)
+}
+
+#[cfg(test)]
+mod material_asset_auth_tests {
+    use super::*;
+
+    #[test]
+    fn identifies_only_aether_signed_access_tokens() {
+        let access = create_auth_token(
+            "access",
+            serde_json::Map::from_iter([("user_id".to_string(), json!("user-1"))]),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .expect("access token");
+        let refresh = create_auth_token(
+            "refresh",
+            serde_json::Map::from_iter([("user_id".to_string(), json!("user-1"))]),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .expect("refresh token");
+        let headers = |value: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::AUTHORIZATION,
+                format!("Bearer {value}").parse().expect("authorization"),
+            );
+            headers
+        };
+
+        assert!(bearer_is_aether_access_token(&headers(&access)));
+        assert!(!bearer_is_aether_access_token(&headers(&refresh)));
+        assert!(!bearer_is_aether_access_token(&headers(
+            "eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoiYWNjZXNzIn0.invalid-signature"
+        )));
+    }
+
+    #[test]
+    fn expired_aether_access_token_is_still_classified_as_local() {
+        let token = create_auth_token(
+            "access",
+            serde_json::Map::from_iter([("user_id".to_string(), json!("user-1"))]),
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )
+        .expect("expired access token");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("authorization"),
+        );
+
+        assert!(bearer_is_aether_access_token(&headers));
+        assert!(decode_auth_token(&token, "access").is_err());
+    }
+}
+
 pub(crate) async fn handle_auth_me(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,

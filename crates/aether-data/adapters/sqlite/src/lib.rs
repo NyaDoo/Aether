@@ -1,6 +1,7 @@
 //! SQLite repositories, pool primitives, and migrations.
 
 mod announcements;
+mod asset_library;
 mod audit;
 mod auth;
 mod auth_modules;
@@ -28,6 +29,7 @@ mod wallet;
 
 pub use aether_data_contracts::{DataLayerError, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
 pub use announcements::SqliteAnnouncementRepository;
+pub use asset_library::SqliteAssetLibraryRepository;
 pub use audit::SqliteAuditLogReadRepository;
 pub use auth::SqliteAuthApiKeyReadRepository;
 pub use auth_modules::{SqliteAuthModuleReadRepository, SqliteAuthModuleRepository};

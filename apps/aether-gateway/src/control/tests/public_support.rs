@@ -4,6 +4,75 @@ use super::{classify_control_route, headers, GatewayPublicRequestContext};
 use crate::handlers::shared::local_proxy_route_requires_buffered_body;
 
 #[test]
+fn classifies_user_material_asset_routes_and_buffers_mutations() {
+    for (method, path, route_kind, should_buffer) in [
+        (
+            http::Method::GET,
+            "/api/material-assets/groups",
+            "list_groups",
+            false,
+        ),
+        (
+            http::Method::POST,
+            "/api/material-assets/groups",
+            "create_group",
+            true,
+        ),
+        (
+            http::Method::POST,
+            "/api/material-assets/assets/url",
+            "create_asset_url",
+            true,
+        ),
+        (
+            http::Method::GET,
+            "/api/material-assets/assets/asset-1/preview",
+            "preview_asset",
+            false,
+        ),
+        (
+            http::Method::POST,
+            "/api/material-assets/verification-sessions",
+            "create_verification_session",
+            true,
+        ),
+        (
+            http::Method::GET,
+            "/api/material-assets/verification-sessions/session-1",
+            "get_verification_session",
+            false,
+        ),
+    ] {
+        let headers = headers(&[("authorization", "Bearer sk-test")]);
+        let uri: Uri = path.parse().expect("uri should parse");
+        let decision = classify_control_route(&method, &uri, &headers)
+            .expect("material asset route should classify");
+
+        assert_eq!(decision.route_class.as_deref(), Some("public_support"));
+        assert_eq!(decision.route_family.as_deref(), Some("material_assets"));
+        assert_eq!(decision.route_kind.as_deref(), Some(route_kind));
+        assert_eq!(
+            decision.auth_endpoint_signature.as_deref(),
+            Some(crate::material_assets::ARK_ASSET_API_FORMAT)
+        );
+        assert!(!decision.is_execution_runtime_candidate());
+
+        let context = GatewayPublicRequestContext::from_request_parts(
+            "trace-user-material-assets",
+            &method,
+            &uri,
+            &headers,
+            Some(decision),
+        );
+        assert_eq!(
+            local_proxy_route_requires_buffered_body(&context),
+            should_buffer,
+            "unexpected body-buffer policy for {method} {path}"
+        );
+    }
+}
+
+#[test]
 fn classifies_models_list_as_public_support_route() {
     let headers = headers(&[("authorization", "Bearer sk-test")]);
     let uri: Uri = "/v1/models".parse().expect("uri should parse");

@@ -13,6 +13,7 @@ use crate::{handlers::proxy::proxy_request, state::AppState, GatewayError};
 // They intentionally stay separate from manifest-facing route inventories in constants.rs,
 // which describe operational compatibility surfaces rather than the concrete axum mount list.
 const AI_POST_ROUTE_PATTERNS: &[&str] = &[
+    "/",
     "/v1/chat/completions",
     "/v1/embeddings",
     "/v1/rerank",
@@ -33,6 +34,8 @@ const AI_POST_ROUTE_PATTERNS: &[&str] = &[
     "/v1internal:recordCodeAssistMetrics",
     "/v1internal:writeTrajectoryAcls",
     "/v1internal:streamGenerateContent",
+    "/v3/asset-library",
+    "/v3/asset-library/{*asset_path}",
 ];
 
 const CLAUDE_POST_ROUTE_PATTERNS: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
@@ -122,7 +125,19 @@ pub(crate) fn admin_default_body_rules_for_signature(
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_endpoint_signature_parts, public_api_format_local_path};
+    use super::{
+        admin_endpoint_signature_parts, public_api_format_local_path, AI_POST_ROUTE_PATTERNS,
+    };
+
+    #[test]
+    fn mounts_native_ark_asset_action_routes() {
+        for path in ["/", "/v3/asset-library", "/v3/asset-library/{*asset_path}"] {
+            assert!(
+                AI_POST_ROUTE_PATTERNS.contains(&path),
+                "missing Ark asset route {path}"
+            );
+        }
+    }
 
     #[test]
     fn supports_data_api_endpoint_signatures_and_public_paths() {

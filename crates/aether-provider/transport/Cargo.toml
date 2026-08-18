@@ -20,6 +20,7 @@ chrono.workspace = true
 crypto_box.workspace = true
 ed25519-dalek.workspace = true
 http.workspace = true
+hmac.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rsa = "0.9.10"

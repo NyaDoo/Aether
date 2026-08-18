@@ -131,8 +131,8 @@ pub(crate) use sync::{
 };
 pub(crate) use transport::execute_sync_plan_with_report_context as execute_execution_runtime_sync_plan_with_report_context;
 pub(crate) use transport::{
-    execute_sync_plan as execute_execution_runtime_sync_plan, DirectSyncExecutionRuntime,
-    DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
+    execute_direct_asset_response, execute_sync_plan as execute_execution_runtime_sync_plan,
+    DirectSyncExecutionRuntime, DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
 };
 pub(crate) use transport_failure::{
     build_transport_error_stop_response, mark_stream_candidate_watchdog_terminal_started,

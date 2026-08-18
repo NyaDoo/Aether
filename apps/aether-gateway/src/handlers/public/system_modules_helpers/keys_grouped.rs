@@ -18,6 +18,7 @@ fn grouped_key_masked_label(
 ) -> &'static str {
     match key.auth_type.trim() {
         "service_account" | "vertex_ai" => "[Service Account]",
+        "volc_aksk" => "[Volcengine AK/SK]",
         "oauth" => {
             let auth_config = parse_catalog_auth_config_json(state, key);
             if provider_key_auth_config_is_agent_identity(provider_type, auth_config.as_ref()) {

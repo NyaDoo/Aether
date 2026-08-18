@@ -1,3 +1,7 @@
+use crate::data::AssetProviderReference;
+use crate::handlers::admin::provider::material_references::{
+    count_material_references, material_reference_conflict_message,
+};
 use crate::handlers::admin::provider::shared::support::{
     put_admin_provider_delete_task, ADMIN_PROVIDER_MAPPING_PREVIEW_FETCH_LIMIT,
     ADMIN_PROVIDER_MAPPING_PREVIEW_MAX_KEYS, ADMIN_PROVIDER_MAPPING_PREVIEW_MAX_MODELS,
@@ -16,6 +20,8 @@ use aether_data_contracts::repository::global_models::{
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const PROVIDER_MODEL_DELETE_PAGE_SIZE: usize = 1_000;
 
 #[derive(Debug, Clone)]
 struct MappingPreviewGlobalModel {
@@ -43,21 +49,41 @@ pub(crate) async fn run_admin_provider_delete_task(
         )));
     };
 
+    let reference_counts =
+        count_material_references(state, AssetProviderReference::ProviderId(&provider.id)).await?;
+    if reference_counts.is_referenced() {
+        return Err(GatewayError::Client {
+            status: http::StatusCode::CONFLICT,
+            message: material_reference_conflict_message(
+                "Provider",
+                &provider.id,
+                reference_counts,
+            ),
+        });
+    }
+
     let keys = state
         .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider.id))
         .await?;
     let endpoints = state
         .list_provider_catalog_endpoints_by_provider_ids(std::slice::from_ref(&provider.id))
         .await?;
-    let models = state
-        .list_admin_provider_models(&AdminProviderModelListQuery {
-            provider_id: provider.id.clone(),
-            offset: 0,
-            limit: 10_000,
-            is_active: None,
-        })
-        .await
-        .unwrap_or_default();
+    let mut models = Vec::new();
+    loop {
+        let page = state
+            .list_admin_provider_models(&AdminProviderModelListQuery {
+                provider_id: provider.id.clone(),
+                offset: models.len(),
+                limit: PROVIDER_MODEL_DELETE_PAGE_SIZE,
+                is_active: None,
+            })
+            .await?;
+        let page_len = page.len();
+        models.extend(page);
+        if page_len < PROVIDER_MODEL_DELETE_PAGE_SIZE {
+            break;
+        }
+    }
 
     let mut task = LocalProviderDeleteTaskState {
         task_id: task_id.to_string(),
@@ -76,7 +102,9 @@ pub(crate) async fn run_admin_provider_delete_task(
     };
     put_admin_provider_delete_task(state, &task);
 
-    if provider.is_active {
+    let provider_before_disable = provider.clone();
+    let provider_was_active = provider.is_active;
+    if provider_was_active {
         provider.is_active = false;
         provider.updated_at_unix_secs = Some(
             SystemTime::now()
@@ -85,7 +113,51 @@ pub(crate) async fn run_admin_provider_delete_task(
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
         );
-        let _ = app.update_provider_catalog_provider(&provider).await?;
+        if app
+            .update_provider_catalog_provider_during_delete(&provider)
+            .await?
+            .is_none()
+        {
+            return Err(GatewayError::Internal(format!(
+                "provider {} disappeared while starting delete task",
+                provider.id
+            )));
+        }
+    }
+
+    let references_after_disable =
+        count_material_references(state, AssetProviderReference::ProviderId(&provider.id)).await;
+    let references_after_disable = match references_after_disable {
+        Ok(references) => references,
+        Err(error) => {
+            if provider_was_active {
+                let _ = app
+                    .update_provider_catalog_provider_during_delete(&provider_before_disable)
+                    .await?;
+            }
+            return Err(error);
+        }
+    };
+    if references_after_disable.is_referenced() {
+        if provider_was_active
+            && app
+                .update_provider_catalog_provider_during_delete(&provider_before_disable)
+                .await?
+                .is_none()
+        {
+            return Err(GatewayError::Internal(format!(
+                "provider {} could not be restored after material reference conflict",
+                provider.id
+            )));
+        }
+        return Err(GatewayError::Client {
+            status: http::StatusCode::CONFLICT,
+            message: material_reference_conflict_message(
+                "Provider",
+                &provider.id,
+                references_after_disable,
+            ),
+        });
     }
     task.stage = "disabling".to_string();
     task.message = "provider disabled; starting cleanup".to_string();
@@ -103,8 +175,8 @@ pub(crate) async fn run_admin_provider_delete_task(
     task.message = format!("deleting {} provider models", models.len());
     put_admin_provider_delete_task(state, &task);
     for model in &models {
-        let _ = state
-            .delete_admin_provider_model(&provider.id, &model.id)
+        let _ = app
+            .delete_admin_provider_model_during_delete(&provider.id, &model.id)
             .await?;
     }
 
@@ -176,6 +248,9 @@ pub(crate) fn mapping_preview_masked_catalog_api_key(
     let auth_config = parse_catalog_auth_config_json(state.as_ref(), key);
     if provider_key_auth_config_is_agent_identity(provider_type, auth_config.as_ref()) {
         return "[Agent Identity]".to_string();
+    }
+    if key.auth_type.trim().eq_ignore_ascii_case("volc_aksk") {
+        return "[Volcengine AK/SK]".to_string();
     }
     let ciphertext = key.encrypted_api_key.as_deref().unwrap_or("").trim();
     if ciphertext.is_empty() {

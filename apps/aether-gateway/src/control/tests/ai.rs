@@ -2,7 +2,70 @@ use aether_ai_formats::{ApiOperation, ClientSurface};
 use http::Uri;
 
 use super::super::auth::GatewayCredentialCarrier;
-use super::{classify_control_route, headers};
+use super::{classify_control_route, headers, GatewayPublicRequestContext};
+use crate::handlers::public::ai_public_local_requires_buffered_body;
+
+#[test]
+fn classifies_ark_asset_library_routes_and_buffers_action_bodies() {
+    for (uri, credential_header, expected_auth_channel, expected_carrier) in [
+        (
+            "/?Action=ListAssets&Version=2024-01-01",
+            ("authorization", "Bearer sk-test"),
+            "bearer_like",
+            GatewayCredentialCarrier::AuthorizationBearer,
+        ),
+        (
+            "/v3/asset-library/CreateAsset",
+            ("x-api-key", "sk-test"),
+            "api_key",
+            GatewayCredentialCarrier::XApiKey,
+        ),
+        (
+            "/v3/asset-library/ListAssets",
+            ("api-key", "sk-test"),
+            "api_key",
+            GatewayCredentialCarrier::ApiKey,
+        ),
+        (
+            "/?Action=DeleteEverything&Version=2024-01-01",
+            ("authorization", "Bearer sk-test"),
+            "bearer_like",
+            GatewayCredentialCarrier::AuthorizationBearer,
+        ),
+    ] {
+        let headers = headers(&[credential_header]);
+        let uri: Uri = uri.parse().expect("uri should parse");
+        let decision = classify_control_route(&http::Method::POST, &uri, &headers)
+            .expect("asset-library route should classify");
+
+        assert_eq!(decision.route_class.as_deref(), Some("ai_public"));
+        assert_eq!(decision.route_family.as_deref(), Some("doubao"));
+        assert_eq!(decision.route_kind.as_deref(), Some("asset_library"));
+        assert_eq!(
+            decision.auth_endpoint_signature.as_deref(),
+            Some("doubao:asset_library")
+        );
+        assert_eq!(
+            decision.request_auth_channel.as_deref(),
+            Some(expected_auth_channel)
+        );
+        assert_eq!(decision.gateway_credential_carrier, Some(expected_carrier));
+        assert!(!decision.is_execution_runtime_candidate());
+
+        let context = GatewayPublicRequestContext::from_request_parts(
+            "trace-asset-library",
+            &http::Method::POST,
+            &uri,
+            &headers,
+            Some(decision),
+        );
+        assert!(ai_public_local_requires_buffered_body(&context));
+    }
+
+    let headers = headers(&[("authorization", "Bearer sk-test")]);
+    let missing_action: Uri = "/?Version=2024-01-01".parse().expect("uri should parse");
+    assert!(classify_control_route(&http::Method::POST, &missing_action, &headers).is_none());
+}
 
 #[test]
 fn classifies_claude_count_tokens_as_execution_runtime_operation() {

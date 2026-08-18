@@ -1,5 +1,7 @@
+use crate::handlers::admin::provider::material_references::material_reference_conflict_response;
 use crate::handlers::admin::provider::shared::paths::admin_update_key_id;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::state::ProviderCatalogKeyDeleteOutcome;
 use crate::GatewayError;
 use axum::{
     body::{Body, Bytes},
@@ -38,8 +40,21 @@ pub(super) async fn maybe_handle(
     else {
         return Ok(Some(not_found_response(format!("Key {key_id} 不存在"))));
     };
-    if !state.delete_provider_catalog_key(&key_id).await? {
-        return Ok(Some(not_found_response(format!("Key {key_id} 不存在"))));
+    match state
+        .delete_provider_catalog_key_if_unreferenced(&key_id)
+        .await?
+    {
+        ProviderCatalogKeyDeleteOutcome::Deleted => {}
+        ProviderCatalogKeyDeleteOutcome::NotDeleted => {
+            return Ok(Some(not_found_response(format!("Key {key_id} 不存在"))));
+        }
+        ProviderCatalogKeyDeleteOutcome::Referenced(reference_counts) => {
+            return Ok(Some(material_reference_conflict_response(
+                "Key",
+                &key_id,
+                reference_counts,
+            )));
+        }
     }
 
     Ok(Some(

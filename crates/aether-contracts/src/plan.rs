@@ -7,9 +7,9 @@ pub const EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER: &str = "x-aether-execution-
 pub const EXECUTION_REQUEST_HTTP1_ONLY_HEADER: &str = "x-aether-execution-http1-only";
 pub const EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER: &str =
     "x-aether-execution-accept-invalid-certs";
-/// Marks a stream plan whose target URL came from an upstream video-task
-/// response rather than the configured provider API endpoint. Runtime
-/// transports use this internal-only marker to apply DNS-pinned asset egress.
+/// Marks a stream plan whose target URL came from an upstream media response
+/// rather than the configured provider API endpoint. Runtime transports use
+/// this internal-only marker to apply DNS-pinned asset egress.
 pub const EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER: &str =
     "x-aether-execution-direct-video-asset";
 pub const EXECUTION_RESPONSE_BODY_MODE_HEADER: &str = "x-aether-execution-response-body-mode";

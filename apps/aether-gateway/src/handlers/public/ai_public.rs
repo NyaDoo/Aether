@@ -107,6 +107,8 @@ pub(crate) fn ai_public_local_requires_buffered_body(
                 && request_context.request_method == http::Method::POST
                 && ((decision.route_family.as_deref() == Some("claude")
                     && decision.route_kind.as_deref() == Some("count_tokens"))
+                    || (decision.route_family.as_deref() == Some("doubao")
+                        && decision.route_kind.as_deref() == Some("asset_library"))
                     || (decision.route_family.as_deref() == Some("openai")
                         && decision.route_kind.as_deref() == Some("embedding")
                         && request_context.request_path == "/v1/embeddings")
@@ -121,6 +123,7 @@ pub(crate) fn ai_public_local_requires_buffered_body(
 pub(crate) async fn maybe_build_local_ai_public_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
+    headers: &http::HeaderMap,
     request_body: Option<&Bytes>,
 ) -> Option<Response<Body>> {
     if let Some(response) = maybe_build_local_ai_public_route_guard_response(request_context) {
@@ -130,6 +133,17 @@ pub(crate) async fn maybe_build_local_ai_public_response(
     let decision = request_context.control_decision.as_ref()?;
     if decision.route_class.as_deref() != Some("ai_public") {
         return None;
+    }
+
+    if let Some(response) = crate::material_assets::maybe_handle_native_asset_request(
+        state,
+        request_context,
+        headers,
+        request_body,
+    )
+    .await
+    {
+        return Some(response);
     }
 
     if let Some(response) =

@@ -133,6 +133,7 @@ pub(crate) fn take_secret_suffix(value: &str, suffix_chars: usize) -> &str {
 pub(crate) fn masked_catalog_api_key(state: &AppState, key: &StoredProviderCatalogKey) -> String {
     match key.auth_type.trim() {
         "service_account" | "vertex_ai" => "[Service Account]".to_string(),
+        "volc_aksk" => "[Volcengine AK/SK]".to_string(),
         "oauth" => {
             if provider_key_auth_config_uses_header_authorization(
                 parse_catalog_auth_config_json(state, key).as_ref(),
@@ -2942,6 +2943,42 @@ mod tests {
             "[Agent Identity]"
         );
         assert!(!masked_catalog_api_key_for_provider(&state, &key, "codex").contains("placeholder"));
+    }
+
+    #[test]
+    fn masked_catalog_api_key_labels_volc_aksk_without_exposing_auth_config() {
+        let state = AppState::new().expect("gateway should build");
+        let encrypted_auth_config = encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"access_key_id":"AKLT-sensitive","secret_access_key":"secret-sensitive"}"#,
+        )
+        .expect("auth config ciphertext should build");
+        let key = StoredProviderCatalogKey::new(
+            "key-ark".to_string(),
+            "provider-ark".to_string(),
+            "ark-aksk".to_string(),
+            "volc_aksk".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["doubao:asset_library"])),
+            None,
+            Some(encrypted_auth_config),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build");
+
+        let masked = masked_catalog_api_key(&state, &key);
+        assert_eq!(masked, "[Volcengine AK/SK]");
+        assert!(!masked.contains("AKLT-sensitive"));
+        assert!(!masked.contains("secret-sensitive"));
     }
 
     #[test]

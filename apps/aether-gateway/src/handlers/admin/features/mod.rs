@@ -1,5 +1,6 @@
 mod background_tasks;
 mod gemini_files;
+mod material_assets;
 mod routes;
 mod video_tasks;
 

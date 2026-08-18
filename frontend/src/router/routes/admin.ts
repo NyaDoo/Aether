@@ -220,6 +220,11 @@ export const adminRoutes: RouteRecordRaw[] = [
         component: view(() => import('@/views/admin/GeminiFilesManagement.vue'))
       },
       {
+        path: 'material-assets',
+        name: 'MaterialAssetsManagement',
+        component: view(() => import('@/views/admin/MaterialAssetsManagement.vue'))
+      },
+      {
         path: 'video-tasks',
         redirect: '/admin/async-tasks'
       }

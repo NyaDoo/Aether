@@ -1,6 +1,7 @@
 mod agent_identity;
 mod anthropic_compat;
 pub mod antigravity;
+pub mod ark_assets;
 pub mod auth;
 mod auth_config;
 mod cache;
@@ -51,6 +52,13 @@ pub use agent_identity::{
 pub use anthropic_compat::{
     resolve_anthropic_compatibility_profile, validate_anthropic_compatibility_profile_config,
     AnthropicCompatibilityProfile, AnthropicCompatibilityProfileConfigError,
+};
+pub use ark_assets::{
+    apply_volc_action_signature, build_volc_action_request, build_volc_action_url,
+    normalize_volc_action_auth_type, resolve_volc_action_auth, VolcActionAuth, VolcActionRequest,
+    VolcActionRequestInput, VolcActionSignature, VolcActionTransportError, VolcAkSkCredentials,
+    ARK_ASSET_API_FORMAT, ARK_ASSET_REQUIRED_CAPABILITY, VOLC_ACTION_DEFAULT_BASE_URL,
+    VOLC_ACTION_DEFAULT_REGION, VOLC_ACTION_DEFAULT_SERVICE, VOLC_ACTION_VERSION,
 };
 pub use auth::{build_passthrough_headers, ensure_upstream_auth_header};
 pub use auth_config::apply_local_auth_config_header_overrides;

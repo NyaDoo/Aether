@@ -7,9 +7,20 @@ use crate::ai_serving::ApiOperation;
 pub(super) fn classify_ai_public_route(
     method: &http::Method,
     normalized_path: &str,
+    query: Option<&str>,
     headers: &http::HeaderMap,
 ) -> Option<ClassifiedRoute> {
-    if let Some(route) = classify_antigravity_v1internal_route(method, normalized_path) {
+    if is_ark_asset_library_request(method, normalized_path, query) {
+        let request_auth_channel = ark_asset_request_auth_channel(headers);
+        Some(classified_with_request_auth_channel(
+            "ai_public",
+            "doubao",
+            "asset_library",
+            request_auth_channel,
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+            false,
+        ))
+    } else if let Some(route) = classify_antigravity_v1internal_route(method, normalized_path) {
         Some(route)
     } else if method == http::Method::POST && normalized_path == "/v1/chat/completions" {
         Some(classified(
@@ -191,6 +202,36 @@ pub(super) fn classify_ai_public_route(
     } else {
         None
     }
+}
+
+fn ark_asset_request_auth_channel(headers: &http::HeaderMap) -> &'static str {
+    if crate::headers::header_value_str(headers, "x-api-key").is_some()
+        || crate::headers::header_value_str(headers, "api-key").is_some()
+    {
+        "api_key"
+    } else {
+        "bearer_like"
+    }
+}
+
+fn is_ark_asset_library_request(
+    method: &http::Method,
+    normalized_path: &str,
+    query: Option<&str>,
+) -> bool {
+    if method != http::Method::POST
+        || !crate::material_assets::is_asset_library_path(normalized_path)
+    {
+        return false;
+    }
+    if normalized_path != "/" {
+        return true;
+    }
+
+    query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, _)| key.eq_ignore_ascii_case("Action"))
+    })
 }
 
 fn claude_request_auth_channel(headers: &http::HeaderMap) -> &'static str {

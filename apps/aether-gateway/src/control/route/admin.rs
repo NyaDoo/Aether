@@ -39,7 +39,9 @@ pub(super) fn classify_admin_route(
         normalized_path_no_trailing
     };
 
-    if method == http::Method::GET
+    if let Some(route) = classify_admin_material_assets_route(method, normalized_path_no_trailing) {
+        Some(route)
+    } else if method == http::Method::GET
         && matches!(
             normalized_path,
             "/api/admin/providers" | "/api/admin/providers/"
@@ -82,4 +84,51 @@ pub(super) fn classify_admin_route(
     } else {
         classify_admin_endpoints_family_route(method, normalized_path)
     }
+}
+
+fn classify_admin_material_assets_route(
+    method: &http::Method,
+    path: &str,
+) -> Option<ClassifiedRoute> {
+    let route_kind = match (method, path) {
+        (&http::Method::GET, "/api/admin/material-assets/groups") => "list_groups",
+        (&http::Method::POST, "/api/admin/material-assets/groups") => "create_group",
+        (&http::Method::GET, "/api/admin/material-assets/assets") => "list_assets",
+        (&http::Method::POST, "/api/admin/material-assets/assets/url") => "create_asset_url",
+        (&http::Method::POST, "/api/admin/material-assets/assets/upload") => "upload_asset",
+        (&http::Method::POST, "/api/admin/material-assets/verification-sessions") => {
+            "create_verification_session"
+        }
+        _ if path.starts_with("/api/admin/material-assets/verification-sessions/")
+            && method == http::Method::GET =>
+        {
+            "get_verification_session"
+        }
+        _ if path.starts_with("/api/admin/material-assets/groups/") => match method {
+            &http::Method::GET => "get_group",
+            &http::Method::PATCH => "update_group",
+            &http::Method::DELETE => "delete_group",
+            _ => return None,
+        },
+        _ if path.starts_with("/api/admin/material-assets/assets/") => {
+            if path.ends_with("/preview") && method == http::Method::GET {
+                "preview_asset"
+            } else {
+                match method {
+                    &http::Method::GET => "get_asset",
+                    &http::Method::PATCH => "update_asset",
+                    &http::Method::DELETE => "delete_asset",
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(classified(
+        "admin_proxy",
+        "material_assets_manage",
+        route_kind,
+        "admin:material_assets",
+        false,
+    ))
 }

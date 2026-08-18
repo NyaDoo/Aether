@@ -12,6 +12,7 @@ pub(crate) enum ProviderKeyCredentialKind {
     RawSecret,
     OAuthSession,
     ServiceAccount,
+    VolcAkSk,
 }
 
 impl ProviderKeyCredentialKind {
@@ -20,6 +21,7 @@ impl ProviderKeyCredentialKind {
             Self::RawSecret => "raw_secret",
             Self::OAuthSession => "oauth_session",
             Self::ServiceAccount => "service_account",
+            Self::VolcAkSk => "volc_aksk",
         }
     }
 }
@@ -29,6 +31,7 @@ pub(crate) enum ProviderKeyRuntimeAuthKind {
     ApiKey,
     Bearer,
     ServiceAccount,
+    VolcAkSk,
     Mixed,
     Unknown,
 }
@@ -39,6 +42,7 @@ impl ProviderKeyRuntimeAuthKind {
             Self::ApiKey => "api_key",
             Self::Bearer => "bearer",
             Self::ServiceAccount => "service_account",
+            Self::VolcAkSk => "volc_aksk",
             Self::Mixed => "mixed",
             Self::Unknown => "unknown",
         }
@@ -197,6 +201,8 @@ pub(crate) fn provider_key_auth_semantics(
         ProviderKeyCredentialKind::OAuthSession
     } else if matches!(auth_type.as_str(), "service_account" | "vertex_ai") {
         ProviderKeyCredentialKind::ServiceAccount
+    } else if auth_type == "volc_aksk" {
+        ProviderKeyCredentialKind::VolcAkSk
     } else {
         ProviderKeyCredentialKind::RawSecret
     };
@@ -212,6 +218,7 @@ pub(crate) fn provider_key_auth_semantics(
             }
         }
         ProviderKeyCredentialKind::ServiceAccount => ProviderKeyRuntimeAuthKind::ServiceAccount,
+        ProviderKeyCredentialKind::VolcAkSk => ProviderKeyRuntimeAuthKind::VolcAkSk,
         ProviderKeyCredentialKind::RawSecret => {
             if key_has_auth_type_overrides(key) {
                 ProviderKeyRuntimeAuthKind::Mixed
@@ -366,6 +373,21 @@ mod tests {
         assert_eq!(
             semantics.runtime_auth_kind(),
             ProviderKeyRuntimeAuthKind::Bearer
+        );
+    }
+
+    #[test]
+    fn recognizes_volc_aksk_credential_and_runtime() {
+        let semantics = provider_key_auth_semantics(&sample_key("volc_aksk"), "custom");
+
+        assert!(!semantics.oauth_managed());
+        assert_eq!(
+            semantics.credential_kind(),
+            ProviderKeyCredentialKind::VolcAkSk
+        );
+        assert_eq!(
+            semantics.runtime_auth_kind(),
+            ProviderKeyRuntimeAuthKind::VolcAkSk
         );
     }
 

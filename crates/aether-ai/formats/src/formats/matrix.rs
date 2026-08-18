@@ -53,6 +53,9 @@ pub fn request_candidate_api_format_preference(
 ) -> Option<(u8, u8)> {
     let client_api_format = normalize_api_format_alias(client_api_format);
     let provider_api_format = normalize_api_format_alias(provider_api_format);
+    if client_api_format == "doubao:asset_library" {
+        return (provider_api_format == "doubao:asset_library").then_some((0, 0));
+    }
     if client_api_format == "openai:video" || client_api_format == "doubao:video" {
         return match (client_api_format.as_str(), provider_api_format.as_str()) {
             ("openai:video", "openai:video") => Some((0, 0)),
@@ -117,6 +120,9 @@ pub fn request_candidate_api_formats(
     _require_streaming: bool,
 ) -> Vec<&'static str> {
     let client_api_format = normalize_api_format_alias(client_api_format);
+    if client_api_format == "doubao:asset_library" {
+        return vec!["doubao:asset_library"];
+    }
     if client_api_format == "openai:video" {
         return vec!["openai:video", "doubao:video"];
     }

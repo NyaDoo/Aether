@@ -21,6 +21,7 @@ export const API_FORMATS = {
   JINA_RERANK: 'jina:rerank',
   DOUBAO_EMBEDDING: 'doubao:embedding',
   DOUBAO_VIDEO: 'doubao:video',
+  DOUBAO_ASSET_LIBRARY: 'doubao:asset_library',
   ALIYUN_MULTIMODAL_EMBEDDING: 'aliyun:multimodal_embedding',
 } as const
 
@@ -46,6 +47,7 @@ export const API_FORMAT_LABELS: Record<string, string> = {
   [API_FORMATS.JINA_RERANK]: 'Jina Rerank',
   [API_FORMATS.DOUBAO_EMBEDDING]: 'Doubao Embedding',
   [API_FORMATS.DOUBAO_VIDEO]: 'Doubao Video',
+  [API_FORMATS.DOUBAO_ASSET_LIBRARY]: 'Ark Asset Library',
   [API_FORMATS.ALIYUN_MULTIMODAL_EMBEDDING]: 'Aliyun Multimodal Embedding',
   CLAUDE: 'Claude Messages',
   CLAUDE_MESSAGES: 'Claude Messages',

@@ -20,7 +20,8 @@ use aether_contracts::{
 use aether_data::repository::proxy_nodes::ProxyNodeTrafficMutation;
 use aether_http::{apply_http_client_config, HttpClientConfig};
 use aether_runtime::{MetricKind, MetricSample};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
+use axum::http::{Response as AxumResponse, StatusCode as AxumStatusCode};
 use base64::Engine as _;
 use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::write::GzEncoder;
@@ -804,6 +805,51 @@ impl DirectSyncExecutionRuntime {
     }
 }
 
+pub(crate) async fn execute_direct_asset_response(
+    plan: &ExecutionPlan,
+) -> Result<AxumResponse<Body>, ExecutionRuntimeTransportError> {
+    let execution = DirectSyncExecutionRuntime::new()
+        .execute_stream(plan)
+        .await?;
+    let status =
+        AxumStatusCode::from_u16(execution.status_code).unwrap_or(AxumStatusCode::BAD_GATEWAY);
+    let mut builder = AxumResponse::builder().status(status);
+    for (name, value) in &execution.headers {
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "content-type"
+                | "content-length"
+                | "content-range"
+                | "accept-ranges"
+                | "content-disposition"
+                | "cache-control"
+                | "etag"
+                | "last-modified"
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder.header("x-content-type-options", "nosniff");
+    let body = match execution.response {
+        DirectUpstreamResponse::Reqwest(response) => {
+            let stream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())));
+            Body::from_stream(stream)
+        }
+        _ => {
+            return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+                "direct asset egress did not use the pinned reqwest transport".to_string(),
+            ));
+        }
+    };
+    builder.body(body).map_err(|error| {
+        ExecutionRuntimeTransportError::UpstreamRequest(format!(
+            "direct asset response build failed: {error}"
+        ))
+    })
+}
+
 pub(crate) async fn execute_sync_plan(
     state: &AppState,
     trace_id: Option<&str>,
@@ -1189,7 +1235,7 @@ fn is_direct_video_asset_stream_plan(plan: &ExecutionPlan) -> bool {
                 .trim()
                 .to_ascii_lowercase()
                 .as_str(),
-            "openai:video" | "doubao:video"
+            "openai:video" | "doubao:video" | "doubao:asset_library"
         )
         && plan.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER)

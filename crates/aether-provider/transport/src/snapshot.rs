@@ -3,8 +3,12 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use aether_data_contracts::DataLayerError;
 use async_trait::async_trait;
+use serde_json::Value;
 
-use super::auth_config::{absorb_local_auth_config_safe_subset, LocalAuthConfigAbsorption};
+use super::auth_config::{
+    absorb_local_auth_config_safe_subset, extract_local_auth_config_safe_metadata,
+    LocalAuthConfigAbsorption,
+};
 
 #[path = "snapshot_mapping.rs"]
 mod snapshot_mapping;
@@ -145,6 +149,10 @@ pub async fn read_provider_transport_snapshot(
     let mut endpoint = map_endpoint(endpoint);
     let mut key = map_key(key, encryption_key, &fallback_encryption_keys)?;
 
+    let auth_config_metadata = key
+        .decrypted_auth_config
+        .as_deref()
+        .and_then(extract_local_auth_config_safe_metadata);
     if let LocalAuthConfigAbsorption::Absorbed {
         base_url,
         header_rules,
@@ -158,6 +166,17 @@ pub async fn read_provider_transport_snapshot(
         endpoint.base_url = base_url;
         endpoint.header_rules = header_rules;
         endpoint.custom_path = custom_path;
+        if let Some(metadata) = auth_config_metadata {
+            let mut merged = key
+                .upstream_metadata
+                .take()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            if let Some(values) = metadata.as_object() {
+                merged.extend(values.clone());
+            }
+            key.upstream_metadata = Some(Value::Object(merged));
+        }
         key.decrypted_auth_config = None;
     }
 
@@ -179,6 +198,7 @@ mod tests {
     use super::super::policy::{
         supports_local_openai_chat_transport, supports_local_standard_transport_with_network,
     };
+    use super::super::{resolve_volc_action_auth, VolcActionAuth, ARK_ASSET_API_FORMAT};
     use super::{
         map_key, read_provider_transport_snapshot, GatewayProviderTransportSnapshot,
         ProviderTransportSnapshotSource,
@@ -531,6 +551,102 @@ mod tests {
             ]))
         );
         assert!(supports_local_openai_chat_transport(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn absorbs_raw_action_auth_metadata_without_blocking_credentials() {
+        for auth_type in ["bearer", "api_key"] {
+            let endpoint_id = format!("endpoint-raw-metadata-{auth_type}");
+            let key_id = format!("key-raw-metadata-{auth_type}");
+            let endpoint = StoredProviderCatalogEndpoint::new(
+                endpoint_id.clone(),
+                "provider-1".to_string(),
+                ARK_ASSET_API_FORMAT.to_string(),
+                Some("doubao".to_string()),
+                Some("asset_library".to_string()),
+                true,
+            )
+            .expect("endpoint should build")
+            .with_transport_fields(
+                "https://ark.cn-beijing.volcengineapi.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("endpoint transport fields should build");
+            let encrypted_api_key =
+                encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "relay-secret")
+                    .expect("raw credential should encrypt");
+            let encrypted_auth_config = encrypt_python_fernet_plaintext(
+                DEVELOPMENT_ENCRYPTION_KEY,
+                r#"{"account_id":"account-1","project":"project-1"}"#,
+            )
+            .expect("auth config should encrypt");
+            let mut key = StoredProviderCatalogKey::new(
+                key_id.clone(),
+                "provider-1".to_string(),
+                format!("raw-metadata-{auth_type}"),
+                auth_type.to_string(),
+                None,
+                true,
+            )
+            .expect("key should build")
+            .with_transport_fields(
+                Some(serde_json::json!([ARK_ASSET_API_FORMAT])),
+                encrypted_api_key,
+                Some(encrypted_auth_config),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("key transport fields should build");
+            key.upstream_metadata = Some(serde_json::json!({"existing": "keep"}));
+            let state = TestSnapshotSource::new(
+                vec![sample_provider()],
+                vec![endpoint],
+                vec![key],
+                Some(DEVELOPMENT_ENCRYPTION_KEY.to_string()),
+            );
+
+            let snapshot =
+                read_provider_transport_snapshot(&state, "provider-1", &endpoint_id, &key_id)
+                    .await
+                    .expect("snapshot read should succeed")
+                    .expect("snapshot should exist");
+
+            assert_eq!(snapshot.key.decrypted_auth_config, None);
+            assert_eq!(
+                snapshot.key.upstream_metadata,
+                Some(serde_json::json!({
+                    "account_id": "account-1",
+                    "existing": "keep",
+                    "project": "project-1"
+                }))
+            );
+            match (auth_type, resolve_volc_action_auth(&snapshot)) {
+                ("bearer", Ok(VolcActionAuth::Bearer(secret))) => {
+                    assert_eq!(secret, "relay-secret");
+                }
+                (
+                    "api_key",
+                    Ok(VolcActionAuth::ApiKey {
+                        header_name,
+                        secret,
+                    }),
+                ) => {
+                    assert_eq!(header_name, "x-api-key");
+                    assert_eq!(secret, "relay-secret");
+                }
+                (_, resolved) => panic!("unexpected raw action auth: {resolved:?}"),
+            }
+        }
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 pub mod announcements;
+pub mod asset_library;
 pub mod audit;
 pub mod auth;
 pub mod auth_modules;

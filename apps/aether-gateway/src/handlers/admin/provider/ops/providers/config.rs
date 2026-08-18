@@ -185,6 +185,60 @@ fn admin_provider_ops_encrypt_credentials(
     Ok(encrypted)
 }
 
+#[cfg(test)]
+mod sensitive_field_tests {
+    use super::{
+        admin_provider_ops_decrypted_credentials, admin_provider_ops_encrypt_credentials,
+        admin_provider_ops_masked_credentials,
+    };
+    use crate::data::GatewayDataState;
+    use crate::handlers::admin::request::AdminAppState;
+    use crate::AppState;
+    use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
+    use serde_json::json;
+
+    fn test_app() -> AppState {
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
+    #[test]
+    fn provider_ops_masks_and_encrypts_volc_aksk_fields() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let credentials = json!({
+            "access_key_id": "AKLT-sensitive",
+            "secret_access_key": "secret-sensitive",
+            "security_token": "session-sensitive",
+            "region": "cn-beijing"
+        })
+        .as_object()
+        .cloned()
+        .expect("credentials should be an object");
+
+        let encrypted = admin_provider_ops_encrypt_credentials(&state, credentials.clone())
+            .expect("AK/SK credentials should encrypt");
+        for field in ["access_key_id", "secret_access_key", "security_token"] {
+            assert_ne!(encrypted.get(field), credentials.get(field));
+        }
+        assert_eq!(encrypted.get("region"), credentials.get("region"));
+
+        let encrypted_value = serde_json::Value::Object(encrypted.clone());
+        let masked = admin_provider_ops_masked_credentials(&state, Some(&encrypted_value));
+        for secret in ["AKLT-sensitive", "secret-sensitive", "session-sensitive"] {
+            assert!(!masked.to_string().contains(secret));
+        }
+        assert_eq!(
+            admin_provider_ops_decrypted_credentials(&state, Some(&encrypted_value)),
+            credentials
+        );
+    }
+}
+
 pub(super) async fn persist_admin_provider_ops_runtime_credentials(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,

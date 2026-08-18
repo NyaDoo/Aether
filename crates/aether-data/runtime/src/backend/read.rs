@@ -8,6 +8,7 @@ use super::PostgresBackend;
 #[cfg(feature = "sqlite")]
 use super::SqliteBackend;
 use crate::repository::announcements::AnnouncementReadRepository;
+use crate::repository::asset_library::AssetLibraryReadRepository;
 use crate::repository::audit::AuditLogReadRepository;
 use crate::repository::auth::AuthApiKeyReadRepository;
 use crate::repository::auth_modules::AuthModuleReadRepository;
@@ -35,6 +36,7 @@ pub struct DataReadRepositories {
     audit_logs: Option<Arc<dyn AuditLogReadRepository>>,
     auth_api_keys: Option<Arc<dyn AuthApiKeyReadRepository>>,
     auth_modules: Option<Arc<dyn AuthModuleReadRepository>>,
+    asset_library: Option<Arc<dyn AssetLibraryReadRepository>>,
     background_tasks: Option<Arc<dyn BackgroundTaskReadRepository>>,
     billing: Option<Arc<dyn BillingReadRepository>>,
     gemini_file_mappings: Option<Arc<dyn GeminiFileMappingReadRepository>>,
@@ -61,6 +63,7 @@ impl fmt::Debug for DataReadRepositories {
             .field("has_announcements", &self.announcements.is_some())
             .field("has_audit_logs", &self.audit_logs.is_some())
             .field("has_auth_modules", &self.auth_modules.is_some())
+            .field("has_asset_library", &self.asset_library.is_some())
             .field("has_background_tasks", &self.background_tasks.is_some())
             .field("has_billing", &self.billing.is_some())
             .field(
@@ -89,6 +92,15 @@ impl fmt::Debug for DataReadRepositories {
 }
 
 impl DataReadRepositories {
+    pub(super) fn with_asset_library_repository(
+        repository: Arc<dyn AssetLibraryReadRepository>,
+    ) -> Self {
+        Self {
+            asset_library: Some(repository),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn from_backends(
         #[cfg(feature = "postgres")] postgres: Option<&PostgresBackend>,
         #[cfg(feature = "mysql")] mysql: Option<&MysqlBackend>,
@@ -123,6 +135,9 @@ impl DataReadRepositories {
         }
         if self.auth_modules.is_none() {
             self.auth_modules = Some(PostgresBackend::auth_module_read_repository(backend));
+        }
+        if self.asset_library.is_none() {
+            self.asset_library = Some(PostgresBackend::asset_library_read_repository(backend));
         }
         if self.background_tasks.is_none() {
             self.background_tasks = Some(PostgresBackend::background_task_read_repository(backend));
@@ -197,6 +212,9 @@ impl DataReadRepositories {
         if self.auth_modules.is_none() {
             self.auth_modules = Some(MysqlBackend::auth_module_read_repository(backend));
         }
+        if self.asset_library.is_none() {
+            self.asset_library = Some(MysqlBackend::asset_library_read_repository(backend));
+        }
         if self.background_tasks.is_none() {
             self.background_tasks = Some(MysqlBackend::background_task_read_repository(backend));
         }
@@ -267,6 +285,9 @@ impl DataReadRepositories {
         }
         if self.auth_modules.is_none() {
             self.auth_modules = Some(SqliteBackend::auth_module_read_repository(backend));
+        }
+        if self.asset_library.is_none() {
+            self.asset_library = Some(SqliteBackend::asset_library_read_repository(backend));
         }
         if self.background_tasks.is_none() {
             self.background_tasks = Some(SqliteBackend::background_task_read_repository(backend));
@@ -352,6 +373,10 @@ impl DataReadRepositories {
         self.auth_modules.clone()
     }
 
+    pub fn asset_library(&self) -> Option<Arc<dyn AssetLibraryReadRepository>> {
+        self.asset_library.clone()
+    }
+
     pub fn background_tasks(&self) -> Option<Arc<dyn BackgroundTaskReadRepository>> {
         self.background_tasks.clone()
     }
@@ -427,6 +452,7 @@ impl DataReadRepositories {
             || self.announcements.is_some()
             || self.audit_logs.is_some()
             || self.auth_modules.is_some()
+            || self.asset_library.is_some()
             || self.background_tasks.is_some()
             || self.billing.is_some()
             || self.gemini_file_mappings.is_some()
@@ -474,6 +500,7 @@ mod tests {
         assert!(read.audit_logs().is_some());
         assert!(read.auth_api_keys().is_some());
         assert!(read.auth_modules().is_some());
+        assert!(read.asset_library().is_some());
         assert!(read.billing().is_some());
         assert!(read.gemini_file_mappings().is_some());
         assert!(read.global_models().is_some());

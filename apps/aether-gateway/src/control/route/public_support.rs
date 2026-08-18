@@ -24,7 +24,9 @@ pub(super) fn classify_public_support_route(
     normalized_path: &str,
     public_models_auth_signature: &str,
 ) -> Option<ClassifiedRoute> {
-    if method == http::Method::GET && normalized_path == "/v1/models" {
+    if let Some(route) = classify_material_assets_route(method, normalized_path) {
+        Some(route)
+    } else if method == http::Method::GET && normalized_path == "/v1/models" {
         Some(classified(
             "public_support",
             "models",
@@ -836,4 +838,54 @@ pub(super) fn classify_public_support_route(
     } else {
         None
     }
+}
+
+fn classify_material_assets_route(
+    method: &http::Method,
+    normalized_path: &str,
+) -> Option<ClassifiedRoute> {
+    let path = normalized_path.trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    let route_kind = match (method, path) {
+        (&http::Method::GET, "/api/material-assets/groups") => "list_groups",
+        (&http::Method::POST, "/api/material-assets/groups") => "create_group",
+        (&http::Method::GET, "/api/material-assets/assets") => "list_assets",
+        (&http::Method::POST, "/api/material-assets/assets/url") => "create_asset_url",
+        (&http::Method::POST, "/api/material-assets/assets/upload") => "upload_asset",
+        (&http::Method::POST, "/api/material-assets/verification-sessions") => {
+            "create_verification_session"
+        }
+        _ if path.starts_with("/api/material-assets/verification-sessions/")
+            && method == http::Method::GET =>
+        {
+            "get_verification_session"
+        }
+        _ if path.starts_with("/api/material-assets/groups/") => match method {
+            &http::Method::PATCH => "update_group",
+            &http::Method::DELETE => "delete_group",
+            &http::Method::GET => "get_group",
+            _ => return None,
+        },
+        _ if path.starts_with("/api/material-assets/assets/") => {
+            if path.ends_with("/preview") && method == http::Method::GET {
+                "preview_asset"
+            } else {
+                match method {
+                    &http::Method::GET => "get_asset",
+                    &http::Method::PATCH => "update_asset",
+                    &http::Method::DELETE => "delete_asset",
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    };
+
+    Some(classified(
+        "public_support",
+        "material_assets",
+        route_kind,
+        crate::material_assets::ARK_ASSET_API_FORMAT,
+        false,
+    ))
 }

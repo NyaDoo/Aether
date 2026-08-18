@@ -2,7 +2,8 @@ use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRe
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    normalize_max_probe_interval_minutes, normalize_rate_multipliers, validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, normalize_rate_multipliers,
+    normalize_volc_aksk_auth_config, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -46,7 +47,10 @@ pub(crate) async fn build_admin_create_provider_key_record(
     };
 
     let api_key = payload.api_key.unwrap_or_default().trim().to_string();
-    let auth_config = normalize_json_object(payload.auth_config, "auth_config")?;
+    let mut auth_config = normalize_json_object(payload.auth_config, "auth_config")?;
+    if auth_type == "volc_aksk" {
+        auth_config = Some(normalize_volc_aksk_auth_config(auth_config)?);
+    }
     let auth_config_object = auth_config
         .as_ref()
         .and_then(serde_json::Value::as_object)
@@ -68,6 +72,9 @@ pub(crate) async fn build_admin_create_provider_key_record(
         }
         "oauth" if !api_key.is_empty() => {
             return Err("OAuth 认证模式下不允许直接填写 api_key".to_string());
+        }
+        "volc_aksk" if !api_key.is_empty() => {
+            return Err("Volcengine AK/SK 认证模式下不允许直接填写 api_key".to_string());
         }
         _ => {}
     }
@@ -150,6 +157,9 @@ pub(crate) async fn build_admin_create_provider_key_record(
         .transpose()
         .map_err(|err| err.to_string())?
         .and_then(|plaintext| encrypt_catalog_secret_with_fallbacks(state, &plaintext));
+    if auth_type == "volc_aksk" && encrypted_auth_config.is_none() {
+        return Err("gateway 未配置 provider key 加密密钥".to_string());
+    }
 
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -158,12 +168,28 @@ pub(crate) async fn build_admin_create_provider_key_record(
         .unwrap_or(0);
     let inherits_provider_api_formats =
         auth_type == "oauth" && provider_type_is_fixed(&provider.provider_type);
+    let mut capabilities = normalize_json_object(payload.capabilities, "capabilities")?;
+    if api_formats.iter().any(|format| {
+        crate::ai_serving::api_format_alias_matches(
+            format,
+            crate::material_assets::ARK_ASSET_API_FORMAT,
+        )
+    }) {
+        capabilities
+            .get_or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| "capabilities 必须是 JSON 对象".to_string())?
+            .insert(
+                crate::material_assets::ARK_ASSET_REQUIRED_CAPABILITY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+    }
     let mut key = StoredProviderCatalogKey::new(
         Uuid::new_v4().to_string(),
         provider.id.clone(),
         name.to_string(),
         auth_type,
-        normalize_json_object(payload.capabilities, "capabilities")?,
+        capabilities,
         true,
     )
     .map_err(|err| err.to_string())?
@@ -224,4 +250,119 @@ fn raw_secret_auth_type(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "api_key" | "bearer"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_admin_create_provider_key_record;
+    use crate::data::GatewayDataState;
+    use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRequest;
+    use crate::handlers::admin::request::AdminAppState;
+    use crate::AppState;
+    use aether_crypto::{decrypt_python_fernet_ciphertext, DEVELOPMENT_ENCRYPTION_KEY};
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+    use serde_json::json;
+
+    fn test_app() -> AppState {
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
+    fn sample_provider() -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            "provider-ark".to_string(),
+            "Ark".to_string(),
+            Some("https://www.volcengine.com".to_string()),
+            "custom".to_string(),
+        )
+        .expect("provider should build")
+    }
+
+    fn create_payload(value: serde_json::Value) -> AdminProviderKeyCreateRequest {
+        serde_json::from_value(value).expect("create payload should parse")
+    }
+
+    #[tokio::test]
+    async fn creates_volc_aksk_key_with_canonical_encrypted_auth_config() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let record = build_admin_create_provider_key_record(
+            &state,
+            &sample_provider(),
+            create_payload(json!({
+                "name": "ark-aksk",
+                "api_formats": ["doubao:asset_library"],
+                "auth_type": "volc-aksk",
+                "auth_config": {
+                    "access_key_id": " AKLT-example ",
+                    "secret_access_key": " secret-example ",
+                    "region": " cn-beijing "
+                }
+            })),
+        )
+        .await
+        .expect("valid AK/SK key should build");
+
+        assert_eq!(record.auth_type, "volc_aksk");
+        assert!(record.encrypted_api_key.is_none());
+        let plaintext = decrypt_python_fernet_ciphertext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            record
+                .encrypted_auth_config
+                .as_deref()
+                .expect("auth config should be encrypted"),
+        )
+        .expect("auth config should decrypt");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plaintext)
+                .expect("auth config should remain JSON"),
+            json!({
+                "access_key_id": "AKLT-example",
+                "secret_access_key": "secret-example",
+                "region": "cn-beijing"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_incomplete_or_raw_secret_mixed_volc_aksk_create() {
+        let app = test_app();
+        let state = AdminAppState::new(&app);
+        let provider = sample_provider();
+
+        let missing = build_admin_create_provider_key_record(
+            &state,
+            &provider,
+            create_payload(json!({
+                "name": "missing-config",
+                "api_formats": ["doubao:asset_library"],
+                "auth_type": "volc_aksk"
+            })),
+        )
+        .await
+        .expect_err("AK/SK config must be required");
+        assert!(missing.contains("auth_config"));
+
+        let mixed = build_admin_create_provider_key_record(
+            &state,
+            &provider,
+            create_payload(json!({
+                "name": "mixed-secret",
+                "api_formats": ["doubao:asset_library"],
+                "auth_type": "volc_aksk",
+                "api_key": "relay-bearer-secret",
+                "auth_config": {
+                    "access_key_id": "AKLT-example",
+                    "secret_access_key": "secret-example"
+                }
+            })),
+        )
+        .await
+        .expect_err("raw secret and AK/SK must be mutually exclusive");
+        assert!(mixed.contains("不允许直接填写 api_key"));
+    }
 }

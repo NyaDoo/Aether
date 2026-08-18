@@ -133,10 +133,89 @@ pub(crate) fn normalize_allow_auth_channel_mismatch_formats(
 }
 
 pub(crate) fn normalize_auth_type(value: Option<&str>) -> Result<String, String> {
-    let auth_type = value.unwrap_or("api_key").trim().to_ascii_lowercase();
+    let auth_type = value
+        .unwrap_or("api_key")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
     match auth_type.as_str() {
-        "api_key" | "service_account" | "oauth" | "bearer" => Ok(auth_type),
-        _ => Err("auth_type 仅支持 api_key / service_account / oauth / bearer".to_string()),
+        "api_key" | "service_account" | "oauth" | "bearer" | "volc_aksk" => Ok(auth_type),
+        "volcengine_aksk" | "aksk" => Ok("volc_aksk".to_string()),
+        _ => Err(
+            "auth_type 仅支持 api_key / service_account / oauth / bearer / volc_aksk".to_string(),
+        ),
+    }
+}
+
+pub(crate) fn normalize_volc_aksk_auth_config(
+    value: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    const REQUIRED_FIELDS: &[&str] = &["access_key_id", "secret_access_key"];
+    const OPTIONAL_FIELDS: &[&str] = &[
+        "security_token",
+        "region",
+        "service",
+        "account_id",
+        "project",
+    ];
+
+    let Some(serde_json::Value::Object(mut config)) = value else {
+        return Err("Volcengine AK/SK 认证模式下 auth_config 为必填 JSON 对象".to_string());
+    };
+    if volc_aksk_auth_config_contains_raw_secret(&serde_json::Value::Object(config.clone())) {
+        return Err(
+            "Volcengine AK/SK auth_config 不允许包含 api_key、Bearer 或 Authorization 凭据"
+                .to_string(),
+        );
+    }
+
+    for field in REQUIRED_FIELDS {
+        let normalized = config
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("auth_config.{field} 为必填非空字符串"))?
+            .to_string();
+        config.insert((*field).to_string(), serde_json::Value::String(normalized));
+    }
+    for field in OPTIONAL_FIELDS {
+        let Some(value) = config.get(*field) else {
+            continue;
+        };
+        let normalized = value
+            .as_str()
+            .ok_or_else(|| format!("auth_config.{field} 必须是字符串"))?
+            .trim()
+            .to_string();
+        if normalized.is_empty() {
+            config.remove(*field);
+        } else {
+            config.insert((*field).to_string(), serde_json::Value::String(normalized));
+        }
+    }
+
+    Ok(serde_json::Value::Object(config))
+}
+
+fn volc_aksk_auth_config_contains_raw_secret(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            let normalized = key
+                .trim()
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .collect::<String>();
+            matches!(
+                normalized.as_str(),
+                "apikey" | "bearer" | "bearertoken" | "authorization" | "accesstoken" | "token"
+            ) || volc_aksk_auth_config_contains_raw_secret(value)
+        }),
+        serde_json::Value::Array(items) => {
+            items.iter().any(volc_aksk_auth_config_contains_raw_secret)
+        }
+        _ => false,
     }
 }
 
@@ -233,7 +312,8 @@ mod tests {
         normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
         normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
         normalize_chat_pii_redaction_config, normalize_pool_advanced_config,
-        normalize_provider_type_input, normalize_rate_multipliers, validate_vertex_api_formats,
+        normalize_provider_type_input, normalize_rate_multipliers, normalize_volc_aksk_auth_config,
+        validate_vertex_api_formats,
     };
     use serde_json::json;
 
@@ -298,6 +378,54 @@ mod tests {
             normalize_auth_type(Some("bearer")).expect("bearer should normalize"),
             "bearer"
         );
+    }
+
+    #[test]
+    fn normalizes_volc_aksk_auth_type_and_canonical_config() {
+        assert_eq!(
+            normalize_auth_type(Some(" Volcengine-AKSK "))
+                .expect("Volcengine alias should normalize"),
+            "volc_aksk"
+        );
+        assert_eq!(
+            normalize_volc_aksk_auth_config(Some(json!({
+                "access_key_id": " AKLT-example ",
+                "secret_access_key": " secret-example ",
+                "security_token": " ",
+                "region": " cn-beijing ",
+                "service": " ark ",
+                "account_id": " account-1 ",
+                "project": " project-1 "
+            })))
+            .expect("valid AK/SK config should normalize"),
+            json!({
+                "access_key_id": "AKLT-example",
+                "secret_access_key": "secret-example",
+                "region": "cn-beijing",
+                "service": "ark",
+                "account_id": "account-1",
+                "project": "project-1"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_mixed_volc_aksk_auth_config() {
+        for config in [
+            None,
+            Some(json!({"access_key_id": "AKLT-example"})),
+            Some(json!({
+                "access_key_id": "AKLT-example",
+                "secret_access_key": " ",
+            })),
+            Some(json!({
+                "access_key_id": "AKLT-example",
+                "secret_access_key": "secret-example",
+                "headers": {"authorization": "Bearer relay-secret"}
+            })),
+        ] {
+            assert!(normalize_volc_aksk_auth_config(config).is_err());
+        }
     }
 
     #[test]

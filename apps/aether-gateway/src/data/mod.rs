@@ -8,5 +8,8 @@ pub(crate) mod state;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use aether_data::repository::asset_library::{
+    AssetProviderReference, AssetProviderReferenceCounts,
+};
 pub use config::GatewayDataConfig;
 pub(crate) use state::GatewayDataState;

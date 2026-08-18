@@ -5,6 +5,9 @@ use crate::driver::mysql::{MysqlPool, MysqlPoolFactory};
 use crate::repository::announcements::{
     AnnouncementReadRepository, AnnouncementWriteRepository, MysqlAnnouncementRepository,
 };
+use crate::repository::asset_library::{
+    AssetLibraryReadRepository, AssetLibraryWriteRepository, MysqlAssetLibraryRepository,
+};
 use crate::repository::audit::{AuditLogReadRepository, MysqlAuditLogReadRepository};
 use crate::repository::auth::{
     AuthApiKeyReadRepository, AuthApiKeyWriteRepository, MysqlAuthApiKeyReadRepository,
@@ -94,6 +97,14 @@ impl MysqlBackend {
 
     pub fn auth_api_key_read_repository(&self) -> Arc<dyn AuthApiKeyReadRepository> {
         Arc::new(MysqlAuthApiKeyReadRepository::new(self.pool_clone()))
+    }
+
+    pub fn asset_library_read_repository(&self) -> Arc<dyn AssetLibraryReadRepository> {
+        Arc::new(MysqlAssetLibraryRepository::new(self.pool_clone()))
+    }
+
+    pub fn asset_library_write_repository(&self) -> Arc<dyn AssetLibraryWriteRepository> {
+        Arc::new(MysqlAssetLibraryRepository::new(self.pool_clone()))
     }
 
     pub fn announcement_read_repository(&self) -> Arc<dyn AnnouncementReadRepository> {

@@ -6,6 +6,7 @@ use aether_data_contracts::repository::background_tasks::{
     UpsertBackgroundTaskRun,
 };
 use aether_runtime::task::spawn_named;
+use aether_runtime_state::RuntimeLockLease;
 use aether_task_runtime::{RetryPolicy, TaskDefinition, TaskKind};
 pub(crate) use aether_task_runtime::{TaskSupervisor, TaskSupervisorMetrics};
 use serde_json::Value;
@@ -51,6 +52,55 @@ pub(crate) const TASK_KEY_USAGE_SYNC_REPORT: &str = "usage.sync.report";
 pub(crate) const TASK_KEY_PROVIDER_OAUTH_ACCOUNT_REFRESH: &str = "provider.oauth.account.refresh";
 pub(crate) const TASK_KEY_PROVIDER_BALANCE_REFRESH: &str = "provider.ops.balance.refresh";
 const PROVIDER_DELETE_LOCK_TTL_SECS: u64 = 60 * 60 * 6;
+const PROVIDER_DELETE_LOCK_RENEW_INTERVAL_SECS: u64 = 60;
+
+pub(crate) fn provider_delete_lock_key(provider_id: &str) -> String {
+    format!("task_runtime:lock:{TASK_KEY_PROVIDER_DELETE}:{provider_id}")
+}
+
+fn spawn_provider_delete_lock_heartbeat(
+    app: AppState,
+    lock: RuntimeLockLease,
+    lock_lost: tokio::sync::oneshot::Sender<()>,
+) -> JoinHandle<()> {
+    spawn_named("task-runtime-provider-delete-lock-heartbeat", async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            PROVIDER_DELETE_LOCK_RENEW_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match app
+                .runtime_state
+                .lock_renew(
+                    &lock,
+                    std::time::Duration::from_secs(PROVIDER_DELETE_LOCK_TTL_SECS),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        lock_key = %lock.key,
+                        "gateway provider delete task lost its singleton lock"
+                    );
+                    let _ = lock_lost.send(());
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        lock_key = %lock.key,
+                        error = ?error,
+                        "gateway provider delete task failed to renew its singleton lock"
+                    );
+                    let _ = lock_lost.send(());
+                    return;
+                }
+            }
+        }
+    })
+}
 
 const RETRY_ONCE: RetryPolicy = RetryPolicy { max_attempts: 1 };
 const RETRY_THREE: RetryPolicy = RetryPolicy { max_attempts: 3 };
@@ -634,7 +684,7 @@ pub(crate) async fn submit_provider_delete_task(
     }
 
     spawn_named("task-runtime-provider-delete", async move {
-        let lock_key = format!("task_runtime:lock:{TASK_KEY_PROVIDER_DELETE}:{provider_id}");
+        let lock_key = provider_delete_lock_key(&provider_id);
         let lock_ttl = std::time::Duration::from_secs(PROVIDER_DELETE_LOCK_TTL_SECS);
         let lock = app
             .runtime_state
@@ -676,6 +726,10 @@ pub(crate) async fn submit_provider_delete_task(
             .await;
             return;
         }
+        let lock = lock.expect("provider delete lock was checked above");
+        let (lock_lost_tx, mut lock_lost_rx) = tokio::sync::oneshot::channel();
+        let lock_heartbeat =
+            spawn_provider_delete_lock_heartbeat(app.clone(), lock.clone(), lock_lost_tx);
 
         let started_at = now_unix_secs();
         let _ = update_run_status(
@@ -700,9 +754,13 @@ pub(crate) async fn submit_provider_delete_task(
         .await;
 
         let admin_state = crate::admin_api::AdminAppState::new(&app);
-        let result = admin_state
-            .run_admin_provider_delete_task(&provider_id, &run_id)
-            .await;
+        let result = tokio::select! {
+            result = admin_state.run_admin_provider_delete_task(&provider_id, &run_id) => result,
+            _ = &mut lock_lost_rx => Err(GatewayError::Internal(
+                "provider delete singleton lock ownership was lost".to_string(),
+            )),
+        };
+        lock_heartbeat.abort();
         match result {
             Ok(task_state) => {
                 let _ = update_run_status(
@@ -774,9 +832,7 @@ pub(crate) async fn submit_provider_delete_task(
             }
         }
 
-        if let Some(lock) = lock {
-            let _ = app.runtime_state.lock_release(&lock).await;
-        }
+        let _ = app.runtime_state.lock_release(&lock).await;
     });
 
     Ok(Some(task_id))

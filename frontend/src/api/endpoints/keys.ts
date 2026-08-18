@@ -1,9 +1,14 @@
 import client from '../client'
-import type { EndpointAPIKey, AllowedModels } from './types'
+import type {
+  EndpointAPIKey,
+  AllowedModels,
+  ProviderKeyAuthConfig,
+  ProviderKeyAuthType,
+} from './types'
 import type { QuotaStatusSnapshot } from './types'
 
 // Re-export types for convenience
-export type { EndpointAPIKey, AllowedModels }
+export type { EndpointAPIKey, AllowedModels, ProviderKeyAuthConfig, ProviderKeyAuthType }
 
 interface KeyRequestOptions {
   timeout?: number
@@ -61,10 +66,10 @@ export async function getModelCapabilities(modelName: string): Promise<ModelCapa
  * 获取完整的 API Key（用于查看和复制）
  */
 export interface RevealKeyResult {
-  auth_type: 'api_key' | 'service_account' | 'oauth' | 'bearer'
+  auth_type: ProviderKeyAuthType
   api_key?: string
   refresh_token?: string
-  auth_config?: string | Record<string, unknown>
+  auth_config?: string | ProviderKeyAuthConfig
 }
 
 export async function revealEndpointKey(keyId: string): Promise<RevealKeyResult> {
@@ -196,10 +201,10 @@ export async function addProviderKey(
   data: {
     api_formats: string[]  // 支持的 API 格式列表（必填）
     api_key: string
-    auth_type?: 'api_key' | 'service_account' | 'oauth' | 'bearer'  // 认证类型
+    auth_type?: ProviderKeyAuthType  // 认证类型
     auth_type_by_format?: Record<string, 'api_key' | 'bearer'> | null
     allow_auth_channel_mismatch_formats?: string[] | null
-    auth_config?: Record<string, unknown>  // 认证配置（Vertex AI Service Account JSON）
+    auth_config?: ProviderKeyAuthConfig  // Service Account、Ark 中转或 Volcengine AK/SK 认证配置
     name: string
     rate_multipliers?: Record<string, number> | null  // 按 API 格式的成本倍率
     internal_priority?: number
@@ -227,10 +232,10 @@ export async function updateProviderKey(
   data: Partial<{
     api_formats: string[]  // 支持的 API 格式列表
     api_key: string
-    auth_type: 'api_key' | 'service_account' | 'oauth' | 'bearer'  // 认证类型
+    auth_type: ProviderKeyAuthType  // 认证类型
     auth_type_by_format: Record<string, 'api_key' | 'bearer'> | null
     allow_auth_channel_mismatch_formats: string[] | null
-    auth_config: Record<string, unknown>  // 认证配置（Vertex AI Service Account JSON）
+    auth_config: ProviderKeyAuthConfig  // Service Account、Ark 中转或 Volcengine AK/SK 认证配置
     name: string
     rate_multipliers: Record<string, number> | null  // 按 API 格式的成本倍率
     internal_priority: number
