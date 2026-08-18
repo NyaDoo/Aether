@@ -371,6 +371,8 @@ fn validate_applied_migrations(
 mod tests {
     use super::{all_up_migrations, pending_migrations_from_applied, POSTGRES_MIGRATOR};
 
+    const ASSET_LIBRARY_MIGRATION_VERSION: i64 = 20260818000000;
+
     #[test]
     fn embeds_ordered_postgres_migration_sources() {
         let versions = POSTGRES_MIGRATOR
@@ -380,6 +382,22 @@ mod tests {
         assert!(!versions.is_empty());
         assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(pending_migrations_from_applied(&[]), all_up_migrations());
+    }
+
+    #[test]
+    fn embeds_asset_library_forward_migration() {
+        let migration = POSTGRES_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == ASSET_LIBRARY_MIGRATION_VERSION)
+            .expect("asset library migration should be embedded");
+        let sql = migration.sql.as_ref();
+
+        for table in ["asset_groups", "assets", "ark_visual_validation_sessions"] {
+            assert!(
+                sql.contains(&format!("CREATE TABLE IF NOT EXISTS public.{table}")),
+                "asset library migration is missing {table}"
+            );
+        }
     }
 
     #[test]

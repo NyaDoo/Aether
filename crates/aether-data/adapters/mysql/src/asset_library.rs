@@ -1269,14 +1269,26 @@ mod tests {
     }
 
     #[test]
-    fn baseline_uses_canonical_upstream_identity_and_restrictive_provider_fks() {
-        let schema = include_str!("../migrations/20260403000000_baseline.sql");
+    fn forward_migration_uses_canonical_upstream_identity_and_restrictive_provider_fks() {
+        let schema = include_str!("../migrations/20260818000000_add_asset_library.sql");
         assert!(schema.contains(
             "uq_asset_groups_upstream (`provider_id`, `account_binding`, `project`, `upstream_group_id`)"
         ));
         assert!(schema.contains(
             "uq_ark_validation_upstream (`provider_id`, `account_binding`, `project`, `session_id`)"
         ));
+        assert_eq!(
+            schema
+                .matches("`account_binding` VARCHAR(128) NOT NULL")
+                .count(),
+            2
+        );
+        const UTF8MB4_MAX_BYTES_PER_CHAR: usize = 4;
+        const CANONICAL_IDENTITY_MAX_CHARS: usize = 64 + 128 + 255 + 255;
+        assert!(
+            CANONICAL_IDENTITY_MAX_CHARS * UTF8MB4_MAX_BYTES_PER_CHAR <= 3072,
+            "canonical identity unique key exceeds the InnoDB utf8mb4 key limit"
+        );
         for constraint in [
             "fk_asset_groups_provider",
             "fk_asset_groups_endpoint",

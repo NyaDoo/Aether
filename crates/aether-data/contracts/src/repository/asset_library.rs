@@ -6,7 +6,8 @@ const UPSTREAM_ID_MAX_LEN: usize = 255;
 const NAME_MAX_LEN: usize = 512;
 const TYPE_MAX_LEN: usize = 64;
 const STATUS_MAX_LEN: usize = 64;
-const BINDING_MAX_LEN: usize = 255;
+const ACCOUNT_BINDING_MAX_LEN: usize = 128;
+const PROJECT_MAX_LEN: usize = 255;
 const HASH_MAX_LEN: usize = 128;
 const ERROR_CODE_MAX_LEN: usize = 128;
 
@@ -70,12 +71,12 @@ impl UpsertAssetGroupRecord {
         validate_optional_text(
             "asset_groups.account_binding",
             self.account_binding.as_deref(),
-            BINDING_MAX_LEN,
+            ACCOUNT_BINDING_MAX_LEN,
         )?;
         validate_optional_text(
             "asset_groups.project",
             self.project.as_deref(),
-            BINDING_MAX_LEN,
+            PROJECT_MAX_LEN,
         )?;
         validate_canonical_optional_binding(
             "asset_groups.account_binding",
@@ -411,12 +412,12 @@ impl UpsertArkVisualValidationSessionRecord {
         validate_optional_text(
             "ark_visual_validation_sessions.account_binding",
             self.account_binding.as_deref(),
-            BINDING_MAX_LEN,
+            ACCOUNT_BINDING_MAX_LEN,
         )?;
         validate_optional_text(
             "ark_visual_validation_sessions.project",
             self.project.as_deref(),
-            BINDING_MAX_LEN,
+            PROJECT_MAX_LEN,
         )?;
         validate_canonical_optional_binding(
             "ark_visual_validation_sessions.account_binding",
@@ -772,6 +773,41 @@ mod tests {
         UpsertArkVisualValidationSessionRecord, UpsertAssetGroupRecord, UpsertAssetRecord,
     };
 
+    fn valid_group() -> UpsertAssetGroupRecord {
+        UpsertAssetGroupRecord {
+            id: "group-1".to_string(),
+            upstream_group_id: Some("upstream-group-1".to_string()),
+            user_id: "user-1".to_string(),
+            api_key_id: None,
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            account_binding: Some("a".repeat(128)),
+            project: Some("p".repeat(255)),
+            group_type: "face".to_string(),
+            name: "group".to_string(),
+            description: None,
+            status: "active".to_string(),
+            created_at_unix_secs: 1,
+            updated_at_unix_secs: 1,
+            deleted_at_unix_secs: None,
+        }
+    }
+
+    #[test]
+    fn canonical_identity_lengths_fit_mysql_utf8mb4_unique_keys() {
+        let record = valid_group();
+        assert!(record.validate().is_ok());
+
+        let mut oversized_account = record.clone();
+        oversized_account.account_binding = Some("a".repeat(129));
+        assert!(oversized_account.validate().is_err());
+
+        let mut oversized_project = record;
+        oversized_project.project = Some("p".repeat(256));
+        assert!(oversized_project.validate().is_err());
+    }
+
     #[test]
     fn provider_reference_targets_and_counts_are_explicit() {
         assert_eq!(
@@ -850,24 +886,10 @@ mod tests {
 
     #[test]
     fn deletion_timestamp_cannot_follow_updated_at() {
-        let record = UpsertAssetGroupRecord {
-            id: "group-1".to_string(),
-            upstream_group_id: None,
-            user_id: "user-1".to_string(),
-            api_key_id: None,
-            provider_id: "provider-1".to_string(),
-            endpoint_id: "endpoint-1".to_string(),
-            key_id: "key-1".to_string(),
-            account_binding: None,
-            project: None,
-            group_type: "face".to_string(),
-            name: "group".to_string(),
-            description: None,
-            status: "deleted".to_string(),
-            created_at_unix_secs: 1,
-            updated_at_unix_secs: 2,
-            deleted_at_unix_secs: Some(3),
-        };
+        let mut record = valid_group();
+        record.status = "deleted".to_string();
+        record.updated_at_unix_secs = 2;
+        record.deleted_at_unix_secs = Some(3);
 
         assert!(record.validate().is_err());
     }

@@ -1,4 +1,3 @@
--- Ark private asset library tables.
 CREATE TABLE IF NOT EXISTS public.asset_groups (
     id character varying(64) NOT NULL,
     upstream_group_id character varying(255),
@@ -24,8 +23,11 @@ CREATE TABLE IF NOT EXISTS public.asset_groups (
     CONSTRAINT fk_asset_groups_endpoint FOREIGN KEY (endpoint_id) REFERENCES public.provider_endpoints (id) ON DELETE RESTRICT,
     CONSTRAINT fk_asset_groups_key FOREIGN KEY (key_id) REFERENCES public.provider_api_keys (id) ON DELETE RESTRICT
 );
-CREATE INDEX IF NOT EXISTS idx_asset_groups_user_deleted_created ON public.asset_groups (user_id, deleted_at_unix_secs, created_at_unix_secs);
-CREATE INDEX IF NOT EXISTS idx_asset_groups_user_type_status ON public.asset_groups (user_id, group_type, status);
+
+CREATE INDEX IF NOT EXISTS idx_asset_groups_user_deleted_created
+    ON public.asset_groups (user_id, deleted_at_unix_secs, created_at_unix_secs);
+CREATE INDEX IF NOT EXISTS idx_asset_groups_user_type_status
+    ON public.asset_groups (user_id, group_type, status);
 
 CREATE TABLE IF NOT EXISTS public.assets (
     id character varying(64) NOT NULL,
@@ -54,9 +56,13 @@ CREATE TABLE IF NOT EXISTS public.assets (
     CONSTRAINT fk_assets_user FOREIGN KEY (user_id) REFERENCES public.users (id) ON DELETE CASCADE,
     CONSTRAINT fk_assets_api_key FOREIGN KEY (api_key_id) REFERENCES public.api_keys (id) ON DELETE SET NULL
 );
-CREATE INDEX IF NOT EXISTS idx_assets_group_deleted_created ON public.assets (group_id, is_deleted, created_at_unix_secs);
-CREATE INDEX IF NOT EXISTS idx_assets_user_type_status ON public.assets (user_id, asset_type, status);
-CREATE INDEX IF NOT EXISTS idx_assets_user_deleted_created ON public.assets (user_id, is_deleted, created_at_unix_secs);
+
+CREATE INDEX IF NOT EXISTS idx_assets_group_deleted_created
+    ON public.assets (group_id, is_deleted, created_at_unix_secs);
+CREATE INDEX IF NOT EXISTS idx_assets_user_type_status
+    ON public.assets (user_id, asset_type, status);
+CREATE INDEX IF NOT EXISTS idx_assets_user_deleted_created
+    ON public.assets (user_id, is_deleted, created_at_unix_secs);
 
 CREATE TABLE IF NOT EXISTS public.ark_visual_validation_sessions (
     id character varying(64) NOT NULL,
@@ -89,5 +95,8 @@ CREATE TABLE IF NOT EXISTS public.ark_visual_validation_sessions (
     CONSTRAINT fk_ark_validation_key FOREIGN KEY (key_id) REFERENCES public.provider_api_keys (id) ON DELETE RESTRICT,
     CONSTRAINT fk_ark_validation_group FOREIGN KEY (group_id) REFERENCES public.asset_groups (id) ON DELETE SET NULL
 );
-CREATE INDEX IF NOT EXISTS idx_ark_validation_user_status_expiry ON public.ark_visual_validation_sessions (user_id, status, expires_at_unix_secs);
-CREATE INDEX IF NOT EXISTS idx_ark_validation_group ON public.ark_visual_validation_sessions (group_id);
+
+CREATE INDEX IF NOT EXISTS idx_ark_validation_user_status_expiry
+    ON public.ark_visual_validation_sessions (user_id, status, expires_at_unix_secs);
+CREATE INDEX IF NOT EXISTS idx_ark_validation_group
+    ON public.ark_visual_validation_sessions (group_id);

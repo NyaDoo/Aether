@@ -1,4 +1,3 @@
--- Ark private asset library tables.
 CREATE TABLE IF NOT EXISTS asset_groups (
     `id` VARCHAR(64) NOT NULL,
     `upstream_group_id` VARCHAR(255),
@@ -7,7 +6,7 @@ CREATE TABLE IF NOT EXISTS asset_groups (
     `provider_id` VARCHAR(64) NOT NULL,
     `endpoint_id` VARCHAR(64) NOT NULL,
     `key_id` VARCHAR(64) NOT NULL,
-    `account_binding` VARCHAR(255) NOT NULL,
+    `account_binding` VARCHAR(128) NOT NULL,
     `project` VARCHAR(255) NOT NULL DEFAULT '',
     `group_type` VARCHAR(64) NOT NULL,
     `name` VARCHAR(512) NOT NULL,
@@ -66,7 +65,7 @@ CREATE TABLE IF NOT EXISTS ark_visual_validation_sessions (
     `provider_id` VARCHAR(64) NOT NULL,
     `endpoint_id` VARCHAR(64) NOT NULL,
     `key_id` VARCHAR(64) NOT NULL,
-    `account_binding` VARCHAR(255) NOT NULL,
+    `account_binding` VARCHAR(128) NOT NULL,
     `project` VARCHAR(255) NOT NULL DEFAULT '',
     `byted_token_hash` VARCHAR(128) NOT NULL,
     `encrypted_byted_token` LONGTEXT NOT NULL,

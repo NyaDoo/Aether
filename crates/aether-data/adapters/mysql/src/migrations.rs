@@ -1,14 +1,52 @@
 use sqlx::{
     migrate::{AppliedMigration, Migrate, MigrateError, Migrator},
-    MySqlPool,
+    MySqlConnection, MySqlPool,
 };
+use tracing::warn;
 
 use aether_data_contracts::PendingMigrationInfo;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+const LEGACY_BASELINE_MIGRATION_VERSION: i64 = 20260403000000;
 
 pub async fn run_migrations(pool: &MySqlPool) -> Result<(), MigrateError> {
-    MIGRATOR.run(pool).await
+    let mut conn = pool.acquire().await?;
+    if MIGRATOR.locking {
+        conn.lock().await?;
+    }
+    let result = run_migrations_locked(&mut conn).await;
+    if MIGRATOR.locking {
+        match conn.unlock().await {
+            Ok(()) => {}
+            Err(unlock_error) if result.is_ok() => return Err(unlock_error),
+            Err(unlock_error) => warn!(
+                error = %unlock_error,
+                "MySQL migration lock release failed after migration error"
+            ),
+        }
+    }
+    result
+}
+
+async fn run_migrations_locked(conn: &mut MySqlConnection) -> Result<(), MigrateError> {
+    conn.ensure_migrations_table().await?;
+    if let Some(version) = conn.dirty_version().await? {
+        return Err(MigrateError::Dirty(version));
+    }
+    let applied_migrations = conn.list_applied_migrations().await?;
+    validate_applied_migrations(&applied_migrations)?;
+    let applied_versions = applied_migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<std::collections::HashSet<_>>();
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .filter(|migration| !applied_versions.contains(&migration.version))
+    {
+        conn.apply(migration).await?;
+    }
+    Ok(())
 }
 
 pub async fn pending_migrations(
@@ -78,6 +116,27 @@ fn validate_applied_migrations(
     {
         return Err(MigrateError::VersionMissing(migration.version));
     }
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        if let Some(applied_migration) = applied_migrations
+            .iter()
+            .find(|applied_migration| applied_migration.version == migration.version)
+        {
+            if migration.checksum != applied_migration.checksum {
+                if migration.version == LEGACY_BASELINE_MIGRATION_VERSION {
+                    warn!(
+                        version = migration.version,
+                        description = %migration.description,
+                        "MySQL legacy baseline checksum mismatch (ignored for asset-library recovery)"
+                    );
+                } else {
+                    return Err(MigrateError::VersionMismatch(migration.version));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -86,9 +145,12 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        pending_migrations, prepare_database_for_startup, validate_applied_migrations, MIGRATOR,
+        pending_migrations, prepare_database_for_startup, validate_applied_migrations,
+        LEGACY_BASELINE_MIGRATION_VERSION, MIGRATOR,
     };
     use sqlx::migrate::{AppliedMigration, MigrateError};
+
+    const ASSET_LIBRARY_MIGRATION_VERSION: i64 = 20260818000000;
 
     #[test]
     fn embeds_mysql_migration_sources() {
@@ -98,6 +160,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!versions.is_empty());
         assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn embeds_asset_library_forward_migration() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == ASSET_LIBRARY_MIGRATION_VERSION)
+            .expect("asset library migration should be embedded");
+        let sql = migration.sql.as_ref();
+
+        for table in ["asset_groups", "assets", "ark_visual_validation_sessions"] {
+            assert!(
+                sql.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "asset library migration is missing {table}"
+            );
+        }
     }
 
     #[test]
@@ -171,6 +249,36 @@ mod tests {
         .expect_err("unknown applied migration should block startup");
 
         assert!(matches!(error, MigrateError::VersionMissing(found) if found == version));
+    }
+
+    #[test]
+    fn accepts_checksum_drift_for_legacy_baseline_only() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == LEGACY_BASELINE_MIGRATION_VERSION)
+            .expect("legacy MySQL baseline should be embedded");
+        validate_applied_migrations(&[AppliedMigration {
+            version: migration.version,
+            checksum: Cow::Borrowed(&[0]),
+        }])
+        .expect("legacy baseline checksum drift should remain recoverable");
+    }
+
+    #[test]
+    fn rejects_checksum_drift_for_non_baseline_migrations() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version != LEGACY_BASELINE_MIGRATION_VERSION)
+            .expect("non-baseline MySQL migration should be embedded");
+        let error = validate_applied_migrations(&[AppliedMigration {
+            version: migration.version,
+            checksum: Cow::Borrowed(&[0]),
+        }])
+        .expect_err("non-baseline checksum drift should remain strict");
+
+        assert!(
+            matches!(error, MigrateError::VersionMismatch(found) if found == migration.version)
+        );
     }
 
     #[tokio::test]

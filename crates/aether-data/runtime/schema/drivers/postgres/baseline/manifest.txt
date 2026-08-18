@@ -3,5 +3,4 @@
 003_constraints.sql
 004_indexes.sql
 005_foreign_keys.sql
-007_asset_library.sql
 006_footer.sql

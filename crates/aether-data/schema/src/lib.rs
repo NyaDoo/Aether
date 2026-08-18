@@ -786,7 +786,7 @@ fn assert_file_contents(path: PathBuf, expected: &str) -> Result<(), SchemaError
         path: path.clone(),
         source,
     })?;
-    if actual.replace("\r\n", "\n") == expected {
+    if actual.replace("\r\n", "\n").trim_end_matches('\n') == expected.trim_end_matches('\n') {
         Ok(())
     } else {
         Err(SchemaError::Validation(format!(

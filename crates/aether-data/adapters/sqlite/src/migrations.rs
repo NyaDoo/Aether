@@ -1,14 +1,52 @@
 use sqlx::{
     migrate::{AppliedMigration, Migrate, MigrateError, Migrator},
-    SqlitePool,
+    SqliteConnection, SqlitePool,
 };
+use tracing::warn;
 
 use aether_data_contracts::PendingMigrationInfo;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+const LEGACY_BASELINE_MIGRATION_VERSION: i64 = 20260403000000;
 
 pub async fn run_migrations(pool: &SqlitePool) -> Result<(), MigrateError> {
-    MIGRATOR.run(pool).await
+    let mut conn = pool.acquire().await?;
+    if MIGRATOR.locking {
+        conn.lock().await?;
+    }
+    let result = run_migrations_locked(&mut conn).await;
+    if MIGRATOR.locking {
+        match conn.unlock().await {
+            Ok(()) => {}
+            Err(unlock_error) if result.is_ok() => return Err(unlock_error),
+            Err(unlock_error) => warn!(
+                error = %unlock_error,
+                "SQLite migration lock release failed after migration error"
+            ),
+        }
+    }
+    result
+}
+
+async fn run_migrations_locked(conn: &mut SqliteConnection) -> Result<(), MigrateError> {
+    conn.ensure_migrations_table().await?;
+    if let Some(version) = conn.dirty_version().await? {
+        return Err(MigrateError::Dirty(version));
+    }
+    let applied_migrations = conn.list_applied_migrations().await?;
+    validate_applied_migrations(&applied_migrations)?;
+    let applied_versions = applied_migrations
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<std::collections::HashSet<_>>();
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .filter(|migration| !applied_versions.contains(&migration.version))
+    {
+        conn.apply(migration).await?;
+    }
+    Ok(())
 }
 
 pub async fn pending_migrations(
@@ -78,6 +116,27 @@ fn validate_applied_migrations(
     {
         return Err(MigrateError::VersionMissing(migration.version));
     }
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        if let Some(applied_migration) = applied_migrations
+            .iter()
+            .find(|applied_migration| applied_migration.version == migration.version)
+        {
+            if migration.checksum != applied_migration.checksum {
+                if migration.version == LEGACY_BASELINE_MIGRATION_VERSION {
+                    warn!(
+                        version = migration.version,
+                        description = %migration.description,
+                        "SQLite legacy baseline checksum mismatch (ignored for asset-library recovery)"
+                    );
+                } else {
+                    return Err(MigrateError::VersionMismatch(migration.version));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -87,9 +146,11 @@ mod tests {
 
     use super::{
         pending_migrations, prepare_database_for_startup, run_migrations,
-        validate_applied_migrations, MIGRATOR,
+        validate_applied_migrations, LEGACY_BASELINE_MIGRATION_VERSION, MIGRATOR,
     };
-    use sqlx::migrate::{AppliedMigration, MigrateError};
+    use sqlx::migrate::{AppliedMigration, Migrate, MigrateError};
+
+    const ASSET_LIBRARY_MIGRATION_VERSION: i64 = 20260818000000;
 
     #[tokio::test]
     async fn migrates_empty_database_and_clears_pending_set() {
@@ -110,6 +171,75 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn upgrades_existing_database_with_asset_library_tables() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        let mut conn = pool.acquire().await.expect("sqlite connection");
+        conn.ensure_migrations_table()
+            .await
+            .expect("migration table should create");
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version < ASSET_LIBRARY_MIGRATION_VERSION)
+        {
+            conn.apply(migration)
+                .await
+                .expect("pre-asset-library migration should apply");
+        }
+        drop(conn);
+
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 20260403000000")
+            .execute(&pool)
+            .await
+            .expect("legacy baseline checksum should be replaceable for regression coverage");
+
+        let table_count_before: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'table'
+  AND name IN ('asset_groups', 'assets', 'ark_visual_validation_sessions')
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pre-upgrade asset table count should load");
+        assert_eq!(table_count_before, 0);
+        assert!(pending_migrations(&pool)
+            .await
+            .expect("pending migrations before asset upgrade")
+            .iter()
+            .any(|migration| migration.version == ASSET_LIBRARY_MIGRATION_VERSION));
+
+        run_migrations(&pool)
+            .await
+            .expect("asset library migration should apply");
+
+        let table_count_after: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'table'
+  AND name IN ('asset_groups', 'assets', 'ark_visual_validation_sessions')
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("post-upgrade asset table count should load");
+        assert_eq!(table_count_after, 3);
+        let migration_applied: bool =
+            sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = ?")
+                .bind(ASSET_LIBRARY_MIGRATION_VERSION)
+                .fetch_one(&pool)
+                .await
+                .expect("asset library migration record should load");
+        assert!(migration_applied);
+    }
+
     #[test]
     fn rejects_applied_migration_versions_unknown_to_this_binary() {
         let version = MIGRATOR
@@ -125,6 +255,36 @@ mod tests {
         .expect_err("unknown applied migration should block startup");
 
         assert!(matches!(error, MigrateError::VersionMissing(found) if found == version));
+    }
+
+    #[test]
+    fn accepts_checksum_drift_for_legacy_baseline_only() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == LEGACY_BASELINE_MIGRATION_VERSION)
+            .expect("legacy SQLite baseline should be embedded");
+        validate_applied_migrations(&[AppliedMigration {
+            version: migration.version,
+            checksum: Cow::Borrowed(&[0]),
+        }])
+        .expect("legacy baseline checksum drift should remain recoverable");
+    }
+
+    #[test]
+    fn rejects_checksum_drift_for_non_baseline_migrations() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version != LEGACY_BASELINE_MIGRATION_VERSION)
+            .expect("non-baseline SQLite migration should be embedded");
+        let error = validate_applied_migrations(&[AppliedMigration {
+            version: migration.version,
+            checksum: Cow::Borrowed(&[0]),
+        }])
+        .expect_err("non-baseline checksum drift should remain strict");
+
+        assert!(
+            matches!(error, MigrateError::VersionMismatch(found) if found == migration.version)
+        );
     }
 
     #[tokio::test]

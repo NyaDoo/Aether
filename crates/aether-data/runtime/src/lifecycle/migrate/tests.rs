@@ -529,6 +529,10 @@ async fn migrated_sqlite_columns_match_the_generated_logical_schema() {
             env!("CARGO_MANIFEST_DIR"),
             "/schema/generated/sqlite/baseline/008_background_tasks.sql"
         )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/schema/generated/sqlite/baseline/009_asset_library.sql"
+        )),
     ];
 
     let migrated = sqlx::sqlite::SqlitePoolOptions::new()

@@ -43,7 +43,7 @@ length = 64
 [[table.asset_groups.columns]]
 name = "account_binding"
 type = "text"
-length = 255
+length = 128
 
 [[table.asset_groups.columns]]
 name = "project"
@@ -319,7 +319,7 @@ length = 64
 [[table.ark_visual_validation_sessions.columns]]
 name = "account_binding"
 type = "text"
-length = 255
+length = 128
 
 [[table.ark_visual_validation_sessions.columns]]
 name = "project"
