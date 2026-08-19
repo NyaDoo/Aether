@@ -6,7 +6,7 @@ use aether_data_contracts::repository::video_tasks::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::util::{safe_external_http_url, value_i32, value_u64};
+use crate::util::{normalize_video_task_error_code, safe_external_http_url, value_i32, value_u64};
 use crate::{
     build_video_follow_up_report_context, current_unix_timestamp_secs, doubao_video_tasks_url,
     map_openai_task_status, parse_doubao_video_content_variant, parse_video_content_variant,
@@ -458,10 +458,11 @@ impl DoubaoVideoTaskSeed {
         }
 
         let error = provider_body.get("error").and_then(Value::as_object);
-        self.error_code = error
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        self.error_code = normalize_video_task_error_code(
+            error
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str),
+        );
         self.error_message = error
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
@@ -1131,7 +1132,7 @@ impl DoubaoVideoTaskSeed {
                 .updated_at_unix_secs
                 .or(self.completed_at_unix_secs)
                 .unwrap_or(now_unix_secs),
-            error_code: self.error_code.clone(),
+            error_code: normalize_video_task_error_code(self.error_code.as_deref()),
             error_message: self.error_message.clone(),
             video_url: self.video_url.clone(),
             request_metadata: Some({

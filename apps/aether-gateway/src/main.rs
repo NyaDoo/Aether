@@ -1306,7 +1306,7 @@ struct Args {
         long,
         env = "AETHER_GATEWAY_VIDEO_TASK_TRUTH_SOURCE_MODE",
         value_enum,
-        default_value = "python-sync-report"
+        default_value = "rust-authoritative"
     )]
     video_task_truth_source_mode: VideoTaskTruthSourceArg,
 
@@ -2558,6 +2558,8 @@ mod tests {
     };
     use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
     use aether_gateway::AppState;
+    use clap::CommandFactory;
+    use std::ffi::OsStr;
 
     fn test_args() -> Args {
         Args {
@@ -2574,7 +2576,7 @@ mod tests {
             apply_backfills: false,
             auto_prepare_database: false,
             static_dir: None,
-            video_task_truth_source_mode: VideoTaskTruthSourceArg::PythonSyncReport,
+            video_task_truth_source_mode: VideoTaskTruthSourceArg::RustAuthoritative,
             video_task_poller_interval_ms: 5_000,
             video_task_poller_batch_size: 32,
             video_task_store_path: None,
@@ -2653,6 +2655,20 @@ mod tests {
                 log_max_files: 30,
             },
         }
+    }
+
+    #[test]
+    fn video_task_truth_source_cli_defaults_to_rust_authoritative() {
+        let command = Args::command();
+        let argument = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "video_task_truth_source_mode")
+            .expect("video task truth source argument should exist");
+
+        assert_eq!(
+            argument.get_default_values(),
+            &[OsStr::new("rust-authoritative")]
+        );
     }
 
     fn test_database(driver: DatabaseDriver, max_connections: u32) -> SqlDatabaseConfig {

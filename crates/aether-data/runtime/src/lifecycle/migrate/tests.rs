@@ -272,6 +272,62 @@ SELECT EXISTS (
     .await
 }
 
+async fn character_column_max_length(
+    pool: &PgPool,
+    table_name: &str,
+    column_name: &str,
+) -> Result<Option<i32>, sqlx::Error> {
+    query_scalar(
+        r#"
+SELECT character_maximum_length
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = $1
+  AND column_name = $2
+"#,
+    )
+    .bind(table_name)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await
+}
+
+const POSTGRES_SNAPSHOT_PENDING_VERSIONS: [i64; 6] = [
+    20260813000000,
+    20260818000000,
+    20260818010000,
+    20260818020000,
+    20260819000000,
+    20260819010000,
+];
+
+fn pending_versions(pending: &[super::PendingMigrationInfo]) -> Vec<i64> {
+    pending.iter().map(|migration| migration.version).collect()
+}
+
+async fn prepare_and_run_current_postgres_schema(pool: &PgPool) {
+    let pending = prepare_database_for_startup(pool)
+        .await
+        .expect("clean database bootstrap should succeed");
+    assert_eq!(
+        pending_versions(&pending),
+        POSTGRES_SNAPSHOT_PENDING_VERSIONS,
+        "the empty database snapshot should leave only forward migrations pending"
+    );
+
+    super::run_migrations(pool)
+        .await
+        .expect("forward postgres migrations should run after snapshot bootstrap");
+
+    let remaining = prepare_database_for_startup(pool)
+        .await
+        .expect("applied postgres migrations should be inspectable");
+    assert!(
+        remaining.is_empty(),
+        "current postgres schema should not leave pending migrations: {remaining:?}"
+    );
+}
+
 async fn foreign_key_exists(
     pool: &PgPool,
     table_name: &str,
@@ -1025,6 +1081,109 @@ fn mysql_and_sqlite_migrations_do_not_use_postgres_jsonb() {
 }
 
 #[test]
+fn async_task_text_width_migration_matches_the_logical_schema() {
+    const VERSION: i64 = 20260819010000;
+    const GENERATED_POSTGRES_PROVIDER_CATALOG: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schema/generated/postgres/baseline/002_provider_catalog.sql"
+    ));
+
+    let postgres_migration = POSTGRES_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == VERSION)
+        .expect("Postgres async task text width migration should be embedded");
+    let postgres_sql = postgres_migration.sql.as_ref();
+
+    for (table, columns) in [
+        (
+            "request_candidates",
+            &[
+                ("id", 64),
+                ("request_id", 128),
+                ("user_id", 64),
+                ("api_key_id", 64),
+                ("username", 255),
+                ("api_key_name", 255),
+                ("provider_id", 64),
+                ("endpoint_id", 64),
+                ("key_id", 64),
+                ("status", 32),
+                ("error_type", 128),
+            ][..],
+        ),
+        (
+            "video_tasks",
+            &[
+                ("id", 64),
+                ("short_id", 32),
+                ("request_id", 128),
+                ("user_id", 64),
+                ("api_key_id", 64),
+                ("username", 255),
+                ("api_key_name", 255),
+                ("external_task_id", 255),
+                ("provider_id", 64),
+                ("endpoint_id", 64),
+                ("key_id", 64),
+                ("client_api_format", 128),
+                ("provider_api_format", 128),
+                ("model", 255),
+                ("resolution", 64),
+                ("aspect_ratio", 32),
+                ("size", 64),
+                ("status", 32),
+                ("error_code", 128),
+                ("remixed_from_task_id", 64),
+            ][..],
+        ),
+    ] {
+        assert!(
+            postgres_sql.contains(&format!("ALTER TABLE public.{table}")),
+            "Postgres migration should alter {table}"
+        );
+        for (column, width) in columns {
+            assert!(
+                postgres_sql.contains(&format!("ALTER COLUMN {column} TYPE VARCHAR({width})")),
+                "Postgres migration should align {table}.{column} to VARCHAR({width})"
+            );
+            assert!(
+                GENERATED_POSTGRES_PROVIDER_CATALOG
+                    .contains(&format!("{column} character varying({width})")),
+                "generated logical schema should define {table}.{column} as VARCHAR({width})"
+            );
+        }
+    }
+
+    for column in ["progress_message", "video_url", "thumbnail_url"] {
+        assert!(
+            postgres_sql.contains(&format!("ALTER COLUMN {column} TYPE TEXT")),
+            "Postgres migration should remove the legacy limit from video_tasks.{column}"
+        );
+        assert!(
+            GENERATED_POSTGRES_PROVIDER_CATALOG.contains(&format!("{column} text")),
+            "generated logical schema should define video_tasks.{column} as TEXT"
+        );
+    }
+
+    for (driver, migrator) in [
+        ("mysql", &super::mysql::MIGRATOR),
+        ("sqlite", &super::sqlite::MIGRATOR),
+    ] {
+        let migration = migrator
+            .iter()
+            .find(|migration| migration.version == VERSION)
+            .unwrap_or_else(|| {
+                panic!("{driver} async task text width migration should be embedded")
+            });
+        assert!(migration.sql.contains("SELECT 1;"));
+        assert!(
+            !migration.sql.to_ascii_uppercase().contains("ALTER TABLE"),
+            "{driver} should not rebuild task tables that already use logical widths"
+        );
+    }
+}
+
+#[test]
 fn worker_boot_cleanup_migration_is_enabled_for_every_driver() {
     const VERSION: i64 = 20260731000000;
 
@@ -1108,6 +1267,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260818000000,
             20260818010000,
             20260818020000,
+            20260819000000,
+            20260819010000,
         ]
     );
     assert_eq!(
@@ -1146,6 +1307,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260818000000,
             20260818010000,
             20260818020000,
+            20260819000000,
+            20260819010000,
         ]
     );
 }
@@ -2256,6 +2419,8 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260818000000,
             20260818010000,
             20260818020000,
+            20260819000000,
+            20260819010000,
         ]
     );
 }
@@ -2280,15 +2445,7 @@ fn pending_migrations_from_applied_leaves_new_outcome_migration_after_empty_data
     // The snapshot is intentionally stamped at the last schema version that
     // predates request-outcome metrics.  The new additive migration must stay
     // pending so startup applies the columns without rewriting historical rows.
-    assert_eq!(
-        pending_versions,
-        vec![
-            20260813000000,
-            20260818000000,
-            20260818010000,
-            20260818020000,
-        ]
-    );
+    assert_eq!(pending_versions, POSTGRES_SNAPSHOT_PENDING_VERSIONS);
 }
 
 #[tokio::test]
@@ -2457,6 +2614,21 @@ WHERE table_schema = 'public'
         total_adjusted_exists, 1,
         "missing postgres wallets.total_adjusted"
     );
+
+    for (table, column, expected_width) in [
+        ("request_candidates", "error_type", 128),
+        ("video_tasks", "client_api_format", 128),
+        ("video_tasks", "provider_api_format", 128),
+        ("video_tasks", "error_code", 128),
+    ] {
+        assert_eq!(
+            character_column_max_length(&pool, table, column)
+                .await
+                .expect("postgres async task text width should load"),
+            Some(expected_width),
+            "fresh snapshot plus forward migrations must align {table}.{column}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2773,9 +2945,10 @@ async fn prepare_database_for_startup_bootstraps_clean_database() {
         .await
         .expect("clean database bootstrap should succeed");
 
-    assert!(
-        pending.is_empty(),
-        "fresh databases should not report pending migrations after startup preparation"
+    assert_eq!(
+        pending_versions(&pending),
+        POSTGRES_SNAPSHOT_PENDING_VERSIONS,
+        "fresh database preparation should stamp the snapshot and report forward migrations"
     );
     assert!(table_exists(&pool, "users")
         .await
@@ -2808,6 +2981,27 @@ async fn prepare_database_for_startup_bootstraps_clean_database() {
             .expect("baseline migrations should resolve")
             .len() as i64
     );
+
+    super::run_migrations(&pool)
+        .await
+        .expect("fresh database forward migrations should run");
+    let remaining = prepare_database_for_startup(&pool)
+        .await
+        .expect("fully migrated database should be inspectable");
+    assert!(remaining.is_empty());
+    assert_eq!(
+        character_column_max_length(&pool, "video_tasks", "error_code")
+            .await
+            .expect("video task error code width should load"),
+        Some(128),
+        "fresh snapshot startup must apply the async task text-width migration"
+    );
+
+    let applied_count: i64 = query_scalar("SELECT COUNT(*)::BIGINT FROM public._sqlx_migrations")
+        .fetch_one(&pool)
+        .await
+        .expect("final migration count query should succeed");
+    assert_eq!(applied_count, all_up_migrations().len() as i64);
 }
 
 #[tokio::test]
@@ -2822,13 +3016,7 @@ async fn postgres_request_candidates_preserve_deleted_api_key_identity() {
     let pool = PgPool::connect(server.database_url())
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(
-        pending.is_empty(),
-        "clean database bootstrap should not leave pending migrations: {pending:?}"
-    );
+    prepare_and_run_current_postgres_schema(&pool).await;
 
     query(
         r#"
@@ -3041,13 +3229,7 @@ async fn postgres_expired_api_key_cleanup_preserves_historical_identity() {
     let pool = PgPool::connect(database_url)
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(
-        pending.is_empty(),
-        "clean database bootstrap should not leave pending migrations: {pending:?}"
-    );
+    prepare_and_run_current_postgres_schema(&pool).await;
 
     query(
         r#"
@@ -3205,13 +3387,7 @@ async fn postgres_api_key_leaderboard_user_filter_preserves_aggregate_history() 
     let pool = PgPool::connect(database_url)
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(
-        pending.is_empty(),
-        "clean database bootstrap should not leave pending migrations: {pending:?}"
-    );
+    prepare_and_run_current_postgres_schema(&pool).await;
 
     query(
         r#"
@@ -3325,6 +3501,172 @@ INSERT INTO public.stats_daily_api_key (
         .collect();
     assert_eq!(by_key.get("aggregate-current-key"), Some(&3));
     assert_eq!(by_key.get("aggregate-deleted-key"), None);
+}
+
+#[tokio::test]
+async fn postgres_async_task_text_width_migration_accepts_logical_schema_values() {
+    const MIGRATION_VERSION: i64 = 20260819010000;
+
+    let Some(server) = ManagedPostgresServer::try_start()
+        .await
+        .expect("postgres async task text width migration test should start or skip")
+    else {
+        return;
+    };
+
+    let mut conn = PgConnection::connect(server.database_url())
+        .await
+        .expect("postgres migration connection should open");
+    conn.ensure_migrations_table()
+        .await
+        .expect("migration table should be created");
+    for migration in POSTGRES_MIGRATOR
+        .iter()
+        .filter(|migration| migration.version < MIGRATION_VERSION)
+    {
+        conn.apply(migration)
+            .await
+            .expect("pre-width postgres migration should apply");
+    }
+    drop(conn);
+
+    let pool = PgPool::connect(server.database_url())
+        .await
+        .expect("postgres migration pool should connect");
+    for (table, column) in [
+        ("request_candidates", "error_type"),
+        ("video_tasks", "client_api_format"),
+        ("video_tasks", "provider_api_format"),
+        ("video_tasks", "error_code"),
+    ] {
+        assert_eq!(
+            character_column_max_length(&pool, table, column)
+                .await
+                .expect("legacy character width should load"),
+            Some(50),
+            "fixture should reproduce the legacy {table}.{column} width"
+        );
+    }
+
+    let migration = POSTGRES_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == MIGRATION_VERSION)
+        .expect("async task text width migration should be embedded");
+    let mut conn = pool.acquire().await.expect("migration connection");
+    conn.apply(migration)
+        .await
+        .expect("async task text width migration should apply");
+    drop(conn);
+
+    for (table, column, expected_width) in [
+        ("request_candidates", "error_type", 128),
+        ("video_tasks", "client_api_format", 128),
+        ("video_tasks", "provider_api_format", 128),
+        ("video_tasks", "model", 255),
+        ("video_tasks", "resolution", 64),
+        ("video_tasks", "aspect_ratio", 32),
+        ("video_tasks", "size", 64),
+        ("video_tasks", "error_code", 128),
+    ] {
+        assert_eq!(
+            character_column_max_length(&pool, table, column)
+                .await
+                .expect("upgraded character width should load"),
+            Some(expected_width),
+            "upgraded {table}.{column} should match the logical schema"
+        );
+    }
+    for column in ["progress_message", "video_url", "thumbnail_url"] {
+        assert_eq!(
+            character_column_max_length(&pool, "video_tasks", column)
+                .await
+                .expect("upgraded text column should load"),
+            None,
+            "upgraded video_tasks.{column} should be unbounded TEXT"
+        );
+    }
+
+    query(
+        r#"
+INSERT INTO public.video_tasks (
+  id,
+  short_id,
+  request_id,
+  client_api_format,
+  provider_api_format,
+  model,
+  prompt,
+  resolution,
+  aspect_ratio,
+  size,
+  status,
+  progress_message,
+  error_code,
+  video_url,
+  thumbnail_url
+) VALUES (
+  repeat('v', 60),
+  repeat('s', 24),
+  repeat('r', 110),
+  repeat('c', 80),
+  repeat('p', 80),
+  repeat('m', 180),
+  'migration fixture',
+  repeat('z', 40),
+  repeat('a', 24),
+  repeat('q', 40),
+  'submitted',
+  repeat('g', 700),
+  repeat('e', 80),
+  repeat('u', 2200),
+  repeat('t', 2200)
+)
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("upgraded video_tasks should accept logical schema text widths");
+
+    query(
+        r#"
+INSERT INTO public.request_candidates (
+  id,
+  request_id,
+  username,
+  api_key_name,
+  candidate_index,
+  status,
+  error_type
+) VALUES (
+  repeat('i', 60),
+  repeat('r', 110),
+  repeat('u', 200),
+  repeat('k', 220),
+  0,
+  'provider_status_over_20',
+  repeat('e', 80)
+)
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("upgraded request_candidates should accept logical schema text widths");
+
+    let video_error_code_length: i32 = query_scalar(
+        "SELECT char_length(error_code) FROM public.video_tasks WHERE id = repeat('v', 60)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("upgraded video task should be readable");
+    assert_eq!(video_error_code_length, 80);
+
+    let candidate_error_type_length: i32 = query_scalar(
+        "SELECT char_length(error_type) FROM public.request_candidates WHERE id = repeat('i', 60)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("upgraded request candidate should be readable");
+    assert_eq!(candidate_error_type_length, 80);
 }
 
 #[tokio::test]
@@ -3531,10 +3873,7 @@ async fn postgres_usage_billing_facts_total_tokens_counts_cached_input_once() {
     let pool = PgPool::connect(server.database_url())
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(pending.is_empty());
+    prepare_and_run_current_postgres_schema(&pool).await;
 
     let legacy_view_migration = POSTGRES_MIGRATOR
         .iter()
@@ -3734,10 +4073,7 @@ async fn postgres_migrations_repair_invalid_concurrent_cleanup_index() {
     let pool = PgPool::connect(server.database_url())
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(pending.is_empty());
+    prepare_and_run_current_postgres_schema(&pool).await;
 
     query("DROP INDEX CONCURRENTLY public.idx_usage_legacy_body_ref_cleanup_created_at")
         .execute(&pool)
@@ -3827,14 +4163,7 @@ async fn prepare_database_for_startup_bootstraps_when_only_unrelated_public_tabl
         .await
         .expect("fixture table should be created");
 
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("startup preparation should tolerate unrelated public tables");
-
-    assert!(
-        pending.is_empty(),
-        "unrelated public tables should not block baseline bootstrap on first startup"
-    );
+    prepare_and_run_current_postgres_schema(&pool).await;
     assert!(table_exists(&pool, "vendor_bootstrap_marker")
         .await
         .expect("fixture table lookup should succeed"));

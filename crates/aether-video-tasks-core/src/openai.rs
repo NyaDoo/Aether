@@ -6,7 +6,7 @@ use aether_data_contracts::repository::video_tasks::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::util::safe_external_http_url;
+use crate::util::{normalize_video_task_error_code, safe_external_http_url};
 use crate::{
     build_video_follow_up_report_context, current_unix_timestamp_secs, map_openai_task_status,
     parse_video_content_variant, request_body_string, request_body_u32, resolve_follow_up_auth,
@@ -141,10 +141,11 @@ impl OpenAiVideoTaskSeed {
         self.completed_at_unix_secs = provider_body.get("completed_at").and_then(Value::as_u64);
         self.expires_at_unix_secs = provider_body.get("expires_at").and_then(Value::as_u64);
         let error = provider_body.get("error").and_then(Value::as_object);
-        self.error_code = error
-            .and_then(|value| value.get("code"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        self.error_code = normalize_video_task_error_code(
+            error
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str),
+        );
         self.error_message = error
             .and_then(|value| value.get("message"))
             .and_then(Value::as_str)
@@ -661,7 +662,7 @@ impl OpenAiVideoTaskSeed {
             submitted_at_unix_secs: Some(self.created_at_unix_ms),
             completed_at_unix_secs: self.completed_at_unix_secs,
             updated_at_unix_secs: self.completed_at_unix_secs.unwrap_or(now_unix_secs),
-            error_code: self.error_code.clone(),
+            error_code: normalize_video_task_error_code(self.error_code.as_deref()),
             error_message: self.error_message.clone(),
             video_url: self.video_url.clone(),
             request_metadata: Some({

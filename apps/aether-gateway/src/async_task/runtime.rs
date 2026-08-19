@@ -1207,6 +1207,37 @@ mod tests {
     }
 
     #[test]
+    fn poll_update_bounds_persisted_error_code_but_retains_full_sanitized_code() {
+        let task = sample_sparse_stored_task();
+        let snapshot = LocalVideoTaskSnapshot::from_stored_task(&task).unwrap();
+        let full_code = format!("{}\u{754c}\u{9519}", "E".repeat(140));
+        let provider_body = json!({
+            "status": "failed",
+            "error": {
+                "code": full_code,
+                "message": "provider rejected the task"
+            }
+        });
+
+        let record = build_successful_poll_update(
+            &task,
+            &snapshot,
+            provider_body.as_object().unwrap(),
+            30,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        let persisted_code = record.error_code.as_deref().unwrap();
+        assert_eq!(persisted_code.chars().count(), 128);
+        assert_eq!(
+            record.request_metadata.as_ref().unwrap()["poll_raw_response"]["error"]["code"],
+            provider_body["error"]["code"]
+        );
+    }
+
+    #[test]
     fn touching_legacy_poll_metadata_replaces_unfiltered_payload() {
         let task = sample_sparse_stored_task();
         let snapshot = LocalVideoTaskSnapshot::from_stored_task(&task).unwrap();

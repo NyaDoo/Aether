@@ -94,6 +94,7 @@ services:
       AETHER_LOG_FORMAT: ${AETHER_LOG_FORMAT:-pretty}
       APP_PORT: ${APP_PORT:-8084}
       AETHER_GATEWAY_AUTO_PREPARE_DATABASE: ${AETHER_GATEWAY_AUTO_PREPARE_DATABASE:-true}
+      AETHER_GATEWAY_VIDEO_TASK_TRUTH_SOURCE_MODE: ${AETHER_GATEWAY_VIDEO_TASK_TRUTH_SOURCE_MODE:-rust-authoritative}
     depends_on:
       postgres:
         condition: service_healthy

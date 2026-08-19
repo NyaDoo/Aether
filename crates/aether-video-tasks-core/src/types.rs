@@ -15,8 +15,8 @@ pub enum VideoTaskSyncReportMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoTaskTruthSourceMode {
-    #[default]
     PythonSyncReport,
+    #[default]
     RustAuthoritative,
 }
 
@@ -281,4 +281,17 @@ pub struct DoubaoVideoTaskSeed {
     pub total_tokens: Option<u64>,
     pub persistence: LocalVideoTaskPersistence,
     pub transport: LocalVideoTaskTransport,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VideoTaskTruthSourceMode;
+
+    #[test]
+    fn rust_authoritative_is_the_default_truth_source() {
+        assert_eq!(
+            VideoTaskTruthSourceMode::default(),
+            VideoTaskTruthSourceMode::RustAuthoritative
+        );
+    }
 }

@@ -1,6 +1,27 @@
 use serde_json::Value;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// Maximum width of `video_tasks.error_code` in the logical schema.
+pub(crate) const VIDEO_TASK_ERROR_CODE_MAX_CHARS: usize = 128;
+
+/// Normalizes an untrusted provider error code for durable task storage.
+///
+/// PostgreSQL `varchar(n)` measures characters rather than UTF-8 bytes, so
+/// truncate by Unicode scalar values to keep the result valid UTF-8. The raw
+/// provider response is retained separately in sanitized task metadata.
+pub(crate) fn normalize_video_task_error_code(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(
+        value
+            .chars()
+            .take(VIDEO_TASK_ERROR_CODE_MAX_CHARS)
+            .collect(),
+    )
+}
+
 pub(crate) fn safe_external_http_url(value: &str) -> Option<String> {
     let value = value.trim();
     let parsed = url::Url::parse(value).ok()?;
@@ -104,7 +125,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        derive_video_task_short_id, non_empty_owned, safe_external_http_url, value_i32, value_u64,
+        derive_video_task_short_id, non_empty_owned, normalize_video_task_error_code,
+        safe_external_http_url, value_i32, value_u64, VIDEO_TASK_ERROR_CODE_MAX_CHARS,
     };
 
     #[test]
@@ -150,6 +172,38 @@ mod tests {
 
         assert_eq!(non_empty_owned(Some(&empty)), None);
         assert_eq!(non_empty_owned(Some(&value)).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn preserves_provider_error_codes_longer_than_the_legacy_limit() {
+        let code = "E".repeat(80);
+
+        assert_eq!(
+            normalize_video_task_error_code(Some(&code)).as_deref(),
+            Some(code.as_str())
+        );
+    }
+
+    #[test]
+    fn truncates_provider_error_codes_to_the_logical_schema_limit() {
+        let code = "E".repeat(VIDEO_TASK_ERROR_CODE_MAX_CHARS + 17);
+        let normalized = normalize_video_task_error_code(Some(&code)).unwrap();
+
+        assert_eq!(normalized.chars().count(), VIDEO_TASK_ERROR_CODE_MAX_CHARS);
+        assert_eq!(normalized, "E".repeat(VIDEO_TASK_ERROR_CODE_MAX_CHARS));
+    }
+
+    #[test]
+    fn truncates_provider_error_codes_on_a_unicode_character_boundary() {
+        let code = format!(
+            "{}\u{754c}\u{9519}",
+            "E".repeat(VIDEO_TASK_ERROR_CODE_MAX_CHARS - 1)
+        );
+        let normalized = normalize_video_task_error_code(Some(&code)).unwrap();
+
+        assert_eq!(normalized.chars().count(), VIDEO_TASK_ERROR_CODE_MAX_CHARS);
+        assert!(normalized.ends_with('\u{754c}'));
+        assert!(!normalized.ends_with('\u{9519}'));
     }
 
     #[test]

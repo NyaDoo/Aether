@@ -529,6 +529,8 @@ VALUES (
   $2,
   $3,
   $4,
+  'api_key',
+  NULL,
   $5,
   $6,
   $7,
@@ -1689,6 +1691,11 @@ fn map_auth_api_key_export_row(
 
 #[cfg(test)]
 mod tests {
+    use aether_data_contracts::repository::auth::{
+        AuthApiKeyWriteRepository, CreateStandaloneApiKeyRecord,
+    };
+    use serde_json::json;
+
     use super::{
         SqlxAuthApiKeySnapshotReadRepository, CREATE_STANDALONE_API_KEY_SQL,
         CREATE_USER_API_KEY_SQL, UPDATE_STANDALONE_API_KEY_BASIC_SQL,
@@ -1705,8 +1712,51 @@ mod tests {
         );
         assert!(CREATE_STANDALONE_API_KEY_SQL
             .contains("expires_at,\n  auto_delete_on_expiry,\n  is_locked,\n  is_standalone,"));
-        assert!(CREATE_STANDALONE_API_KEY_SQL
-            .contains("$13,\n  $14,\n  $15,\n  FALSE,\n  TRUE,\n  $16,"));
+    }
+
+    #[test]
+    fn create_standalone_api_key_sql_maps_every_column_to_its_repository_argument() {
+        let values = CREATE_STANDALONE_API_KEY_SQL
+            .split_once(")\nVALUES (\n")
+            .expect("standalone insert should contain a VALUES clause")
+            .1
+            .split_once("\n)\nRETURNING")
+            .expect("standalone insert should contain a RETURNING clause")
+            .0
+            .lines()
+            .map(|line| line.trim().trim_end_matches(','))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec![
+                "$1",
+                "$2",
+                "$3",
+                "$4",
+                "'api_key'",
+                "NULL",
+                "$5",
+                "$6",
+                "$7",
+                "$8",
+                "$9",
+                "$10",
+                "$11",
+                "$12",
+                "NULL",
+                "$13",
+                "$14",
+                "$15",
+                "FALSE",
+                "TRUE",
+                "$16",
+                "$17",
+                "$18",
+                "NOW()",
+                "NOW()",
+            ]
+        );
     }
 
     #[test]
@@ -1754,5 +1804,105 @@ mod tests {
         let pool = factory.connect_lazy().expect("pool should build");
         let repository = SqlxAuthApiKeySnapshotReadRepository::new(pool);
         let _ = repository.pool();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL migrations"]
+    async fn live_postgres_create_standalone_api_key_maps_every_field() {
+        let database_url = std::env::var("AETHER_TEST_DATABASE_URL")
+            .expect("AETHER_TEST_DATABASE_URL must point at the test database");
+        let factory = PostgresPoolFactory::new(PostgresPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 2,
+            acquire_timeout_ms: 10_000,
+            idle_timeout_ms: 30_000,
+            max_lifetime_ms: 60_000,
+            statement_cache_capacity: 64,
+            require_ssl: false,
+        })
+        .expect("factory should build");
+        let repository = SqlxAuthApiKeySnapshotReadRepository::new(
+            factory.connect_lazy().expect("lazy pool should build"),
+        );
+        crate::run_migrations(repository.pool())
+            .await
+            .expect("test database migrations should succeed");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let api_key_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, username, email_verified) VALUES ($1, $2, TRUE)")
+            .bind(&user_id)
+            .bind(format!("standalone-create-{suffix}"))
+            .execute(repository.pool())
+            .await
+            .expect("standalone key owner should seed");
+
+        let expires_at_unix_secs = 2_100_000_000;
+        let created = repository
+            .create_standalone_api_key(CreateStandaloneApiKeyRecord {
+                user_id: user_id.clone(),
+                api_key_id: api_key_id.clone(),
+                key_hash: format!("standalone-hash-{suffix}"),
+                key_encrypted: Some("encrypted-standalone-key".to_string()),
+                name: Some("Repository Standalone Key".to_string()),
+                allowed_providers: Some(vec!["provider-a".to_string()]),
+                allowed_api_formats: Some(vec!["openai:video".to_string()]),
+                allowed_models: Some(vec!["video-model".to_string()]),
+                ip_rules: Some(vec!["127.0.0.1/32".to_string()]),
+                rate_limit: Some(47),
+                concurrent_limit: Some(3),
+                force_capabilities: Some(json!({"video": true})),
+                is_active: false,
+                expires_at_unix_secs: Some(expires_at_unix_secs),
+                auto_delete_on_expiry: true,
+                total_requests: 17,
+                total_tokens: 23,
+                total_cost_usd: 4.5,
+            })
+            .await
+            .expect("standalone key insert should execute")
+            .expect("standalone key insert should return the row");
+
+        assert_eq!(created.user_id, user_id);
+        assert_eq!(created.api_key_id, api_key_id);
+        assert_eq!(created.credential_type, "api_key");
+        assert_eq!(created.access_key_id, None);
+        assert_eq!(created.name.as_deref(), Some("Repository Standalone Key"));
+        assert_eq!(
+            created.allowed_providers,
+            Some(vec!["provider-a".to_string()])
+        );
+        assert_eq!(
+            created.allowed_api_formats,
+            Some(vec!["openai:video".to_string()])
+        );
+        assert_eq!(
+            created.allowed_models,
+            Some(vec!["video-model".to_string()])
+        );
+        assert_eq!(created.ip_rules, Some(vec!["127.0.0.1/32".to_string()]));
+        assert_eq!(created.rate_limit, Some(47));
+        assert_eq!(created.concurrent_limit, Some(3));
+        assert_eq!(created.force_capabilities, Some(json!({"video": true})));
+        assert!(!created.is_active);
+        assert_eq!(created.expires_at_unix_secs, Some(expires_at_unix_secs));
+        assert!(created.auto_delete_on_expiry);
+        assert!(created.is_standalone);
+        assert_eq!(created.total_requests, 17);
+        assert_eq!(created.total_tokens, 23);
+        assert_eq!(created.total_cost_usd, 4.5);
+
+        sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(&api_key_id)
+            .execute(repository.pool())
+            .await
+            .expect("standalone key should clean up");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(repository.pool())
+            .await
+            .expect("standalone key owner should clean up");
     }
 }

@@ -12,16 +12,17 @@ its own request/response shape, route classification and plan kinds.
 
 ## Prerequisite
 
-Video tasks are only polled when the gateway runs with Rust as the source of
-truth:
+The gateway uses Rust as the video-task source of truth by default. It persists
+tasks, polls provider status and finalizes billing:
 
 ```
 --video-task-truth-source-mode rust-authoritative
 # or AETHER_GATEWAY_VIDEO_TASK_TRUTH_SOURCE_MODE=rust-authoritative
 ```
 
-The default is `python-sync-report`, under which no poller runs and tasks stay
-in `submitted` forever. This applies to all three surfaces.
+`python-sync-report` is a legacy compatibility mode for deployments that still
+run an external Python task owner. It must be selected explicitly; the gateway
+does not persist or poll tasks in that mode.
 
 ## Doubao (Volcengine Ark)
 

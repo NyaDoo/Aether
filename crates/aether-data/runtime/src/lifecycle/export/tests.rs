@@ -69,6 +69,23 @@ fn core_export_domains_match_across_sql_drivers() {
     assert!(sqlite_core_export_domains().contains(&ExportDomain::Auxiliary));
 }
 
+#[test]
+fn material_asset_auxiliary_tables_keep_foreign_key_import_order() {
+    let names = AUXILIARY_TABLES
+        .iter()
+        .map(|table| table.name)
+        .collect::<Vec<_>>();
+    let group_index = names
+        .iter()
+        .position(|name| *name == "asset_groups")
+        .expect("asset groups should be exported");
+
+    assert_eq!(
+        &names[group_index..group_index + 3],
+        &["asset_groups", "assets", "ark_visual_validation_sessions"]
+    );
+}
+
 #[tokio::test]
 async fn sqlite_core_export_covers_every_portable_table() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()

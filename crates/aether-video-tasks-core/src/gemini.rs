@@ -4,6 +4,7 @@ use aether_data_contracts::repository::video_tasks::{
 };
 use serde_json::{json, Map, Value};
 
+use crate::util::normalize_video_task_error_code;
 use crate::{
     build_video_follow_up_report_context, current_unix_timestamp_secs, gemini_metadata_video_url,
     request_body_string, request_body_u32, resolve_follow_up_auth, GeminiVideoTaskSeed,
@@ -123,10 +124,8 @@ impl GeminiVideoTaskSeed {
             if let Some(error) = error {
                 self.status = LocalVideoTaskStatus::Failed;
                 self.progress_percent = 100;
-                self.error_code = error
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                self.error_code =
+                    normalize_video_task_error_code(error.get("code").and_then(Value::as_str));
                 self.error_message = error
                     .get("message")
                     .and_then(Value::as_str)
@@ -373,7 +372,7 @@ impl GeminiVideoTaskSeed {
             submitted_at_unix_secs: Some(now_unix_secs),
             completed_at_unix_secs: None,
             updated_at_unix_secs: now_unix_secs,
-            error_code: self.error_code.clone(),
+            error_code: normalize_video_task_error_code(self.error_code.as_deref()),
             error_message: self.error_message.clone(),
             video_url: gemini_metadata_video_url(&self.metadata),
             request_metadata: Some({

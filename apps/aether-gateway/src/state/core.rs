@@ -317,7 +317,7 @@ impl AppState {
             runtime_state: runtime_state.clone(),
             usage_runtime: Arc::new(usage::UsageRuntime::disabled()),
             video_tasks: Arc::new(VideoTaskService::new(
-                VideoTaskTruthSourceMode::PythonSyncReport,
+                VideoTaskTruthSourceMode::RustAuthoritative,
             )),
             video_task_poller: None,
             frontdoor_runtime_guards: Arc::clone(&frontdoor_runtime_guards),

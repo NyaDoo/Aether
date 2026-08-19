@@ -207,6 +207,20 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
         name: "video_tasks",
         primary_key: &["id"],
     },
+    // Keep the material asset parent before both child tables so an exported
+    // auxiliary stream remains directly importable with foreign keys enabled.
+    AuxiliaryTable {
+        name: "asset_groups",
+        primary_key: &["id"],
+    },
+    AuxiliaryTable {
+        name: "assets",
+        primary_key: &["id"],
+    },
+    AuxiliaryTable {
+        name: "ark_visual_validation_sessions",
+        primary_key: &["id"],
+    },
     AuxiliaryTable {
         name: "usage_body_blobs",
         primary_key: &["body_ref"],
