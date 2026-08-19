@@ -75,4 +75,20 @@ describe('request outcome metrics', () => {
     expect(resolveServiceErrorRate(metrics, 1)).toBe(0.1)
     expect(resolveUserErrorRate(metrics, 1)).toBeCloseTo(1 / 6)
   })
+
+  it('never renders an invalid percentage while aggregate counters are being reset', () => {
+    const inconsistent = {
+      total_requests: 122,
+      sla_eligible_count: 122,
+      success_count: 0,
+      service_error_count: 11_933,
+      user_error_count: 0,
+      success_rate: -9_681.15,
+      service_error_rate: 9_781.15,
+    }
+
+    expect(resolveSlaSuccessRate(inconsistent)).toBe(0)
+    expect(resolveServiceErrorRate(inconsistent)).toBe(100)
+    expect(resolveUserErrorRate({ total_requests: 1, user_error_count: 2 })).toBe(100)
+  })
 })

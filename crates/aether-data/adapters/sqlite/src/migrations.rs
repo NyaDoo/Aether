@@ -153,6 +153,169 @@ mod tests {
     const ASSET_LIBRARY_MIGRATION_VERSION: i64 = 20260818000000;
     const PROVIDER_BOUND_ASSETS_MIGRATION_VERSION: i64 = 20260818010000;
     const USER_AKSK_MIGRATION_VERSION: i64 = 20260818020000;
+    const REQUEST_OUTCOME_STATISTICS_RESET_MIGRATION_VERSION: i64 = 20260819000000;
+
+    #[test]
+    fn request_outcome_statistics_reset_preserves_historical_totals() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| {
+                migration.version == REQUEST_OUTCOME_STATISTICS_RESET_MIGRATION_VERSION
+            })
+            .expect("request outcome statistics reset migration should be embedded");
+        let sql = migration.sql.as_ref();
+
+        for table in [
+            "stats_hourly",
+            "stats_daily",
+            "stats_summary",
+            "stats_user_summary",
+            "provider_api_keys",
+            "usage_counter_deltas",
+        ] {
+            assert!(
+                sql.contains(&format!("UPDATE {table}")),
+                "missing reset for {table}"
+            );
+        }
+        for preserved_field in [
+            "request_count = 0",
+            "total_requests = 0",
+            "total_tokens = 0",
+            "total_cost_usd = 0",
+            "total_response_time_ms = 0",
+        ] {
+            assert!(
+                !sql.contains(preserved_field),
+                "must preserve {preserved_field}"
+            );
+        }
+        assert!(!sql.contains("DELETE FROM"));
+        assert!(sql.contains("WHERE kind = 'provider_api_key'"));
+    }
+
+    #[tokio::test]
+    async fn request_outcome_statistics_reset_only_clears_outcome_fields() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        let mut conn = pool.acquire().await.expect("sqlite connection");
+        conn.ensure_migrations_table()
+            .await
+            .expect("migration table should create");
+        for migration in MIGRATOR.iter().filter(|migration| {
+            migration.version < REQUEST_OUTCOME_STATISTICS_RESET_MIGRATION_VERSION
+        }) {
+            conn.apply(migration)
+                .await
+                .expect("pre-reset migration should apply");
+        }
+        drop(conn);
+
+        sqlx::query(
+            r#"
+INSERT INTO stats_daily (
+  id, date, total_requests, success_requests, error_requests,
+  sla_eligible_requests, user_error_requests, input_tokens, output_tokens,
+  cache_creation_tokens, cache_read_tokens, total_cost, actual_total_cost,
+  response_time_sum_ms, response_time_samples, created_at, updated_at
+) VALUES ('daily-reset', 1, 120, 100, 20, 0, 0, 300, 400, 50, 60, 12.5, 11.5, 900, 100, 1, 1);
+
+INSERT INTO stats_daily_error (
+  id, date, error_category, provider_name, model, count, created_at, updated_at
+) VALUES ('daily-error-reset', 1, 'legacy', 'provider', 'model', 20, 1, 1);
+
+INSERT INTO provider_api_keys (
+  id, provider_id, name, request_count, total_tokens, total_cost_usd,
+  success_count, sla_eligible_count, error_count, user_error_count,
+  total_response_time_ms, created_at, updated_at
+) VALUES ('provider-key-reset', 'provider-reset', 'Reset key', 120, 700, 12.5, 100, 0, 20, 0, 900, 1, 1);
+
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, request_count_delta, success_count_delta,
+  sla_eligible_count_delta, error_count_delta, user_error_count_delta,
+  total_tokens_delta, total_cost_usd_delta, total_response_time_ms_delta, created_at
+) VALUES
+  ('delta-provider-key', 'request-1', 'provider_api_key', 'provider-key-reset', 1, 1, 1, 1, 1, 7, 0.5, 9, 1),
+  ('delta-provider-monthly', 'request-1', 'provider_monthly', 'provider-reset', 1, 1, 1, 1, 1, 7, 0.5, 9, 1);
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy aggregate fixtures should seed");
+
+        let reset = MIGRATOR
+            .iter()
+            .find(|migration| {
+                migration.version == REQUEST_OUTCOME_STATISTICS_RESET_MIGRATION_VERSION
+            })
+            .expect("request outcome statistics reset migration");
+        let mut conn = pool.acquire().await.expect("sqlite connection");
+        conn.apply(reset)
+            .await
+            .expect("reset migration should apply");
+        drop(conn);
+
+        let daily: (i64, i64, i64, i64, i64, i64, i64, f64, f64) = sqlx::query_as(
+            r#"
+SELECT total_requests, success_requests, error_requests, sla_eligible_requests,
+       user_error_requests, input_tokens, output_tokens, total_cost, actual_total_cost
+FROM stats_daily WHERE id = 'daily-reset'
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("daily aggregate should remain");
+        assert_eq!(daily, (120, 0, 0, 0, 0, 300, 400, 12.5, 11.5));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count FROM stats_daily_error WHERE id = 'daily-error-reset'"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("daily error aggregate should remain"),
+            0
+        );
+
+        let provider_key: (i64, i64, i64, i64, i64, i64, f64, i64) = sqlx::query_as(
+            r#"
+SELECT request_count, success_count, error_count, sla_eligible_count,
+       user_error_count, total_tokens, total_cost_usd, total_response_time_ms
+FROM provider_api_keys WHERE id = 'provider-key-reset'
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("provider key counters should remain");
+        assert_eq!(provider_key, (120, 0, 0, 0, 0, 700, 12.5, 900));
+
+        let provider_delta: (i64, i64, i64, i64, i64, i64, f64, i64) = sqlx::query_as(
+            r#"
+SELECT request_count_delta, success_count_delta, error_count_delta,
+       sla_eligible_count_delta, user_error_count_delta, total_tokens_delta,
+       total_cost_usd_delta, total_response_time_ms_delta
+FROM usage_counter_deltas WHERE id = 'delta-provider-key'
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("provider delta should remain");
+        assert_eq!(provider_delta, (1, 0, 0, 0, 0, 7, 0.5, 9));
+
+        let monthly_outcomes: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+SELECT success_count_delta, error_count_delta, sla_eligible_count_delta,
+       user_error_count_delta
+FROM usage_counter_deltas WHERE id = 'delta-provider-monthly'
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("non-provider-key delta should remain untouched");
+        assert_eq!(monthly_outcomes, (1, 1, 1, 1));
+    }
 
     #[tokio::test]
     async fn migrates_empty_database_and_clears_pending_set() {

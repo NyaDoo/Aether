@@ -104,7 +104,7 @@ export function getHealthLabel(
   emptyLabel = '暂无请求'
 ) {
   if (!hasSlaSamples(item)) {
-    return item.total_attempts > 0 ? '暂无 SLA 样本' : emptyLabel
+    return item.total_attempts > 0 ? '暂无有效请求' : emptyLabel
   }
   if (item.success_rate >= 0.95) return '正常'
   if (item.success_rate >= 0.8) return '波动'
@@ -190,7 +190,7 @@ export function formatTimelineTooltip(input: {
 }) {
   const metrics = input.metrics
   const lines = [
-    `总请求/SLA样本/成功/服务错误/用户错误/SLA可用率/状态：${formatTimelineRequestBreakdown(metrics, input.status)}`,
+    `总请求/有效请求/成功/服务错误/用户错误/成功率/状态：${formatTimelineRequestBreakdown(metrics, input.status)}`,
     `平均耗时/TTFB/速度：${formatTimelineAverageMetrics(metrics)}`,
     `时间范围：${formatFullTimestamp(input.timeRangeStart)} - ${formatFullTimestamp(input.timeRangeEnd)}`
   ]

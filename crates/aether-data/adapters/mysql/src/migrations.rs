@@ -151,6 +151,7 @@ mod tests {
     use sqlx::migrate::{AppliedMigration, MigrateError};
 
     const ASSET_LIBRARY_MIGRATION_VERSION: i64 = 20260818000000;
+    const REQUEST_OUTCOME_STATISTICS_RESET_MIGRATION_VERSION: i64 = 20260819000000;
 
     #[test]
     fn embeds_mysql_migration_sources() {
@@ -176,6 +177,60 @@ mod tests {
                 "asset library migration is missing {table}"
             );
         }
+    }
+
+    #[test]
+    fn request_outcome_statistics_reset_preserves_historical_totals() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| {
+                migration.version == REQUEST_OUTCOME_STATISTICS_RESET_MIGRATION_VERSION
+            })
+            .expect("request outcome statistics reset migration should be embedded");
+        let sql = migration.sql.as_ref();
+
+        for table in [
+            "stats_hourly",
+            "stats_daily",
+            "stats_summary",
+            "stats_user_summary",
+            "provider_api_keys",
+            "usage_counter_deltas",
+        ] {
+            assert!(
+                sql.contains(&format!("UPDATE {table}")),
+                "missing reset for {table}"
+            );
+        }
+        for outcome_field in [
+            "success_requests = 0",
+            "error_requests = 0",
+            "sla_eligible_requests = 0",
+            "user_error_requests = 0",
+            "success_count = 0",
+            "error_count = 0",
+            "sla_eligible_count = 0",
+            "user_error_count = 0",
+        ] {
+            assert!(
+                sql.contains(outcome_field),
+                "missing reset for {outcome_field}"
+            );
+        }
+        for preserved_field in [
+            "request_count = 0",
+            "total_requests = 0",
+            "total_tokens = 0",
+            "total_cost_usd = 0",
+            "total_response_time_ms = 0",
+        ] {
+            assert!(
+                !sql.contains(preserved_field),
+                "must preserve {preserved_field}"
+            );
+        }
+        assert!(!sql.contains("DELETE FROM"));
+        assert!(sql.contains("WHERE kind = 'provider_api_key'"));
     }
 
     #[test]

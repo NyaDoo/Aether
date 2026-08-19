@@ -643,6 +643,35 @@ describe('HorizontalRequestTimeline', () => {
     expect(root.textContent).not.toContain('该错误被标记为敏感上游错误')
   })
 
+  it('keeps legacy user-error candidates visible as failed attempts', async () => {
+    const trace: RequestTrace = {
+      ...buildTrace([
+        buildCandidate({
+          id: 'cand-user-error',
+          provider_id: 'provider-user-error',
+          provider_name: 'Provider User Error',
+          status: 'user_error',
+          outcome_class: 'user_error',
+          status_code: 400,
+          error_message: 'Invalid value: human',
+        }),
+      ]),
+      final_status: 'user_error',
+      outcome_class: 'user_error',
+      sla_eligible: false,
+    }
+
+    const root = mountTimeline(trace)
+    await nextTick()
+
+    expect(root.textContent).toContain('用户请求错误')
+    expect(root.textContent).toContain('Provider User Error')
+    expect(root.querySelectorAll('.minimal-node-group')).toHaveLength(1)
+    expect(root.textContent).toContain('错误信息')
+    expect(root.textContent).toContain('HTTP 400')
+    expect(root.textContent).toContain('Invalid value: human')
+  })
+
   it('keeps local sync diagnostics visible when upstream response body capture is disabled', async () => {
     const trace = buildTrace([
       buildCandidate({

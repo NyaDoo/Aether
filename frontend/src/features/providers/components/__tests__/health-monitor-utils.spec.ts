@@ -20,7 +20,7 @@ describe('health monitor SLA outcome semantics', () => {
       success_rate: 1,
     }
 
-    expect(getHealthLabel(item)).toBe('暂无 SLA 样本')
+    expect(getHealthLabel(item)).toBe('暂无有效请求')
     expect(getHealthBadgeVariant(item)).toBe('outline')
     expect(formatAvailability(item)).toBe('-')
     expect(summarizeHealthMonitorItems([item])).toMatchObject({
@@ -45,7 +45,7 @@ describe('health monitor SLA outcome semantics', () => {
       },
     })
 
-    expect(tooltip).toContain('总请求/SLA样本/成功/服务错误/用户错误/SLA可用率/状态')
+    expect(tooltip).toContain('总请求/有效请求/成功/服务错误/用户错误/成功率/状态')
     expect(tooltip).toContain('12 次/10 次/9 次/1 次/2 次/90.00%/波动')
   })
 

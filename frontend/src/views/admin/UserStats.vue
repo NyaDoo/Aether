@@ -101,7 +101,7 @@
           </div>
           <div>
             <div class="text-xs text-muted-foreground">
-              SLA 成功率
+              成功率
             </div>
             <div class="font-semibold">
               {{ formatPercent(userSlaSuccessRate) }}

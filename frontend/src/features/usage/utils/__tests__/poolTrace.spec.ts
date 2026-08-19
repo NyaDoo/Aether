@@ -205,6 +205,7 @@ describe('poolTrace', () => {
 
   it('treats only real execution statuses as attempted', () => {
     expect(isAttemptedCandidate(buildCandidate({ status: 'success' }))).toBe(true)
+    expect(isAttemptedCandidate(buildCandidate({ status: 'user_error' }))).toBe(true)
     expect(isAttemptedCandidate(buildCandidate({ status: 'failed' }))).toBe(true)
     expect(isAttemptedCandidate(buildCandidate({ status: 'cancelled' }))).toBe(true)
     expect(isAttemptedCandidate(buildCandidate({ status: 'streaming' }))).toBe(true)

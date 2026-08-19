@@ -410,12 +410,7 @@ impl UsageReadRepository for MysqlUsageReadRepository {
         provider_id: &str,
         since_unix_secs: u64,
     ) -> Result<StoredProviderUsageSummary, DataLayerError> {
-        let repository = InMemoryUsageReadRepository::seed(
-            self.storage
-                .load_usage_records_for_provider_since(provider_id, since_unix_secs)
-                .await?,
-        );
-        repository
+        self.storage
             .summarize_provider_usage_since(provider_id, since_unix_secs)
             .await
     }

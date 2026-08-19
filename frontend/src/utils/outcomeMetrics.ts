@@ -27,6 +27,10 @@ function firstFinite(...values: Array<number | null | undefined>): number | null
   return null
 }
 
+function clampRate(value: number, unit: number): number {
+  return Math.min(Math.max(0, unit), Math.max(0, value))
+}
+
 export function resolveRequestCount(source: RequestOutcomeMetricSource): number | null {
   return firstFinite(source.request_count, source.total_requests, source.total_attempts)
 }
@@ -70,16 +74,16 @@ export function resolveSlaSuccessRate(
   if (explicitEligibleCount != null && explicitEligibleCount <= 0) return null
 
   const explicit = finite(source.success_rate)
-  if (explicit != null) return explicit
+  if (explicit != null) return clampRate(explicit, unit)
 
   const successCount = finite(source.success_count)
   const eligibleCount = resolveSlaEligibleCount(source)
   if (successCount != null && eligibleCount != null && eligibleCount > 0) {
-    return successCount / eligibleCount * unit
+    return clampRate(successCount / eligibleCount * unit, unit)
   }
 
   const serviceErrorRate = resolveServiceErrorRate(source, unit, false)
-  return serviceErrorRate == null ? null : Math.max(0, unit - serviceErrorRate)
+  return serviceErrorRate == null ? null : clampRate(unit - serviceErrorRate, unit)
 }
 
 export function resolveServiceErrorRate(
@@ -91,17 +95,17 @@ export function resolveServiceErrorRate(
   if (explicitEligibleCount != null && explicitEligibleCount <= 0) return null
 
   const explicit = firstFinite(source.service_error_rate, source.error_rate)
-  if (explicit != null) return explicit
+  if (explicit != null) return clampRate(explicit, unit)
 
   const serviceErrorCount = resolveServiceErrorCount(source)
   const eligibleCount = resolveSlaEligibleCount(source)
   if (serviceErrorCount != null && eligibleCount != null && eligibleCount > 0) {
-    return serviceErrorCount / eligibleCount * unit
+    return clampRate(serviceErrorCount / eligibleCount * unit, unit)
   }
 
   if (allowSuccessRateFallback) {
     const successRate = finite(source.success_rate)
-    if (successRate != null) return Math.max(0, unit - successRate)
+    if (successRate != null) return clampRate(unit - successRate, unit)
   }
   return null
 }
@@ -111,12 +115,12 @@ export function resolveUserErrorRate(
   unit = 100,
 ): number | null {
   const explicit = finite(source.user_error_rate)
-  if (explicit != null) return explicit
+  if (explicit != null) return clampRate(explicit, unit)
 
   const userErrorCount = resolveUserErrorCount(source)
   const requestCount = resolveRequestCount(source)
   if (userErrorCount != null && requestCount != null && requestCount > 0) {
-    return userErrorCount / requestCount * unit
+    return clampRate(userErrorCount / requestCount * unit, unit)
   }
   return null
 }

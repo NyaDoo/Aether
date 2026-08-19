@@ -6,7 +6,7 @@
     <HealthMonitorHeader
       v-model:lookback-hours="lookbackHours"
       :title="title"
-      description="基于真实请求统计端点 SLA 可用率；用户错误单列且不影响服务健康"
+      description="基于真实请求统计端点成功率；用户错误单列且不影响服务健康"
       :loading="loading"
       @refresh="refreshData"
     />

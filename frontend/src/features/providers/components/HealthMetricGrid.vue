@@ -48,7 +48,7 @@ const availabilityItem = computed(() => ({
 
 const metrics = computed(() => [
   {
-    label: 'SLA 可用率',
+    label: '成功率',
     value: formatAvailability(availabilityItem.value),
     valueClass: getAvailabilityClass(availabilityItem.value)
   },

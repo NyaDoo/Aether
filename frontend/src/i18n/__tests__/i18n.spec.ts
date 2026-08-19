@@ -118,4 +118,18 @@ describe('i18n infrastructure', () => {
     expect(translateLegacyText('  发布于 2026-01-01  ', 'en-US')).toBe('  Published at 2026-01-01  ')
     expect(translateLegacyText('git clone https://github.com/fawney19/Aether.git', 'en-US')).toBe('git clone https://github.com/fawney19/Aether.git')
   })
+
+  it('presents success metrics without exposing the internal SLA term', () => {
+    expect(translateLegacyText('成功率', 'en-US')).toBe('Success rate')
+    expect(translateLegacyText('成功率与错误', 'en-US')).toBe('Success rate and errors')
+    expect(translateLegacyText('暂无有效请求', 'en-US')).toBe('No eligible requests')
+    expect(translateLegacyText(
+      '基于真实请求统计端点成功率；用户错误单列且不影响服务健康',
+      'en-US',
+    )).toBe('Endpoint success rate based on real requests. User errors are reported separately and do not affect service health.')
+    expect(translateLegacyText(
+      '总请求/有效请求/成功/服务错误/用户错误/成功率/状态：12 次/10 次/9 次/1 次/2 次/90.00%/波动',
+      'en-US',
+    )).toContain('Total requests/eligible requests/successes/service errors/user errors/success rate/status:')
+  })
 })

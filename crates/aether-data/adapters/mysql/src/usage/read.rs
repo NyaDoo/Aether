@@ -1,9 +1,10 @@
 use aether_data_contracts::repository::usage::{
-    ProviderApiKeyWindowUsageRequest, StoredRequestUsageAudit, UsageAuditKeywordSearchQuery,
-    UsageAuditListQuery, UsageMonitoringErrorCountQuery, UsageMonitoringErrorListQuery,
+    ProviderApiKeyWindowUsageRequest, StoredProviderUsageSummary, StoredRequestUsageAudit,
+    UsageAuditKeywordSearchQuery, UsageAuditListQuery, UsageMonitoringErrorCountQuery,
+    UsageMonitoringErrorListQuery,
 };
 use aether_data_contracts::DataLayerError;
-use sqlx::{MySql, QueryBuilder};
+use sqlx::{MySql, QueryBuilder, Row};
 
 use crate::error::SqlResultExt;
 
@@ -31,6 +32,39 @@ const SUCCESS_PERCENTILE_PREDICATE: &str = r#"(
     AND TRIM(COALESCE(`usage`.error_message, '')) = ''
   )
 )"#;
+
+fn summarize_provider_usage_since_sql() -> String {
+    format!(
+        r#"
+SELECT
+  CAST(COUNT(*) AS SIGNED) AS total_requests,
+  CAST(COALESCE(SUM(CASE WHEN `usage`.sla_eligible <> 0 THEN 1 ELSE 0 END), 0) AS SIGNED)
+    AS sla_eligible_requests,
+  CAST(COALESCE(SUM(CASE WHEN `usage`.outcome_class = 'success' THEN 1 ELSE 0 END), 0) AS SIGNED)
+    AS successful_requests,
+  CAST(COALESCE(SUM(CASE WHEN `usage`.outcome_class = 'service_error' THEN 1 ELSE 0 END), 0) AS SIGNED)
+    AS failed_requests,
+  CAST(COALESCE(SUM(CASE WHEN `usage`.outcome_class = 'user_error' THEN 1 ELSE 0 END), 0) AS SIGNED)
+    AS user_error_requests,
+  CAST(COALESCE(AVG(CASE
+    WHEN `usage`.response_time_ms IS NOT NULL THEN GREATEST(`usage`.response_time_ms, 0)
+    ELSE NULL
+  END), 0) AS DOUBLE) AS avg_response_time_ms,
+  CAST(COALESCE(SUM(COALESCE(
+    usage_settlement_snapshots.billing_total_cost_usd,
+    `usage`.total_cost_usd,
+    0
+  )), 0) AS DOUBLE) AS total_cost_usd
+FROM `usage`
+LEFT JOIN usage_routing_snapshots
+  ON usage_routing_snapshots.request_id = `usage`.request_id
+LEFT JOIN usage_settlement_snapshots
+  ON usage_settlement_snapshots.request_id = `usage`.request_id
+WHERE ({EFFECTIVE_PROVIDER_ID_EXPR}) = ?
+  AND `usage`.created_at_unix_ms >= ?
+"#,
+    )
+}
 
 /// A SQL-side superset filter used before the runtime applies complex usage analytics.
 ///
@@ -441,6 +475,29 @@ WHERE created_at_unix_ms >= ?
         self.fetch_usage_items(builder).await
     }
 
+    pub async fn summarize_provider_usage_since(
+        &self,
+        provider_id: &str,
+        since_unix_secs: u64,
+    ) -> Result<StoredProviderUsageSummary, DataLayerError> {
+        let row = sqlx::query(&summarize_provider_usage_since_sql())
+            .bind(provider_id)
+            .bind(to_i64(since_unix_secs, "usage.created_at_unix_ms")?)
+            .fetch_one(&self.pool)
+            .await
+            .map_sql_err()?;
+
+        Ok(StoredProviderUsageSummary {
+            total_requests: row_u64(&row, "total_requests")?,
+            sla_eligible_requests: row_u64(&row, "sla_eligible_requests")?,
+            successful_requests: row_u64(&row, "successful_requests")?,
+            failed_requests: row_u64(&row, "failed_requests")?,
+            user_error_requests: row_u64(&row, "user_error_requests")?,
+            avg_response_time_ms: row.try_get("avg_response_time_ms").map_sql_err()?,
+            total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
+        })
+    }
+
     async fn fetch_usage_items(
         &self,
         mut builder: QueryBuilder<'_, MySql>,
@@ -795,6 +852,17 @@ mod tests {
         push_order_limit_offset(&mut query, true, Some(25), Some(50))
             .expect("pagination should build");
         assert!(query.sql().contains("LIMIT ? OFFSET ?"));
+    }
+
+    #[test]
+    fn provider_summary_preserves_totals_but_uses_persisted_outcomes() {
+        let sql = summarize_provider_usage_since_sql();
+        assert!(sql.contains("COUNT(*)"));
+        assert!(sql.contains("SUM(CASE WHEN `usage`.sla_eligible <> 0"));
+        assert!(sql.contains("`usage`.outcome_class = 'success'"));
+        assert!(sql.contains("`usage`.outcome_class = 'service_error'"));
+        assert!(sql.contains("`usage`.outcome_class = 'user_error'"));
+        assert!(!sql.contains("outcome_class <> 'in_flight'"));
     }
 
     #[test]

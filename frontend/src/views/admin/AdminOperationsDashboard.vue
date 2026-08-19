@@ -690,16 +690,16 @@
       <Card class="overflow-hidden">
         <div class="border-b border-border/70 bg-muted/20 px-4 py-3">
           <h2 class="text-sm font-semibold">
-            SLA 与错误
+            成功率与错误
           </h2>
           <p class="text-xs text-muted-foreground">
-            SLA 服务错误、用户错误与熔断风险
+            成功率、服务错误、用户错误与熔断风险
           </p>
         </div>
         <div class="space-y-4 p-4">
           <div class="grid grid-cols-2 gap-3">
             <MetricCell
-              label="SLA 成功率"
+              label="成功率"
               :value="formatPercentagePoints(slaRate)"
               :value-class="slaValueClass"
             />
@@ -772,7 +772,7 @@
                   请求
                 </TableHead>
                 <TableHead class="text-right">
-                  SLA 成功率
+                  成功率
                 </TableHead>
                 <TableHead class="text-right">
                   用户错误
@@ -1604,7 +1604,7 @@ const kpiCards = computed<Array<{
     iconClass: 'text-amber-500',
   },
   {
-    title: 'SLA',
+    title: '成功率',
     value: formatPercentagePoints(slaRate.value),
     hint: `服务错误率 ${formatPercentagePoints(serviceErrorRate.value)}`,
     icon: ShieldCheck,

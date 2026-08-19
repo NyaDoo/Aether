@@ -644,7 +644,7 @@
                   请求
                 </th>
                 <th class="px-3 py-2 text-right font-medium">
-                  SLA 成功率
+                  成功率
                 </th>
                 <th class="px-3 py-2 text-right font-medium">
                   服务错误率
@@ -1374,7 +1374,7 @@ const providerPerformanceSummaryCards = computed(() => {
       iconClass: 'text-blue-500',
     },
     {
-      title: 'SLA 成功率',
+      title: '成功率',
       value: formatProviderPerformanceMetric(summary ? resolveSlaSuccessRate(summary) : null, '%'),
       hint: `服务错误率 ${formatProviderPerformanceMetric(summary ? resolveServiceErrorRate(summary) : null, '%')}`,
       icon: CheckCircle2,

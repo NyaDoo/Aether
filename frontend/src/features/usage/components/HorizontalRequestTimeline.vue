@@ -464,7 +464,7 @@
 
                 <!-- 错误信息：将实际上游响应头和响应体作为同一个对象展示 -->
                 <div
-                  v-if="currentAttempt.status === 'failed' && currentAttemptRequestError"
+                  v-if="currentAttemptDisplayStatus === 'failed' && currentAttemptRequestError"
                   class="error-block"
                 >
                   <div class="error-heading">
@@ -1650,7 +1650,7 @@ const currentAttemptRequestError = computed<{
   diagnostic: Record<string, unknown> | null
 } | null>(() => {
   const attempt = currentAttempt.value
-  if (!attempt || attempt.status !== 'failed') return null
+  if (!attempt || getDisplayStatus(attempt) !== 'failed') return null
 
   const extra = extractObject(attempt.extra_data)
   const upstreamResponse = extractObject(extra?.upstream_response)
@@ -2356,6 +2356,9 @@ function getDisplayStatus(attempt: CandidateRecord | null | undefined): string {
       return 'failed'
     }
     return 'success'
+  }
+  if (attempt.status === 'user_error') {
+    return 'failed'
   }
   if (
     attempt.status === 'failed' ||

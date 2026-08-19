@@ -2190,8 +2190,12 @@ const legacyExactEnglishMessages: Record<string, string> = {
   '用户排行榜': 'User leaderboard',
   '用户摘要': 'User summary',
   '错误率': 'Error rate',
-  'SLA 成功率': 'SLA success rate',
-  'SLA 可用率': 'SLA availability',
+  '成功率': 'Success rate',
+  '成功率与错误': 'Success rate and errors',
+  '成功率、服务错误、用户错误与熔断风险': 'Success rate, service errors, user errors, and circuit-breaker risk',
+  '暂无有效请求': 'No eligible requests',
+  '基于真实请求统计端点成功率；用户错误单列且不影响服务健康': 'Endpoint success rate based on real requests. User errors are reported separately and do not affect service health.',
+  '基于真实请求统计模型成功率；用户错误单列且不影响服务健康': 'Model success rate based on real requests. User errors are reported separately and do not affect service health.',
   '服务错误': 'Service errors',
   '服务错误率': 'Service error rate',
   '用户错误': 'User errors',
@@ -2320,6 +2324,7 @@ const legacyExactEnglishMessages: Record<string, string> = {
 }
 
 const legacyPhraseEnglishMessages: Array<[string, string]> = [
+  ['总请求/有效请求/成功/服务错误/用户错误/成功率/状态：', 'Total requests/eligible requests/successes/service errors/user errors/success rate/status: '],
   ['缓存读', 'Cache reads'],
   ['加载延迟百分位中', 'Loading latency percentiles'],
   ['当前时间窗口暂无上游样本', 'No upstream samples in the current time window'],

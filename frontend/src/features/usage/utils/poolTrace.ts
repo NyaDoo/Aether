@@ -2,6 +2,7 @@ import type { CandidateRecord } from '@/api/requestTrace'
 
 export const TIMELINE_STATUS: CandidateRecord['status'][] = [
   'success',
+  'user_error',
   'failed',
   'skipped',
   'cancelled',
@@ -44,6 +45,7 @@ export const isAttemptedCandidate = (
   switch (candidate.status) {
     case 'streaming':
     case 'success':
+    case 'user_error':
     case 'failed':
     case 'cancelled':
     case 'stream_interrupted':

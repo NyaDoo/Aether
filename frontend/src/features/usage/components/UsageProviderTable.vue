@@ -28,7 +28,7 @@
               缓存命中率
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
-              SLA 成功率
+              成功率
             </TableHead>
             <TableHead class="h-8 px-2 text-right">
               <div class="flex flex-col text-xs gap-0.5 whitespace-nowrap">
