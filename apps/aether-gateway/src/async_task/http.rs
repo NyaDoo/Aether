@@ -21,7 +21,9 @@ use super::{
 };
 use crate::{AppState, GatewayError};
 
-pub(crate) use self::cancel::{cancel_video_task_record, CancelVideoTaskError};
+pub(crate) use self::cancel::{
+    cancel_video_task_record, cancel_video_task_record_for_owner, CancelVideoTaskError,
+};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListVideoTasksQuery {

@@ -109,6 +109,34 @@ pub(crate) async fn read_video_task_video_source(
     let Some(task) = read_video_task_detail(state, task_id).await? else {
         return Ok(None);
     };
+    read_video_task_video_source_from_task(state, task_id, &task).await
+}
+
+/// Resolves media only after establishing task ownership. Provider transport
+/// snapshots contain credentials, so the owner check must precede that read.
+pub(crate) async fn read_video_task_video_source_for_owner(
+    state: &AppState,
+    task_id: &str,
+    expected_user_id: &str,
+) -> Result<Option<VideoTaskVideoSource>, GatewayError> {
+    let Some(task) = read_video_task_detail(state, task_id).await? else {
+        return Ok(None);
+    };
+    let expected_user_id = expected_user_id.trim();
+    if expected_user_id.is_empty()
+        || task.user_id.as_deref().map(str::trim) != Some(expected_user_id)
+        || task.status == VideoTaskStatus::Deleted
+    {
+        return Ok(None);
+    }
+    read_video_task_video_source_from_task(state, task_id, &task).await
+}
+
+async fn read_video_task_video_source_from_task(
+    state: &AppState,
+    task_id: &str,
+    task: &StoredVideoTask,
+) -> Result<Option<VideoTaskVideoSource>, GatewayError> {
     let Some(video_url) = task
         .video_url
         .as_deref()

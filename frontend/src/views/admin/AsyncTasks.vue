@@ -1,7 +1,10 @@
 <template>
   <div class="space-y-6 pb-8">
     <!-- 视频生成任务与系统运维任务是两套独立的后端系统，分 Tab 展示避免语义混淆 -->
-    <Tabs v-model="activeTab">
+    <Tabs
+      v-if="isAdmin"
+      v-model="activeTab"
+    >
       <TabsList class="tabs-button-list grid w-full max-w-[420px] grid-cols-2">
         <TabsTrigger value="video">
           <span class="flex items-center gap-1.5">
@@ -37,6 +40,7 @@
       >
         <VideoTasksPanel
           :active="activeTab === 'video'"
+          scope="admin"
           @stats="onVideoStats"
         />
       </TabsContent>
@@ -452,8 +456,19 @@
       </TabsContent>
     </Tabs>
 
+    <!-- 普通用户只查看自己的视频请求，不挂载任何管理员系统任务能力。 -->
+    <VideoTasksPanel
+      v-else
+      :active="true"
+      scope="user"
+      @stats="onVideoStats"
+    />
+
     <!-- 任务详情抽屉 -->
-    <Teleport to="body">
+    <Teleport
+      v-if="isAdmin"
+      to="body"
+    >
       <Transition name="drawer">
         <div
           v-if="showDetail && selectedTask"
@@ -858,6 +873,7 @@
 
     <!-- 使用记录详情抽屉 -->
     <RequestDetailDrawer
+      v-if="isAdmin"
       :is-open="usageDetailOpen"
       :request-id="usageRequestId"
       @close="usageDetailOpen = false"
@@ -986,6 +1002,7 @@ function isSucceededStatus(status: string): boolean {
 
 // 获取任务列表
 async function fetchTasks() {
+  if (!isAdmin.value) return
   loading.value = true
   try {
     const response = await asyncTasksApi.list({
@@ -1009,6 +1026,7 @@ async function fetchTasks() {
 
 // 获取统计数据
 async function fetchStats() {
+  if (!isAdmin.value) return
   try {
     stats.value = await asyncTasksApi.getStats()
   } catch (error) {
@@ -1017,6 +1035,7 @@ async function fetchStats() {
 }
 
 async function refreshOverview() {
+  if (!isAdmin.value) return
   if (overviewRefreshInFlight) return
   overviewRefreshInFlight = true
   try {
@@ -1321,12 +1340,16 @@ function handleVisibilityChange() {
 }
 
 onMounted(() => {
-  document.addEventListener('visibilitychange', handleVisibilityChange)
-  refreshOverview()
+  if (isAdmin.value) {
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    refreshOverview()
+  }
 })
 
 onUnmounted(() => {
-  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  if (isAdmin.value) {
+    document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }
   stopAutoRefresh()
   stopDetailAutoRefresh()
   clearTimeout(filterTimeout)

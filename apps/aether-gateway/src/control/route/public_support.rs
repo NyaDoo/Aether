@@ -525,6 +525,72 @@ pub(super) fn classify_public_support_route(
     } else if method == http::Method::GET
         && matches!(
             normalized_path,
+            "/api/users/me/video-tasks" | "/api/users/me/video-tasks/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "video_tasks_list",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
+            "/api/users/me/video-tasks/stats" | "/api/users/me/video-tasks/stats/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "video_tasks_stats",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && has_single_nested_suffix_after_prefix(
+            normalized_path,
+            "/api/users/me/video-tasks/",
+            "cancel",
+        )
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "video_task_cancel",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && has_single_nested_suffix_after_prefix(
+            normalized_path,
+            "/api/users/me/video-tasks/",
+            "video",
+        )
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "video_task_video",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && normalized_path != "/api/users/me/video-tasks/stats"
+        && normalized_path != "/api/users/me/video-tasks/stats/"
+        && has_single_segment_after_prefix(normalized_path, "/api/users/me/video-tasks/")
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "video_task_detail",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
             "/api/users/me"
                 | "/api/users/me/sessions"
                 | "/api/users/me/api-keys"

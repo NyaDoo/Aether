@@ -89,6 +89,7 @@ export function buildNavigation(options: {
         items: [
           { name: t('nav.modelCatalog'), href: '/dashboard/models', icon: Box },
           { name: t('nav.materialAssets'), href: '/dashboard/material-assets', icon: Library },
+          { name: t('nav.asyncTasks'), href: '/dashboard/async-tasks', icon: Zap },
           { name: t('nav.apiKeys'), href: '/dashboard/api-keys', icon: Key },
         ]
       },

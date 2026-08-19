@@ -61,6 +61,24 @@ impl VideoTaskService {
             trace_id,
         )
     }
+
+    pub(crate) fn prepare_follow_up_sync_plan_for_owner(
+        &self,
+        plan_kind: &str,
+        request_path: &str,
+        body_json: Option<&serde_json::Value>,
+        user_id: &str,
+        trace_id: &str,
+    ) -> Option<LocalVideoTaskFollowUpPlan> {
+        self.0.prepare_follow_up_sync_plan_for_user(
+            plan_kind,
+            request_path,
+            body_json,
+            Some(user_id),
+            None,
+            trace_id,
+        )
+    }
 }
 
 impl Deref for VideoTaskService {

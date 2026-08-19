@@ -49,6 +49,8 @@ use chrono::{TimeZone, Utc};
 
 #[path = "public_support/dashboard.rs"]
 mod dashboard;
+#[path = "public_support/video_tasks.rs"]
+mod video_tasks;
 
 #[tokio::test]
 async fn gateway_handles_public_announcements_list_without_proxying_upstream() {

@@ -26,6 +26,9 @@ use user_me_api_keys::*;
 #[path = "user_me_usage.rs"]
 mod user_me_usage;
 use user_me_usage::*;
+#[path = "user_me_video_tasks.rs"]
+mod user_me_video_tasks;
+use user_me_video_tasks::*;
 #[path = "user_me_catalog.rs"]
 mod user_me_catalog;
 use user_me_catalog::*;

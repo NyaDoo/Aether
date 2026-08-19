@@ -31,12 +31,13 @@ export interface VideoTaskItem {
   usage_id?: string | null
   external_task_id?: string | null
   user_id?: string | null
-  username: string
+  /** Admin-only owner label; omitted by the self-service API. */
+  username?: string
   /** Stable Aether/global model identity shown to API clients. */
   global_model_name?: string | null
-  /** Provider-facing model selected after routing and model mapping. */
+  /** Admin-only Provider-facing model selected after routing and model mapping. */
   mapped_model?: string | null
-  /** Model/version echoed by the upstream provider during execution. */
+  /** Admin-only model/version echoed by the upstream provider during execution. */
   observed_model?: string | null
   /** Exact model value supplied on the original request; also used by the model filter. */
   model?: string | null
@@ -45,10 +46,14 @@ export interface VideoTaskItem {
   progress_percent: number
   progress_message?: string | null
   provider_id?: string | null
-  provider_name: string
+  /** Admin-only Provider label; omitted by the self-service API. */
+  provider_name?: string
   duration_seconds?: number | null
   resolution?: string | null
   aspect_ratio?: string | null
+  /** Safe playback capability flag used by the self-service API. */
+  video_available?: boolean
+  /** Admin-only upstream location; omitted by the self-service API. */
   video_url?: string | null
   error_code?: string | null
   error_message?: string | null
@@ -59,6 +64,7 @@ export interface VideoTaskItem {
   output_tokens?: number | null
   total_tokens?: number | null
   cost?: number | null
+  /** Admin-only upstream cost; omitted by the self-service API. */
   actual_cost?: number | null
   created_at?: string | null
   completed_at?: string | null
@@ -89,46 +95,77 @@ export interface VideoTaskQueryParams {
   page_size?: number
 }
 
-export const videoTasksApi = {
-  async list(params: VideoTaskQueryParams = {}): Promise<VideoTaskListResponse> {
-    const searchParams = new URLSearchParams()
-    if (params.status) searchParams.append('status', params.status)
-    if (params.user_id) searchParams.append('user_id', params.user_id)
-    if (params.model) searchParams.append('model', params.model)
-    if (params.page) searchParams.append('page', params.page.toString())
-    if (params.page_size) searchParams.append('page_size', params.page_size.toString())
+export type VideoTasksApiScope = 'admin' | 'user'
 
-    const query = searchParams.toString()
-    const url = query ? `/api/admin/video-tasks?${query}` : '/api/admin/video-tasks'
-    const response = await apiClient.get<VideoTaskListResponse>(url)
-    return response.data
-  },
-
-  async getStats(): Promise<VideoTaskStatsResponse> {
-    const response = await apiClient.get<VideoTaskStatsResponse>('/api/admin/video-tasks/stats')
-    return response.data
-  },
-
-  async getDetail(taskId: string): Promise<VideoTaskItem & Record<string, unknown>> {
-    const response = await apiClient.get<VideoTaskItem & Record<string, unknown>>(
-      `/api/admin/video-tasks/${taskId}`,
-    )
-    return response.data
-  },
-
-  async cancel(taskId: string): Promise<{ id: string; status: string; message: string }> {
-    const response = await apiClient.post<{ id: string; status: string; message: string }>(
-      `/api/admin/video-tasks/${taskId}/cancel`,
-    )
-    return response.data
-  },
-
-  videoUrl(taskId: string, token?: string | null): string {
-    if (token) {
-      return `/api/admin/video-tasks/${taskId}/video?token=${encodeURIComponent(token)}`
-    }
-    return `/api/admin/video-tasks/${taskId}/video`
-  },
+function videoTasksBasePath(scope: VideoTasksApiScope): string {
+  return scope === 'admin' ? '/api/admin/video-tasks' : '/api/users/me/video-tasks'
 }
+
+export function createVideoTasksApi(scope: VideoTasksApiScope) {
+  const basePath = videoTasksBasePath(scope)
+
+  return {
+    async list(params: VideoTaskQueryParams = {}): Promise<VideoTaskListResponse> {
+      const searchParams = new URLSearchParams()
+      if (params.status) searchParams.append('status', params.status)
+      // The self-service API derives ownership from the authenticated session.
+      // Never forward an owner hint that could be mistaken for impersonation.
+      if (scope === 'admin' && params.user_id) searchParams.append('user_id', params.user_id)
+      if (params.model) searchParams.append('model', params.model)
+      if (params.page) searchParams.append('page', params.page.toString())
+      if (params.page_size) searchParams.append('page_size', params.page_size.toString())
+
+      const query = searchParams.toString()
+      const url = query ? `${basePath}?${query}` : basePath
+      const response = await apiClient.get<VideoTaskListResponse>(url)
+      return response.data
+    },
+
+    async getStats(): Promise<VideoTaskStatsResponse> {
+      const response = await apiClient.get<VideoTaskStatsResponse>(`${basePath}/stats`)
+      return response.data
+    },
+
+    async getDetail(taskId: string): Promise<VideoTaskItem & Record<string, unknown>> {
+      const response = await apiClient.get<VideoTaskItem & Record<string, unknown>>(
+        `${basePath}/${encodeURIComponent(taskId)}`,
+      )
+      return response.data
+    },
+
+    async cancel(taskId: string): Promise<{ id: string; status: string; message: string }> {
+      const response = await apiClient.post<{ id: string; status: string; message: string }>(
+        `${basePath}/${encodeURIComponent(taskId)}/cancel`,
+      )
+      return response.data
+    },
+
+    /**
+     * Loads protected video content through the authenticated API client.
+     * This is required by the user surface: its session token must stay in the
+     * Authorization header and must never be placed in a media URL query string.
+     */
+    async getVideoBlob(taskId: string, signal?: AbortSignal): Promise<Blob> {
+      const response = await apiClient.get<Blob>(
+        `${basePath}/${encodeURIComponent(taskId)}/video`,
+        { responseType: 'blob', signal },
+      )
+      return response.data
+    },
+
+    videoUrl(taskId: string, token?: string | null): string {
+      const path = `${basePath}/${encodeURIComponent(taskId)}/video`
+      // Query-token media URLs are retained only for the existing admin flow.
+      // User media must go through getVideoBlob so Authorization stays a header.
+      if (scope === 'admin' && token) {
+        return `${path}?token=${encodeURIComponent(token)}`
+      }
+      return path
+    },
+  }
+}
+
+/** Backwards-compatible admin client for existing admin-only call sites. */
+export const videoTasksApi = createVideoTasksApi('admin')
 
 export default videoTasksApi

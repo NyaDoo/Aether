@@ -30,9 +30,28 @@ pub(crate) async fn cancel_video_task_record(
     state: &AppState,
     task_id: &str,
 ) -> Result<StoredVideoTask, CancelVideoTaskError> {
+    cancel_video_task_record_for_owner(state, task_id, None).await
+}
+
+/// Cancels a video task while enforcing an optional immutable owner boundary.
+///
+/// Admin callers use `None`; self-service callers must pass the authenticated
+/// user id. Ownership is checked both before any provider credential hydration
+/// or upstream request and again before the active-only persistence CAS.
+pub(crate) async fn cancel_video_task_record_for_owner(
+    state: &AppState,
+    task_id: &str,
+    expected_user_id: Option<&str>,
+) -> Result<StoredVideoTask, CancelVideoTaskError> {
     let Some(task) = read_video_task_detail(state, task_id).await? else {
         return Err(CancelVideoTaskError::NotFound);
     };
+    if !video_task_owner_matches(&task, expected_user_id) {
+        return Err(CancelVideoTaskError::NotFound);
+    }
+    if expected_user_id.is_some() && task.status == VideoTaskStatus::Deleted {
+        return Err(CancelVideoTaskError::NotFound);
+    }
 
     if matches!(
         task.status,
@@ -51,25 +70,52 @@ pub(crate) async fn cancel_video_task_record(
             "video task provider cancellation contract is unavailable".to_string(),
         ))
     })?;
-    state
-        .hydrate_video_task_for_route(Some(cancel_plan.route_family), &cancel_plan.request_path)
-        .await?;
+    let hydrated = match expected_user_id {
+        Some(expected_user_id) => {
+            state
+                .hydrate_video_task_for_route_for_user(
+                    Some(cancel_plan.route_family),
+                    &cancel_plan.request_path,
+                    expected_user_id,
+                )
+                .await?
+        }
+        None => {
+            let _ = state
+                .hydrate_video_task_for_route(
+                    Some(cancel_plan.route_family),
+                    &cancel_plan.request_path,
+                )
+                .await?;
+            true
+        }
+    };
+    if !hydrated {
+        return Err(CancelVideoTaskError::NotFound);
+    }
 
     let body_json = json!({});
-    let follow_up = state
-        .video_tasks
-        .prepare_follow_up_sync_plan(
+    let follow_up = match expected_user_id {
+        Some(expected_user_id) => state.video_tasks.prepare_follow_up_sync_plan_for_owner(
+            cancel_plan.plan_kind,
+            &cancel_plan.request_path,
+            Some(&body_json),
+            expected_user_id,
+            &trace_id,
+        ),
+        None => state.video_tasks.prepare_follow_up_sync_plan(
             cancel_plan.plan_kind,
             &cancel_plan.request_path,
             Some(&body_json),
             None,
             &trace_id,
-        )
-        .ok_or_else(|| {
-            CancelVideoTaskError::Gateway(GatewayError::Internal(
-                "video task provider credentials are unavailable for cancellation".to_string(),
-            ))
-        })?;
+        ),
+    }
+    .ok_or_else(|| {
+        CancelVideoTaskError::Gateway(GatewayError::Internal(
+            "video task provider credentials are unavailable for cancellation".to_string(),
+        ))
+    })?;
 
     execute_video_task_cancel_plan(state, &trace_id, follow_up.plan)
         .await
@@ -82,6 +128,12 @@ pub(crate) async fn cancel_video_task_record(
     let Some(current_task) = state.find_video_task_by_id(task_id).await? else {
         return Err(CancelVideoTaskError::NotFound);
     };
+    if !video_task_owner_matches(&current_task, expected_user_id) {
+        return Err(CancelVideoTaskError::NotFound);
+    }
+    if expected_user_id.is_some() && current_task.status == VideoTaskStatus::Deleted {
+        return Err(CancelVideoTaskError::NotFound);
+    }
     if !current_task.status.is_active() {
         return Err(CancelVideoTaskError::InvalidStatus(current_task.status));
     }
@@ -109,6 +161,13 @@ pub(crate) async fn cancel_video_task_record(
     state.video_tasks.hydrate_from_stored_task(&stored);
     finalize_video_task_if_terminal(state, &stored).await;
     Ok(stored)
+}
+
+fn video_task_owner_matches(task: &StoredVideoTask, expected_user_id: Option<&str>) -> bool {
+    expected_user_id.is_none_or(|expected| {
+        let expected = expected.trim();
+        !expected.is_empty() && task.user_id.as_deref().map(str::trim) == Some(expected)
+    })
 }
 
 #[derive(Debug, Clone)]

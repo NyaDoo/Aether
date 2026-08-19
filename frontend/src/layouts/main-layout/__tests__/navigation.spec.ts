@@ -35,7 +35,10 @@ describe('main layout navigation builder', () => {
       'tx:nav.group.account',
     ])
     expect(navigation.flatMap(group => group.items.map(item => item.name))).toContain('tx:nav.myReferral')
-    expect(navigation.flatMap(group => group.items.map(item => item.href))).toContain('/dashboard/material-assets')
+    expect(navigation.flatMap(group => group.items.map(item => item.href))).toEqual(expect.arrayContaining([
+      '/dashboard/material-assets',
+      '/dashboard/async-tasks',
+    ]))
   })
 
   it('builds admin navigation with dynamic module menu items sorted by menu order', () => {

@@ -510,6 +510,31 @@ fn classifies_users_me_routes_as_public_support_route() {
             "available_models",
         ),
         (
+            http::Method::GET,
+            "/api/users/me/video-tasks?page=2",
+            "video_tasks_list",
+        ),
+        (
+            http::Method::GET,
+            "/api/users/me/video-tasks/stats",
+            "video_tasks_stats",
+        ),
+        (
+            http::Method::GET,
+            "/api/users/me/video-tasks/task-1",
+            "video_task_detail",
+        ),
+        (
+            http::Method::POST,
+            "/api/users/me/video-tasks/task-1/cancel",
+            "video_task_cancel",
+        ),
+        (
+            http::Method::GET,
+            "/api/users/me/video-tasks/task-1/video",
+            "video_task_video",
+        ),
+        (
             http::Method::PUT,
             "/api/users/me/model-capabilities",
             "model_capabilities_update",

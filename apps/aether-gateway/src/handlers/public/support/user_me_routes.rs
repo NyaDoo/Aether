@@ -18,12 +18,16 @@ use super::{
     handle_users_me_preferences_put, handle_users_me_providers_get, handle_users_me_referral_get,
     handle_users_me_sessions_get, handle_users_me_update_session, handle_users_me_usage_active_get,
     handle_users_me_usage_get, handle_users_me_usage_heatmap_get,
-    handle_users_me_usage_interval_timeline_get, users_me_api_key_capabilities_path_matches,
-    users_me_api_key_detail_path_matches, users_me_api_key_install_sessions_path_matches,
-    users_me_api_key_providers_path_matches, users_me_management_token_detail_path_matches,
+    handle_users_me_usage_interval_timeline_get, handle_users_me_video_task_cancel,
+    handle_users_me_video_task_detail, handle_users_me_video_task_video,
+    handle_users_me_video_tasks_list, handle_users_me_video_tasks_stats,
+    users_me_api_key_capabilities_path_matches, users_me_api_key_detail_path_matches,
+    users_me_api_key_install_sessions_path_matches, users_me_api_key_providers_path_matches,
+    users_me_management_token_detail_path_matches,
     users_me_management_token_regenerate_path_matches,
     users_me_management_token_toggle_path_matches, users_me_management_tokens_root,
-    users_me_session_detail_path_matches, AppState, GatewayPublicRequestContext,
+    users_me_session_detail_path_matches, users_me_video_task_detail_id,
+    users_me_video_task_nested_id, AppState, GatewayPublicRequestContext,
 };
 
 pub(crate) async fn maybe_build_local_users_me_response(
@@ -186,6 +190,38 @@ pub(crate) async fn maybe_build_local_users_me_response(
             if users_me_management_token_regenerate_path_matches(&request_context.request_path) =>
         {
             Some(handle_users_me_management_token_regenerate(state, request_context, headers).await)
+        }
+        Some("video_tasks_list")
+            if matches!(
+                request_context.request_path.as_str(),
+                "/api/users/me/video-tasks" | "/api/users/me/video-tasks/"
+            ) =>
+        {
+            Some(handle_users_me_video_tasks_list(state, request_context, headers).await)
+        }
+        Some("video_tasks_stats")
+            if matches!(
+                request_context.request_path.as_str(),
+                "/api/users/me/video-tasks/stats" | "/api/users/me/video-tasks/stats/"
+            ) =>
+        {
+            Some(handle_users_me_video_tasks_stats(state, request_context, headers).await)
+        }
+        Some("video_task_detail")
+            if users_me_video_task_detail_id(&request_context.request_path).is_some() =>
+        {
+            Some(handle_users_me_video_task_detail(state, request_context, headers).await)
+        }
+        Some("video_task_cancel")
+            if users_me_video_task_nested_id(&request_context.request_path, "/cancel")
+                .is_some() =>
+        {
+            Some(handle_users_me_video_task_cancel(state, request_context, headers).await)
+        }
+        Some("video_task_video")
+            if users_me_video_task_nested_id(&request_context.request_path, "/video").is_some() =>
+        {
+            Some(handle_users_me_video_task_video(state, request_context, headers).await)
         }
         Some("usage") if request_context.request_path == "/api/users/me/usage" => {
             Some(handle_users_me_usage_get(state, request_context, headers).await)

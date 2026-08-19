@@ -182,19 +182,20 @@
           <TableRow
             v-for="task in tasks"
             :key="task.id"
-            class="cursor-pointer hover:bg-muted/50"
-            @click="openUsageDetail(task)"
+            :class="isAdmin ? 'cursor-pointer hover:bg-muted/50' : 'hover:bg-muted/50'"
+            @click="isAdmin && openUsageDetail(task)"
           >
             <!-- 预览 -->
             <TableCell>
               <button
-                v-if="task.video_url && isCompleted(task.status)"
+                v-if="hasPlayableVideo(task) && isCompleted(task.status)"
                 type="button"
                 class="relative w-16 h-10 rounded overflow-hidden bg-muted group"
                 title="点击播放"
                 @click.stop="openPreview(task)"
               >
                 <video
+                  v-if="resolveVideoUrl(task)"
                   :src="resolveVideoUrl(task)"
                   class="w-full h-full object-cover"
                   preload="metadata"
@@ -204,7 +205,14 @@
                 <span
                   class="absolute inset-0 flex items-center justify-center bg-black/30 group-hover:bg-black/45 transition-colors"
                 >
-                  <Play class="w-4 h-4 text-white" />
+                  <Loader2
+                    v-if="previewLoadingTaskId === task.id"
+                    class="w-4 h-4 text-white animate-spin"
+                  />
+                  <Play
+                    v-else
+                    class="w-4 h-4 text-white"
+                  />
                 </span>
               </button>
               <div
@@ -374,6 +382,7 @@
             <TableCell>
               <div class="flex items-center justify-center gap-1">
                 <Button
+                  v-if="isAdmin"
                   variant="ghost"
                   size="icon"
                   class="h-7 w-7"
@@ -421,9 +430,9 @@
 
     <!-- 视频预览 -->
     <div
-      v-if="previewTask"
+      v-if="previewTask && previewVideoUrl"
       class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
-      @click="previewTask = null"
+      @click="closePreview"
     >
       <div
         class="max-w-3xl w-full space-y-2"
@@ -460,13 +469,13 @@
             variant="ghost"
             size="icon"
             class="text-white hover:text-white"
-            @click="previewTask = null"
+            @click="closePreview"
           >
             <X class="w-4 h-4" />
           </Button>
         </div>
         <video
-          :src="resolveVideoUrl(previewTask)"
+          :src="previewVideoUrl"
           class="w-full rounded-lg bg-black"
           controls
           autoplay
@@ -476,6 +485,7 @@
 
     <!-- 计费与请求明细，复用使用记录页的抽屉 -->
     <RequestDetailDrawer
+      v-if="isAdmin"
       :is-open="usageDetailOpen"
       :request-id="usageRequestId"
       @close="usageDetailOpen = false"
@@ -484,15 +494,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import {
-  videoTasksApi,
+  createVideoTasksApi,
   type VideoTaskItem,
   type VideoTaskStatus,
   type VideoTaskStatsResponse,
+  type VideoTasksApiScope,
 } from '@/api/video-tasks'
 import { useToast } from '@/composables/useToast'
-import { useAuthStore } from '@/stores/auth'
 import { formatTokens, formatCurrency } from '@/utils/format'
 import { videoTaskModelIdentity } from '@/features/async-tasks/utils/videoTaskModelIdentity'
 import Card from '@/components/ui/card.vue'
@@ -527,12 +537,17 @@ import {
   Eye,
 } from 'lucide-vue-next'
 
-const props = defineProps<{ active: boolean }>()
+const props = withDefaults(defineProps<{
+  active: boolean
+  scope?: VideoTasksApiScope
+}>(), {
+  scope: 'admin',
+})
 const emit = defineEmits<{ (event: 'stats', payload: VideoTaskStatsResponse | null): void }>()
 
 const { toast } = useToast()
-const authStore = useAuthStore()
-const isAdmin = computed(() => authStore.canAccessAdmin)
+const isAdmin = computed(() => props.scope === 'admin')
+const taskApi = computed(() => createVideoTasksApi(props.scope))
 
 const loading = ref(false)
 const tasks = ref<VideoTaskItem[]>([])
@@ -543,8 +558,13 @@ const pageSize = ref(20)
 const filterStatus = ref('all')
 const filterModel = ref('')
 const previewTask = ref<VideoTaskItem | null>(null)
+const previewVideoUrl = ref('')
+const previewLoadingTaskId = ref<string | null>(null)
 const usageDetailOpen = ref(false)
 const usageRequestId = ref<string | null>(null)
+let previewObjectUrl: string | null = null
+let previewLoadRequestId = 0
+let previewAbortController: AbortController | null = null
 
 const processingCount = computed(() => {
   return stats.value?.processing_count
@@ -552,10 +572,23 @@ const processingCount = computed(() => {
     ?? 0
 })
 
-const taskModelIdentity = videoTaskModelIdentity
+function taskModelIdentity(task: VideoTaskItem) {
+  const identity = videoTaskModelIdentity(task)
+  if (isAdmin.value) return identity
+
+  return {
+    ...identity,
+    mapped: null,
+    observed: null,
+  }
+}
 
 function isCompleted(status: string): boolean {
   return status === 'completed'
+}
+
+function hasPlayableVideo(task: VideoTaskItem): boolean {
+  return isAdmin.value ? Boolean(task.video_url) : Boolean(task.video_available || task.video_url)
 }
 
 function isProcessing(status: string): boolean {
@@ -577,7 +610,8 @@ function hasUsage(task: VideoTaskItem): boolean {
 
 /** Mirrors the usage records table: the discounted price is only worth showing when it differs. */
 function showsActualCost(task: VideoTaskItem): boolean {
-  return task.actual_cost !== null
+  return isAdmin.value
+    && task.actual_cost !== null
     && task.actual_cost !== undefined
     && task.actual_cost !== task.cost
 }
@@ -627,18 +661,76 @@ function formatDate(dateStr: string | null | undefined): string {
  * gateway; already-public signed URLs are used directly.
  */
 function resolveVideoUrl(task: VideoTaskItem): string {
+  // The self-service surface always uses the authenticated media endpoint. In
+  // addition to keeping the session token out of URLs, this keeps ownership
+  // enforcement in the gateway instead of trusting an upstream URL.
+  if (!isAdmin.value) return ''
+
   const originalUrl = task.video_url || ''
   if (originalUrl.includes('generativelanguage.googleapis.com')) {
-    return videoTasksApi.videoUrl(task.id, localStorage.getItem('access_token'))
+    return taskApi.value.videoUrl(task.id, localStorage.getItem('access_token'))
   }
   return originalUrl
 }
 
-function openPreview(task: VideoTaskItem) {
-  previewTask.value = task
+function revokePreviewObjectUrl() {
+  if (!previewObjectUrl) return
+  URL.revokeObjectURL(previewObjectUrl)
+  previewObjectUrl = null
+}
+
+function closePreview() {
+  previewLoadRequestId += 1
+  previewAbortController?.abort()
+  previewAbortController = null
+  previewLoadingTaskId.value = null
+  previewTask.value = null
+  previewVideoUrl.value = ''
+  revokePreviewObjectUrl()
+}
+
+async function openPreview(task: VideoTaskItem) {
+  const requestId = ++previewLoadRequestId
+  previewAbortController?.abort()
+  const controller = new AbortController()
+  previewAbortController = controller
+  previewLoadingTaskId.value = task.id
+
+  try {
+    let url = resolveVideoUrl(task)
+    let objectUrl: string | null = null
+    if (!url) {
+      const video = await taskApi.value.getVideoBlob(task.id, controller.signal)
+      objectUrl = URL.createObjectURL(video)
+      url = objectUrl
+    }
+
+    if (requestId !== previewLoadRequestId) {
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+      return
+    }
+
+    revokePreviewObjectUrl()
+    previewObjectUrl = objectUrl
+    previewTask.value = task
+    previewVideoUrl.value = url
+  } catch (error: unknown) {
+    if (requestId !== previewLoadRequestId || controller.signal.aborted) return
+    toast({
+      title: '加载视频失败',
+      description: error instanceof Error ? error.message : String(error),
+      variant: 'destructive',
+    })
+  } finally {
+    if (requestId === previewLoadRequestId) {
+      previewAbortController = null
+      previewLoadingTaskId.value = null
+    }
+  }
 }
 
 function openUsageDetail(task: VideoTaskItem) {
+  if (!isAdmin.value) return
   // The drawer resolves records by usage primary key, which only exists once the
   // task has settled and produced a usage row.
   const usageId = task.usage_id?.trim()
@@ -656,7 +748,7 @@ function openUsageDetail(task: VideoTaskItem) {
 async function fetchTasks() {
   loading.value = true
   try {
-    const response = await videoTasksApi.list({
+    const response = await taskApi.value.list({
       status: filterStatus.value !== 'all' ? filterStatus.value as VideoTaskStatus : undefined,
       model: filterModel.value || undefined,
       page: currentPage.value,
@@ -677,7 +769,7 @@ async function fetchTasks() {
 
 async function fetchStats() {
   try {
-    stats.value = await videoTasksApi.getStats()
+    stats.value = await taskApi.value.getStats()
     emit('stats', stats.value)
   } catch {
     stats.value = null
@@ -707,7 +799,7 @@ function onPageSizeChange(size: number) {
 
 async function cancelTask(task: VideoTaskItem) {
   try {
-    await videoTasksApi.cancel(task.id)
+    await taskApi.value.cancel(task.id)
     toast({ title: '已请求取消任务' })
     await refresh()
   } catch (error: unknown) {
@@ -735,6 +827,10 @@ onMounted(() => {
   if (props.active) {
     refresh()
   }
+})
+
+onUnmounted(() => {
+  closePreview()
 })
 
 defineExpose({ refresh })

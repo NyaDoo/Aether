@@ -1365,8 +1365,8 @@ pub(crate) async fn send_request(
 
 /// Identifies video stream plans whose URL came from a provider task response
 /// instead of the configured provider API endpoint. The internal marker keeps
-/// native OpenAI `/videos/{id}/content` follow-ups on their configured
-/// transport while direct OpenAI and Ark asset URLs get DNS-pinned egress.
+/// native provider content follow-ups on their configured transport while
+/// direct OpenAI, Ark, and Gemini asset URLs get DNS-pinned egress.
 fn is_direct_video_asset_stream_plan(plan: &ExecutionPlan) -> bool {
     plan.stream
         && plan.method.trim().eq_ignore_ascii_case("GET")
@@ -1375,7 +1375,7 @@ fn is_direct_video_asset_stream_plan(plan: &ExecutionPlan) -> bool {
                 .trim()
                 .to_ascii_lowercase()
                 .as_str(),
-            "openai:video" | "doubao:video" | "doubao:asset_library"
+            "openai:video" | "doubao:video" | "gemini:video" | "doubao:asset_library"
         )
         && plan.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case(EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER)
@@ -4735,6 +4735,10 @@ mod tests {
         let openai_asset =
             direct_video_asset_plan("https://cdn.example.com/video.mp4", "openai:video");
         assert!(is_direct_video_asset_stream_plan(&openai_asset));
+
+        let gemini_asset =
+            direct_video_asset_plan("https://cdn.example.com/video.mp4", "gemini:video");
+        assert!(is_direct_video_asset_stream_plan(&gemini_asset));
 
         let mut refresh = plan.clone();
         refresh.stream = false;
