@@ -70,26 +70,24 @@ describe('material assets API', () => {
     })
   })
 
-  it('creates an official Ark asset group contract', async () => {
+  it('allows the official Ark group type to be omitted without injecting a value', async () => {
     const group = {
       id: 'group-1',
-      name: '真人素材',
-      description: '已授权人物',
-      group_type: 'LivenessFace',
+      name: '角色素材',
+      description: '视频生成参考图',
+      group_type: 'AIGC',
       asset_count: 0,
     }
     postMock.mockResolvedValue({ data: group })
 
     await expect(createMaterialAssetsApi('user').createGroup({
-      name: '真人素材',
-      description: '已授权人物',
-      group_type: 'LivenessFace',
+      name: '角色素材',
+      description: '视频生成参考图',
     })).resolves.toEqual(group)
 
     expect(postMock).toHaveBeenCalledWith('/api/material-assets/groups', {
-      name: '真人素材',
-      description: '已授权人物',
-      group_type: 'LivenessFace',
+      name: '角色素材',
+      description: '视频生成参考图',
     })
   })
 

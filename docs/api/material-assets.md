@@ -58,7 +58,7 @@ Action 冲突、非法 JSON 或非对象 body 返回标准 Ark 错误 envelope�
 
 | Action | 关键请求字段 | 关键响应字段 |
 | --- | --- | --- |
-| `CreateAssetGroup` | `Name`、`GroupType=AIGC`，可选 `Description` | `Result.Id` |
+| `CreateAssetGroup` | `Name`；可选 `Description`、`GroupType`（省略时默认 `AIGC`） | `Result.Id` |
 | `GetAssetGroup`、`UpdateAssetGroup`、`DeleteAssetGroup` | `Id`；更新时可带 `Name`、`Description` | 资源信息、`Result.Id` 或空结果 |
 | `ListAssetGroups` | `Filter.GroupType`，可选 `Filter.GroupIds` 数组、`Filter.Name`、分页和排序字段 | `Result.TotalCount`、`Items`、`PageNumber`、`PageSize` |
 | `CreateAsset` | `GroupId`、`URL`、`AssetType=Image`，可选 `Name` | `Result.Id` |
@@ -81,7 +81,7 @@ Aether 以 Provider 作为素材隔离和路由边界，不持久化 Ark 项目�
 curl 'https://aether.example/?Action=CreateAssetGroup&Version=2024-01-01' \
   -H 'Authorization: Bearer <AETHER_API_KEY>' \
   -H 'Content-Type: application/json' \
-  -d '{"Name":"角色素材","GroupType":"AIGC"}'
+  -d '{"Name":"角色素材"}'
 
 curl 'https://aether.example/?Action=CreateAsset&Version=2024-01-01' \
   -H 'X-Api-Key: <AETHER_API_KEY>' \

@@ -88,7 +88,7 @@ export interface MaterialAssetGroupListParams {
 export interface CreateMaterialAssetGroupRequest {
   name: string
   description?: string
-  group_type?: 'AIGC' | 'LivenessFace'
+  group_type?: 'AIGC'
   user_id?: string
 }
 

@@ -214,6 +214,9 @@ pub(crate) fn canonicalize_provider_body(
     };
     let mut canonical = source.clone();
     match action {
+        ArkAssetAction::CreateAssetGroup => {
+            canonicalize_create_group_type(&mut canonical)?;
+        }
         ArkAssetAction::GetAssetGroup
         | ArkAssetAction::UpdateAssetGroup
         | ArkAssetAction::DeleteAssetGroup => {
@@ -237,6 +240,50 @@ pub(crate) fn canonicalize_provider_body(
             && !name.eq_ignore_ascii_case("project_name")
     });
     Ok(Value::Object(canonical))
+}
+
+fn canonicalize_create_group_type(
+    object: &mut Map<String, Value>,
+) -> Result<(), ArkAssetProtocolError> {
+    let value = ["GroupType", "Type", "group_type"]
+        .into_iter()
+        .find_map(|candidate| {
+            object.get(candidate).or_else(|| {
+                object
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(candidate))
+                    .map(|(_, value)| value)
+            })
+        });
+    let group_type = match value {
+        None | Some(Value::Null) => "AIGC".to_string(),
+        Some(Value::String(value)) if value.trim().is_empty() => "AIGC".to_string(),
+        Some(Value::String(value)) if value.trim() == "AIGC" => "AIGC".to_string(),
+        Some(Value::String(_)) => {
+            return Err(ArkAssetProtocolError::InvalidBody(
+                "GroupType must be AIGC".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(ArkAssetProtocolError::InvalidBody(
+                "GroupType must be a string".to_string(),
+            ));
+        }
+    };
+    let aliases = object
+        .keys()
+        .filter(|name| {
+            name.eq_ignore_ascii_case("GroupType")
+                || name.eq_ignore_ascii_case("Type")
+                || name.eq_ignore_ascii_case("group_type")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for alias in aliases {
+        object.remove(&alias);
+    }
+    object.insert("GroupType".to_string(), Value::String(group_type));
+    Ok(())
 }
 
 fn canonicalize_string_alias(
@@ -510,6 +557,65 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!({"CallbackURL": "https://example.com/legacy-callback"})
+        );
+    }
+
+    #[test]
+    fn create_group_defaults_group_type_in_canonical_upstream_body() {
+        for input in [
+            serde_json::json!({"Name": "products"}),
+            serde_json::json!({"Name": "products", "GroupType": null}),
+            serde_json::json!({"Name": "products", "GroupType": ""}),
+            serde_json::json!({"Name": "products", "GroupType": "   "}),
+        ] {
+            assert_eq!(
+                canonicalize_provider_body(ArkAssetAction::CreateAssetGroup, &input).unwrap(),
+                serde_json::json!({"Name": "products", "GroupType": "AIGC"})
+            );
+        }
+    }
+
+    #[test]
+    fn create_group_normalizes_group_type_aliases_for_upstream() {
+        for input in [
+            serde_json::json!({"Name": "products", "Type": "AIGC"}),
+            serde_json::json!({"Name": "products", "group_type": "AIGC"}),
+            serde_json::json!({"Name": "products", "gRoUpTyPe": "AIGC"}),
+        ] {
+            let canonical =
+                canonicalize_provider_body(ArkAssetAction::CreateAssetGroup, &input).unwrap();
+            assert_eq!(
+                canonical,
+                serde_json::json!({"Name": "products", "GroupType": "AIGC"})
+            );
+            let object = canonical.as_object().unwrap();
+            assert_eq!(object.keys().filter(|key| key.contains("Type")).count(), 1);
+        }
+    }
+
+    #[test]
+    fn create_group_rejects_non_string_group_type_during_canonicalization() {
+        assert_eq!(
+            canonicalize_provider_body(
+                ArkAssetAction::CreateAssetGroup,
+                &serde_json::json!({"Name": "products", "GroupType": 1}),
+            ),
+            Err(ArkAssetProtocolError::InvalidBody(
+                "GroupType must be a string".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn create_group_rejects_explicit_non_aigc_group_type_before_upstream() {
+        assert_eq!(
+            canonicalize_provider_body(
+                ArkAssetAction::CreateAssetGroup,
+                &serde_json::json!({"Name": "products", "Type": "LivenessFace"}),
+            ),
+            Err(ArkAssetProtocolError::InvalidBody(
+                "GroupType must be AIGC".to_string()
+            ))
         );
     }
 

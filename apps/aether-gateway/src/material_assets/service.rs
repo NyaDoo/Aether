@@ -680,11 +680,16 @@ async fn handle_rest_request(
                     "admin group creation requires user_id",
                 ));
             }
-            let upstream_body = json!({
+            let mut upstream_body = json!({
                 "Name": required_string_field(&body, &["name", "Name"], "name")?,
                 "Description": string_field(&body, &["description", "Description"]),
-                "GroupType": string_field(&body, &["group_type", "GroupType"]).unwrap_or_else(|| "AIGC".to_string()),
             });
+            if let Some(group_type) = value_field(&body, &["group_type", "GroupType"]) {
+                upstream_body
+                    .as_object_mut()
+                    .expect("group request body is an object")
+                    .insert("GroupType".to_string(), group_type.clone());
+            }
             if is_admin {
                 validate_admin_group_owner(state, &caller.user_id).await?;
             }
@@ -1488,11 +1493,7 @@ async fn create_group(
 ) -> Result<StoredAssetGroup, AssetServiceError> {
     let name = required_string_field(&body, &["Name", "name"], "Name")?;
     validate_group_text_lengths(&body)?;
-    let group_type =
-        required_string_field(&body, &["GroupType", "Type", "group_type"], "GroupType")?;
-    if group_type != "AIGC" {
-        return Err(AssetServiceError::bad_request("GroupType must be AIGC"));
-    }
+    let group_type = create_group_type(&body)?;
     let transport = select_transport(state, caller).await?;
     let response = execute_action(
         state,
@@ -3405,6 +3406,16 @@ fn required_asset_type(value: &Value) -> Result<String, AssetServiceError> {
     Ok("Image".to_string())
 }
 
+fn create_group_type(value: &Value) -> Result<String, AssetServiceError> {
+    match value_field(value, &["GroupType", "Type", "group_type"]) {
+        None | Some(Value::Null) => Ok("AIGC".to_string()),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok("AIGC".to_string()),
+        Some(Value::String(value)) if value.trim() == "AIGC" => Ok("AIGC".to_string()),
+        Some(Value::String(_)) => Err(AssetServiceError::bad_request("GroupType must be AIGC")),
+        Some(_) => Err(AssetServiceError::bad_request("GroupType must be a string")),
+    }
+}
+
 fn normalize_asset_type_filter(value: String) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "image" => "Image".to_string(),
@@ -4370,32 +4381,37 @@ mod tests {
         assert_eq!(error.message, "GroupType must be AIGC");
     }
 
-    #[tokio::test]
-    async fn create_group_requires_group_type_before_provider_selection() {
-        let state = AppState::new().expect("gateway state");
-        let headers = HeaderMap::new();
-        let context = GatewayPublicRequestContext::from_request_parts(
-            "trace-create-group-missing-type",
-            &http::Method::POST,
-            &"/?Action=CreateAssetGroup&Version=2024-01-01"
-                .parse()
-                .unwrap(),
-            &headers,
-            None,
-        );
-
-        let error = create_group(
-            &state,
-            &context,
-            &headers,
-            &caller("user-1"),
+    #[test]
+    fn create_group_type_defaults_when_omitted_null_or_empty() {
+        for body in [
             json!({"Name": "人物参考素材"}),
-        )
-        .await
-        .expect_err("GroupType is required by the k23 contract");
+            json!({"Name": "人物参考素材", "GroupType": null}),
+            json!({"Name": "人物参考素材", "GroupType": ""}),
+            json!({"Name": "人物参考素材", "GroupType": "   "}),
+        ] {
+            assert_eq!(create_group_type(&body).unwrap(), "AIGC");
+        }
+    }
 
+    #[test]
+    fn create_group_type_accepts_aliases_and_rejects_invalid_values() {
+        for body in [
+            json!({"Type": "AIGC"}),
+            json!({"group_type": "AIGC"}),
+            json!({"GroupType": " AIGC "}),
+        ] {
+            assert_eq!(create_group_type(&body).unwrap(), "AIGC");
+        }
+
+        let error = create_group_type(&json!({"GroupType": "LivenessFace"}))
+            .expect_err("unsupported explicit group types must be rejected");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.message, "GroupType is required");
+        assert_eq!(error.message, "GroupType must be AIGC");
+
+        let error = create_group_type(&json!({"GroupType": 1}))
+            .expect_err("non-string group types must be rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "GroupType must be a string");
     }
 
     #[test]
