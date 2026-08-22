@@ -75,9 +75,12 @@ const MAX_AUTH_CAPACITY_CACHE_TTL_MS: u64 = 10_000;
 const AUTH_CAPACITY_CACHE_TTL_MS_ENV: &str = "AETHER_GATEWAY_AUTH_CAPACITY_CACHE_TTL_MS";
 
 // 客户端断开后继续消费上游流式响应的兜底超时（499 取消也计费场景）。
+// 语义：上游单帧静默等待上限——每收到一帧即重置，不限制 drain 总时长。
+// 因此长流式请求（如 1 小时）用默认值即可完整 drain；仅当上游可能出现
+// 长静默段（深度思考、无 SSE ping 的上游）时才需要调大。
 const DEFAULT_STREAM_DRAIN_TIMEOUT_MS: u64 = 60_000;
 const MIN_STREAM_DRAIN_TIMEOUT_MS: u64 = 1_000;
-const MAX_STREAM_DRAIN_TIMEOUT_MS: u64 = 300_000;
+const MAX_STREAM_DRAIN_TIMEOUT_MS: u64 = 86_400_000;
 const STREAM_DRAIN_TIMEOUT_MS_ENV: &str = "AETHER_GATEWAY_STREAM_DRAIN_TIMEOUT_MS";
 
 #[cfg(test)]

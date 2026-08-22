@@ -3086,6 +3086,8 @@ async fn execute_stream_from_direct_passthrough(
         loop {
             let item = if downstream_dropped {
                 // 客户端断开后继续消费上游流式响应，以便按真实 token 计费（499 取消也计费）。
+                // 超时为单帧静默上限：每收到一帧即重置，不限制 drain 总时长，
+                // 长流式响应只要持续有数据就能一直 drain 到结束。
                 match tokio::time::timeout(stream_drain_timeout, upstream.next()).await {
                     Ok(Some(item)) => Some(item),
                     Ok(None) => {
