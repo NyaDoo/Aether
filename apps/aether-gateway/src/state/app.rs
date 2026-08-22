@@ -74,6 +74,12 @@ const MIN_AUTH_CAPACITY_CACHE_TTL_MS: u64 = 10;
 const MAX_AUTH_CAPACITY_CACHE_TTL_MS: u64 = 10_000;
 const AUTH_CAPACITY_CACHE_TTL_MS_ENV: &str = "AETHER_GATEWAY_AUTH_CAPACITY_CACHE_TTL_MS";
 
+// 客户端断开后继续消费上游流式响应的兜底超时（499 取消也计费场景）。
+const DEFAULT_STREAM_DRAIN_TIMEOUT_MS: u64 = 60_000;
+const MIN_STREAM_DRAIN_TIMEOUT_MS: u64 = 1_000;
+const MAX_STREAM_DRAIN_TIMEOUT_MS: u64 = 300_000;
+const STREAM_DRAIN_TIMEOUT_MS_ENV: &str = "AETHER_GATEWAY_STREAM_DRAIN_TIMEOUT_MS";
+
 #[cfg(test)]
 type TestExecutionRuntimeSyncOverrideFn = dyn Fn(
         &aether_contracts::ExecutionPlan,
@@ -106,6 +112,7 @@ pub(crate) struct FrontdoorRuntimeGuardConfig {
     pub(crate) candidate_planning_gate_limit: Option<usize>,
     pub(crate) upstream_execution_gate_limit: Option<usize>,
     pub(crate) upstream_target_gate_limit: Option<usize>,
+    pub(crate) stream_drain_timeout: Duration,
 }
 
 pub(crate) const METRIC_SNAPSHOT_TTL: Duration = Duration::from_secs(2);
@@ -143,6 +150,12 @@ impl FrontdoorRuntimeGuardConfig {
             candidate_planning_gate_limit: candidate_planning_gate_limit_from_env(),
             upstream_execution_gate_limit: upstream_execution_gate_limit_from_env(),
             upstream_target_gate_limit: upstream_target_gate_limit_from_env(),
+            stream_drain_timeout: env_duration_ms(
+                STREAM_DRAIN_TIMEOUT_MS_ENV,
+                DEFAULT_STREAM_DRAIN_TIMEOUT_MS,
+                MIN_STREAM_DRAIN_TIMEOUT_MS,
+                MAX_STREAM_DRAIN_TIMEOUT_MS,
+            ),
         }
     }
 
@@ -164,6 +177,7 @@ impl FrontdoorRuntimeGuardConfig {
             candidate_planning_gate_limit: Some(DEFAULT_CANDIDATE_PLANNING_GATE_LIMIT),
             upstream_execution_gate_limit: Some(DEFAULT_UPSTREAM_EXECUTION_GATE_LIMIT),
             upstream_target_gate_limit: Some(DEFAULT_UPSTREAM_TARGET_GATE_LIMIT),
+            stream_drain_timeout: Duration::from_millis(DEFAULT_STREAM_DRAIN_TIMEOUT_MS),
         }
     }
 }

@@ -7,7 +7,7 @@ use crate::request_metadata::{
     request_body_derived_facts_action, sanitize_usage_request_metadata,
     RequestBodyDerivedFactsAction,
 };
-use crate::{UsageEvent, UsageEventType};
+use crate::{UsageEvent, UsageEventData, UsageEventType};
 
 fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
     metadata
@@ -33,7 +33,7 @@ fn metadata_u64(metadata: Option<&serde_json::Value>, key: &str) -> Option<u64> 
 pub fn build_upsert_usage_record_from_event(
     event: &UsageEvent,
 ) -> Result<UpsertUsageRecord, DataLayerError> {
-    let (status, billing_status) = lifecycle_status_and_billing(event.event_type);
+    let (status, billing_status) = lifecycle_status_and_billing(event.event_type, &event.data);
     let finalized_at_unix_secs = match event.event_type {
         UsageEventType::Pending | UsageEventType::Streaming => None,
         UsageEventType::Completed | UsageEventType::Failed | UsageEventType::Cancelled => {
@@ -177,13 +177,22 @@ pub fn build_upsert_usage_record_from_event(
     })
 }
 
-fn lifecycle_status_and_billing(event_type: UsageEventType) -> (&'static str, &'static str) {
+fn lifecycle_status_and_billing(
+    event_type: UsageEventType,
+    data: &UsageEventData,
+) -> (&'static str, &'static str) {
     match event_type {
         UsageEventType::Pending => ("pending", "pending"),
         UsageEventType::Streaming => ("streaming", "pending"),
         UsageEventType::Completed => ("completed", "pending"),
         UsageEventType::Failed => ("failed", "void"),
-        UsageEventType::Cancelled => ("cancelled", "void"),
+        UsageEventType::Cancelled => {
+            if data.billing_treat_as_completed.unwrap_or(false) {
+                ("cancelled", "pending")
+            } else {
+                ("cancelled", "void")
+            }
+        }
     }
 }
 
@@ -435,6 +444,37 @@ mod tests {
         assert_eq!(record.status_code, Some(499));
         assert_eq!(record.response_time_ms, Some(200));
         assert_eq!(record.first_byte_time_ms, Some(50));
+    }
+
+    #[test]
+    fn cancelled_terminal_record_with_drain_completed_is_pending_for_billing() {
+        // 客户端断开后上游流式响应仍被完整消费（billing_treat_as_completed）：
+        // status 保持 cancelled，但 billing_status 升为 pending 以便正常结算计费。
+        let record = build_upsert_usage_record_from_event(&UsageEvent {
+            event_type: UsageEventType::Cancelled,
+            request_id: "req-cancelled-drained".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            data: UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                total_tokens: Some(30),
+                total_cost_usd: Some(0.03),
+                actual_total_cost_usd: Some(0.02),
+                status_code: Some(499),
+                response_time_ms: Some(200),
+                first_byte_time_ms: Some(50),
+                billing_treat_as_completed: Some(true),
+                ..UsageEventData::default()
+            },
+        })
+        .expect("record should build");
+
+        assert_eq!(record.status, "cancelled");
+        assert_eq!(record.billing_status, "pending");
+        assert_eq!(record.total_tokens, Some(30));
+        assert_eq!(record.status_code, Some(499));
     }
 
     #[test]

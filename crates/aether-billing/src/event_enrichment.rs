@@ -39,7 +39,9 @@ pub async fn enrich_usage_event_with_billing(
     data: &dyn BillingModelContextLookup,
     event: &mut UsageEvent,
 ) -> Result<(), DataLayerError> {
-    if !matches!(event.event_type, UsageEventType::Completed) {
+    let treat_as_completed = matches!(event.event_type, UsageEventType::Completed)
+        || event.data.billing_treat_as_completed.unwrap_or(false);
+    if !treat_as_completed {
         event.data.total_cost_usd = Some(0.0);
         event.data.actual_total_cost_usd = Some(0.0);
         return Ok(());
@@ -126,8 +128,11 @@ fn calculate_billing_computation(
     pricing: &BillingModelPricingSnapshot,
     event: &UsageEvent,
 ) -> Result<BillingComputation, DataLayerError> {
-    let failed =
-        event.data.status_code.unwrap_or_default() >= 400 || event.data.error_message.is_some();
+    // A cancelled request whose upstream stream was fully drained is billed like a
+    // completed request, so its 499 status must not zero out per-request counts.
+    let failed = !event.data.billing_treat_as_completed.unwrap_or(false)
+        && (event.data.status_code.unwrap_or_default() >= 400
+            || event.data.error_message.is_some());
     let is_image_usage = usage_event_is_image_usage(&event.data);
     let image_count = if failed {
         0
@@ -1481,6 +1486,71 @@ mod tests {
                 .and_then(|value| value.get("cache_read_tokens"))
                 .and_then(Value::as_i64),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_usage_event_with_drain_completed_is_billed() {
+        // 客户端断开后上游流式响应仍被完整消费（billing_treat_as_completed）：
+        // 取消事件按 completed 路径正常计费，生成完整 billing snapshot。
+        let lookup = TestLookup {
+            name_context: Some(
+                StoredBillingModelContext::new(
+                    "provider-1".to_string(),
+                    Some("pay_as_you_go".to_string()),
+                    Some("key-1".to_string()),
+                    Some(json!({"openai:responses": 0.5})),
+                    Some(60),
+                    "global-model-1".to_string(),
+                    "gpt-5".to_string(),
+                    None,
+                    Some(0.02),
+                    Some(json!({"tiers":[{"up_to":null,"input_price_per_1m":3.0,"output_price_per_1m":15.0,"cache_creation_price_per_1m":3.75,"cache_read_price_per_1m":0.30}]})),
+                    Some("model-1".to_string()),
+                    Some("gpt-5-upstream".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("billing context should build"),
+            ),
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Cancelled,
+            "req-billing-cancelled-drained-1",
+            UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                request_type: Some("chat".to_string()),
+                api_format: Some("openai:responses".to_string()),
+                endpoint_api_format: Some("openai:responses".to_string()),
+                input_tokens: Some(1_000),
+                output_tokens: Some(500),
+                cache_read_input_tokens: Some(100),
+                status_code: Some(499),
+                billing_treat_as_completed: Some(true),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("billing should succeed");
+
+        // drain 完成的取消按 completed 路径计费，cost > 0 且生成完整 snapshot。
+        assert!(event.data.total_cost_usd.unwrap_or(0.0) > 0.0);
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_snapshot"))
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("complete")
         );
     }
 

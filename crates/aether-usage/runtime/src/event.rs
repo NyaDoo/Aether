@@ -144,6 +144,8 @@ pub struct UsageEventData {
     pub local_execution_runtime_miss_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_treat_as_completed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

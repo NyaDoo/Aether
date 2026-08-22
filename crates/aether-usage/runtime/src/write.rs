@@ -172,6 +172,7 @@ pub struct StreamTerminalUsagePayloadSeed {
     pub observed_stream_finish: Option<bool>,
     pub terminal_error_message: Option<String>,
     pub capture_metadata: Option<Value>,
+    pub billing_treat_as_completed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +223,7 @@ pub struct TerminalUsageSeed {
     pub request_metadata: Option<Value>,
     pub audit_payload: Option<Value>,
     pub standardized_usage: Option<StandardizedUsage>,
+    pub billing_treat_as_completed: bool,
 }
 
 pub type TerminalUsageOutcome = TerminalUsageSeed;
@@ -682,6 +684,7 @@ fn build_terminal_usage_event_from_seed_impl(
         request_metadata,
         audit_payload,
         standardized_usage,
+        billing_treat_as_completed,
     } = seed;
     let event_type = match terminal_state {
         // A deferred submission stays pending so the terminal poll can still
@@ -778,6 +781,11 @@ fn build_terminal_usage_event_from_seed_impl(
         execution_path: routing.execution_path,
         local_execution_runtime_miss_reason: routing.local_execution_runtime_miss_reason,
         request_metadata,
+        billing_treat_as_completed: if billing_treat_as_completed {
+            Some(true)
+        } else {
+            None
+        },
         ..UsageEventData::default()
     };
 
@@ -1008,6 +1016,8 @@ pub fn build_stream_terminal_usage_payload_seed(
             payload.provider_body_state,
             payload.client_body_state,
         ),
+        billing_treat_as_completed: context_bool(context, "billing_treat_as_completed")
+            .unwrap_or(false),
     }
 }
 
@@ -1089,6 +1099,7 @@ pub fn build_sync_terminal_usage_seed(
         request_metadata,
         audit_payload: capture_metadata,
         standardized_usage,
+        billing_treat_as_completed: false,
     }
 }
 
@@ -1132,6 +1143,7 @@ pub fn build_stream_terminal_usage_seed(
         observed_stream_finish,
         terminal_error_message,
         capture_metadata,
+        billing_treat_as_completed,
     } = payload_seed;
     let standardized_usage = standardized_usage.or_else(|| {
         provider_response_full.as_ref().map(|response| {
@@ -1274,6 +1286,7 @@ pub fn build_stream_terminal_usage_seed(
         request_metadata,
         audit_payload: capture_metadata,
         standardized_usage,
+        billing_treat_as_completed,
     }
 }
 
@@ -6630,6 +6643,7 @@ mod tests {
             })),
             audit_payload: None,
             standardized_usage: None,
+            billing_treat_as_completed: false,
         })
         .expect("usage event should build");
 

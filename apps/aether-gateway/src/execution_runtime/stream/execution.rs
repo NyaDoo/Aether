@@ -675,6 +675,24 @@ fn build_stream_usage_payload(
     }
 }
 
+/// 当上游流式响应在客户端断开后仍被完整消费时，把计费标记透传进 report_context，
+/// 供 usage runtime 在 enrich/record 阶段将 cancelled 事件按 completed 路径计费。
+fn merge_billing_treat_as_completed_into_context(
+    context: Option<Value>,
+    enabled: bool,
+) -> Option<Value> {
+    if !enabled {
+        return context;
+    }
+    match context {
+        Some(Value::Object(mut map)) => {
+            map.insert("billing_treat_as_completed".to_string(), Value::Bool(true));
+            Some(Value::Object(map))
+        }
+        _ => Some(json!({ "billing_treat_as_completed": true })),
+    }
+}
+
 fn seed_kiro_report_context_input_tokens(plan: &ExecutionPlan, report_context: &mut Option<Value>) {
     if !plan
         .provider_name
@@ -3024,6 +3042,7 @@ async fn execute_stream_from_direct_passthrough(
     let request_id_for_report_log = request_id_for_log.clone();
     let candidate_id_for_report = candidate_id.clone();
     let provider_pool_in_flight_guard_for_report = in_flight_guard;
+    let stream_drain_timeout = state.frontdoor_runtime_guards.stream_drain_timeout;
     record_stream_pre_first_byte_spawn();
     tokio::spawn(async move {
         let mut stage_trace_for_report = stage_trace_for_report;
@@ -3057,6 +3076,7 @@ async fn execute_stream_from_direct_passthrough(
         let mut client_stream_bytes = 0u64;
         let mut last_client_chunk_elapsed_ms = 0u64;
         let mut downstream_dropped = false;
+        let mut upstream_drained = false;
         let mut terminal_failure: Option<StreamFailureReport> = None;
         let mut provider_error_forwarded_to_client = false;
         let mut upstream = direct_upstream_response_byte_stream(prefetched_body, response);
@@ -3064,10 +3084,17 @@ async fn execute_stream_from_direct_passthrough(
         let mut observed_first_client_send = false;
 
         loop {
-            if downstream_dropped {
-                break;
-            }
-            let item = if usage_stream_telemetry
+            let item = if downstream_dropped {
+                // 客户端断开后继续消费上游流式响应，以便按真实 token 计费（499 取消也计费）。
+                match tokio::time::timeout(stream_drain_timeout, upstream.next()).await {
+                    Ok(Some(item)) => Some(item),
+                    Ok(None) => {
+                        upstream_drained = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            } else if usage_stream_telemetry
                 .as_ref()
                 .and_then(|telemetry| telemetry.ttfb_ms)
                 .is_none()
@@ -3076,7 +3103,7 @@ async fn execute_stream_from_direct_passthrough(
                     biased;
                     _ = tx.closed(), if !downstream_dropped => {
                         downstream_dropped = true;
-                        break;
+                        continue;
                     }
                     result = await_direct_passthrough_first_item(
                         upstream.next(),
@@ -3101,7 +3128,7 @@ async fn execute_stream_from_direct_passthrough(
                     biased;
                     _ = tx.closed(), if !downstream_dropped => {
                         downstream_dropped = true;
-                        break;
+                        continue;
                     }
                     item = upstream.next() => item,
                 }
@@ -3156,7 +3183,13 @@ async fn execute_stream_from_direct_passthrough(
                     .observe_anthropic_message_stop_terminal_end(provider_chunk.as_ref())
                 {
                     provider_chunk.truncate(terminal_end);
-                    client_visible_stream_completed = true;
+                    if downstream_dropped {
+                        // Drain 模式下观测到 message_stop：计费用量已完整，
+                        // 视同上游 drain 完成；保持取消语义（不标记 completed）。
+                        upstream_drained = true;
+                    } else {
+                        client_visible_stream_completed = true;
+                    }
                 }
             }
 
@@ -3383,7 +3416,7 @@ async fn execute_stream_from_direct_passthrough(
                 stream_started_at_for_report,
                 terminal_telemetry.as_ref(),
             );
-            let usage_payload = build_stream_usage_payload(
+            let mut usage_payload = build_stream_usage_payload(
                 trace_id_owned,
                 report_kind_owned.unwrap_or_default(),
                 report_context_for_payload,
@@ -3396,6 +3429,12 @@ async fn execute_stream_from_direct_passthrough(
                 stream_terminal_summary,
                 terminal_telemetry,
             );
+            if upstream_drained {
+                usage_payload.report_context = merge_billing_treat_as_completed_into_context(
+                    usage_payload.report_context.take(),
+                    true,
+                );
+            }
             record_stream_terminal_usage(
                 &state_for_report,
                 &plan_for_report,

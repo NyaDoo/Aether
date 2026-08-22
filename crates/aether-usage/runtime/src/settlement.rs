@@ -25,7 +25,7 @@ pub async fn settle_usage_if_needed(
     if !writer.has_usage_settlement_writer() || usage.billing_status != "pending" {
         return Ok(());
     }
-    if !matches!(usage.status.as_str(), "completed" | "failed") {
+    if !matches!(usage.status.as_str(), "completed" | "failed" | "cancelled") {
         return Ok(());
     }
     // A numeric zero is not proof that billing succeeded: unresolved pricing
@@ -368,7 +368,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_pending_cancelled_usage() {
+    async fn skips_void_cancelled_usage() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.status = "cancelled".to_string();
+        usage.status_code = Some(499);
+        usage.billing_status = "void".to_string();
+
+        settle_usage_if_needed(&writer, &usage)
+            .await
+            .expect("skipped settlement should succeed");
+
+        let inputs = writer.inputs.lock().expect("settlement inputs lock");
+        assert!(inputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settles_cancelled_usage_with_pending_billing() {
+        // 客户端断开后上游流仍被完整消费的取消请求（billing_treat_as_completed）：
+        // billing_status=pending，需要正常结算计费。
         let writer = TestSettlementWriter {
             has_writer: true,
             ..Default::default()
@@ -379,10 +400,13 @@ mod tests {
 
         settle_usage_if_needed(&writer, &usage)
             .await
-            .expect("skipped settlement should succeed");
+            .expect("settlement should succeed");
 
         let inputs = writer.inputs.lock().expect("settlement inputs lock");
-        assert!(inputs.is_empty());
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].status, "cancelled");
+        assert_eq!(inputs[0].billing_status, "pending");
+        assert_eq!(inputs[0].total_cost_usd, 1.25);
     }
 
     #[tokio::test]
