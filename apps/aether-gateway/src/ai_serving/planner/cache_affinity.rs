@@ -28,7 +28,21 @@ pub(crate) struct PromptCacheAffinitySettings {
     enabled: Option<bool>,
     models: Option<Vec<String>>,
     profiles: Vec<PromptCacheAffinityProfile>,
+    auto: Option<AutoAffinitySettings>,
 }
+
+/// auto 模式：对首条 user 消息的稳定前缀实时哈希生成 key，
+/// 租户换 prompt 后无需更新任何配置。
+#[derive(Clone, Copy, Debug)]
+struct AutoAffinitySettings {
+    /// 首条 user 消息至少这么多字符才值得钉路由。
+    min_chars: usize,
+    /// 参与哈希的前缀长度；尾部动态内容不影响 key 稳定性。
+    prefix_chars: usize,
+}
+
+const AUTO_MIN_CHARS_DEFAULT: usize = 4096;
+const AUTO_PREFIX_CHARS_DEFAULT: usize = 16384;
 
 #[derive(Clone, Debug)]
 struct PromptCacheAffinityProfile {
@@ -67,6 +81,29 @@ impl PromptCacheAffinitySettings {
                 .filter_map(parse_affinity_profile)
                 .collect();
         }
+        match settings.get("auto") {
+            Some(Value::Object(auto)) => {
+                if auto.get("enabled").and_then(Value::as_bool) == Some(false) {
+                    self.auto = None;
+                } else {
+                    self.auto = Some(AutoAffinitySettings {
+                        min_chars: read_usize(auto.get("min_chars"), AUTO_MIN_CHARS_DEFAULT),
+                        prefix_chars: read_usize(auto.get("prefix_chars"), AUTO_PREFIX_CHARS_DEFAULT)
+                            .max(1),
+                    });
+                }
+            }
+            Some(Value::Bool(true)) => {
+                self.auto = Some(AutoAffinitySettings {
+                    min_chars: AUTO_MIN_CHARS_DEFAULT,
+                    prefix_chars: AUTO_PREFIX_CHARS_DEFAULT,
+                });
+            }
+            Some(Value::Bool(false)) | Some(Value::Null) => {
+                self.auto = None;
+            }
+            _ => {}
+        }
     }
 
     fn effective_enabled(&self) -> bool {
@@ -82,7 +119,7 @@ impl PromptCacheAffinitySettings {
         requested_model: &str,
         body_json: &Value,
     ) -> Option<String> {
-        if !self.effective_enabled() || self.profiles.is_empty() {
+        if !self.effective_enabled() || (self.profiles.is_empty() && self.auto.is_none()) {
             return None;
         }
         if body_has_prompt_cache_key(body_json) {
@@ -96,16 +133,28 @@ impl PromptCacheAffinitySettings {
         }
         let content = first_user_message_text(body_json)?;
         let digest = hex_sha256(content);
-        let profile = self
+        if let Some(profile) = self
             .profiles
             .iter()
-            .find(|profile| profile.match_first_user_sha256.eq_ignore_ascii_case(&digest))?;
+            .find(|profile| profile.match_first_user_sha256.eq_ignore_ascii_case(&digest))
+        {
+            debug!(
+                profile_id = %profile.id,
+                profile_version = profile.version,
+                "prompt cache affinity profile matched"
+            );
+            return Some(profile.cache_key.clone());
+        }
+        let auto = self.auto?;
+        if content.chars().count() < auto.min_chars {
+            return None;
+        }
+        let prefix_digest = hex_sha256(utf8_char_prefix(content, auto.prefix_chars));
         debug!(
-            profile_id = %profile.id,
-            profile_version = profile.version,
-            "prompt cache affinity profile matched"
+            key_fingerprint = %&prefix_digest[..16],
+            "prompt cache affinity auto key derived"
         );
-        Some(profile.cache_key.clone())
+        Some(format!("aff:{}", &prefix_digest[..32]))
     }
 }
 
@@ -126,6 +175,21 @@ fn parse_affinity_profile(value: &Value) -> Option<PromptCacheAffinityProfile> {
         match_first_user_sha256,
         cache_key,
     })
+}
+
+fn read_usize(value: Option<&Value>, default: usize) -> usize {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+/// 按字符数截取前缀，避免在多字节 UTF-8 序列中间切断。
+fn utf8_char_prefix(content: &str, max_chars: usize) -> &str {
+    match content.char_indices().nth(max_chars) {
+        Some((byte_index, _)) => &content[..byte_index],
+        None => content,
+    }
 }
 
 fn non_empty_trimmed(value: Option<&Value>) -> Option<String> {
@@ -335,6 +399,68 @@ mod tests {
             "messages": [{"role": "user", "content": [{"type": "text", "text": "big prompt"}]}]
         });
         assert_eq!(resolved(&settings_value(true, "big prompt"), "glm-5.3", &body), None);
+    }
+
+    fn auto_settings_value(min_chars: usize) -> serde_json::Value {
+        json!({
+            "prompt_cache_affinity": {
+                "enabled": true,
+                "models": ["glm-5.3"],
+                "auto": {"min_chars": min_chars}
+            }
+        })
+    }
+
+    #[test]
+    fn auto_mode_derives_stable_key_for_big_prompt() {
+        let prompt = "稳".repeat(5000);
+        let first = resolved(&auto_settings_value(4096), "glm-5.3", &chat_body(&prompt));
+        let second = resolved(&auto_settings_value(4096), "glm-5.3", &chat_body(&prompt));
+        assert!(first.as_deref().is_some_and(|key| key.starts_with("aff:")));
+        assert_eq!(first, second);
+        let other = resolved(
+            &auto_settings_value(4096),
+            "glm-5.3",
+            &chat_body(&"异".repeat(5000)),
+        );
+        assert!(other.is_some());
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn auto_mode_ignores_dynamic_tail_beyond_prefix_chars() {
+        let stable_prefix = "前".repeat(20000);
+        let first = resolved(
+            &auto_settings_value(4096),
+            "glm-5.3",
+            &chat_body(&format!("{stable_prefix}动态提问一")),
+        );
+        let second = resolved(
+            &auto_settings_value(4096),
+            "glm-5.3",
+            &chat_body(&format!("{stable_prefix}完全不同的动态提问二")),
+        );
+        assert!(first.is_some());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn auto_mode_skips_small_prompts() {
+        assert_eq!(
+            resolved(&auto_settings_value(4096), "glm-5.3", &chat_body("短消息")),
+            None
+        );
+    }
+
+    #[test]
+    fn profiles_take_precedence_over_auto() {
+        let prompt = "长".repeat(5000);
+        let mut settings_json = settings_value(true, &prompt);
+        settings_json["prompt_cache_affinity"]["auto"] = json!({"min_chars": 1});
+        assert_eq!(
+            resolved(&settings_json, "glm-5.3", &chat_body(&prompt)),
+            Some("databao:glm-5.3:A:2".to_string())
+        );
     }
 
     #[test]

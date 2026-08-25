@@ -351,6 +351,34 @@ async fn ai_execute_sync_cache_affinity_unconfigured_is_passthrough_impl() {
 }
 
 large_stack_async_test!(
+    ai_execute_sync_cache_affinity_auto_mode_derives_key_without_profiles,
+    ai_execute_sync_cache_affinity_auto_mode_derives_key_without_profiles_impl
+);
+
+async fn ai_execute_sync_cache_affinity_auto_mode_derives_key_without_profiles_impl() {
+    let big_prompt = "生产轮换的新大提示词".repeat(500);
+    let mut request = databao_style_request();
+    request["messages"][1]["content"] = json!(big_prompt);
+    let seen = run_sync_cache_affinity_case(
+        "cache-affinity-auto",
+        Some(json!({
+            "prompt_cache_affinity": {
+                "enabled": true,
+                "models": ["gpt-5"],
+                "auto": {"min_chars": 1000}
+            }
+        })),
+        request,
+    )
+    .await;
+
+    let key = seen["prompt_cache_key"]
+        .as_str()
+        .expect("auto mode should inject a prompt_cache_key");
+    assert!(key.starts_with("aff:"), "unexpected key {key}");
+}
+
+large_stack_async_test!(
     ai_execute_sync_cache_affinity_unmatched_prompt_is_passthrough,
     ai_execute_sync_cache_affinity_unmatched_prompt_is_passthrough_impl
 );
