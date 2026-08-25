@@ -2,19 +2,29 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildMaterialAssetVideoReference,
-  materialAssetMediaType,
   materialAssetErrorMessage,
+  materialAssetMediaType,
+  materialAssetOfficialUrl,
   materialAssetUri,
   normalizeMaterialAssetStatus,
 } from '@/features/material-assets/utils/materialAssetPresentation'
 
 describe('material asset presentation', () => {
-  it('normalizes upstream lifecycle states and preserves an explicit asset URI', () => {
+  it('normalizes upstream lifecycle states and prefers the official asset ID and URL', () => {
     expect(normalizeMaterialAssetStatus('Succeeded')).toBe('active')
     expect(normalizeMaterialAssetStatus('Rejected')).toBe('failed')
     expect(normalizeMaterialAssetStatus('Processing')).toBe('processing')
-    expect(materialAssetUri({ id: 'local-1', uri: 'asset://ark-1' })).toBe('asset://ark-1')
-    expect(materialAssetUri({ id: 'local-1' })).toBe('asset://local-1')
+    expect(materialAssetUri({ id: 'asset-ark-1', uri: 'asset://legacy-local-id' })).toBe('asset://asset-ark-1')
+    expect(materialAssetUri({ id: 'asset-ark-1' })).toBe('asset://asset-ark-1')
+    expect(materialAssetOfficialUrl({
+      url: 'https://ark.example.test/asset-ark-1?signature=short-lived',
+      uri: 'asset://asset-ark-1',
+    })).toBe('https://ark.example.test/asset-ark-1?signature=short-lived')
+    expect(materialAssetOfficialUrl({
+      url: null,
+      uri: 'https://legacy.example.test/asset-ark-1',
+    })).toBe('https://legacy.example.test/asset-ark-1')
+    expect(materialAssetOfficialUrl({ url: null, uri: 'asset://asset-ark-1' })).toBeNull()
   })
 
   it('builds the official Seedance content object for each supported media type', () => {
@@ -33,7 +43,7 @@ describe('material asset presentation', () => {
       media_type: 'video',
     })).toEqual({
       type: 'video_url',
-      video_url: { url: 'asset://upstream-video' },
+      video_url: { url: 'asset://video-1' },
       role: 'reference_video',
     })
     expect(buildMaterialAssetVideoReference({

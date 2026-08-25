@@ -561,6 +561,9 @@ impl AssetLibraryWriteRepository for InMemoryAssetLibraryRepository {
             };
             if group.user_id != record.user_id
                 || group.provider_id != record.provider_id
+                || group.endpoint_id != record.endpoint_id
+                || group.key_id != record.key_id
+                || group.project_name != record.project_name
                 || group.deleted_at_unix_secs.is_some()
             {
                 return Err(DataLayerError::InvalidInput(
@@ -671,6 +674,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
             group_type: "face".to_string(),
             name: format!("Group {id}"),
             description: None,
@@ -715,6 +719,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
             byted_token_hash: "token-hash".to_string(),
             encrypted_byted_token: "encrypted-token".to_string(),
             callback_state_hash: "state-hash".to_string(),
@@ -962,7 +967,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_group_must_match_provider() -> Result<(), DataLayerError> {
+    async fn validation_group_must_match_complete_transport_and_project(
+    ) -> Result<(), DataLayerError> {
         let repository = InMemoryAssetLibraryRepository::default();
         repository
             .upsert_group(group_record("group-1", "user-1"))
@@ -972,6 +978,27 @@ mod tests {
         wrong_provider.provider_id = "provider-2".to_string();
         assert!(repository
             .upsert_visual_validation_session(wrong_provider)
+            .await
+            .is_err());
+
+        let mut wrong_endpoint = validation_record();
+        wrong_endpoint.endpoint_id = "endpoint-2".to_string();
+        assert!(repository
+            .upsert_visual_validation_session(wrong_endpoint)
+            .await
+            .is_err());
+
+        let mut wrong_key = validation_record();
+        wrong_key.key_id = "key-2".to_string();
+        assert!(repository
+            .upsert_visual_validation_session(wrong_key)
+            .await
+            .is_err());
+
+        let mut wrong_project = validation_record();
+        wrong_project.project_name = "another-project".to_string();
+        assert!(repository
+            .upsert_visual_validation_session(wrong_project)
             .await
             .is_err());
         Ok(())

@@ -3,7 +3,7 @@
     :open="Boolean(asset)"
     size="6xl"
     :title="asset?.name || '素材预览'"
-    :description="asset ? materialAssetUri(asset) : undefined"
+    :description="asset?.id"
     no-padding
     @update:open="handleOpenChange"
   >
@@ -90,7 +90,47 @@
         <dl class="space-y-3 text-sm">
           <div>
             <dt class="text-xs text-muted-foreground">
-              素材 URI
+              方舟素材 ID
+            </dt>
+            <dd class="mt-1 break-all font-mono text-xs text-foreground">
+              {{ asset.id }}
+            </dd>
+          </div>
+          <div v-if="asset.group_id">
+            <dt class="text-xs text-muted-foreground">
+              方舟素材组 ID
+            </dt>
+            <dd class="mt-1 break-all font-mono text-xs text-foreground">
+              {{ asset.group_id }}
+            </dd>
+          </div>
+          <div v-if="asset.project_name">
+            <dt class="text-xs text-muted-foreground">
+              ProjectName
+            </dt>
+            <dd class="mt-1 break-all font-mono text-xs text-foreground">
+              {{ asset.project_name }}
+            </dd>
+          </div>
+          <div v-if="officialUrl">
+            <dt class="text-xs text-muted-foreground">
+              方舟素材 URL（临时）
+            </dt>
+            <dd class="mt-1 break-all font-mono text-xs text-foreground">
+              {{ officialUrl }}
+            </dd>
+          </div>
+          <div v-if="asset.preview_url">
+            <dt class="text-xs text-muted-foreground">
+              Aether 预览代理
+            </dt>
+            <dd class="mt-1 break-all font-mono text-xs text-muted-foreground">
+              {{ asset.preview_url }}
+            </dd>
+          </div>
+          <div>
+            <dt class="text-xs text-muted-foreground">
+              视频请求引用
             </dt>
             <dd class="mt-1 break-all font-mono text-xs text-foreground">
               {{ materialAssetUri(asset) }}
@@ -198,6 +238,7 @@ import {
   materialAssetErrorMessage,
   materialAssetMediaLabel,
   materialAssetMediaType,
+  materialAssetOfficialUrl,
   materialAssetStatusLabel,
   materialAssetSupportsVideoReference,
   materialAssetUri,
@@ -224,6 +265,7 @@ const api = createMaterialAssetsApi(props.scope)
 let previewController: AbortController | null = null
 
 const normalizedMediaType = computed(() => props.asset ? materialAssetMediaType(props.asset) : 'unknown')
+const officialUrl = computed(() => props.asset ? materialAssetOfficialUrl(props.asset) : null)
 const supportsVideoReference = computed(() => props.asset
   ? materialAssetSupportsVideoReference(props.asset)
   : false)
@@ -270,6 +312,7 @@ async function loadPreview() {
       props.asset.id,
       controller.signal,
       props.ownerUserId,
+      props.asset.preview_url,
     )
     if (controller.signal.aborted) return
     objectUrl.value = URL.createObjectURL(blob)
@@ -284,7 +327,7 @@ async function loadPreview() {
 }
 
 watch(
-  () => [props.asset?.id, props.asset?.status, props.asset?.updated_at, props.ownerUserId],
+  () => [props.asset?.id, props.asset?.status, props.asset?.updated_at, props.asset?.preview_url, props.ownerUserId],
   () => { void loadPreview() },
   { immediate: true },
 )

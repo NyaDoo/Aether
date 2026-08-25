@@ -145,7 +145,10 @@
                   v-else
                   class="h-4 w-4 shrink-0 text-muted-foreground"
                 />
-                <span class="min-w-0 flex-1 truncate">{{ group.name }}</span>
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate">{{ group.name }}</span>
+                  <span class="mt-0.5 block truncate font-mono text-[9px] text-muted-foreground">{{ group.id }}</span>
+                </span>
                 <span
                   v-if="group.group_type === 'LivenessFace'"
                   class="rounded bg-amber-500/10 px-1 py-0.5 text-[9px] font-medium text-amber-700 dark:text-amber-300"
@@ -237,9 +240,6 @@
                   </SelectItem>
                   <SelectItem value="audio">
                     音频
-                  </SelectItem>
-                  <SelectItem value="file">
-                    文件
                   </SelectItem>
                 </SelectContent>
               </Select>
@@ -421,7 +421,14 @@
                     {{ asset.name }}
                   </h3>
                   <p class="mt-1 truncate font-mono text-[11px] text-muted-foreground">
-                    {{ materialAssetUri(asset) }}
+                    {{ asset.id }}
+                  </p>
+                  <p
+                    v-if="officialAssetUrl(asset)"
+                    class="mt-0.5 truncate font-mono text-[10px] text-muted-foreground/80"
+                    :title="officialAssetUrl(asset) || undefined"
+                  >
+                    {{ officialAssetUrl(asset) }}
                   </p>
                 </div>
                 <MaterialAssetActionsMenu
@@ -503,7 +510,14 @@
                         {{ asset.name }}
                       </p>
                       <p class="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
-                        {{ materialAssetUri(asset) }}
+                        {{ asset.id }}
+                      </p>
+                      <p
+                        v-if="officialAssetUrl(asset)"
+                        class="mt-0.5 max-w-[360px] truncate font-mono text-[10px] text-muted-foreground/80"
+                        :title="officialAssetUrl(asset) || undefined"
+                      >
+                        {{ officialAssetUrl(asset) }}
                       </p>
                     </div>
                   </div>
@@ -681,17 +695,39 @@
 
     <Dialog
       v-model:open="urlUploadOpen"
-      title="通过公网 URL 创建图片素材"
-      description="火山方舟将抓取并处理远程文件，URL 必须可从公网直接访问。"
+      title="通过公网 URL 创建素材"
+      description="支持图片、视频和音频。创建为异步任务，视频通常需要更长处理时间。"
     >
       <div class="space-y-4">
+        <div>
+          <Label>素材类型</Label>
+          <Select v-model="sourceUrlAssetType">
+            <SelectTrigger class="mt-2 w-full">
+              <SelectValue placeholder="选择素材类型" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="Image">
+                图片（Image）
+              </SelectItem>
+              <SelectItem value="Video">
+                视频（Video）
+              </SelectItem>
+              <SelectItem value="Audio">
+                音频（Audio）
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <p class="mt-1.5 text-xs leading-5 text-muted-foreground">
+            {{ sourceUrlAssetTypeHint }}
+          </p>
+        </div>
         <div>
           <Label for="material-url">素材 URL</Label>
           <Input
             id="material-url"
             v-model="sourceUrl"
             class="mt-2"
-            placeholder="https://example.com/reference.jpg"
+            :placeholder="sourceUrlPlaceholder"
             @keyup.enter="createAssetFromUrl"
           />
         </div>
@@ -701,7 +737,8 @@
             id="material-url-name"
             v-model="sourceUrlName"
             class="mt-2"
-            placeholder="参考图片"
+            placeholder="用于列表搜索的素材名称"
+            maxlength="64"
           />
         </div>
         <div>
@@ -716,7 +753,7 @@
                 :key="group.id"
                 :value="group.id"
               >
-                {{ group.name }}
+                {{ group.name }} · {{ group.id }}
               </SelectItem>
             </SelectContent>
           </Select>
@@ -745,7 +782,7 @@
     <Dialog
       :open="Boolean(renamingAsset)"
       title="重命名素材"
-      description="素材 URI 与素材 ID 不会变化。"
+      description="素材 ID 不会变化；Ark 返回的素材 URL 可能定期刷新。"
       @update:open="(open: boolean) => { if (!open) renamingAsset = null }"
     >
       <Label for="material-rename">素材名称</Label>
@@ -753,7 +790,7 @@
         id="material-rename"
         v-model="renameValue"
         class="mt-2"
-        maxlength="120"
+        maxlength="64"
         @keyup.enter="renameAsset"
       />
       <template #footer>
@@ -792,7 +829,7 @@
             将以下对象加入请求的 content 数组
           </p>
           <p class="mt-1 text-xs leading-5 text-muted-foreground">
-            请求必须使用与该素材相同的方舟账户和 ProjectName；Aether 会校验绑定关系。
+            请求必须路由到与该素材相同的提供商；Aether 会校验素材所有权和提供商绑定。
           </p>
         </div>
         <pre class="max-h-80 overflow-auto rounded-lg bg-zinc-950 p-4 text-xs leading-6 text-zinc-100"><code>{{ videoUsageSnippet }}</code></pre>
@@ -843,6 +880,7 @@ import {
 
 import {
   createMaterialAssetsApi,
+  type ArkCreatableMaterialAssetType,
   type MaterialAsset,
   type MaterialAssetGroup,
   type MaterialAssetScope,
@@ -892,6 +930,7 @@ import {
   buildMaterialAssetVideoReference,
   materialAssetErrorMessage,
   materialAssetMediaType,
+  materialAssetOfficialUrl,
   materialAssetRequiresVerification,
   materialAssetStatusLabel,
   materialAssetUri,
@@ -951,6 +990,7 @@ const urlUploadOpen = ref(false)
 const sourceUrl = ref('')
 const sourceUrlName = ref('')
 const sourceUrlGroupId = ref('')
+const sourceUrlAssetType = ref<ArkCreatableMaterialAssetType>('Image')
 const creatingFromUrl = ref(false)
 
 const previewAsset = ref<MaterialAsset | null>(null)
@@ -1039,6 +1079,18 @@ const videoUsageSnippet = computed(() => {
   if (!videoUsageAsset.value) return ''
   return JSON.stringify(buildMaterialAssetVideoReference(videoUsageAsset.value), null, 2)
 })
+
+const sourceUrlPlaceholder = computed(() => ({
+  Image: 'https://example.com/reference.jpg',
+  Video: 'https://example.com/reference.mp4',
+  Audio: 'https://example.com/reference.mp3',
+})[sourceUrlAssetType.value])
+
+const sourceUrlAssetTypeHint = computed(() => ({
+  Image: '支持 jpeg、png、webp、bmp、tiff、gif、heic、heif，单张小于 30 MB。',
+  Video: '支持 mp4、mov，时长 2–30 秒，单个文件不超过 200 MB。',
+  Audio: '支持 wav、mp3，时长 2–30 秒，单个文件不超过 15 MB。',
+})[sourceUrlAssetType.value])
 
 function syncRouteQuery() {
   patchQuery({
@@ -1172,6 +1224,10 @@ function handlePageSizeChange(size: number) {
 
 function normalizedMediaType(asset: MaterialAsset): string {
   return materialAssetMediaType(asset)
+}
+
+function officialAssetUrl(asset: MaterialAsset): string | null {
+  return materialAssetOfficialUrl(asset)
 }
 
 function mediaIcon(mediaType: string | null | undefined) {
@@ -1334,6 +1390,7 @@ function openUrlUploadDialog() {
   }
   sourceUrl.value = ''
   sourceUrlName.value = ''
+  sourceUrlAssetType.value = 'Image'
   sourceUrlGroupId.value = creatableGroups.value.some(group => group.id === selectedGroupId.value)
     ? selectedGroupId.value
     : creatableGroups.value[0]?.id || ''
@@ -1361,7 +1418,7 @@ async function createAssetFromUrl() {
       url,
       name: sourceUrlName.value.trim() || undefined,
       group_id: sourceUrlGroupId.value,
-      asset_type: 'Image',
+      asset_type: sourceUrlAssetType.value,
       user_id: ownerUserId.value || undefined,
     })
     urlUploadOpen.value = false

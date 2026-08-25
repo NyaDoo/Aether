@@ -12,7 +12,8 @@ export type MaterialAssetStatus =
 
 export type MaterialAssetMediaType = 'image' | 'video' | 'audio' | 'file' | 'unknown'
 export type ArkMaterialAssetType = 'Image' | 'Video' | 'Audio'
-export type ArkCreatableMaterialAssetType = 'Image'
+/** AssetType values accepted by Ark CreateAsset. */
+export type ArkCreatableMaterialAssetType = ArkMaterialAssetType
 
 export interface MaterialAssetError {
   code?: string | null
@@ -20,17 +21,26 @@ export interface MaterialAssetError {
 }
 
 export interface MaterialAssetGroup {
+  /** Official Ark Asset Group ID. */
   id: string
   name: string
   description?: string | null
   group_type: 'AIGC' | 'LivenessFace' | string
+  project_name?: string | null
+  status?: string | null
   asset_count: number
   created_at?: string | null
   updated_at?: string | null
 }
 
 export interface MaterialAsset {
+  /** Official Ark Asset ID. */
   id: string
+  /** Official public URL returned by Ark (may be a short-lived URL). */
+  url?: string | null
+  /** Aether-authenticated preview proxy URL. Never use this as the Ark asset reference. */
+  preview_url?: string | null
+  /** Legacy/reference field. `asset://<id>` is preferred for video requests. */
   uri?: string | null
   name: string
   status: MaterialAssetStatus | string
@@ -39,6 +49,7 @@ export interface MaterialAsset {
   mime_type?: string | null
   group_id?: string | null
   group_name?: string | null
+  project_name?: string | null
   source_type?: 'url' | 'upload' | 'generated' | string | null
   size_bytes?: number | null
   width?: number | null
@@ -139,6 +150,17 @@ function adminOwnerParams(
 ): { user_id: string } | undefined {
   const userId = ownerUserId?.trim()
   return scope === 'admin' && userId ? { user_id: userId } : undefined
+}
+
+function materialAssetPreviewPath(
+  basePath: string,
+  assetId: string,
+  previewUrl?: string | null,
+): string {
+  const candidate = previewUrl?.trim()
+  const expectedPrefix = `${basePath}/assets/`
+  if (candidate?.startsWith(expectedPrefix)) return candidate
+  return `${basePath}/assets/${encodeURIComponent(assetId)}/preview`
 }
 
 export function createMaterialAssetsApi(scope: MaterialAssetScope) {
@@ -254,9 +276,10 @@ export function createMaterialAssetsApi(scope: MaterialAssetScope) {
       assetId: string,
       signal?: AbortSignal,
       ownerUserId?: string,
+      previewUrl?: string | null,
     ): Promise<Blob> {
       const response = await apiClient.get<Blob>(
-        `${basePath}/assets/${encodeURIComponent(assetId)}/preview`,
+        materialAssetPreviewPath(basePath, assetId, previewUrl),
         {
           responseType: 'blob',
           signal,

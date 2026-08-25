@@ -10,7 +10,7 @@ use crate::error::SqlxResultExt;
 
 const GROUP_COLUMNS: &str = r#"
 SELECT id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       group_type, name, description, status,
+       project_name, group_type, name, description, status,
        created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
 FROM public.asset_groups
 "#;
@@ -26,7 +26,7 @@ FROM public.assets
 
 const SESSION_COLUMNS: &str = r#"
 SELECT id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       byted_token_hash, encrypted_byted_token,
+       project_name, byted_token_hash, encrypted_byted_token,
        callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
        group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
 FROM public.ark_visual_validation_sessions
@@ -416,9 +416,9 @@ impl AssetLibraryWriteRepository for SqlxAssetLibraryRepository {
             r#"
 INSERT INTO public.asset_groups (
   id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  group_type, name, description, status,
+  project_name, group_type, name, description, status,
   created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 ON CONFLICT (id) DO UPDATE SET
   api_key_id = EXCLUDED.api_key_id,
   name = EXCLUDED.name,
@@ -430,6 +430,7 @@ WHERE public.asset_groups.upstream_group_id IS NOT DISTINCT FROM EXCLUDED.upstre
   AND public.asset_groups.provider_id = EXCLUDED.provider_id
   AND public.asset_groups.endpoint_id = EXCLUDED.endpoint_id
   AND public.asset_groups.key_id = EXCLUDED.key_id
+  AND public.asset_groups.project_name = EXCLUDED.project_name
   AND public.asset_groups.group_type = EXCLUDED.group_type
   AND public.asset_groups.deleted_at_unix_secs IS NOT DISTINCT FROM EXCLUDED.deleted_at_unix_secs
   AND (public.asset_groups.deleted_at_unix_secs IS NULL OR public.asset_groups.status = EXCLUDED.status)
@@ -443,6 +444,7 @@ RETURNING *
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
+        .bind(record.project_name)
         .bind(record.group_type)
         .bind(record.name)
         .bind(record.description)
@@ -636,6 +638,9 @@ SELECT id FROM public.asset_groups
  WHERE id = $1
    AND user_id = $2
    AND provider_id = $3
+   AND endpoint_id = $4
+   AND key_id = $5
+   AND project_name = $6
    AND deleted_at_unix_secs IS NULL
  FOR UPDATE
 "#,
@@ -643,6 +648,9 @@ SELECT id FROM public.asset_groups
             .bind(group_id)
             .bind(&record.user_id)
             .bind(&record.provider_id)
+            .bind(&record.endpoint_id)
+            .bind(&record.key_id)
+            .bind(&record.project_name)
             .fetch_optional(&mut *tx)
             .await
             .map_postgres_err()?
@@ -657,13 +665,15 @@ SELECT id FROM public.asset_groups
             r#"
 INSERT INTO public.ark_visual_validation_sessions (
   id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  byted_token_hash, encrypted_byted_token,
+  project_name, byted_token_hash, encrypted_byted_token,
   callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
   group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
-) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
-   WHERE $14 IS NULL OR EXISTS (
+) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+   WHERE $15 IS NULL OR EXISTS (
      SELECT 1 FROM public.asset_groups
-      WHERE id = $14 AND user_id = $3 AND provider_id = $5 AND deleted_at_unix_secs IS NULL
+      WHERE id = $15 AND user_id = $3 AND provider_id = $5
+        AND endpoint_id = $6 AND key_id = $7 AND project_name = $8
+        AND deleted_at_unix_secs IS NULL
    )
 ON CONFLICT (id) DO UPDATE SET
   api_key_id = EXCLUDED.api_key_id,
@@ -678,6 +688,7 @@ WHERE public.ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
   AND public.ark_visual_validation_sessions.provider_id = EXCLUDED.provider_id
   AND public.ark_visual_validation_sessions.endpoint_id = EXCLUDED.endpoint_id
   AND public.ark_visual_validation_sessions.key_id = EXCLUDED.key_id
+  AND public.ark_visual_validation_sessions.project_name = EXCLUDED.project_name
   AND public.ark_visual_validation_sessions.byted_token_hash = EXCLUDED.byted_token_hash
   AND public.ark_visual_validation_sessions.encrypted_byted_token = EXCLUDED.encrypted_byted_token
   AND public.ark_visual_validation_sessions.callback_state_hash = EXCLUDED.callback_state_hash
@@ -694,6 +705,7 @@ RETURNING *
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
+        .bind(record.project_name)
         .bind(record.byted_token_hash)
         .bind(record.encrypted_byted_token)
         .bind(record.callback_state_hash)
@@ -937,6 +949,7 @@ fn map_group(row: &PgRow) -> Result<StoredAssetGroup, DataLayerError> {
         provider_id: row.try_get("provider_id").map_postgres_err()?,
         endpoint_id: row.try_get("endpoint_id").map_postgres_err()?,
         key_id: row.try_get("key_id").map_postgres_err()?,
+        project_name: row.try_get("project_name").map_postgres_err()?,
         group_type: row.try_get("group_type").map_postgres_err()?,
         name: row.try_get("name").map_postgres_err()?,
         description: row.try_get("description").map_postgres_err()?,
@@ -989,6 +1002,7 @@ fn map_session(row: &PgRow) -> Result<StoredArkVisualValidationSession, DataLaye
         provider_id: row.try_get("provider_id").map_postgres_err()?,
         endpoint_id: row.try_get("endpoint_id").map_postgres_err()?,
         key_id: row.try_get("key_id").map_postgres_err()?,
+        project_name: row.try_get("project_name").map_postgres_err()?,
         byted_token_hash: row.try_get("byted_token_hash").map_postgres_err()?,
         encrypted_byted_token: row.try_get("encrypted_byted_token").map_postgres_err()?,
         callback_state_hash: row.try_get("callback_state_hash").map_postgres_err()?,

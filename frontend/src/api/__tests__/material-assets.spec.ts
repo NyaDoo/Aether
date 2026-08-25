@@ -104,9 +104,20 @@ describe('material assets API', () => {
       '/api/admin/material-assets/assets/asset%2Fid/preview',
       { responseType: 'blob', signal: controller.signal, params: undefined },
     )
+
+    await createMaterialAssetsApi('admin').getPreviewBlob(
+      'asset/id',
+      controller.signal,
+      'owner-1',
+      '/api/admin/material-assets/assets/asset%2Fid/preview',
+    )
+    expect(getMock).toHaveBeenLastCalledWith(
+      '/api/admin/material-assets/assets/asset%2Fid/preview',
+      { responseType: 'blob', signal: controller.signal, params: { user_id: 'owner-1' } },
+    )
   })
 
-  it('requires the official group and asset type fields for URL creation', async () => {
+  it('passes every official Ark URL asset type without narrowing it to images', async () => {
     const asset = {
       id: 'asset-1',
       name: 'reference.png',
@@ -116,16 +127,18 @@ describe('material assets API', () => {
     postMock.mockResolvedValue({ data: asset })
     const api = createMaterialAssetsApi('user')
 
-    await api.createFromUrl({
-      url: 'https://example.test/reference.png',
-      group_id: 'group-1',
-      asset_type: 'Image',
-    })
-    expect(postMock).toHaveBeenCalledWith('/api/material-assets/assets/url', {
-      url: 'https://example.test/reference.png',
-      group_id: 'group-1',
-      asset_type: 'Image',
-    })
+    for (const assetType of ['Image', 'Video', 'Audio'] as const) {
+      await api.createFromUrl({
+        url: `https://example.test/reference-${assetType.toLowerCase()}`,
+        group_id: 'group-official-1',
+        asset_type: assetType,
+      })
+      expect(postMock).toHaveBeenLastCalledWith('/api/material-assets/assets/url', {
+        url: `https://example.test/reference-${assetType.toLowerCase()}`,
+        group_id: 'group-official-1',
+        asset_type: assetType,
+      })
+    }
   })
 
   it('uses the official callback_url field for real-person verification', async () => {

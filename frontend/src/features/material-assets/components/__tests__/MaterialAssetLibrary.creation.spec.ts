@@ -43,15 +43,18 @@ describe('MaterialAssetLibrary real-person verification', () => {
   })
 })
 
-describe('MaterialAssetLibrary K23 URL asset contract', () => {
-  it('creates only HTTPS image assets', () => {
+describe('MaterialAssetLibrary official Ark URL asset contract', () => {
+  it('creates HTTPS image, video, and audio assets with an explicit AssetType', () => {
     const createAsset = source
       .split('async function createAssetFromUrl()')[1]
       ?.split('function openRenameDialog')[0]
 
-    expect(source).toContain('title="通过公网 URL 创建图片素材"')
-    expect(source).not.toContain('v-model="sourceUrlAssetType"')
+    expect(source).toContain('title="通过公网 URL 创建素材"')
+    expect(source).toContain('v-model="sourceUrlAssetType"')
+    expect(source).toContain('<SelectItem value="Image">')
+    expect(source).toContain('<SelectItem value="Video">')
+    expect(source).toContain('<SelectItem value="Audio">')
     expect(createAsset).toContain("parsed.protocol !== 'https:'")
-    expect(createAsset).toContain("asset_type: 'Image'")
+    expect(createAsset).toContain('asset_type: sourceUrlAssetType.value')
   })
 })

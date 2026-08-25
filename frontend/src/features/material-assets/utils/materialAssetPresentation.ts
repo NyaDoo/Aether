@@ -32,8 +32,18 @@ export function materialAssetStatusLabel(status: string | null | undefined): str
 }
 
 export function materialAssetUri(asset: Pick<MaterialAsset, 'id' | 'uri'>): string {
-  const explicit = asset.uri?.trim()
-  return explicit || `asset://${asset.id}`
+  const officialId = asset.id.trim()
+  if (officialId) return `asset://${officialId}`
+  return asset.uri?.trim() || ''
+}
+
+export function materialAssetOfficialUrl(
+  asset: Pick<MaterialAsset, 'url' | 'uri'>,
+): string | null {
+  const officialUrl = asset.url?.trim()
+  if (officialUrl) return officialUrl
+  const legacyUrl = asset.uri?.trim()
+  return legacyUrl && /^https?:\/\//i.test(legacyUrl) ? legacyUrl : null
 }
 
 export function materialAssetErrorMessage(asset: MaterialAsset): string | null {

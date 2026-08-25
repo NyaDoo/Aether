@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS asset_groups (
     `provider_id` VARCHAR(64) NOT NULL,
     `endpoint_id` VARCHAR(64) NOT NULL,
     `key_id` VARCHAR(64) NOT NULL,
+    `project_name` VARCHAR(128) NOT NULL DEFAULT 'default',
     `group_type` VARCHAR(64) NOT NULL,
     `name` VARCHAR(512) NOT NULL,
     `description` LONGTEXT,
@@ -26,7 +27,6 @@ CREATE TABLE IF NOT EXISTS asset_groups (
     CONSTRAINT fk_asset_groups_endpoint FOREIGN KEY (`endpoint_id`) REFERENCES provider_endpoints (`id`) ON DELETE RESTRICT,
     CONSTRAINT fk_asset_groups_key FOREIGN KEY (`key_id`) REFERENCES provider_api_keys (`id`) ON DELETE RESTRICT
 );
-
 CREATE TABLE IF NOT EXISTS assets (
     `id` VARCHAR(64) NOT NULL,
     `upstream_asset_id` VARCHAR(255),
@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS ark_visual_validation_sessions (
     `provider_id` VARCHAR(64) NOT NULL,
     `endpoint_id` VARCHAR(64) NOT NULL,
     `key_id` VARCHAR(64) NOT NULL,
+    `project_name` VARCHAR(128) NOT NULL DEFAULT 'default',
     `byted_token_hash` VARCHAR(128) NOT NULL,
     `encrypted_byted_token` LONGTEXT NOT NULL,
     `callback_state_hash` VARCHAR(128) NOT NULL,

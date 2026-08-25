@@ -5,6 +5,7 @@ const ID_MAX_LEN: usize = 64;
 const UPSTREAM_ID_MAX_LEN: usize = 255;
 const NAME_MAX_LEN: usize = 512;
 const TYPE_MAX_LEN: usize = 64;
+const PROJECT_NAME_MAX_LEN: usize = 128;
 const STATUS_MAX_LEN: usize = 64;
 const HASH_MAX_LEN: usize = 128;
 const ERROR_CODE_MAX_LEN: usize = 128;
@@ -18,6 +19,7 @@ pub struct StoredAssetGroup {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
+    pub project_name: String,
     pub group_type: String,
     pub name: String,
     pub description: Option<String>,
@@ -36,6 +38,7 @@ pub struct UpsertAssetGroupRecord {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
+    pub project_name: String,
     pub group_type: String,
     pub name: String,
     pub description: Option<String>,
@@ -62,6 +65,11 @@ impl UpsertAssetGroupRecord {
         validate_required_text("asset_groups.provider_id", &self.provider_id, ID_MAX_LEN)?;
         validate_required_text("asset_groups.endpoint_id", &self.endpoint_id, ID_MAX_LEN)?;
         validate_required_text("asset_groups.key_id", &self.key_id, ID_MAX_LEN)?;
+        validate_required_text(
+            "asset_groups.project_name",
+            &self.project_name,
+            PROJECT_NAME_MAX_LEN,
+        )?;
         validate_required_text("asset_groups.group_type", &self.group_type, TYPE_MAX_LEN)?;
         validate_required_text("asset_groups.name", &self.name, NAME_MAX_LEN)?;
         validate_required_text("asset_groups.status", &self.status, STATUS_MAX_LEN)?;
@@ -82,6 +90,7 @@ impl UpsertAssetGroupRecord {
             provider_id: self.provider_id,
             endpoint_id: self.endpoint_id,
             key_id: self.key_id,
+            project_name: self.project_name,
             group_type: self.group_type,
             name: self.name,
             description: self.description,
@@ -99,6 +108,7 @@ impl UpsertAssetGroupRecord {
             && self.provider_id == stored.provider_id
             && self.endpoint_id == stored.endpoint_id
             && self.key_id == stored.key_id
+            && self.project_name == stored.project_name
             && self.group_type == stored.group_type
             && self.deleted_at_unix_secs == stored.deleted_at_unix_secs
             && (stored.deleted_at_unix_secs.is_none() || self.status == stored.status)
@@ -311,6 +321,7 @@ pub struct StoredArkVisualValidationSession {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
+    pub project_name: String,
     pub byted_token_hash: String,
     pub encrypted_byted_token: String,
     pub callback_state_hash: String,
@@ -332,6 +343,7 @@ pub struct UpsertArkVisualValidationSessionRecord {
     pub provider_id: String,
     pub endpoint_id: String,
     pub key_id: String,
+    pub project_name: String,
     pub byted_token_hash: String,
     pub encrypted_byted_token: String,
     pub callback_state_hash: String,
@@ -376,6 +388,11 @@ impl UpsertArkVisualValidationSessionRecord {
             "ark_visual_validation_sessions.key_id",
             &self.key_id,
             ID_MAX_LEN,
+        )?;
+        validate_required_text(
+            "ark_visual_validation_sessions.project_name",
+            &self.project_name,
+            PROJECT_NAME_MAX_LEN,
         )?;
         validate_required_text(
             "ark_visual_validation_sessions.byted_token_hash",
@@ -428,6 +445,7 @@ impl UpsertArkVisualValidationSessionRecord {
             provider_id: self.provider_id,
             endpoint_id: self.endpoint_id,
             key_id: self.key_id,
+            project_name: self.project_name,
             byted_token_hash: self.byted_token_hash,
             encrypted_byted_token: self.encrypted_byted_token,
             callback_state_hash: self.callback_state_hash,
@@ -448,6 +466,7 @@ impl UpsertArkVisualValidationSessionRecord {
             && self.provider_id == stored.provider_id
             && self.endpoint_id == stored.endpoint_id
             && self.key_id == stored.key_id
+            && self.project_name == stored.project_name
             && self.byted_token_hash == stored.byted_token_hash
             && self.encrypted_byted_token == stored.encrypted_byted_token
             && self.callback_state_hash == stored.callback_state_hash
@@ -709,6 +728,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
             group_type: "face".to_string(),
             name: "group".to_string(),
             description: None,
@@ -778,6 +798,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
             byted_token_hash: "hash".to_string(),
             encrypted_byted_token: "encrypted".to_string(),
             callback_state_hash: "state-hash".to_string(),

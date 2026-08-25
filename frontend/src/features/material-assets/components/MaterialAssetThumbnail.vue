@@ -76,6 +76,7 @@ async function loadThumbnail() {
       props.asset.id,
       controller.signal,
       props.ownerUserId,
+      props.asset.preview_url,
     )
     if (controller.signal.aborted) return
     objectUrl.value = URL.createObjectURL(blob)
@@ -90,7 +91,7 @@ async function loadThumbnail() {
 }
 
 watch(
-  () => [props.asset.id, props.asset.status, props.asset.updated_at, props.ownerUserId],
+  () => [props.asset.id, props.asset.status, props.asset.updated_at, props.asset.preview_url, props.ownerUserId],
   () => { void loadThumbnail() },
   { immediate: true },
 )

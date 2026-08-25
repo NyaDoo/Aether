@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use aether_contracts::{ExecutionPlan, RequestBody};
@@ -24,6 +24,7 @@ use axum::http::{self, HeaderMap, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::Json;
 use base64::Engine as _;
+use futures_util::{stream, StreamExt};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -40,6 +41,7 @@ const DEFAULT_PAGE_SIZE: usize = 20;
 const MAX_PAGE_SIZE: usize = 500;
 const ARK_DEFAULT_PAGE_SIZE: usize = 10;
 const ARK_MAX_PAGE_SIZE: usize = 100;
+const MAX_LIST_MERGE_WINDOW: usize = 10_000;
 const ASSET_ROUTING_MODEL: &str = "__ark_asset_library__";
 
 #[derive(Debug, Clone)]
@@ -186,6 +188,11 @@ struct ActionResponse {
     body: Value,
 }
 
+struct UpstreamListFetch {
+    items: Vec<Value>,
+    total: usize,
+}
+
 struct AssetCandidateTerminalGuard {
     state: AppState,
     plan: ExecutionPlan,
@@ -308,7 +315,13 @@ pub(crate) async fn maybe_handle_native_asset_request(
         Ok(caller) => {
             let body = match parse_json_body(request_body) {
                 Ok(body) => body,
-                Err(error) => return Some(native_error_response(error)),
+                Err(error) => {
+                    return Some(native_error_response_with_context(
+                        error,
+                        request_context,
+                        None,
+                    ))
+                }
             };
             let uri = request_uri(request_context);
             match action_from_request(&uri, &body)
@@ -330,13 +343,15 @@ pub(crate) async fn maybe_handle_native_asset_request(
                     .await
                     {
                         Ok(body) => json_response(StatusCode::OK, body),
-                        Err(error) => native_error_response(error),
+                        Err(error) => {
+                            native_error_response_with_context(error, request_context, Some(action))
+                        }
                     }
                 }
-                Err(error) => native_error_response(error),
+                Err(error) => native_error_response_with_context(error, request_context, None),
             }
         }
-        Err(error) => native_error_response(error),
+        Err(error) => native_error_response_with_context(error, request_context, None),
     };
     Some(response)
 }
@@ -561,71 +576,85 @@ async fn handle_native_action(
     action: ArkAssetAction,
     body: Value,
 ) -> Result<Value, AssetServiceError> {
-    validate_native_project(&body)?;
+    let _ = native_project_name(&body)?;
     match action {
         ArkAssetAction::ListAssetGroups => {
-            list_groups_native(state, request_context, caller, &body).await
+            list_groups_native(state, request_context, headers, caller, &body).await
         }
         ArkAssetAction::ListAssets => {
-            list_assets_native(state, request_context, caller, &body).await
+            list_assets_native(state, request_context, headers, caller, &body).await
         }
         ArkAssetAction::CreateAssetGroup => {
             let group = create_group(state, request_context, headers, caller, body).await?;
             Ok(native_envelope(
                 request_context,
                 action,
-                json!({"Id": group.id}),
+                json!({"Id": public_group_id(&group)}),
             ))
         }
         ArkAssetAction::GetAssetGroup => {
             let id = required_string_field(&body, &["Id", "GroupId", "id", "group_id"], "Id")?;
-            let group = refresh_group(state, request_context, headers, caller, &id).await?;
-            Ok(native_envelope(
-                request_context,
-                action,
-                group_native_json(&group),
-            ))
+            let owned = load_group_by_upstream_id(state, caller, &id).await?;
+            ensure_project_matches(&body, &owned.project_name)?;
+            let (_group, upstream_result) =
+                refresh_group_with_result(state, request_context, headers, caller, &id).await?;
+            Ok(native_envelope(request_context, action, upstream_result))
         }
         ArkAssetAction::UpdateAssetGroup => {
+            let id = required_string_field(&body, &["Id", "GroupId", "id", "group_id"], "Id")?;
+            let owned = load_group_by_upstream_id(state, caller, &id).await?;
+            ensure_project_matches(&body, &owned.project_name)?;
             let group = update_group(state, request_context, headers, caller, body).await?;
             Ok(native_envelope(
                 request_context,
                 action,
-                json!({"Id": group.id}),
+                json!({"Id": public_group_id(&group)}),
             ))
         }
         ArkAssetAction::DeleteAssetGroup => {
             let id = required_string_field(&body, &["Id", "GroupId", "id", "group_id"], "Id")?;
+            let owned = load_group_by_upstream_id(state, caller, &id).await?;
+            ensure_project_matches(&body, &owned.project_name)?;
             delete_group(state, request_context, headers, caller, &id).await?;
             Ok(native_envelope(request_context, action, json!({})))
         }
         ArkAssetAction::CreateAsset => {
+            let group_id = required_string_field(&body, &["GroupId", "group_id"], "GroupId")?;
+            let owned = load_group_by_upstream_id(state, caller, &group_id).await?;
+            ensure_project_matches(&body, &owned.project_name)?;
             let asset = create_asset(state, request_context, headers, caller, body).await?;
             Ok(native_envelope(
                 request_context,
                 action,
-                json!({"Id": asset.id}),
+                json!({"Id": public_asset_id(&asset)}),
             ))
         }
         ArkAssetAction::GetAsset => {
             let id = required_string_field(&body, &["Id", "AssetId", "id", "asset_id"], "Id")?;
-            let asset = refresh_asset(state, request_context, headers, caller, &id).await?;
-            Ok(native_envelope(
-                request_context,
-                action,
-                asset_native_json(&asset),
-            ))
+            let owned = load_asset_by_upstream_id(state, caller, &id).await?;
+            let owned_group = load_group(state, caller, &owned.group_id, false).await?;
+            ensure_project_matches(&body, &owned_group.project_name)?;
+            let (_asset, upstream_result) =
+                refresh_asset_with_result(state, request_context, headers, caller, &id).await?;
+            Ok(native_envelope(request_context, action, upstream_result))
         }
         ArkAssetAction::UpdateAsset => {
+            let id = required_string_field(&body, &["Id", "AssetId", "id", "asset_id"], "Id")?;
+            let owned = load_asset_by_upstream_id(state, caller, &id).await?;
+            let owned_group = load_group(state, caller, &owned.group_id, false).await?;
+            ensure_project_matches(&body, &owned_group.project_name)?;
             let asset = update_asset(state, request_context, headers, caller, body).await?;
             Ok(native_envelope(
                 request_context,
                 action,
-                json!({"Id": asset.id}),
+                json!({"Id": public_asset_id(&asset)}),
             ))
         }
         ArkAssetAction::DeleteAsset => {
             let id = required_string_field(&body, &["Id", "AssetId", "id", "asset_id"], "Id")?;
+            let owned = load_asset_by_upstream_id(state, caller, &id).await?;
+            let owned_group = load_group(state, caller, &owned.group_id, false).await?;
+            ensure_project_matches(&body, &owned_group.project_name)?;
             delete_asset(state, request_context, headers, caller, &id).await?;
             Ok(native_envelope(request_context, action, json!({})))
         }
@@ -644,13 +673,13 @@ async fn handle_native_action(
             }
             let (_session, upstream) =
                 create_validation_session(state, request_context, headers, caller, body).await?;
-            Ok(native_create_validation_payload(upstream))
+            canonical_visual_success(request_context, action, upstream)
         }
         ArkAssetAction::GetVisualValidateResult => {
             let upstream =
                 get_validation_result_native(state, request_context, headers, caller, &body)
                     .await?;
-            Ok(upstream)
+            canonical_visual_success(request_context, action, upstream)
         }
     }
 }
@@ -671,7 +700,7 @@ async fn handle_rest_request(
         .unwrap_or_default();
     match kind {
         "list_groups" => {
-            let page = list_groups_rest(state, request_context, &caller, is_admin).await?;
+            let page = list_groups_rest(state, request_context, headers, &caller, is_admin).await?;
             Ok(json_response(StatusCode::OK, page))
         }
         "create_group" => {
@@ -683,6 +712,7 @@ async fn handle_rest_request(
             let mut upstream_body = json!({
                 "Name": required_string_field(&body, &["name", "Name"], "name")?,
                 "Description": string_field(&body, &["description", "Description"]),
+                "ProjectName": native_project_name(&body)?,
             });
             if let Some(group_type) = value_field(&body, &["group_type", "GroupType"]) {
                 upstream_body
@@ -702,7 +732,8 @@ async fn handle_rest_request(
         }
         "get_group" => {
             let id = path_resource_id(&request_context.request_path, "groups")?;
-            let group = load_group(state, &caller, &id, is_admin).await?;
+            validate_official_request_id(&id, "group-", "Id")?;
+            let group = refresh_group(state, request_context, headers, &caller, &id).await?;
             let count = group_asset_count(state, &group).await?;
             Ok(json_response(
                 StatusCode::OK,
@@ -711,9 +742,12 @@ async fn handle_rest_request(
         }
         "update_group" => {
             let id = path_resource_id(&request_context.request_path, "groups")?;
+            validate_official_request_id(&id, "group-", "Id")?;
+            let current = load_group(state, &caller, &id, is_admin).await?;
             let mut upstream_body = json!({
                 "Id": id,
                 "Name": required_string_field(&body, &["name", "Name"], "name")?,
+                "ProjectName": current.project_name,
             });
             if object_has_field(&body, &["description", "Description"]) {
                 upstream_body.as_object_mut().expect("object body").insert(
@@ -733,11 +767,12 @@ async fn handle_rest_request(
         }
         "delete_group" => {
             let id = path_resource_id(&request_context.request_path, "groups")?;
+            validate_official_request_id(&id, "group-", "Id")?;
             delete_group(state, request_context, headers, &caller, &id).await?;
             Ok(empty_response(StatusCode::NO_CONTENT))
         }
         "list_assets" => {
-            let page = list_assets_rest(state, request_context, &caller, is_admin).await?;
+            let page = list_assets_rest(state, request_context, headers, &caller, is_admin).await?;
             Ok(json_response(StatusCode::OK, page))
         }
         "create_asset_url" => {
@@ -748,22 +783,23 @@ async fn handle_rest_request(
             }
             let source_url = required_string_field(&body, &["url", "URL"], "url")?;
             validate_source_url(&source_url)?;
-            let group_id = required_string_field(&body, &["group_id", "GroupId"], "group_id")?;
+            let group_id = required_string_field(&body, &["group_id", "GroupId"], "GroupId")?;
+            validate_official_request_id(&group_id, "group-", "GroupId")?;
+            let group = load_group(state, &caller, &group_id, is_admin).await?;
             let asset_type = required_asset_type(&body)?;
             let upstream_body = json!({
                 "GroupId": group_id,
                 "URL": source_url,
                 "AssetType": asset_type,
                 "Name": string_field(&body, &["name", "Name"]),
+                "ProjectName": group.project_name,
             });
             let asset =
                 create_asset(state, request_context, headers, &caller, upstream_body).await?;
-            let group = load_group(state, &caller, &asset.group_id, is_admin)
-                .await
-                .ok();
+            let group = load_group(state, &caller, &asset.group_id, is_admin).await?;
             Ok(json_response(
                 StatusCode::CREATED,
-                asset_rest_json(&asset, group.as_ref(), is_admin),
+                asset_rest_json(&asset, &group, is_admin),
             ))
         }
         "upload_asset" => Err(AssetServiceError::new(
@@ -773,38 +809,41 @@ async fn handle_rest_request(
         )),
         "get_asset" => {
             let id = path_resource_id(&request_context.request_path, "assets")?;
+            validate_official_request_id(&id, "asset-", "Id")?;
             let asset = refresh_asset(state, request_context, headers, &caller, &id).await?;
-            let group = load_group(state, &caller, &asset.group_id, is_admin)
-                .await
-                .ok();
+            let group = load_group(state, &caller, &asset.group_id, is_admin).await?;
             Ok(json_response(
                 StatusCode::OK,
-                asset_rest_json(&asset, group.as_ref(), is_admin),
+                asset_rest_json(&asset, &group, is_admin),
             ))
         }
         "update_asset" => {
             let id = path_resource_id(&request_context.request_path, "assets")?;
+            validate_official_request_id(&id, "asset-", "Id")?;
+            let current = load_asset(state, &caller, &id, is_admin).await?;
+            let current_group = load_group(state, &caller, &current.group_id, is_admin).await?;
             let upstream_body = json!({
                 "Id": id,
                 "Name": required_string_field(&body, &["name", "Name"], "name")?,
+                "ProjectName": current_group.project_name,
             });
             let asset =
                 update_asset(state, request_context, headers, &caller, upstream_body).await?;
-            let group = load_group(state, &caller, &asset.group_id, is_admin)
-                .await
-                .ok();
+            let group = load_group(state, &caller, &asset.group_id, is_admin).await?;
             Ok(json_response(
                 StatusCode::OK,
-                asset_rest_json(&asset, group.as_ref(), is_admin),
+                asset_rest_json(&asset, &group, is_admin),
             ))
         }
         "delete_asset" => {
             let id = path_resource_id(&request_context.request_path, "assets")?;
+            validate_official_request_id(&id, "asset-", "Id")?;
             delete_asset(state, request_context, headers, &caller, &id).await?;
             Ok(empty_response(StatusCode::NO_CONTENT))
         }
         "preview_asset" => {
             let id = path_resource_id(&request_context.request_path, "assets")?;
+            validate_official_request_id(&id, "asset-", "Id")?;
             preview_asset(state, request_context, headers, &caller, &id).await
         }
         "create_verification_session" => {
@@ -816,9 +855,12 @@ async fn handle_rest_request(
             let callback_url = required_string_field(
                 &body,
                 &["callback_url", "CallbackURL", "return_url", "ReturnUrl"],
-                "callback_url",
+                "CallbackURL",
             )?;
-            let upstream_body = json!({"CallbackURL": callback_url});
+            let upstream_body = json!({
+                "CallbackURL": callback_url,
+                "ProjectName": native_project_name(&body)?,
+            });
             let (session, upstream) =
                 create_validation_session(state, request_context, headers, &caller, upstream_body)
                     .await?;
@@ -1406,7 +1448,7 @@ async fn execute_action(
     let mut body = execution_result_json(&result).unwrap_or(Value::Null);
     if visual_validation_result_is_pending(action, &body) {
         status = StatusCode::OK;
-        body = json!({"Status": "Pending"});
+        body = native_envelope(request_context, action, json!({"Status": "Pending"}));
     }
     if !status.is_success() {
         let (error_type, error_message) = result
@@ -1489,11 +1531,19 @@ async fn create_group(
     request_context: &GatewayPublicRequestContext,
     headers: &HeaderMap,
     caller: &AssetCaller,
-    body: Value,
+    mut body: Value,
 ) -> Result<StoredAssetGroup, AssetServiceError> {
     let name = required_string_field(&body, &["Name", "name"], "Name")?;
     validate_group_text_lengths(&body)?;
     let group_type = create_group_type(&body)?;
+    let project_name = native_project_name(&body)?;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "ProjectName".to_string(),
+            Value::String(project_name.clone()),
+        );
+        object.remove("project_name");
+    }
     let transport = select_transport(state, caller).await?;
     let response = execute_action(
         state,
@@ -1506,14 +1556,7 @@ async fn create_group(
     )
     .await?;
     let result = extract_result(&response.body).unwrap_or(&response.body);
-    let upstream_group_id =
-        string_field(result, &["GroupId", "Id", "group_id", "id"]).ok_or_else(|| {
-            AssetServiceError::new(
-                StatusCode::BAD_GATEWAY,
-                "InvalidUpstreamResponse",
-                "Ark CreateAssetGroup response is missing GroupId",
-            )
-        })?;
+    let upstream_group_id = upstream_required_official_id(result, &["Id"], "Id", "group-")?;
     let now = crate::clock::current_unix_secs();
     let record = UpsertAssetGroupRecord {
         id: local_id("agrp"),
@@ -1523,6 +1566,7 @@ async fn create_group(
         provider_id: transport.snapshot.provider.id.clone(),
         endpoint_id: transport.snapshot.endpoint.id.clone(),
         key_id: transport.snapshot.key.id.clone(),
+        project_name,
         group_type,
         name,
         description: string_field(&body, &["Description", "description"]),
@@ -1531,10 +1575,47 @@ async fn create_group(
         updated_at_unix_secs: timestamp_field(result, &["UpdateTime", "UpdatedAt"]).unwrap_or(now),
         deleted_at_unix_secs: None,
     };
-    write_repo(state)?
-        .upsert_group(record)
-        .await
-        .map_err(data_error)
+    let mut last_error = None;
+    for _ in 0..3 {
+        match write_repo(state)?.upsert_group(record.clone()).await {
+            Ok(group) => return Ok(group),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let projection_error =
+        data_error(last_error.expect("three failed group upserts record an error"));
+    let existing = read_repo(state)?
+        .find_group_by_canonical_upstream(
+            &record.provider_id,
+            record
+                .upstream_group_id
+                .as_deref()
+                .expect("validated upstream group ID"),
+        )
+        .await;
+    if let Ok(Some(existing)) = existing {
+        if existing.user_id == record.user_id
+            && existing.endpoint_id == record.endpoint_id
+            && existing.key_id == record.key_id
+            && existing.project_name == record.project_name
+            && existing.deleted_at_unix_secs.is_none()
+        {
+            return Ok(existing);
+        }
+        return Err(AssetServiceError::new(
+            StatusCode::CONFLICT,
+            "AssetGroupOwnershipConflict",
+            "Ark 素材组 ID 已绑定到另一用户、端点、密钥或项目",
+        ));
+    }
+    tracing::error!(
+        upstream_group_id = %record.upstream_group_id.as_deref().unwrap_or("<missing>"),
+        provider_id = %record.provider_id,
+        reconciliation_required = true,
+        binding_lookup_failed = existing.is_err(),
+        "asset group projection failed after upstream create; destructive compensation was skipped"
+    );
+    Err(projection_error)
 }
 
 async fn create_asset(
@@ -1545,6 +1626,7 @@ async fn create_asset(
     mut body: Value,
 ) -> Result<StoredAsset, AssetServiceError> {
     let group_id = required_string_field(&body, &["GroupId", "group_id"], "GroupId")?;
+    validate_asset_text_lengths(&body)?;
     let group = load_group(
         state,
         caller,
@@ -1556,6 +1638,7 @@ async fn create_asset(
         .upstream_group_id
         .as_deref()
         .ok_or_else(|| AssetServiceError::unavailable("素材组尚未与上游完成绑定"))?;
+    ensure_project_matches(&body, &group.project_name)?;
     let asset_type = required_asset_type(&body)?;
     let url = required_string_field(&body, &["URL", "Url", "url"], "URL")?;
     validate_source_url(&url)?;
@@ -1568,6 +1651,23 @@ async fn create_asset(
         object.insert("URL".to_string(), Value::String(url));
         object.remove("Url");
         object.remove("url");
+        let asset_type_aliases = object
+            .keys()
+            .filter(|name| {
+                name.as_str() != "AssetType"
+                    && (name.eq_ignore_ascii_case("AssetType") || name.eq_ignore_ascii_case("type"))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for alias in asset_type_aliases {
+            object.remove(&alias);
+        }
+        object.insert("AssetType".to_string(), Value::String(asset_type.clone()));
+        object.insert(
+            "ProjectName".to_string(),
+            Value::String(group.project_name.clone()),
+        );
+        object.remove("project_name");
     }
     let transport = exact_transport_for_group(state, caller, &group).await?;
     let response = execute_action(
@@ -1581,14 +1681,7 @@ async fn create_asset(
     )
     .await?;
     let result = extract_result(&response.body).unwrap_or(&response.body);
-    let upstream_asset_id =
-        string_field(result, &["AssetId", "Id", "asset_id", "id"]).ok_or_else(|| {
-            AssetServiceError::new(
-                StatusCode::BAD_GATEWAY,
-                "InvalidUpstreamResponse",
-                "Ark CreateAsset response is missing AssetId",
-            )
-        })?;
+    let upstream_asset_id = upstream_required_official_id(result, &["Id"], "Id", "asset-")?;
     let source_url = string_field(&body, &["URL", "Url", "url"]);
     let now = crate::clock::current_unix_secs();
     let record = UpsertAssetRecord {
@@ -1619,10 +1712,42 @@ async fn create_asset(
         created_at_unix_secs: timestamp_field(result, &["CreateTime", "CreatedAt"]).unwrap_or(now),
         updated_at_unix_secs: timestamp_field(result, &["UpdateTime", "UpdatedAt"]).unwrap_or(now),
     };
-    write_repo(state)?
-        .upsert_asset(record)
-        .await
-        .map_err(data_error)
+    let mut last_error = None;
+    for _ in 0..3 {
+        match write_repo(state)?.upsert_asset(record.clone()).await {
+            Ok(asset) => return Ok(asset),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let projection_error =
+        data_error(last_error.expect("three failed asset upserts record an error"));
+    let existing = read_repo(state)?
+        .find_asset_by_upstream(
+            &record.group_id,
+            record
+                .upstream_asset_id
+                .as_deref()
+                .expect("validated upstream asset ID"),
+        )
+        .await;
+    if let Ok(Some(existing)) = existing {
+        if existing.user_id == record.user_id && !existing.is_deleted {
+            return Ok(existing);
+        }
+        return Err(AssetServiceError::new(
+            StatusCode::CONFLICT,
+            "AssetOwnershipConflict",
+            "Ark 素材 ID 已绑定到另一资源或已删除资源",
+        ));
+    }
+    tracing::error!(
+        upstream_asset_id = %record.upstream_asset_id.as_deref().unwrap_or("<missing>"),
+        group_id = %record.group_id,
+        reconciliation_required = true,
+        binding_lookup_failed = existing.is_err(),
+        "asset projection failed after upstream create; destructive compensation was skipped"
+    );
+    Err(projection_error)
 }
 
 async fn refresh_group(
@@ -1632,6 +1757,18 @@ async fn refresh_group(
     caller: &AssetCaller,
     group_id: &str,
 ) -> Result<StoredAssetGroup, AssetServiceError> {
+    refresh_group_with_result(state, request_context, headers, caller, group_id)
+        .await
+        .map(|(group, _)| group)
+}
+
+async fn refresh_group_with_result(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    headers: &HeaderMap,
+    caller: &AssetCaller,
+    group_id: &str,
+) -> Result<(StoredAssetGroup, Value), AssetServiceError> {
     let group = load_group(state, caller, group_id, caller.unrestricted_provider_access).await?;
     let upstream_id = group
         .upstream_group_id
@@ -1645,11 +1782,16 @@ async fn refresh_group(
         caller,
         &transport,
         ArkAssetAction::GetAssetGroup,
-        &json!({"Id": upstream_id}),
+        &json!({"Id": upstream_id, "ProjectName": group.project_name}),
     )
     .await?;
     let result = extract_result(&response.body).unwrap_or(&response.body);
-    persist_group_projection(state, group, result).await
+    let mut upstream_result = result.clone();
+    normalize_upstream_project_name(&mut upstream_result, &group.project_name)?;
+    validate_upstream_identity(&upstream_result, "Id", upstream_id)?;
+    validate_upstream_group_resource(&upstream_result)?;
+    let group = persist_group_projection(state, group, &upstream_result).await?;
+    Ok((group, upstream_result))
 }
 
 async fn update_group(
@@ -1672,11 +1814,17 @@ async fn update_group(
         .upstream_group_id
         .as_deref()
         .ok_or_else(|| AssetServiceError::unavailable("素材组尚未与上游完成绑定"))?;
+    ensure_project_matches(&body, &group.project_name)?;
     if let Some(object) = body.as_object_mut() {
         object.insert("Id".to_string(), Value::String(upstream_id.to_string()));
         object.remove("GroupId");
         object.remove("group_id");
         object.remove("id");
+        object.insert(
+            "ProjectName".to_string(),
+            Value::String(group.project_name.clone()),
+        );
+        object.remove("project_name");
         if object_has_field(
             &Value::Object(object.clone()),
             &["Description", "description"],
@@ -1702,6 +1850,7 @@ async fn update_group(
     )
     .await?;
     let result = extract_result(&response.body).unwrap_or(&response.body);
+    validate_upstream_identity(result, "Id", upstream_id)?;
     let mut updated = group;
     if let Some(name) = string_field(&body, &["Name", "name"]) {
         updated.name = name;
@@ -1725,25 +1874,22 @@ async fn delete_group(
         .as_deref()
         .ok_or_else(|| AssetServiceError::unavailable("素材组尚未与上游完成绑定"))?;
     let transport = exact_transport_for_group(state, caller, &group).await?;
-    execute_action(
+    let upstream_delete = execute_action(
         state,
         request_context,
         headers,
         caller,
         &transport,
         ArkAssetAction::DeleteAssetGroup,
-        &json!({"Id": upstream_id}),
+        &json!({"Id": upstream_id, "ProjectName": group.project_name}),
     )
-    .await?;
-    let now = crate::clock::current_unix_secs();
-    if !write_repo(state)?
-        .soft_delete_group(&group.id, now)
-        .await
-        .map_err(data_error)?
-    {
-        return Err(AssetServiceError::not_found());
+    .await;
+    if let Err(error) = upstream_delete {
+        if !is_upstream_resource_not_found(&error) {
+            return Err(error);
+        }
     }
-    Ok(())
+    soft_delete_group_with_retry(state, &group.id, crate::clock::current_unix_secs()).await
 }
 
 async fn refresh_asset(
@@ -1753,6 +1899,18 @@ async fn refresh_asset(
     caller: &AssetCaller,
     asset_id: &str,
 ) -> Result<StoredAsset, AssetServiceError> {
+    refresh_asset_with_result(state, request_context, headers, caller, asset_id)
+        .await
+        .map(|(asset, _)| asset)
+}
+
+async fn refresh_asset_with_result(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    headers: &HeaderMap,
+    caller: &AssetCaller,
+    asset_id: &str,
+) -> Result<(StoredAsset, Value), AssetServiceError> {
     let asset = load_asset(state, caller, asset_id, caller.unrestricted_provider_access).await?;
     let group = load_group(
         state,
@@ -1773,11 +1931,17 @@ async fn refresh_asset(
         caller,
         &transport,
         ArkAssetAction::GetAsset,
-        &json!({"Id": upstream_id}),
+        &json!({"Id": upstream_id, "ProjectName": group.project_name}),
     )
     .await?;
     let result = extract_result(&response.body).unwrap_or(&response.body);
-    persist_asset_projection(state, asset, result).await
+    let mut upstream_result = result.clone();
+    normalize_upstream_project_name(&mut upstream_result, &group.project_name)?;
+    validate_upstream_identity(&upstream_result, "Id", upstream_id)?;
+    validate_upstream_identity(&upstream_result, "GroupId", public_group_id(&group))?;
+    validate_upstream_asset_resource(&upstream_result)?;
+    let asset = persist_asset_projection(state, asset, &upstream_result).await?;
+    Ok((asset, upstream_result))
 }
 
 async fn update_asset(
@@ -1787,6 +1951,7 @@ async fn update_asset(
     caller: &AssetCaller,
     mut body: Value,
 ) -> Result<StoredAsset, AssetServiceError> {
+    validate_asset_text_lengths(&body)?;
     let asset_id = required_string_field(&body, &["Id", "AssetId", "id", "asset_id"], "Id")?;
     let asset = load_asset(
         state,
@@ -1806,11 +1971,17 @@ async fn update_asset(
         .upstream_asset_id
         .as_deref()
         .ok_or_else(|| AssetServiceError::unavailable("素材尚未与上游完成绑定"))?;
+    ensure_project_matches(&body, &group.project_name)?;
     if let Some(object) = body.as_object_mut() {
         object.insert("Id".to_string(), Value::String(upstream_id.to_string()));
         object.remove("AssetId");
         object.remove("asset_id");
         object.remove("id");
+        object.insert(
+            "ProjectName".to_string(),
+            Value::String(group.project_name.clone()),
+        );
+        object.remove("project_name");
     }
     let transport = exact_transport_for_group(state, caller, &group).await?;
     let response = execute_action(
@@ -1824,6 +1995,7 @@ async fn update_asset(
     )
     .await?;
     let result = extract_result(&response.body).unwrap_or(&response.body);
+    validate_upstream_identity(result, "Id", upstream_id)?;
     let mut updated = asset;
     if let Some(name) = string_field(&body, &["Name", "name"]) {
         updated.name = name;
@@ -1851,25 +2023,94 @@ async fn delete_asset(
         .as_deref()
         .ok_or_else(|| AssetServiceError::unavailable("素材尚未与上游完成绑定"))?;
     let transport = exact_transport_for_group(state, caller, &group).await?;
-    execute_action(
+    let upstream_delete = execute_action(
         state,
         request_context,
         headers,
         caller,
         &transport,
         ArkAssetAction::DeleteAsset,
-        &json!({"Id": upstream_id}),
+        &json!({"Id": upstream_id, "ProjectName": group.project_name}),
     )
-    .await?;
-    let now = crate::clock::current_unix_secs();
-    if !write_repo(state)?
-        .soft_delete_asset(&asset.id, now)
-        .await
-        .map_err(data_error)?
-    {
-        return Err(AssetServiceError::not_found());
+    .await;
+    if let Err(error) = upstream_delete {
+        if !is_upstream_resource_not_found(&error) {
+            return Err(error);
+        }
     }
-    Ok(())
+    soft_delete_asset_with_retry(state, &asset.id, crate::clock::current_unix_secs()).await
+}
+
+fn is_upstream_resource_not_found(error: &AssetServiceError) -> bool {
+    let code = error.code.trim().to_ascii_lowercase();
+    code == "resourcenotfound"
+        || code.starts_with("resourcenotfound.")
+        || code == "notfound"
+        || code.starts_with("notfound.")
+        || code == "assetnotfound"
+        || code == "assetgroupnotfound"
+}
+
+async fn soft_delete_group_with_retry(
+    state: &AppState,
+    group_id: &str,
+    deleted_at_unix_secs: u64,
+) -> Result<(), AssetServiceError> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        match write_repo(state)?
+            .soft_delete_group(group_id, deleted_at_unix_secs)
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                let already_deleted = read_repo(state)?
+                    .find_group_by_id(group_id)
+                    .await
+                    .map_err(data_error)?
+                    .is_some_and(|group| group.deleted_at_unix_secs.is_some());
+                if already_deleted {
+                    return Ok(());
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(data_error(error));
+    }
+    Err(AssetServiceError::not_found())
+}
+
+async fn soft_delete_asset_with_retry(
+    state: &AppState,
+    asset_id: &str,
+    deleted_at_unix_secs: u64,
+) -> Result<(), AssetServiceError> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        match write_repo(state)?
+            .soft_delete_asset(asset_id, deleted_at_unix_secs)
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                let already_deleted = read_repo(state)?
+                    .find_asset_by_id(asset_id)
+                    .await
+                    .map_err(data_error)?
+                    .is_some_and(|asset| asset.is_deleted);
+                if already_deleted {
+                    return Ok(());
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(data_error(error));
+    }
+    Err(AssetServiceError::not_found())
 }
 
 async fn persist_group_projection(
@@ -1886,6 +2127,7 @@ async fn persist_group_projection(
         provider_id: group.provider_id,
         endpoint_id: group.endpoint_id,
         key_id: group.key_id,
+        project_name: group.project_name,
         group_type: string_field(result, &["GroupType", "Type"]).unwrap_or(group.group_type),
         name: string_field(result, &["Name", "name"]).unwrap_or(group.name),
         description: string_field(result, &["Description", "description"]).or(group.description),
@@ -1895,10 +2137,19 @@ async fn persist_group_projection(
         updated_at_unix_secs: timestamp_field(result, &["UpdateTime", "UpdatedAt"]).unwrap_or(now),
         deleted_at_unix_secs: group.deleted_at_unix_secs,
     };
-    write_repo(state)?
-        .upsert_group(record)
-        .await
-        .map_err(data_error)
+    let projected = record.clone().into_stored();
+    match write_repo(state)?.upsert_group(record).await {
+        Ok(stored) => Ok(stored),
+        Err(error) => {
+            tracing::error!(
+                group_id = %projected.id,
+                upstream_group_id = ?projected.upstream_group_id,
+                error = %error,
+                "official Ark group response succeeded but cache projection needs retry"
+            );
+            Ok(projected)
+        }
+    }
 }
 
 async fn persist_asset_projection(
@@ -1937,10 +2188,19 @@ async fn persist_asset_projection(
             .unwrap_or(asset.created_at_unix_secs),
         updated_at_unix_secs: timestamp_field(result, &["UpdateTime", "UpdatedAt"]).unwrap_or(now),
     };
-    let mut persisted = write_repo(state)?
-        .upsert_asset(record)
-        .await
-        .map_err(data_error)?;
+    let projected = record.clone().into_stored();
+    let mut persisted = match write_repo(state)?.upsert_asset(record).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::error!(
+                asset_id = %projected.id,
+                upstream_asset_id = ?projected.upstream_asset_id,
+                error = %error,
+                "official Ark asset response succeeded but cache projection needs retry"
+            );
+            projected
+        }
+    };
     persisted.provider_url = next_url;
     persisted.provider_url_expires_at_unix_secs = persisted
         .provider_url
@@ -1952,14 +2212,27 @@ async fn persist_asset_projection(
 async fn list_groups_native(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
+    headers: &HeaderMap,
     caller: &AssetCaller,
     body: &Value,
 ) -> Result<Value, AssetServiceError> {
-    let page = page_number(body);
-    let page_size = page_size(body)?;
-    let filter = value_field(body, &["Filter", "filter"])
-        .filter(|value| value.is_object())
-        .ok_or_else(|| AssetServiceError::bad_request("Filter.GroupType is required"))?;
+    let page = required_native_page_number(body)?;
+    let page_size = required_native_page_size(body)?;
+    let filter = required_object_field(body, &["Filter", "filter"], "Filter")?;
+    reject_unknown_fields(
+        body,
+        &[
+            "Filter",
+            "PageNumber",
+            "PageSize",
+            "SortBy",
+            "SortOrder",
+            "ProjectName",
+        ],
+        "ListAssetGroups",
+    )?;
+    reject_unknown_fields(filter, &["GroupIds", "GroupType", "Name"], "Filter")?;
+    sort_upstream_items(&mut [], body, false)?;
     let group_type = required_string_field(
         filter,
         &["GroupType", "group_type", "Type"],
@@ -1970,37 +2243,141 @@ async fn list_groups_native(
             "Filter.GroupType must be AIGC or LivenessFace",
         ));
     }
-    let group_ids = string_list_field(filter, &["GroupIds", "group_ids", "GroupId", "group_id"]);
-    let statuses = string_list_field(filter, &["Statuses", "statuses", "Status", "status"]);
-    let query = AssetGroupListQuery {
-        user_id: Some(caller.user_id.clone()),
-        api_key_id: None,
-        provider_id: None,
-        group_type: Some(group_type),
-        search: string_field(filter, &["Name", "Search"]),
-        include_deleted: false,
-        ..AssetGroupListQuery::default()
-    };
-    let groups = list_all_groups(state, query).await?;
-    let filtered = groups.into_iter().filter(|group| {
-        (group_ids.is_empty()
-            || group_ids.iter().any(|id| {
-                id == &group.id || group.upstream_group_id.as_deref() == Some(id.as_str())
-            }))
-            && (statuses.is_empty()
-                || statuses
+    let requested_ids =
+        optional_string_array_field(filter, &["GroupIds", "group_ids"], "Filter.GroupIds")?;
+    validate_requested_group_ids(&requested_ids)?;
+    let name = optional_native_string(filter, &["Name", "name"], "Filter.Name")?;
+    if name.as_ref().is_some_and(|name| name.chars().count() > 64) {
+        return Err(AssetServiceError::bad_request(
+            "Filter.Name must be at most 64 characters",
+        ));
+    }
+    let project_name = native_project_name(body)?;
+    let mut groups = policy_visible_bound_groups(state, caller).await?;
+    groups.retain(|group| {
+        group.project_name == project_name
+            && group.group_type.eq_ignore_ascii_case(&group_type)
+            && (requested_ids.is_empty()
+                || requested_ids
                     .iter()
-                    .any(|status| status.eq_ignore_ascii_case(&group.status)))
+                    .any(|id| group.upstream_group_id.as_deref() == Some(id.as_str())))
     });
-    let mut filtered = filtered.collect::<Vec<_>>();
-    sort_native_groups(&mut filtered, body)?;
-    let total = filtered.len();
-    let offset = (page - 1).saturating_mul(page_size);
-    let items = filtered
-        .iter()
+    let mut partitions = BTreeMap::<(String, String, String), Vec<StoredAssetGroup>>::new();
+    for group in groups {
+        partitions
+            .entry((
+                group.provider_id.clone(),
+                group.endpoint_id.clone(),
+                group.key_id.clone(),
+            ))
+            .or_default()
+            .push(group);
+    }
+    let source_count = partitions
+        .values()
+        .map(|groups| groups.len().div_ceil(ARK_MAX_PAGE_SIZE))
+        .sum::<usize>();
+    let direct_page = source_count <= 1;
+    let merge_window = page
+        .checked_mul(page_size)
+        .ok_or_else(|| AssetServiceError::bad_request("PageNumber is too large"))?;
+    if !direct_page && merge_window > MAX_LIST_MERGE_WINDOW {
+        return Err(AssetServiceError::bad_request(format!(
+            "multi-provider pagination window must not exceed {MAX_LIST_MERGE_WINDOW} items"
+        )));
+    }
+    let fetch_start_page = if direct_page { page } else { 1 };
+    let fetch_limit = if direct_page { page_size } else { merge_window };
+    let (sort_by, sort_order) = upstream_sort_options(body, false)?;
+    let mut reported_total = 0usize;
+    let mut items_by_id = BTreeMap::<String, Value>::new();
+    for groups in partitions.into_values() {
+        let transport = exact_transport_for_group(state, caller, &groups[0]).await?;
+        let owned = groups
+            .iter()
+            .filter_map(|group| {
+                group
+                    .upstream_group_id
+                    .as_ref()
+                    .map(|id| (id.clone(), group))
+            })
+            .collect::<HashMap<_, _>>();
+        let ids = owned.keys().cloned().collect::<Vec<_>>();
+        for chunk in ids.chunks(ARK_MAX_PAGE_SIZE) {
+            let mut filter = json!({
+                "GroupIds": chunk,
+                "GroupType": group_type,
+            });
+            if let Some(name) = name.as_ref() {
+                filter
+                    .as_object_mut()
+                    .expect("list group filter is an object")
+                    .insert("Name".to_string(), Value::String(name.clone()));
+            }
+            let fetched = fetch_upstream_list_items(
+                state,
+                request_context,
+                headers,
+                caller,
+                &transport,
+                ArkAssetAction::ListAssetGroups,
+                filter,
+                &project_name,
+                fetch_start_page,
+                fetch_limit,
+                &sort_by,
+                &sort_order,
+            )
+            .await?;
+            reported_total = reported_total.checked_add(fetched.total).ok_or_else(|| {
+                AssetServiceError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "InvalidUpstreamResponse",
+                    "Ark ListAssetGroups TotalCount overflowed",
+                )
+            })?;
+            for item in fetched.items {
+                let id = upstream_required_official_id(&item, &["Id"], "Items.Id", "group-")?;
+                let Some(local) = owned.get(&id) else {
+                    return Err(AssetServiceError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "InvalidUpstreamResponse",
+                        "Ark ListAssetGroups returned an unowned GroupId",
+                    ));
+                };
+                validate_upstream_group_resource(&item)?;
+                let item_group_type =
+                    upstream_required_string(&item, &["GroupType"], "Items.GroupType")?;
+                if !item_group_type.eq_ignore_ascii_case(&group_type) {
+                    return Err(AssetServiceError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "InvalidUpstreamResponse",
+                        "Ark ListAssetGroups returned an unexpected GroupType",
+                    ));
+                }
+                let _ = persist_group_projection(state, (*local).clone(), &item).await?;
+                if items_by_id.insert(id, item).is_some() {
+                    return Err(AssetServiceError::new(
+                        StatusCode::CONFLICT,
+                        "UpstreamIdentityConflict",
+                        "多个素材库来源返回了相同的官方素材组 ID",
+                    ));
+                }
+            }
+        }
+    }
+    let mut items = items_by_id.into_values().collect::<Vec<_>>();
+    sort_upstream_items(&mut items, body, false)?;
+    let total = reported_total;
+    let offset = if direct_page {
+        0
+    } else {
+        (page - 1).saturating_mul(page_size)
+    };
+    let items = items
+        .into_iter()
         .skip(offset)
         .take(page_size)
-        .map(group_native_json)
         .collect::<Vec<_>>();
     Ok(native_envelope(
         request_context,
@@ -2017,61 +2394,196 @@ async fn list_groups_native(
 async fn list_assets_native(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
+    headers: &HeaderMap,
     caller: &AssetCaller,
     body: &Value,
 ) -> Result<Value, AssetServiceError> {
-    let page = page_number(body);
-    let page_size = page_size(body)?;
-    let filter = native_list_filter(body);
-    let group_ids = string_list_field(filter, &["GroupIds", "group_ids", "GroupId", "group_id"]);
-    let statuses = string_list_field(filter, &["Statuses", "statuses", "Status", "status"]);
-    let group_type = string_field(filter, &["GroupType", "group_type"]);
-    let query = AssetListQuery {
-        user_id: Some(caller.user_id.clone()),
-        api_key_id: None,
-        asset_type: string_field(filter, &["AssetType", "Type"]),
-        search: string_field(filter, &["Name", "Search"]),
-        include_deleted: false,
-        ..AssetListQuery::default()
-    };
-    let assets = list_all_assets(state, query).await?;
-    let groups = list_all_groups(
-        state,
-        AssetGroupListQuery {
-            user_id: Some(caller.user_id.clone()),
-            include_deleted: false,
-            ..AssetGroupListQuery::default()
-        },
-    )
-    .await?
-    .into_iter()
-    .map(|group| (group.id.clone(), group))
-    .collect::<HashMap<_, _>>();
-    let filtered = assets.into_iter().filter(|asset| {
-        let group = groups.get(&asset.group_id);
-        (group_ids.is_empty()
-            || group_ids.iter().any(|id| {
-                id == &asset.group_id
-                    || group.and_then(|group| group.upstream_group_id.as_deref())
-                        == Some(id.as_str())
-            }))
-            && (statuses.is_empty()
-                || statuses
-                    .iter()
-                    .any(|status| status.eq_ignore_ascii_case(&asset.status)))
-            && group_type.as_ref().is_none_or(|expected| {
-                group.is_some_and(|group| group.group_type.eq_ignore_ascii_case(expected))
-            })
-    });
-    let mut filtered = filtered.collect::<Vec<_>>();
-    sort_native_assets(&mut filtered, body)?;
-    let total = filtered.len();
-    let offset = (page - 1).saturating_mul(page_size);
-    let items = filtered
+    let page = optional_native_page_number(body)?;
+    let page_size = optional_native_page_size(body)?;
+    reject_unknown_fields(
+        body,
+        &[
+            "Filter",
+            "PageNumber",
+            "PageSize",
+            "SortBy",
+            "SortOrder",
+            "ProjectName",
+        ],
+        "ListAssets",
+    )?;
+    let filter =
+        optional_object_field(body, &["Filter", "filter"], "Filter")?.unwrap_or(&Value::Null);
+    if !filter.is_null() {
+        reject_unknown_fields(
+            filter,
+            &["GroupIds", "GroupType", "Name", "Statuses"],
+            "Filter",
+        )?;
+    }
+    sort_upstream_items(&mut [], body, true)?;
+    if value_field(filter, &["AssetType", "asset_type", "Type"]).is_some() {
+        return Err(AssetServiceError::bad_request(
+            "Filter.AssetType is not part of the official ListAssets request",
+        ));
+    }
+    let requested_ids =
+        optional_string_array_field(filter, &["GroupIds", "group_ids"], "Filter.GroupIds")?;
+    validate_requested_group_ids(&requested_ids)?;
+    let statuses =
+        optional_string_array_field(filter, &["Statuses", "statuses"], "Filter.Statuses")?;
+    if statuses
         .iter()
+        .any(|status| !matches!(status.as_str(), "Active" | "Processing" | "Failed"))
+    {
+        return Err(AssetServiceError::bad_request(
+            "Filter.Statuses values must be Active, Processing, or Failed",
+        ));
+    }
+    let group_type =
+        optional_native_string(filter, &["GroupType", "group_type"], "Filter.GroupType")?;
+    if group_type
+        .as_ref()
+        .is_some_and(|value| !matches!(value.as_str(), "AIGC" | "LivenessFace"))
+    {
+        return Err(AssetServiceError::bad_request(
+            "Filter.GroupType must be AIGC or LivenessFace",
+        ));
+    }
+    let name = optional_native_string(filter, &["Name", "name"], "Filter.Name")?;
+    if name.as_ref().is_some_and(|name| name.chars().count() > 64) {
+        return Err(AssetServiceError::bad_request(
+            "Filter.Name must be at most 64 characters",
+        ));
+    }
+    let project_name = native_project_name(body)?;
+    let mut groups = policy_visible_bound_groups(state, caller).await?;
+    groups.retain(|group| {
+        group.project_name == project_name
+            && group_type
+                .as_ref()
+                .is_none_or(|expected| group.group_type.eq_ignore_ascii_case(expected))
+            && (requested_ids.is_empty()
+                || requested_ids
+                    .iter()
+                    .any(|id| group.upstream_group_id.as_deref() == Some(id.as_str())))
+    });
+    let mut partitions = BTreeMap::<(String, String, String, String), Vec<StoredAssetGroup>>::new();
+    for group in groups {
+        partitions
+            .entry((
+                group.provider_id.clone(),
+                group.endpoint_id.clone(),
+                group.key_id.clone(),
+                group.group_type.clone(),
+            ))
+            .or_default()
+            .push(group);
+    }
+    let source_count = partitions
+        .values()
+        .map(|groups| groups.len().div_ceil(ARK_MAX_PAGE_SIZE))
+        .sum::<usize>();
+    let direct_page = source_count <= 1;
+    let merge_window = page
+        .checked_mul(page_size)
+        .ok_or_else(|| AssetServiceError::bad_request("PageNumber is too large"))?;
+    if !direct_page && merge_window > MAX_LIST_MERGE_WINDOW {
+        return Err(AssetServiceError::bad_request(format!(
+            "multi-provider pagination window must not exceed {MAX_LIST_MERGE_WINDOW} items"
+        )));
+    }
+    let fetch_start_page = if direct_page { page } else { 1 };
+    let fetch_limit = if direct_page { page_size } else { merge_window };
+    let (sort_by, sort_order) = upstream_sort_options(body, true)?;
+    let mut reported_total = 0usize;
+    let mut items_by_id = BTreeMap::<String, Value>::new();
+    for groups in partitions.into_values() {
+        let transport = exact_transport_for_group(state, caller, &groups[0]).await?;
+        let owned = groups
+            .iter()
+            .filter_map(|group| {
+                group
+                    .upstream_group_id
+                    .as_ref()
+                    .map(|id| (id.clone(), group))
+            })
+            .collect::<HashMap<_, _>>();
+        let ids = owned.keys().cloned().collect::<Vec<_>>();
+        for chunk in ids.chunks(ARK_MAX_PAGE_SIZE) {
+            let mut upstream_filter = json!({
+                "GroupIds": chunk,
+                "GroupType": groups[0].group_type,
+            });
+            if let Some(name) = name.as_ref() {
+                upstream_filter
+                    .as_object_mut()
+                    .expect("list asset filter is an object")
+                    .insert("Name".to_string(), Value::String(name.clone()));
+            }
+            if !statuses.is_empty() {
+                upstream_filter
+                    .as_object_mut()
+                    .expect("list asset filter is an object")
+                    .insert("Statuses".to_string(), json!(statuses));
+            }
+            let fetched = fetch_upstream_list_items(
+                state,
+                request_context,
+                headers,
+                caller,
+                &transport,
+                ArkAssetAction::ListAssets,
+                upstream_filter,
+                &project_name,
+                fetch_start_page,
+                fetch_limit,
+                &sort_by,
+                &sort_order,
+            )
+            .await?;
+            reported_total = reported_total.checked_add(fetched.total).ok_or_else(|| {
+                AssetServiceError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "InvalidUpstreamResponse",
+                    "Ark ListAssets TotalCount overflowed",
+                )
+            })?;
+            for item in fetched.items {
+                let id = upstream_required_official_id(&item, &["Id"], "Items.Id", "asset-")?;
+                let group_id =
+                    upstream_required_official_id(&item, &["GroupId"], "Items.GroupId", "group-")?;
+                let Some(group) = owned.get(&group_id) else {
+                    return Err(AssetServiceError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "InvalidUpstreamResponse",
+                        "Ark ListAssets returned an asset from an unowned group",
+                    ));
+                };
+                validate_upstream_asset_resource(&item)?;
+                let _ = upsert_asset_projection_from_list(state, group, &item).await?;
+                if items_by_id.insert(id, item).is_some() {
+                    return Err(AssetServiceError::new(
+                        StatusCode::CONFLICT,
+                        "UpstreamIdentityConflict",
+                        "多个素材库来源返回了相同的官方素材 ID",
+                    ));
+                }
+            }
+        }
+    }
+    let mut items = items_by_id.into_values().collect::<Vec<_>>();
+    sort_upstream_items(&mut items, body, true)?;
+    let total = reported_total;
+    let offset = if direct_page {
+        0
+    } else {
+        (page - 1).saturating_mul(page_size)
+    };
+    let items = items
+        .into_iter()
         .skip(offset)
         .take(page_size)
-        .map(asset_native_json)
         .collect::<Vec<_>>();
     Ok(native_envelope(
         request_context,
@@ -2083,6 +2595,336 @@ async fn list_assets_native(
             "Items": items,
         }),
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_upstream_list_items(
+    state: &AppState,
+    request_context: &GatewayPublicRequestContext,
+    headers: &HeaderMap,
+    caller: &AssetCaller,
+    transport: &AssetTransport,
+    action: ArkAssetAction,
+    filter: Value,
+    project_name: &str,
+    start_page: usize,
+    max_items: usize,
+    sort_by: &str,
+    sort_order: &str,
+) -> Result<UpstreamListFetch, AssetServiceError> {
+    if start_page == 0 || max_items == 0 {
+        return Err(AssetServiceError::bad_request(
+            "upstream list pagination must be positive",
+        ));
+    }
+    let request_page_size = max_items.min(ARK_MAX_PAGE_SIZE);
+    let pages_to_fetch = max_items.div_ceil(request_page_size);
+    let mut items = Vec::new();
+    let mut reported_total = None;
+    for page_offset in 0..pages_to_fetch {
+        let page_number = start_page
+            .checked_add(page_offset)
+            .ok_or_else(|| AssetServiceError::bad_request("PageNumber is too large"))?;
+        let response = execute_action(
+            state,
+            request_context,
+            headers,
+            caller,
+            transport,
+            action,
+            &json!({
+                "Filter": filter,
+                "PageNumber": page_number,
+                "PageSize": request_page_size,
+                "SortBy": sort_by,
+                "SortOrder": sort_order,
+                "ProjectName": project_name,
+            }),
+        )
+        .await?;
+        let result = extract_result(&response.body).ok_or_else(|| {
+            AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                format!("Ark {} response is missing Result", action.as_str()),
+            )
+        })?;
+        let total = upstream_required_usize(result, "TotalCount")?;
+        if reported_total
+            .replace(total)
+            .is_some_and(|known| known != total)
+        {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                format!(
+                    "Ark {} changed TotalCount during pagination",
+                    action.as_str()
+                ),
+            ));
+        }
+        let upstream_page = upstream_required_usize(result, "PageNumber")?;
+        let upstream_page_size = upstream_required_usize(result, "PageSize")?;
+        if upstream_page != page_number || upstream_page_size != request_page_size {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                format!(
+                    "Ark {} returned invalid pagination metadata",
+                    action.as_str()
+                ),
+            ));
+        }
+        let page_items = result
+            .get("Items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AssetServiceError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "InvalidUpstreamResponse",
+                    format!("Ark {} response is missing Items", action.as_str()),
+                )
+            })?;
+        if page_items.len() > request_page_size {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                format!("Ark {} returned too many Items", action.as_str()),
+            ));
+        }
+        let upstream_offset = page_number
+            .saturating_sub(1)
+            .checked_mul(request_page_size)
+            .ok_or_else(|| AssetServiceError::bad_request("PageNumber is too large"))?;
+        if page_items.is_empty() {
+            if upstream_offset >= total {
+                return Ok(UpstreamListFetch { items, total });
+            }
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                format!("Ark {} pagination ended before TotalCount", action.as_str()),
+            ));
+        }
+        if upstream_offset >= total
+            || upstream_offset.saturating_add(page_items.len()) > total
+            || (page_items.len() < request_page_size
+                && upstream_offset.saturating_add(page_items.len()) < total)
+        {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                format!("Ark {} returned inconsistent pagination", action.as_str()),
+            ));
+        }
+        let remaining = max_items.saturating_sub(items.len());
+        for item in page_items.iter().take(remaining) {
+            let mut item = item.clone();
+            normalize_upstream_project_name(&mut item, project_name)?;
+            items.push(item);
+        }
+        if upstream_offset.saturating_add(page_items.len()) >= total || items.len() >= max_items {
+            return Ok(UpstreamListFetch { items, total });
+        }
+    }
+    Ok(UpstreamListFetch {
+        items,
+        total: reported_total.unwrap_or_default(),
+    })
+}
+
+async fn policy_visible_bound_groups(
+    state: &AppState,
+    caller: &AssetCaller,
+) -> Result<Vec<StoredAssetGroup>, AssetServiceError> {
+    let access = resolve_caller_access(state, caller, crate::clock::current_unix_secs()).await?;
+    if !access_policy_allows_format(&access.policy, ARK_ASSET_API_FORMAT) {
+        return Err(AssetServiceError::new(
+            StatusCode::FORBIDDEN,
+            "ApiFormatNotAllowed",
+            "当前凭据无权访问 Ark 素材库",
+        ));
+    }
+    let mut groups = list_all_groups(
+        state,
+        AssetGroupListQuery {
+            user_id: Some(caller.user_id.clone()),
+            include_deleted: false,
+            ..AssetGroupListQuery::default()
+        },
+    )
+    .await?;
+    groups.retain(|group| {
+        group
+            .upstream_group_id
+            .as_ref()
+            .is_some_and(|id| id.starts_with("group-") && id.len() > "group-".len())
+    });
+    let provider_ids = groups
+        .iter()
+        .map(|group| group.provider_id.clone())
+        .collect::<Vec<_>>();
+    let providers = state
+        .read_provider_catalog_providers_by_ids(&provider_ids)
+        .await
+        .map_err(gateway_error)?
+        .into_iter()
+        .map(|provider| (provider.id.clone(), provider))
+        .collect::<HashMap<_, _>>();
+    groups.retain(|group| {
+        providers.get(&group.provider_id).is_some_and(|provider| {
+            access_policy_allows_provider(
+                &access.policy,
+                &provider.id,
+                &provider.name,
+                &provider.provider_type,
+            )
+        })
+    });
+    Ok(groups)
+}
+
+async fn upsert_asset_projection_from_list(
+    state: &AppState,
+    group: &StoredAssetGroup,
+    item: &Value,
+) -> Result<StoredAsset, AssetServiceError> {
+    let upstream_asset_id = upstream_required_official_id(item, &["Id"], "Items.Id", "asset-")?;
+    let upstream_group_id =
+        upstream_required_official_id(item, &["GroupId"], "Items.GroupId", "group-")?;
+    if upstream_group_id != public_group_id(group) {
+        return Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark ListAssets returned an unexpected GroupId",
+        ));
+    }
+    let asset_type = normalize_upstream_asset_type(&upstream_required_string(
+        item,
+        &["AssetType"],
+        "Items.AssetType",
+    )?)?;
+    let existing = read_repo(state)?
+        .find_asset_by_upstream(&group.id, &upstream_asset_id)
+        .await
+        .map_err(data_error)?;
+    let now = crate::clock::current_unix_secs();
+    let record = UpsertAssetRecord {
+        id: existing
+            .as_ref()
+            .map(|asset| asset.id.clone())
+            .unwrap_or_else(|| {
+                deterministic_validation_asset_id(&group.provider_id, &group.id, &upstream_asset_id)
+            }),
+        upstream_asset_id: Some(upstream_asset_id),
+        group_id: group.id.clone(),
+        user_id: group.user_id.clone(),
+        api_key_id: group.api_key_id.clone(),
+        asset_type,
+        name: string_field(item, &["Name"])
+            .or_else(|| existing.as_ref().map(|asset| asset.name.clone()))
+            .unwrap_or_else(|| "未命名素材".to_string()),
+        status: upstream_required_string(item, &["Status"], "Items.Status")?,
+        error_code: error_field(item, "Code"),
+        error_message: error_field(item, "Message"),
+        moderation: object_field(item, &["Moderation"]),
+        last_inference_at_unix_secs: timestamp_field(item, &["LastInferenceTime"]),
+        source_url_fingerprint: existing
+            .as_ref()
+            .and_then(|asset| asset.source_url_fingerprint.clone()),
+        provider_url: None,
+        provider_url_expires_at_unix_secs: None,
+        sanitized_metadata: sanitize_asset_metadata(item),
+        is_deleted: false,
+        deleted_at_unix_secs: None,
+        created_at_unix_secs: timestamp_field(item, &["CreateTime"])
+            .or_else(|| existing.as_ref().map(|asset| asset.created_at_unix_secs))
+            .unwrap_or(now),
+        updated_at_unix_secs: timestamp_field(item, &["UpdateTime"]).unwrap_or(now),
+    };
+    let projected = record.clone().into_stored();
+    let mut persisted = match write_repo(state)?.upsert_asset(record).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::error!(
+                asset_id = %projected.id,
+                upstream_asset_id = ?projected.upstream_asset_id,
+                error = %error,
+                "official Ark list response succeeded but asset cache projection needs retry"
+            );
+            projected
+        }
+    };
+    persisted.provider_url = provider_url(item);
+    persisted.provider_url_expires_at_unix_secs = persisted
+        .provider_url
+        .as_ref()
+        .map(|_| now.saturating_add(ASSET_URL_TTL_SECS));
+    Ok(persisted)
+}
+
+fn upstream_required_usize(value: &Value, field: &str) -> Result<usize, AssetServiceError> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                format!("Ark response {field} must be a non-negative integer"),
+            )
+        })
+}
+
+fn sort_upstream_items(
+    items: &mut [Value],
+    body: &Value,
+    allow_group_id: bool,
+) -> Result<(), AssetServiceError> {
+    let (sort_by, sort_order) = upstream_sort_options(body, allow_group_id)?;
+    let descending = sort_order == "Desc";
+    items.sort_by(|left, right| {
+        let order = if sort_by == "GroupId" {
+            string_field(left, &["GroupId"]).cmp(&string_field(right, &["GroupId"]))
+        } else {
+            timestamp_field(left, &[sort_by.as_str()])
+                .cmp(&timestamp_field(right, &[sort_by.as_str()]))
+        };
+        let order = if descending { order.reverse() } else { order };
+        order.then_with(|| string_field(left, &["Id"]).cmp(&string_field(right, &["Id"])))
+    });
+    Ok(())
+}
+
+fn upstream_sort_options(
+    body: &Value,
+    allow_group_id: bool,
+) -> Result<(String, String), AssetServiceError> {
+    let sort_by = optional_native_string(body, &["SortBy", "sort_by"], "SortBy")?
+        .unwrap_or_else(|| "CreateTime".to_string());
+    if !matches!(sort_by.as_str(), "CreateTime" | "UpdateTime")
+        && !(allow_group_id && sort_by == "GroupId")
+    {
+        return Err(AssetServiceError::bad_request(if allow_group_id {
+            "SortBy must be CreateTime, UpdateTime, or GroupId"
+        } else {
+            "SortBy must be CreateTime or UpdateTime"
+        }));
+    }
+    let sort_order = match optional_native_string(body, &["SortOrder", "sort_order"], "SortOrder")?
+        .unwrap_or_else(|| "Desc".to_string())
+        .as_str()
+    {
+        "Desc" => "Desc".to_string(),
+        "Asc" => "Asc".to_string(),
+        _ => {
+            return Err(AssetServiceError::bad_request(
+                "SortOrder must be Asc or Desc",
+            ));
+        }
+    };
+    Ok((sort_by, sort_order))
 }
 
 async fn list_all_groups(
@@ -2132,54 +2974,129 @@ async fn list_all_assets(
 async fn list_groups_rest(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
+    headers: &HeaderMap,
     caller: &AssetCaller,
     _is_admin: bool,
 ) -> Result<Value, AssetServiceError> {
-    let query = AssetGroupListQuery {
-        user_id: Some(caller.user_id.clone()),
-        api_key_id: None,
-        provider_id: None,
-        group_type: query_value(
-            request_context.request_query_string.as_deref(),
-            "group_type",
-        ),
-        status: query_value(request_context.request_query_string.as_deref(), "status"),
-        search: query_value(request_context.request_query_string.as_deref(), "search"),
-        include_deleted: false,
-        offset: 0,
-        limit: MAX_PAGE_SIZE,
-    };
-    let response = read_repo(state)?
-        .list_groups(&query)
-        .await
-        .map_err(data_error)?;
-    let mut counts = HashMap::<String, usize>::with_capacity(response.items.len());
-    for group in &response.items {
-        let total = read_repo(state)?
-            .list_assets(&AssetListQuery {
-                group_id: Some(group.id.clone()),
-                user_id: Some(caller.user_id.clone()),
-                include_deleted: false,
-                offset: 0,
-                limit: 1,
-                ..AssetListQuery::default()
+    let group_type = query_value(
+        request_context.request_query_string.as_deref(),
+        "group_type",
+    );
+    let status = query_value(request_context.request_query_string.as_deref(), "status");
+    let search_query = query_value(request_context.request_query_string.as_deref(), "search");
+    let search = search_query
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase());
+    let visible_groups = policy_visible_bound_groups(state, caller).await?;
+    let mut refresh_partitions = BTreeMap::<(String, String), Vec<String>>::new();
+    for group in &visible_groups {
+        refresh_partitions
+            .entry((group.project_name.clone(), group.group_type.clone()))
+            .or_default()
+            .push(public_group_id(group).to_string());
+    }
+    let mut authoritative_ids = HashSet::new();
+    for ((project_name, partition_group_type), group_ids) in refresh_partitions {
+        let mut filter = json!({
+            "GroupIds": group_ids,
+            "GroupType": partition_group_type,
+        });
+        if let Some(search) = search_query.as_ref() {
+            filter
+                .as_object_mut()
+                .expect("REST ListAssetGroups filter is an object")
+                .insert("Name".to_string(), Value::String(search.clone()));
+        }
+        for page_number in 1..=MAX_LIST_MERGE_WINDOW.div_ceil(ARK_MAX_PAGE_SIZE) {
+            let response = list_groups_native(
+                state,
+                request_context,
+                headers,
+                caller,
+                &json!({
+                    "Filter": filter,
+                    "PageNumber": page_number,
+                    "PageSize": ARK_MAX_PAGE_SIZE,
+                    "ProjectName": project_name,
+                }),
+            )
+            .await?;
+            let result = extract_result(&response).ok_or_else(|| {
+                AssetServiceError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "Aether ListAssetGroups projection is missing Result",
+                )
+            })?;
+            let total = upstream_required_usize(result, "TotalCount")?;
+            if total > MAX_LIST_MERGE_WINDOW {
+                return Err(AssetServiceError::bad_request(format!(
+                    "REST material group list supports at most {MAX_LIST_MERGE_WINDOW} items"
+                )));
+            }
+            let items = result
+                .get("Items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    AssetServiceError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        "Aether ListAssetGroups projection is missing Items",
+                    )
+                })?;
+            for item in items {
+                authoritative_ids.insert(upstream_required_official_id(
+                    item,
+                    &["Id"],
+                    "Items.Id",
+                    "group-",
+                )?);
+            }
+            if page_number.saturating_mul(ARK_MAX_PAGE_SIZE) >= total {
+                break;
+            }
+        }
+    }
+    let mut groups = policy_visible_bound_groups(state, caller).await?;
+    groups.retain(|group| {
+        authoritative_ids.contains(public_group_id(group))
+            && group_type
+                .as_ref()
+                .is_none_or(|expected| group.group_type.eq_ignore_ascii_case(expected))
+            && status
+                .as_ref()
+                .is_none_or(|expected| group.status.eq_ignore_ascii_case(expected))
+            && search.as_ref().is_none_or(|search| {
+                group.name.to_ascii_lowercase().contains(search)
+                    || group
+                        .description
+                        .as_ref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(search))
             })
-            .await
-            .map_err(data_error)?
-            .total;
+    });
+    groups.sort_by(|left, right| {
+        right
+            .created_at_unix_secs
+            .cmp(&left.created_at_unix_secs)
+            .then_with(|| public_group_id(left).cmp(public_group_id(right)))
+    });
+    let mut counts = HashMap::<String, usize>::with_capacity(groups.len());
+    for group in &groups {
+        let total = group_asset_count(state, group).await?;
         counts.insert(group.id.clone(), total);
     }
     Ok(json!({
-        "items": response.items.iter().map(|group| {
+        "items": groups.iter().map(|group| {
             group_rest_json(group, counts.get(&group.id).copied().unwrap_or_default())
         }).collect::<Vec<_>>(),
-        "total": response.total,
+        "total": groups.len(),
     }))
 }
 
 async fn list_assets_rest(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
+    headers: &HeaderMap,
     caller: &AssetCaller,
     is_admin: bool,
 ) -> Result<Value, AssetServiceError> {
@@ -2191,48 +3108,164 @@ async fn list_assets_rest(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
-    let group_id = query_value(request_context.request_query_string.as_deref(), "group_id");
-    if let Some(group_id) = group_id.as_deref() {
-        let _ = load_group(state, caller, group_id, is_admin).await?;
+    let requested_group_id =
+        query_value(request_context.request_query_string.as_deref(), "group_id");
+    let requested_group = if let Some(group_id) = requested_group_id.as_deref() {
+        validate_official_request_id(group_id, "group-", "GroupId")?;
+        Some(load_group(state, caller, group_id, is_admin).await?)
+    } else {
+        None
+    };
+    let mut visible_groups = policy_visible_bound_groups(state, caller).await?;
+    if let Some(requested_group) = requested_group.as_ref() {
+        visible_groups.retain(|group| group.id == requested_group.id);
     }
-    let response = read_repo(state)?
-        .list_assets(&AssetListQuery {
-            group_id,
-            user_id: Some(caller.user_id.clone()),
-            api_key_id: None,
-            asset_type: query_value(request_context.request_query_string.as_deref(), "type")
-                .map(normalize_asset_type_filter),
-            status: query_value(request_context.request_query_string.as_deref(), "status"),
-            search: query_value(request_context.request_query_string.as_deref(), "search"),
-            include_deleted: false,
-            offset: (page - 1).saturating_mul(page_size),
-            limit: page_size,
-        })
-        .await
-        .map_err(data_error)?;
-    let groups = read_repo(state)?
-        .list_groups(&AssetGroupListQuery {
-            user_id: Some(caller.user_id.clone()),
-            include_deleted: false,
-            offset: 0,
-            limit: MAX_PAGE_SIZE,
-            ..AssetGroupListQuery::default()
-        })
-        .await
-        .map_err(data_error)?;
-    let groups = groups
-        .items
+    let mut project_groups = BTreeMap::<String, Vec<String>>::new();
+    for group in &visible_groups {
+        project_groups
+            .entry(group.project_name.clone())
+            .or_default()
+            .push(public_group_id(group).to_string());
+    }
+    let status = query_value(request_context.request_query_string.as_deref(), "status");
+    let search = query_value(request_context.request_query_string.as_deref(), "search");
+    let mut authoritative_ids = HashSet::new();
+    for (project_name, group_ids) in project_groups {
+        let mut filter = json!({"GroupIds": group_ids});
+        if let Some(status) = status.as_ref() {
+            filter
+                .as_object_mut()
+                .expect("REST ListAssets filter is an object")
+                .insert("Statuses".to_string(), json!([status]));
+        }
+        if let Some(search) = search.as_ref() {
+            filter
+                .as_object_mut()
+                .expect("REST ListAssets filter is an object")
+                .insert("Name".to_string(), Value::String(search.clone()));
+        }
+        for page_number in 1..=MAX_LIST_MERGE_WINDOW.div_ceil(ARK_MAX_PAGE_SIZE) {
+            let response = list_assets_native(
+                state,
+                request_context,
+                headers,
+                caller,
+                &json!({
+                    "Filter": filter,
+                    "PageNumber": page_number,
+                    "PageSize": ARK_MAX_PAGE_SIZE,
+                    "ProjectName": project_name,
+                }),
+            )
+            .await?;
+            let result = extract_result(&response).ok_or_else(|| {
+                AssetServiceError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "Aether ListAssets projection is missing Result",
+                )
+            })?;
+            let total = upstream_required_usize(result, "TotalCount")?;
+            if total > MAX_LIST_MERGE_WINDOW {
+                return Err(AssetServiceError::bad_request(format!(
+                    "REST material asset list supports at most {MAX_LIST_MERGE_WINDOW} items per project"
+                )));
+            }
+            let items = result
+                .get("Items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    AssetServiceError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        "Aether ListAssets projection is missing Items",
+                    )
+                })?;
+            for item in items {
+                authoritative_ids.insert(upstream_required_official_id(
+                    item,
+                    &["Id"],
+                    "Items.Id",
+                    "asset-",
+                )?);
+            }
+            if page_number.saturating_mul(ARK_MAX_PAGE_SIZE) >= total {
+                break;
+            }
+        }
+    }
+    let groups = visible_groups
         .into_iter()
         .map(|group| (group.id.clone(), group))
         .collect::<HashMap<_, _>>();
+    let requested_type = query_value(request_context.request_query_string.as_deref(), "type")
+        .map(normalize_asset_type_filter);
+    let search_lower = search.as_ref().map(|value| value.to_ascii_lowercase());
+    let mut assets = list_all_assets(
+        state,
+        AssetListQuery {
+            user_id: Some(caller.user_id.clone()),
+            include_deleted: false,
+            ..AssetListQuery::default()
+        },
+    )
+    .await?;
+    assets.retain(|asset| {
+        groups.contains_key(&asset.group_id)
+            && authoritative_ids.contains(public_asset_id(asset))
+            && asset
+                .upstream_asset_id
+                .as_ref()
+                .is_some_and(|id| id.starts_with("asset-") && id.len() > "asset-".len())
+            && requested_group
+                .as_ref()
+                .is_none_or(|group| asset.group_id == group.id)
+            && requested_type
+                .as_ref()
+                .is_none_or(|expected| asset.asset_type.eq_ignore_ascii_case(expected))
+            && status
+                .as_ref()
+                .is_none_or(|expected| asset.status.eq_ignore_ascii_case(expected))
+            && search_lower
+                .as_ref()
+                .is_none_or(|search| asset.name.to_ascii_lowercase().contains(search))
+    });
+    assets.sort_by(|left, right| {
+        right
+            .created_at_unix_secs
+            .cmp(&left.created_at_unix_secs)
+            .then_with(|| public_asset_id(left).cmp(public_asset_id(right)))
+    });
+    let total = assets.len();
+    let offset = (page - 1).saturating_mul(page_size);
+    let page_assets = assets
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .collect::<Vec<_>>();
+    let refreshed = stream::iter(page_assets.into_iter().map(|asset| async move {
+        refresh_asset(
+            state,
+            request_context,
+            headers,
+            caller,
+            public_asset_id(&asset),
+        )
+        .await
+    }))
+    .buffered(8)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({
-        "items": response.items.iter().map(|asset| {
-            asset_rest_json(asset, groups.get(&asset.group_id), is_admin)
+        "items": refreshed.iter().map(|asset| {
+            asset_rest_json(asset, &groups[&asset.group_id], is_admin)
         }).collect::<Vec<_>>(),
-        "total": response.total,
+        "total": total,
         "page": page,
         "page_size": page_size,
-        "pages": response.total.div_ceil(page_size),
+        "pages": total.div_ceil(page_size),
     }))
 }
 
@@ -2242,56 +3275,117 @@ async fn load_group(
     group_id: &str,
     is_admin: bool,
 ) -> Result<StoredAssetGroup, AssetServiceError> {
-    let group = if is_admin {
+    let direct = if is_admin {
         read_repo(state)?.find_group_by_id(group_id).await
     } else {
         read_repo(state)?
             .find_group_for_user(group_id, &caller.user_id)
             .await
     }
-    .map_err(data_error)?
-    .filter(|group| !is_admin || group.user_id == caller.user_id)
-    .filter(|group| group.deleted_at_unix_secs.is_none())
-    .ok_or_else(AssetServiceError::not_found)?;
+    .map_err(data_error)?;
+    let group = if direct.is_some() {
+        direct
+    } else {
+        let groups = list_all_groups(
+            state,
+            AssetGroupListQuery {
+                user_id: Some(caller.user_id.clone()),
+                include_deleted: false,
+                ..AssetGroupListQuery::default()
+            },
+        )
+        .await?;
+        groups.into_iter().find(|group| {
+            group.upstream_group_id.as_deref() == Some(group_id)
+                && (!is_admin || group.user_id == caller.user_id)
+        })
+    };
+    let group = group
+        .filter(|group| !is_admin || group.user_id == caller.user_id)
+        .filter(|group| group.deleted_at_unix_secs.is_none())
+        .ok_or_else(AssetServiceError::not_found)?;
     Ok(group)
+}
+
+async fn load_group_by_upstream_id(
+    state: &AppState,
+    caller: &AssetCaller,
+    upstream_group_id: &str,
+) -> Result<StoredAssetGroup, AssetServiceError> {
+    if !upstream_group_id.starts_with("group-") || upstream_group_id.len() == "group-".len() {
+        return Err(AssetServiceError::bad_request(
+            "Id must be an official Ark group-* ID",
+        ));
+    }
+    list_all_groups(
+        state,
+        AssetGroupListQuery {
+            user_id: Some(caller.user_id.clone()),
+            include_deleted: false,
+            ..AssetGroupListQuery::default()
+        },
+    )
+    .await?
+    .into_iter()
+    .find(|group| group.upstream_group_id.as_deref() == Some(upstream_group_id))
+    .ok_or_else(AssetServiceError::not_found)
 }
 
 async fn load_asset(
     state: &AppState,
     caller: &AssetCaller,
     asset_id: &str,
-    is_admin: bool,
+    _is_admin: bool,
 ) -> Result<StoredAsset, AssetServiceError> {
-    let asset = if is_admin {
-        read_repo(state)?.find_asset_by_id(asset_id).await
-    } else {
-        read_repo(state)?
-            .find_asset_for_user(asset_id, &caller.user_id)
-            .await
+    load_asset_by_upstream_id(state, caller, asset_id).await
+}
+
+async fn load_asset_by_upstream_id(
+    state: &AppState,
+    caller: &AssetCaller,
+    upstream_asset_id: &str,
+) -> Result<StoredAsset, AssetServiceError> {
+    if !upstream_asset_id.starts_with("asset-") || upstream_asset_id.len() == "asset-".len() {
+        return Err(AssetServiceError::bad_request(
+            "Id must be an official Ark asset-* ID",
+        ));
     }
-    .map_err(data_error)?
-    .filter(|asset| !is_admin || asset.user_id == caller.user_id)
-    .filter(|asset| !asset.is_deleted)
-    .ok_or_else(AssetServiceError::not_found)?;
-    Ok(asset)
+    list_all_assets(
+        state,
+        AssetListQuery {
+            user_id: Some(caller.user_id.clone()),
+            include_deleted: false,
+            ..AssetListQuery::default()
+        },
+    )
+    .await?
+    .into_iter()
+    .find(|asset| asset.upstream_asset_id.as_deref() == Some(upstream_asset_id))
+    .ok_or_else(AssetServiceError::not_found)
 }
 
 async fn group_asset_count(
     state: &AppState,
     group: &StoredAssetGroup,
 ) -> Result<usize, AssetServiceError> {
-    Ok(read_repo(state)?
-        .list_assets(&AssetListQuery {
+    Ok(list_all_assets(
+        state,
+        AssetListQuery {
             group_id: Some(group.id.clone()),
             user_id: Some(group.user_id.clone()),
             include_deleted: false,
-            offset: 0,
-            limit: 1,
             ..AssetListQuery::default()
-        })
-        .await
-        .map_err(data_error)?
-        .total)
+        },
+    )
+    .await?
+    .into_iter()
+    .filter(|asset| {
+        asset
+            .upstream_asset_id
+            .as_ref()
+            .is_some_and(|id| id.starts_with("asset-") && id.len() > "asset-".len())
+    })
+    .count())
 }
 
 async fn create_validation_session(
@@ -2301,6 +3395,17 @@ async fn create_validation_session(
     caller: &AssetCaller,
     body: Value,
 ) -> Result<(StoredArkVisualValidationSession, Value), AssetServiceError> {
+    let project_name = native_project_name(&body)?;
+    let callback_url = required_string_field(
+        &body,
+        &["CallbackURL", "callback_url", "ReturnUrl", "return_url"],
+        "CallbackURL",
+    )?;
+    let encryption_key = state
+        .encryption_key()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AssetServiceError::unavailable("素材库真人验证需要配置数据加密密钥"))?;
     let transport = select_transport(state, caller).await?;
     let response = execute_action(
         state,
@@ -2321,24 +3426,32 @@ async fn create_validation_session(
                 "Ark CreateVisualValidateSession response is missing BytedToken",
             )
         })?;
+    let h5_link = validation_verification_url(result).ok_or_else(|| {
+        AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark CreateVisualValidateSession response is missing a safe H5Link",
+        )
+    })?;
+    let returned_callback = upstream_required_string(result, &["CallbackURL"], "CallbackURL")?;
+    if returned_callback != callback_url {
+        return Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark CreateVisualValidateSession returned a different CallbackURL",
+        ));
+    }
     let session_id = string_field(result, &["SessionId", "session_id", "Id", "id"])
         .unwrap_or_else(|| sha256_text(&byted_token)[..32].to_string());
-    let encryption_key = state
-        .encryption_key()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AssetServiceError::unavailable("素材库真人验证需要配置数据加密密钥"))?;
     let encrypted_byted_token =
         aether_crypto::encrypt_python_fernet_plaintext(encryption_key, &byted_token).map_err(
             |error| AssetServiceError::unavailable(format!("真人验证 token 加密失败: {error}")),
         )?;
-    let encrypted_verification_url = validation_verification_url(result)
-        .map(|url| {
-            aether_crypto::encrypt_python_fernet_plaintext(encryption_key, &url).map_err(|error| {
-                AssetServiceError::unavailable(format!("真人验证链接加密失败: {error}"))
-            })
-        })
-        .transpose()?;
+    let encrypted_verification_url = Some(
+        aether_crypto::encrypt_python_fernet_plaintext(encryption_key, &h5_link).map_err(
+            |error| AssetServiceError::unavailable(format!("真人验证链接加密失败: {error}")),
+        )?,
+    );
     let callback_state = local_id("vstate");
     let now = crate::clock::current_unix_secs();
     let expires_at = timestamp_field(result, &["ExpireAt", "ExpiresAt", "Expiration"])
@@ -2351,6 +3464,7 @@ async fn create_validation_session(
         provider_id: transport.snapshot.provider.id.clone(),
         endpoint_id: transport.snapshot.endpoint.id.clone(),
         key_id: transport.snapshot.key.id.clone(),
+        project_name,
         byted_token_hash: sha256_text(&byted_token),
         encrypted_byted_token,
         callback_state_hash: sha256_text(&callback_state),
@@ -2368,11 +3482,19 @@ async fn create_validation_session(
         created_at_unix_secs: now,
         updated_at_unix_secs: now,
     };
-    let session = write_repo(state)?
-        .upsert_visual_validation_session(record)
-        .await
-        .map_err(data_error)?;
-    Ok((session, response.body))
+    let mut last_error = None;
+    for _ in 0..3 {
+        match write_repo(state)?
+            .upsert_visual_validation_session(record.clone())
+            .await
+        {
+            Ok(session) => return Ok((session, response.body)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(data_error(last_error.expect(
+        "three failed validation-session upserts record an error",
+    )))
 }
 
 async fn get_validation_result_native(
@@ -2393,8 +3515,13 @@ async fn get_validation_result_native(
         .map_err(data_error)?
         .filter(|session| session.user_id == caller.user_id)
         .ok_or_else(AssetServiceError::not_found)?;
+    ensure_project_matches(body, &session.project_name)?;
     if validation_session_is_terminal(&session) {
-        return Ok(public_validation_result(&session));
+        return Ok(native_envelope(
+            request_context,
+            ArkAssetAction::GetVisualValidateResult,
+            public_validation_result(&session),
+        ));
     }
     if session.expires_at_unix_secs <= crate::clock::current_unix_secs() {
         return Err(AssetServiceError::new(
@@ -2405,7 +3532,7 @@ async fn get_validation_result_native(
     }
     let response =
         poll_validation_session(state, request_context, headers, caller, session, token).await?;
-    Ok(native_validation_payload(response))
+    Ok(response)
 }
 
 async fn refresh_validation_session(
@@ -2496,34 +3623,73 @@ async fn poll_validation_session(
         caller,
         &transport,
         ArkAssetAction::GetVisualValidateResult,
-        &json!({"BytedToken": token}),
+        &json!({"BytedToken": token, "ProjectName": session.project_name}),
     )
     .await?;
     let result = extract_result(&response.body).unwrap_or(&response.body);
-    let status = validation_result_status(result, &session.status);
-    let upstream_group_id = string_field(result, &["GroupId", "group_id"]);
+    let status = validation_result_status(result, &session.status)?;
+    let upstream_group_id = if value_field(result, &["GroupId", "group_id"]).is_some() {
+        Some(upstream_required_official_id(
+            result,
+            &["GroupId", "group_id"],
+            "GroupId",
+            "group-",
+        )?)
+    } else {
+        None
+    };
     let group_id = if let Some(upstream_group_id) = upstream_group_id.as_deref() {
-        let group =
-            ensure_validation_group(state, caller, &transport, upstream_group_id, result).await?;
-        if let Some(group) = group {
-            sync_validation_group_assets(
+        let projection = async {
+            let group = ensure_validation_group(
                 state,
-                request_context,
-                headers,
                 caller,
                 &transport,
-                &group,
                 upstream_group_id,
+                &session.project_name,
+                result,
             )
             .await?;
-            Some(group.id)
-        } else {
-            None
+            if let Some(group) = group {
+                sync_validation_group_assets(
+                    state,
+                    request_context,
+                    headers,
+                    caller,
+                    &transport,
+                    &group,
+                    upstream_group_id,
+                )
+                .await?;
+                Ok::<_, AssetServiceError>(Some(group.id))
+            } else {
+                Ok(None)
+            }
+        }
+        .await;
+        match projection {
+            Ok(group_id) => group_id,
+            Err(error) if error.status == StatusCode::CONFLICT => return Err(error),
+            Err(error) => {
+                tracing::error!(
+                    session_id = %session.id,
+                    upstream_group_id,
+                    error_code = %error.code,
+                    error = %error.message,
+                    "visual validation succeeded upstream but local asset projection needs retry"
+                );
+                None
+            }
         }
     } else {
         session.group_id.clone()
     };
-    let projected_group_id = group_id.clone();
+    let projection_pending = upstream_group_id.is_some() && group_id.is_none();
+    let persisted_status = if projection_pending {
+        "ProjectionPending".to_string()
+    } else {
+        status.clone()
+    };
+    let projected_group_id = upstream_group_id.clone();
     let now = crate::clock::current_unix_secs();
     let record = UpsertArkVisualValidationSessionRecord {
         id: session.id,
@@ -2533,13 +3699,14 @@ async fn poll_validation_session(
         provider_id: session.provider_id,
         endpoint_id: session.endpoint_id,
         key_id: session.key_id,
+        project_name: session.project_name,
         byted_token_hash: session.byted_token_hash,
         encrypted_byted_token: session.encrypted_byted_token,
         callback_state_hash: session.callback_state_hash,
-        status: status.clone(),
+        status: persisted_status.clone(),
         expires_at_unix_secs: session.expires_at_unix_secs,
         consumed_at_unix_secs: matches!(
-            status.to_ascii_lowercase().as_str(),
+            persisted_status.to_ascii_lowercase().as_str(),
             "succeeded" | "success" | "failed"
         )
         .then_some(now),
@@ -2553,33 +3720,17 @@ async fn poll_validation_session(
         created_at_unix_secs: session.created_at_unix_secs,
         updated_at_unix_secs: now,
     };
-    write_repo(state)?
+    if let Err(error) = write_repo(state)?
         .upsert_visual_validation_session(record)
         .await
-        .map_err(data_error)?;
-    let mut projected = response.body;
-    if let Some(group_id) = projected_group_id {
-        let mut replaced = false;
-        if let Some(object) = projected.get_mut("Result").and_then(Value::as_object_mut) {
-            object.insert("GroupId".to_string(), Value::String(group_id.clone()));
-            object.remove("group_id");
-            replaced = true;
-        }
-        if !replaced {
-            if let Some(object) = projected.get_mut("result").and_then(Value::as_object_mut) {
-                object.insert("GroupId".to_string(), Value::String(group_id.clone()));
-                object.remove("group_id");
-                replaced = true;
-            }
-        }
-        if !replaced {
-            if let Some(object) = projected.as_object_mut() {
-                object.insert("GroupId".to_string(), Value::String(group_id));
-                object.remove("group_id");
-            }
-        }
+    {
+        tracing::error!(
+            upstream_group_id = ?projected_group_id,
+            error = %error,
+            "visual validation succeeded upstream but session projection needs retry"
+        );
     }
-    Ok(projected)
+    Ok(response.body)
 }
 
 async fn ensure_validation_group(
@@ -2587,6 +3738,7 @@ async fn ensure_validation_group(
     caller: &AssetCaller,
     transport: &AssetTransport,
     upstream_group_id: &str,
+    project_name: &str,
     result: &Value,
 ) -> Result<Option<StoredAssetGroup>, AssetServiceError> {
     if let Some(group) = read_repo(state)?
@@ -2594,7 +3746,13 @@ async fn ensure_validation_group(
         .await
         .map_err(data_error)?
     {
-        if group.user_id != caller.user_id || group.deleted_at_unix_secs.is_some() {
+        if group.user_id != caller.user_id
+            || group.project_name != project_name
+            || group.endpoint_id != transport.snapshot.endpoint.id
+            || group.key_id != transport.snapshot.key.id
+            || !group.group_type.eq_ignore_ascii_case("LivenessFace")
+            || group.deleted_at_unix_secs.is_some()
+        {
             return Err(AssetServiceError::new(
                 StatusCode::CONFLICT,
                 "AssetGroupOwnershipConflict",
@@ -2612,6 +3770,7 @@ async fn ensure_validation_group(
         provider_id: transport.snapshot.provider.id.clone(),
         endpoint_id: transport.snapshot.endpoint.id.clone(),
         key_id: transport.snapshot.key.id.clone(),
+        project_name: project_name.to_string(),
         group_type: "LivenessFace".to_string(),
         name: string_field(result, &["GroupName", "Name"])
             .unwrap_or_else(|| "真人素材".to_string()),
@@ -2637,57 +3796,32 @@ async fn sync_validation_group_assets(
     group: &StoredAssetGroup,
     upstream_group_id: &str,
 ) -> Result<(), AssetServiceError> {
-    let mut synced = 0usize;
-    for page_number in 1..=100usize {
-        let response = execute_action(
-            state,
-            request_context,
-            headers,
-            caller,
-            transport,
-            ArkAssetAction::ListAssets,
-            &json!({
-                "Filter": {"GroupIds": [upstream_group_id]},
-                "PageNumber": page_number,
-                "PageSize": ARK_MAX_PAGE_SIZE,
-            }),
-        )
-        .await?;
-        let result = extract_result(&response.body).unwrap_or(&response.body);
-        let total = number_field(result, &["TotalCount", "Total"]).ok_or_else(|| {
-            AssetServiceError::new(
-                StatusCode::BAD_GATEWAY,
-                "InvalidUpstreamResponse",
-                "Ark ListAssets response is missing TotalCount",
-            )
-        })?;
-        let items = value_field(result, &["Items", "Assets"])
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                AssetServiceError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "InvalidUpstreamResponse",
-                    "Ark ListAssets response is missing Items",
-                )
-            })?;
-        for item in items {
-            upsert_validation_asset(state, group, upstream_group_id, item).await?;
-        }
-        synced = synced.saturating_add(items.len());
-        let total = usize::try_from(total).unwrap_or(usize::MAX);
-        if validation_asset_page_complete(items.len(), synced, total) {
-            return Ok(());
-        }
+    let fetched = fetch_upstream_list_items(
+        state,
+        request_context,
+        headers,
+        caller,
+        transport,
+        ArkAssetAction::ListAssets,
+        json!({"GroupIds": [upstream_group_id]}),
+        &group.project_name,
+        1,
+        MAX_LIST_MERGE_WINDOW,
+        "CreateTime",
+        "Desc",
+    )
+    .await?;
+    if fetched.items.len() != fetched.total {
+        return Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            format!("Ark validation group contains more than {MAX_LIST_MERGE_WINDOW} assets"),
+        ));
     }
-    Err(AssetServiceError::new(
-        StatusCode::BAD_GATEWAY,
-        "InvalidUpstreamResponse",
-        "Ark ListAssets response exceeded 100 pages",
-    ))
-}
-
-fn validation_asset_page_complete(_page_len: usize, synced: usize, total: usize) -> bool {
-    synced >= total
+    for item in &fetched.items {
+        upsert_validation_asset(state, group, upstream_group_id, item).await?;
+    }
+    Ok(())
 }
 
 async fn upsert_validation_asset(
@@ -2696,24 +3830,19 @@ async fn upsert_validation_asset(
     upstream_group_id: &str,
     item: &Value,
 ) -> Result<StoredAsset, AssetServiceError> {
-    let upstream_asset_id = upstream_required_string(item, &["Id", "AssetId"], "Id")?;
-    if let Some(item_group_id) = string_field(item, &["GroupId", "group_id"]) {
-        if item_group_id != upstream_group_id {
-            return Err(AssetServiceError::new(
-                StatusCode::BAD_GATEWAY,
-                "InvalidUpstreamResponse",
-                "Ark ListAssets returned an asset from another group",
-            ));
-        }
-    }
-    let asset_type = upstream_required_string(item, &["AssetType", "asset_type"], "AssetType")?;
-    if !asset_type.eq_ignore_ascii_case("Image") {
+    let upstream_asset_id =
+        upstream_required_official_id(item, &["Id", "AssetId"], "Id", "asset-")?;
+    let item_group_id = upstream_required_official_id(item, &["GroupId"], "GroupId", "group-")?;
+    if item_group_id != upstream_group_id {
         return Err(AssetServiceError::new(
             StatusCode::BAD_GATEWAY,
             "InvalidUpstreamResponse",
-            "Ark ListAssets returned a non-Image asset",
+            "Ark ListAssets returned an asset from another group",
         ));
     }
+    validate_upstream_asset_resource(item)?;
+    let asset_type = upstream_required_string(item, &["AssetType", "asset_type"], "AssetType")?;
+    let asset_type = normalize_upstream_asset_type(&asset_type)?;
     let existing = read_repo(state)?
         .find_asset_by_upstream(&group.id, &upstream_asset_id)
         .await
@@ -2730,9 +3859,11 @@ async fn upsert_validation_asset(
         group_id: group.id.clone(),
         user_id: group.user_id.clone(),
         api_key_id: group.api_key_id.clone(),
-        asset_type: "Image".to_string(),
-        name: string_field(item, &["Name", "name"]).unwrap_or_else(|| "真人素材".to_string()),
-        status: string_field(item, &["Status", "status"]).unwrap_or_else(|| "Active".to_string()),
+        asset_type,
+        name: upstream_optional_asset_name(item)?
+            .or_else(|| existing.as_ref().map(|asset| asset.name.clone()))
+            .unwrap_or_else(|| "未命名素材".to_string()),
+        status: upstream_required_string(item, &["Status"], "Status")?,
         error_code: error_field(item, "Code"),
         error_message: error_field(item, "Message"),
         moderation: object_field(item, &["ModerationResult", "Moderation", "moderation"]),
@@ -2768,9 +3899,196 @@ fn upstream_required_string(
         AssetServiceError::new(
             StatusCode::BAD_GATEWAY,
             "InvalidUpstreamResponse",
-            format!("Ark ListAssets item is missing {display_name}"),
+            format!("Ark response is missing {display_name}"),
         )
     })
+}
+
+fn upstream_optional_asset_name(value: &Value) -> Result<Option<String>, AssetServiceError> {
+    match value.get("Name") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) if name.trim().is_empty() => Ok(None),
+        Some(Value::String(name)) if name.chars().count() <= 64 => Ok(Some(name.clone())),
+        Some(Value::String(_)) => Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark response Name must be at most 64 characters",
+        )),
+        Some(_) => Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark response Name must be a string",
+        )),
+    }
+}
+
+fn upstream_required_official_id(
+    value: &Value,
+    names: &[&str],
+    display_name: &str,
+    prefix: &str,
+) -> Result<String, AssetServiceError> {
+    let id = upstream_required_string(value, names, display_name)?;
+    if !id.starts_with(prefix) || id.len() == prefix.len() {
+        return Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            format!("Ark response {display_name} must use the official {prefix} ID format"),
+        ));
+    }
+    Ok(id)
+}
+
+fn validate_upstream_identity(
+    value: &Value,
+    field: &str,
+    expected: &str,
+) -> Result<(), AssetServiceError> {
+    let actual = upstream_required_string(value, &[field], field)?;
+    if actual != expected {
+        return Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            format!("Ark response returned an unexpected {field}"),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_upstream_project_name(
+    value: &mut Value,
+    project_name: &str,
+) -> Result<(), AssetServiceError> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark response resource must be an object",
+        )
+    })?;
+    let aliases = object
+        .keys()
+        .filter(|name| {
+            name.eq_ignore_ascii_case("ProjectName") || name.eq_ignore_ascii_case("project_name")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for alias in aliases {
+        object.remove(&alias);
+    }
+    object.insert(
+        "ProjectName".to_string(),
+        Value::String(project_name.to_string()),
+    );
+    Ok(())
+}
+
+fn validate_upstream_group_resource(value: &Value) -> Result<(), AssetServiceError> {
+    let _ = upstream_required_official_id(value, &["Id"], "Id", "group-")?;
+    let group_type = upstream_required_string(value, &["GroupType"], "GroupType")?;
+    if !matches!(group_type.as_str(), "AIGC" | "LivenessFace") {
+        return Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark response GroupType must be AIGC or LivenessFace",
+        ));
+    }
+    if let Some(name) = value.get("Name") {
+        let name = name.as_str().ok_or_else(|| {
+            AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                "Ark response Name must be a string",
+            )
+        })?;
+        if name.chars().count() > 64 {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                "Ark response Name must be at most 64 characters",
+            ));
+        }
+    }
+    validate_upstream_timestamp(value, "CreateTime")?;
+    validate_upstream_timestamp(value, "UpdateTime")?;
+    Ok(())
+}
+
+fn validate_upstream_asset_resource(value: &Value) -> Result<(), AssetServiceError> {
+    let _ = upstream_required_official_id(value, &["Id"], "Id", "asset-")?;
+    let _ = upstream_required_official_id(value, &["GroupId"], "GroupId", "group-")?;
+    let _ = upstream_optional_asset_name(value)?;
+    let _ = normalize_upstream_asset_type(&upstream_required_string(
+        value,
+        &["AssetType"],
+        "AssetType",
+    )?)?;
+    let status = upstream_required_string(value, &["Status"], "Status")?;
+    if !matches!(status.as_str(), "Active" | "Processing" | "Failed") {
+        return Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark response Status must be Active, Processing, or Failed",
+        ));
+    }
+    validate_upstream_timestamp(value, "CreateTime")?;
+    validate_upstream_timestamp(value, "UpdateTime")?;
+    match value.get("URL") {
+        Some(Value::String(url)) if !url.trim().is_empty() => {
+            if !safe_provider_url(url.trim()) {
+                return Err(AssetServiceError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "InvalidUpstreamResponse",
+                    "Ark response URL is not a safe HTTPS address",
+                ));
+            }
+        }
+        None | Some(Value::Null) | Some(Value::String(_)) if status != "Active" => {}
+        None | Some(Value::Null) | Some(Value::String(_)) => {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                "Ark Active asset response is missing URL",
+            ));
+        }
+        Some(_) => {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                "Ark response URL must be a string",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_upstream_timestamp(value: &Value, field: &str) -> Result<(), AssetServiceError> {
+    match value.get(field) {
+        Some(Value::String(timestamp)) if !timestamp.trim().is_empty() => Ok(()),
+        Some(Value::String(_)) | None => Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            format!("Ark response is missing {field}"),
+        )),
+        Some(_) => Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            format!("Ark response {field} must be a string"),
+        )),
+    }
+}
+
+fn normalize_upstream_asset_type(value: &str) -> Result<String, AssetServiceError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "image" => Ok("Image".to_string()),
+        "video" => Ok("Video".to_string()),
+        "audio" => Ok("Audio".to_string()),
+        _ => Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark response AssetType must be Image, Video, or Audio",
+        )),
+    }
 }
 
 fn deterministic_validation_asset_id(
@@ -2860,11 +4178,19 @@ pub(crate) async fn project_video_asset_references(
     else {
         return Ok(projected);
     };
-    let mut local_ids = Vec::new();
-    collect_asset_reference_ids(content, &mut local_ids);
-    local_ids.sort();
-    local_ids.dedup();
-    if local_ids.is_empty() {
+    let mut references = Vec::new();
+    collect_asset_references(content, &mut references);
+    references.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut required_types = HashMap::<String, AssetReferenceType>::new();
+    for (asset_id, expected_type) in references {
+        if required_types
+            .insert(asset_id.clone(), expected_type)
+            .is_some_and(|existing| existing != expected_type)
+        {
+            return Err(format!("素材 {asset_id} 不能同时作为不同媒体类型引用"));
+        }
+    }
+    if required_types.is_empty() {
         return Ok(projected);
     }
     let reader = state
@@ -2872,17 +4198,52 @@ pub(crate) async fn project_video_asset_references(
         .asset_library_read_repository()
         .ok_or_else(|| "素材库数据读取服务不可用".to_string())?;
     let mut replacements = HashMap::new();
-    for local_id in local_ids {
-        let asset = reader
-            .find_asset_for_user(&local_id, user_id)
-            .await
-            .map_err(|error| format!("读取素材 {local_id} 失败: {error}"))?
+    for (requested_id, expected_type) in required_types {
+        if !requested_id.starts_with("asset-") || requested_id.len() == "asset-".len() {
+            return Err(format!(
+                "素材引用 {requested_id} 必须使用方舟返回的官方 asset-* ID"
+            ));
+        }
+        let mut asset = None;
+        let mut offset = 0usize;
+        loop {
+            let page = reader
+                .list_assets(&AssetListQuery {
+                    user_id: Some(user_id.to_string()),
+                    include_deleted: false,
+                    offset,
+                    limit: MAX_PAGE_SIZE,
+                    ..AssetListQuery::default()
+                })
+                .await
+                .map_err(|error| format!("读取素材 {requested_id} 失败: {error}"))?;
+            let page_len = page.items.len();
+            asset = page
+                .items
+                .into_iter()
+                .find(|asset| asset.upstream_asset_id.as_deref() == Some(requested_id.as_str()));
+            if asset.is_some() || page_len == 0 || offset + page_len >= page.total {
+                break;
+            }
+            offset = offset.saturating_add(page_len);
+        }
+        let asset = asset
             .filter(|asset| !asset.is_deleted)
-            .ok_or_else(|| format!("素材 {local_id} 不存在或不属于当前用户"))?;
+            .ok_or_else(|| format!("素材 {requested_id} 不存在或不属于当前用户"))?;
         if !asset.status.eq_ignore_ascii_case("Active") {
             return Err(format!(
-                "素材 {local_id} 当前状态为 {}，必须为 Active",
+                "素材 {requested_id} 当前状态为 {}，必须为 Active",
                 asset.status
+            ));
+        }
+        if !asset
+            .asset_type
+            .eq_ignore_ascii_case(expected_type.official_name())
+        {
+            return Err(format!(
+                "素材 {requested_id} 的类型为 {}，不能用于 {} 字段",
+                asset.asset_type,
+                expected_type.field_name()
             ));
         }
         let group = reader
@@ -2890,110 +4251,159 @@ pub(crate) async fn project_video_asset_references(
             .await
             .map_err(|error| format!("读取素材组失败: {error}"))?
             .filter(|group| group.deleted_at_unix_secs.is_none())
-            .ok_or_else(|| format!("素材 {local_id} 所属素材组不存在"))?;
+            .ok_or_else(|| format!("素材 {requested_id} 所属素材组不存在"))?;
         if group.provider_id != transport.provider.id {
-            return Err(format!("素材 {local_id} 与本次视频生成的 Provider 不一致"));
+            return Err(format!(
+                "素材 {requested_id} 与本次视频生成的 Provider 不一致"
+            ));
         }
         let upstream_id = asset
             .upstream_asset_id
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("素材 {local_id} 尚未完成上游绑定"))?;
-        replacements.insert(local_id, upstream_id);
+            .filter(|value| value.starts_with("asset-") && value.len() > "asset-".len())
+            .ok_or_else(|| format!("素材 {requested_id} 尚未完成上游绑定"))?;
+        replacements.insert(requested_id, upstream_id);
     }
-    replace_asset_reference_ids(content, &replacements);
+    replace_asset_references(content, &replacements);
     Ok(projected)
 }
 
-fn collect_asset_reference_ids(value: &Value, output: &mut Vec<String>) {
-    match value {
-        Value::String(value) => {
-            if let Some(id) = value
-                .strip_prefix("asset://")
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-            {
-                output.push(id.to_string());
-            }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssetReferenceType {
+    Image,
+    Video,
+    Audio,
+}
+
+impl AssetReferenceType {
+    fn from_content_type(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "image_url" | "input_image" => Some(Self::Image),
+            "video_url" | "input_video" => Some(Self::Video),
+            "audio_url" | "input_audio" => Some(Self::Audio),
+            _ => None,
         }
-        Value::Array(values) => {
-            for value in values {
-                collect_asset_reference_ids(value, output);
-            }
+    }
+
+    fn field_name(self) -> &'static str {
+        match self {
+            Self::Image => "image_url",
+            Self::Video => "video_url",
+            Self::Audio => "audio_url",
         }
-        Value::Object(values) => {
-            for value in values.values() {
-                collect_asset_reference_ids(value, output);
-            }
+    }
+
+    fn official_name(self) -> &'static str {
+        match self {
+            Self::Image => "Image",
+            Self::Video => "Video",
+            Self::Audio => "Audio",
         }
-        _ => {}
     }
 }
 
-fn replace_asset_reference_ids(value: &mut Value, replacements: &HashMap<String, String>) {
+fn media_reference_url<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    let media = value.as_object()?.get(field)?;
+    media
+        .as_str()
+        .or_else(|| media.as_object()?.get("url")?.as_str())
+}
+
+fn media_reference_url_mut<'a>(
+    object: &'a mut Map<String, Value>,
+    field: &str,
+) -> Option<&'a mut String> {
+    let media = object.get_mut(field)?;
+    match media {
+        Value::String(url) => Some(url),
+        Value::Object(object) => match object.get_mut("url") {
+            Some(Value::String(url)) => Some(url),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn collect_asset_references(value: &Value, output: &mut Vec<(String, AssetReferenceType)>) {
     match value {
-        Value::String(value) => {
-            if let Some(id) = value.strip_prefix("asset://").map(str::trim) {
-                if let Some(upstream_id) = replacements.get(id) {
-                    *value = format!("asset://{upstream_id}");
+        Value::Array(values) => {
+            for value in values {
+                collect_asset_references(value, output);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(reference_type) = object
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(AssetReferenceType::from_content_type)
+            {
+                if let Some(id) = media_reference_url(value, reference_type.field_name())
+                    .and_then(|url| url.strip_prefix("asset://"))
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    output.push((id.to_string(), reference_type));
                 }
             }
-        }
-        Value::Array(values) => {
-            for value in values {
-                replace_asset_reference_ids(value, replacements);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values_mut() {
-                replace_asset_reference_ids(value, replacements);
+            if let Some(nested) = object.get("content") {
+                collect_asset_references(nested, output);
             }
         }
         _ => {}
     }
 }
 
-fn group_native_json(group: &StoredAssetGroup) -> Value {
-    json!({
-        "Id": group.id,
-        "GroupType": group.group_type,
-        "Name": group.name,
-        "Description": group.description,
-        "Status": group.status,
-        "CreateTime": unix_secs_rfc3339(group.created_at_unix_secs),
-        "UpdateTime": unix_secs_rfc3339(group.updated_at_unix_secs),
-    })
+fn replace_asset_references(value: &mut Value, replacements: &HashMap<String, String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                replace_asset_references(value, replacements);
+            }
+        }
+        Value::Object(object) => {
+            let reference_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(AssetReferenceType::from_content_type);
+            if let Some(reference_type) = reference_type {
+                if let Some(url) = media_reference_url_mut(object, reference_type.field_name()) {
+                    if let Some(id) = url.strip_prefix("asset://").map(str::trim) {
+                        if let Some(upstream_id) = replacements.get(id) {
+                            *url = format!("asset://{upstream_id}");
+                        }
+                    }
+                }
+            }
+            if let Some(nested) = object.get_mut("content") {
+                replace_asset_references(nested, replacements);
+            }
+        }
+        _ => {}
+    }
 }
 
-fn asset_native_json(asset: &StoredAsset) -> Value {
-    let metadata = asset.sanitized_metadata.as_ref();
-    json!({
-        "Id": asset.id,
-        "GroupId": asset.group_id,
-        "AssetType": asset.asset_type,
-        "Name": asset.name,
-        "Status": asset.status,
-        "URL": format!("/api/material-assets/assets/{}/preview", asset.id),
-        "Error": if asset.error_code.is_some() || asset.error_message.is_some() {
-            Some(json!({"Code": asset.error_code, "Message": asset.error_message}))
-        } else { None },
-        "ModerationResult": asset.moderation,
-        "Moderation": asset.moderation,
-        "MimeType": metadata.and_then(|value| value_field(value, &["MimeType", "mime_type"])).cloned(),
-        "Size": metadata.and_then(|value| value_field(value, &["Size", "Bytes", "size_bytes"])).cloned(),
-        "Width": metadata.and_then(|value| value_field(value, &["Width", "width"])).cloned(),
-        "Height": metadata.and_then(|value| value_field(value, &["Height", "height"])).cloned(),
-        "Duration": metadata.and_then(|value| value_field(value, &["Duration", "duration"])).cloned(),
-        "CreateTime": unix_secs_rfc3339(asset.created_at_unix_secs),
-        "UpdateTime": unix_secs_rfc3339(asset.updated_at_unix_secs),
-    })
+fn public_group_id(group: &StoredAssetGroup) -> &str {
+    group
+        .upstream_group_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(group.id.as_str())
+}
+
+fn public_asset_id(asset: &StoredAsset) -> &str {
+    asset
+        .upstream_asset_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(asset.id.as_str())
 }
 
 fn group_rest_json(group: &StoredAssetGroup, asset_count: usize) -> Value {
     json!({
-        "id": group.id,
+        "id": public_group_id(group),
         "name": group.name,
         "description": group.description,
         "group_type": group.group_type,
+        "project_name": group.project_name,
         "status": group.status,
         "asset_count": asset_count,
         "created_at": unix_secs_rfc3339(group.created_at_unix_secs),
@@ -3001,19 +4411,29 @@ fn group_rest_json(group: &StoredAssetGroup, asset_count: usize) -> Value {
     })
 }
 
-fn asset_rest_json(asset: &StoredAsset, group: Option<&StoredAssetGroup>, is_admin: bool) -> Value {
+fn asset_rest_json(asset: &StoredAsset, group: &StoredAssetGroup, is_admin: bool) -> Value {
     let metadata = asset.sanitized_metadata.as_ref();
+    let public_id = public_asset_id(asset);
+    let public_group_id = public_group_id(group);
+    let preview_prefix = if is_admin {
+        "/api/admin/material-assets/assets"
+    } else {
+        "/api/material-assets/assets"
+    };
     let mut body = json!({
-        "id": asset.id,
-        "uri": format!("asset://{}", asset.id),
+        "id": public_id,
+        "uri": format!("asset://{public_id}"),
         "name": asset.name,
         "status": asset.status,
         "asset_type": asset.asset_type,
         "media_type": asset.asset_type.to_ascii_lowercase(),
         "mime_type": metadata.and_then(|value| value_field(value, &["MimeType", "mime_type"])).cloned(),
-        "group_id": asset.group_id,
-        "group_name": group.map(|group| group.name.as_str()),
+        "group_id": public_group_id,
+        "group_name": group.name,
+        "project_name": group.project_name,
         "source_type": "url",
+        "url": asset.provider_url,
+        "preview_url": format!("{preview_prefix}/{public_id}/preview"),
         "size_bytes": metadata.and_then(|value| value_field(value, &["Size", "Bytes", "size_bytes"])).cloned(),
         "width": metadata.and_then(|value| value_field(value, &["Width", "width"])).cloned(),
         "height": metadata.and_then(|value| value_field(value, &["Height", "height"])).cloned(),
@@ -3029,12 +4449,10 @@ fn asset_rest_json(asset: &StoredAsset, group: Option<&StoredAssetGroup>, is_adm
     if is_admin {
         if let Some(object) = body.as_object_mut() {
             object.insert("user_id".to_string(), Value::String(asset.user_id.clone()));
-            if let Some(group) = group {
-                object.insert(
-                    "provider_id".to_string(),
-                    Value::String(group.provider_id.clone()),
-                );
-            }
+            object.insert(
+                "provider_id".to_string(),
+                Value::String(group.provider_id.clone()),
+            );
         }
     }
     body
@@ -3057,31 +4475,67 @@ fn validation_session_rest_json(
         "status": session.status,
         "verification_url": verification_url,
         "h5_link": verification_url,
-        "group_id": session.group_id,
+        "group_id": public_validation_group_id(session),
         "error_message": session.sanitized_result.as_ref().and_then(|value| string_field(value, &["ErrorMessage", "Message"])),
         "expires_at": unix_secs_rfc3339(session.expires_at_unix_secs),
     }))
 }
 
 fn validation_session_is_terminal(session: &StoredArkVisualValidationSession) -> bool {
-    matches!(
-        session.status.trim().to_ascii_lowercase().as_str(),
-        "succeeded" | "success" | "failed"
-    ) || session.consumed_at_unix_secs.is_some()
+    let normalized = session.status.trim().to_ascii_lowercase();
+    normalized == "failed"
+        || ((normalized == "succeeded" || normalized == "success")
+            && public_validation_group_id(session).is_some())
 }
 
-fn validation_result_status(result: &Value, fallback: &str) -> String {
+fn validation_result_status(result: &Value, fallback: &str) -> Result<String, AssetServiceError> {
     if string_field(result, &["GroupId", "group_id"]).is_some() {
-        return "Succeeded".to_string();
+        return Ok("Succeeded".to_string());
     }
     if let Some(status) = string_field(result, &["Status", "status"]) {
-        return status;
+        if matches!(
+            status.to_ascii_lowercase().as_str(),
+            "succeeded" | "success"
+        ) {
+            return Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                "Ark GetVisualValidateResult reported success without GroupId",
+            ));
+        }
+        return Ok(status);
     }
     match number_field(result, &["ResultCode", "resultCode", "result_code"]) {
-        Some(10000) => "Succeeded".to_string(),
-        Some(_) => "Failed".to_string(),
-        None => fallback.to_string(),
+        Some(10000) => Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark GetVisualValidateResult returned resultCode=10000 without GroupId",
+        )),
+        Some(_) => Ok("Failed".to_string()),
+        None if matches!(
+            fallback.trim().to_ascii_lowercase().as_str(),
+            "succeeded" | "success"
+        ) =>
+        {
+            Err(AssetServiceError::new(
+                StatusCode::BAD_GATEWAY,
+                "InvalidUpstreamResponse",
+                "Ark GetVisualValidateResult is missing GroupId",
+            ))
+        }
+        None => Err(AssetServiceError::new(
+            StatusCode::BAD_GATEWAY,
+            "InvalidUpstreamResponse",
+            "Ark GetVisualValidateResult response is missing GroupId, Status, and ResultCode",
+        )),
     }
+}
+
+fn public_validation_group_id(session: &StoredArkVisualValidationSession) -> Option<String> {
+    session
+        .sanitized_result
+        .as_ref()
+        .and_then(|value| string_field(value, &["GroupId"]))
 }
 
 fn public_validation_result(session: &StoredArkVisualValidationSession) -> Value {
@@ -3089,7 +4543,7 @@ fn public_validation_result(session: &StoredArkVisualValidationSession) -> Value
         session.status.trim().to_ascii_lowercase().as_str(),
         "succeeded" | "success"
     ) {
-        if let Some(group_id) = session.group_id.as_ref() {
+        if let Some(group_id) = public_validation_group_id(session) {
             return json!({"GroupId": group_id});
         }
     }
@@ -3100,8 +4554,8 @@ fn public_validation_result(session: &StoredArkVisualValidationSession) -> Value
     if let Some(object) = result.as_object_mut() {
         object.remove("EncryptedVerificationUrl");
         object.insert("Status".to_string(), Value::String(session.status.clone()));
-        if let Some(group_id) = session.group_id.as_ref() {
-            object.insert("GroupId".to_string(), Value::String(group_id.clone()));
+        if let Some(group_id) = public_validation_group_id(session) {
+            object.insert("GroupId".to_string(), Value::String(group_id));
         }
     }
     result
@@ -3176,29 +4630,79 @@ fn native_envelope(
     })
 }
 
-fn native_validation_payload(body: Value) -> Value {
-    extract_result(&body).cloned().unwrap_or(body)
-}
-
-fn native_create_validation_payload(body: Value) -> Value {
-    let result = extract_result(&body).unwrap_or(&body);
-    let mut projected = Map::new();
-    for (name, aliases) in [
-        (
-            "BytedToken",
-            &["BytedToken", "Token", "byted_token", "token"][..],
-        ),
-        ("H5Link", &["H5Link", "H5Url", "VerificationUrl", "URL"][..]),
-        (
-            "CallbackURL",
-            &["CallbackURL", "callback_url", "ReturnUrl", "return_url"][..],
-        ),
-    ] {
-        if let Some(value) = string_field(result, aliases) {
-            projected.insert(name.to_string(), Value::String(value));
+fn canonical_visual_success(
+    request_context: &GatewayPublicRequestContext,
+    action: ArkAssetAction,
+    body: Value,
+) -> Result<Value, AssetServiceError> {
+    let upstream = extract_result(&body).unwrap_or(&body);
+    let result = match action {
+        ArkAssetAction::CreateVisualValidateSession => {
+            let byted_token = upstream_required_string(
+                upstream,
+                &["BytedToken", "Token", "byted_token", "token"],
+                "BytedToken",
+            )?;
+            let callback_url = upstream_required_string(
+                upstream,
+                &["CallbackURL", "callback_url"],
+                "CallbackURL",
+            )?;
+            let h5_link = validation_verification_url(upstream).ok_or_else(|| {
+                AssetServiceError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "InvalidUpstreamResponse",
+                    "Ark CreateVisualValidateSession response is missing a safe H5Link",
+                )
+            })?;
+            json!({
+                "BytedToken": byted_token,
+                "CallbackURL": callback_url,
+                "H5Link": h5_link,
+            })
         }
-    }
-    Value::Object(projected)
+        ArkAssetAction::GetVisualValidateResult => {
+            if value_field(upstream, &["GroupId", "group_id"]).is_some() {
+                let group_id = upstream_required_official_id(
+                    upstream,
+                    &["GroupId", "group_id"],
+                    "GroupId",
+                    "group-",
+                )?;
+                json!({"GroupId": group_id})
+            } else {
+                let status = upstream_required_string(upstream, &["Status", "status"], "Status")?;
+                if !matches!(
+                    status.to_ascii_lowercase().as_str(),
+                    "pending" | "processing" | "failed"
+                ) {
+                    return Err(AssetServiceError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "InvalidUpstreamResponse",
+                        "Ark GetVisualValidateResult returned success without GroupId",
+                    ));
+                }
+                let mut result = json!({"Status": status});
+                if let Some(result_code) =
+                    number_field(upstream, &["ResultCode", "resultCode", "result_code"])
+                {
+                    result
+                        .as_object_mut()
+                        .expect("canonical visual result is an object")
+                        .insert("ResultCode".to_string(), json!(result_code));
+                }
+                result
+            }
+        }
+        _ => {
+            return Err(AssetServiceError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "canonical visual response used for a non-visual action",
+            ));
+        }
+    };
+    Ok(native_envelope(request_context, action, result))
 }
 
 fn native_error_response(error: AssetServiceError) -> Response<Body> {
@@ -3206,6 +4710,64 @@ fn native_error_response(error: AssetServiceError) -> Response<Body> {
         .provider_body
         .unwrap_or_else(|| build_error_envelope(&error.code, &error.message));
     json_response(error.status, body)
+}
+
+fn native_error_response_with_context(
+    error: AssetServiceError,
+    request_context: &GatewayPublicRequestContext,
+    action: Option<ArkAssetAction>,
+) -> Response<Body> {
+    let status = error.status;
+    let body = if let Some(mut provider_body) = error.provider_body {
+        if let Some(metadata) = provider_body
+            .get_mut("ResponseMetadata")
+            .and_then(Value::as_object_mut)
+        {
+            metadata
+                .entry("Version".to_string())
+                .or_insert_with(|| Value::String(super::ARK_ASSET_VERSION.to_string()));
+            metadata
+                .entry("Service".to_string())
+                .or_insert_with(|| Value::String("ark".to_string()));
+            metadata
+                .entry("Region".to_string())
+                .or_insert_with(|| Value::String("cn-beijing".to_string()));
+            if let Some(action) = action {
+                metadata
+                    .entry("Action".to_string())
+                    .or_insert_with(|| Value::String(action.as_str().to_string()));
+            }
+        }
+        provider_body
+    } else {
+        let mut metadata = Map::from_iter([
+            (
+                "RequestId".to_string(),
+                Value::String(request_context.trace_id.clone()),
+            ),
+            (
+                "Version".to_string(),
+                Value::String(super::ARK_ASSET_VERSION.to_string()),
+            ),
+            ("Service".to_string(), Value::String("ark".to_string())),
+            (
+                "Region".to_string(),
+                Value::String("cn-beijing".to_string()),
+            ),
+            (
+                "Error".to_string(),
+                json!({"Code": error.code, "Message": error.message}),
+            ),
+        ]);
+        if let Some(action) = action {
+            metadata.insert(
+                "Action".to_string(),
+                Value::String(action.as_str().to_string()),
+            );
+        }
+        json!({"ResponseMetadata": metadata})
+    };
+    json_response(status, body)
 }
 
 fn rest_error_response(error: AssetServiceError) -> Response<Body> {
@@ -3371,14 +4933,214 @@ fn data_error(error: aether_data_contracts::DataLayerError) -> AssetServiceError
     AssetServiceError::unavailable(error.to_string())
 }
 
+fn missing_parameter(display_name: &str) -> AssetServiceError {
+    AssetServiceError::new(
+        StatusCode::BAD_REQUEST,
+        format!("MissingParameter.{display_name}"),
+        format!("{display_name} is required"),
+    )
+}
+
 fn required_string_field(
     value: &Value,
     names: &[&str],
     display_name: &str,
 ) -> Result<String, AssetServiceError> {
-    string_field(value, names)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| AssetServiceError::bad_request(format!("{display_name} is required")))
+    match value_field(value, names) {
+        None | Some(Value::Null) => Err(missing_parameter(display_name)),
+        Some(Value::String(value)) if value.trim().is_empty() => {
+            Err(missing_parameter(display_name))
+        }
+        Some(Value::String(value)) => Ok(value.trim().to_string()),
+        Some(_) => Err(AssetServiceError::bad_request(format!(
+            "{display_name} must be a string"
+        ))),
+    }
+}
+
+fn optional_native_string(
+    value: &Value,
+    names: &[&str],
+    display_name: &str,
+) -> Result<Option<String>, AssetServiceError> {
+    match value_field(value, names) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.trim().to_string()))
+        }
+        Some(Value::String(_)) => Err(AssetServiceError::bad_request(format!(
+            "{display_name} must not be empty"
+        ))),
+        Some(_) => Err(AssetServiceError::bad_request(format!(
+            "{display_name} must be a string"
+        ))),
+    }
+}
+
+fn required_object_field<'a>(
+    value: &'a Value,
+    names: &[&str],
+    display_name: &str,
+) -> Result<&'a Value, AssetServiceError> {
+    optional_object_field(value, names, display_name)?
+        .ok_or_else(|| missing_parameter(display_name))
+}
+
+fn optional_object_field<'a>(
+    value: &'a Value,
+    names: &[&str],
+    display_name: &str,
+) -> Result<Option<&'a Value>, AssetServiceError> {
+    match value_field(value, names) {
+        None => Ok(None),
+        Some(value) if value.is_object() => Ok(Some(value)),
+        Some(_) => Err(AssetServiceError::bad_request(format!(
+            "{display_name} must be an object"
+        ))),
+    }
+}
+
+fn optional_string_array_field(
+    value: &Value,
+    names: &[&str],
+    display_name: &str,
+) -> Result<Vec<String>, AssetServiceError> {
+    let Some(value) = value_field(value, names) else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        AssetServiceError::bad_request(format!("{display_name} must be an array of strings"))
+    })?;
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AssetServiceError::bad_request(format!(
+                    "{display_name} must contain non-empty strings"
+                ))
+            })?;
+        if !output.iter().any(|existing| existing == value) {
+            output.push(value.to_string());
+        }
+    }
+    Ok(output)
+}
+
+fn validate_requested_group_ids(ids: &[String]) -> Result<(), AssetServiceError> {
+    if ids
+        .iter()
+        .any(|id| !id.starts_with("group-") || id.len() == "group-".len())
+    {
+        return Err(AssetServiceError::bad_request(
+            "Filter.GroupIds must contain official Ark group-* IDs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_official_request_id(
+    id: &str,
+    prefix: &str,
+    field: &str,
+) -> Result<(), AssetServiceError> {
+    if id.starts_with(prefix) && id.len() > prefix.len() {
+        return Ok(());
+    }
+    Err(AssetServiceError::bad_request(format!(
+        "{field} must use the official Ark {prefix}* ID format"
+    )))
+}
+
+fn reject_unknown_fields(
+    value: &Value,
+    allowed: &[&str],
+    display_name: &str,
+) -> Result<(), AssetServiceError> {
+    let Some(object) = value.as_object() else {
+        return Err(AssetServiceError::bad_request(format!(
+            "{display_name} must be an object"
+        )));
+    };
+    if let Some(name) = object.keys().find(|name| {
+        !allowed
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    }) {
+        return Err(AssetServiceError::bad_request(format!(
+            "{display_name}.{name} is not part of the official request"
+        )));
+    }
+    Ok(())
+}
+
+fn native_positive_integer(
+    value: &Value,
+    names: &[&str],
+    display_name: &str,
+    required: bool,
+    default: usize,
+) -> Result<usize, AssetServiceError> {
+    let Some(value) = value_field(value, names) else {
+        return required
+            .then(|| missing_parameter(display_name))
+            .map_or(Ok(default), Err);
+    };
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            AssetServiceError::bad_request(format!("{display_name} must be a positive integer"))
+        })
+}
+
+fn required_native_page_number(value: &Value) -> Result<usize, AssetServiceError> {
+    native_positive_integer(value, &["PageNumber", "page_number"], "PageNumber", true, 1)
+}
+
+fn required_native_page_size(value: &Value) -> Result<usize, AssetServiceError> {
+    let page_size = native_positive_integer(
+        value,
+        &["PageSize", "page_size"],
+        "PageSize",
+        true,
+        ARK_DEFAULT_PAGE_SIZE,
+    )?;
+    if page_size > ARK_MAX_PAGE_SIZE {
+        return Err(AssetServiceError::bad_request(
+            "PageSize must be between 1 and 100",
+        ));
+    }
+    Ok(page_size)
+}
+
+fn optional_native_page_number(value: &Value) -> Result<usize, AssetServiceError> {
+    native_positive_integer(
+        value,
+        &["PageNumber", "page_number"],
+        "PageNumber",
+        false,
+        1,
+    )
+}
+
+fn optional_native_page_size(value: &Value) -> Result<usize, AssetServiceError> {
+    let page_size = native_positive_integer(
+        value,
+        &["PageSize", "page_size"],
+        "PageSize",
+        false,
+        ARK_DEFAULT_PAGE_SIZE,
+    )?;
+    if page_size > ARK_MAX_PAGE_SIZE {
+        return Err(AssetServiceError::bad_request(
+            "PageSize must be between 1 and 100",
+        ));
+    }
+    Ok(page_size)
 }
 
 fn validate_group_text_lengths(value: &Value) -> Result<(), AssetServiceError> {
@@ -3397,13 +5159,26 @@ fn validate_group_text_lengths(value: &Value) -> Result<(), AssetServiceError> {
     Ok(())
 }
 
+fn validate_asset_text_lengths(value: &Value) -> Result<(), AssetServiceError> {
+    if string_field(value, &["Name", "name"]).is_some_and(|name| name.chars().count() > 64) {
+        return Err(AssetServiceError::bad_request(
+            "Name must be at most 64 characters",
+        ));
+    }
+    Ok(())
+}
+
 fn required_asset_type(value: &Value) -> Result<String, AssetServiceError> {
     let asset_type =
         required_string_field(value, &["AssetType", "asset_type", "type"], "AssetType")?;
-    if !asset_type.trim().eq_ignore_ascii_case("image") {
-        return Err(AssetServiceError::bad_request("AssetType must be Image"));
+    match asset_type.trim().to_ascii_lowercase().as_str() {
+        "image" => Ok("Image".to_string()),
+        "video" => Ok("Video".to_string()),
+        "audio" => Ok("Audio".to_string()),
+        _ => Err(AssetServiceError::bad_request(
+            "AssetType must be Image, Video, or Audio",
+        )),
     }
-    Ok("Image".to_string())
 }
 
 fn create_group_type(value: &Value) -> Result<String, AssetServiceError> {
@@ -3757,21 +5532,35 @@ fn sort_native_assets(assets: &mut [StoredAsset], body: &Value) -> Result<(), As
     Ok(())
 }
 
-fn validate_native_project(body: &Value) -> Result<(), AssetServiceError> {
-    let Some(project) = value_field(body, &["ProjectName", "project_name"]) else {
-        return Ok(());
-    };
-    if project.is_null()
-        || project
-            .as_str()
-            .map(str::trim)
-            .is_some_and(|project| project.eq_ignore_ascii_case("default"))
-    {
-        return Ok(());
+fn native_project_name(body: &Value) -> Result<String, AssetServiceError> {
+    match value_field(body, &["ProjectName", "project_name"]) {
+        None | Some(Value::Null) => Ok("default".to_string()),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            let value = value.trim();
+            if value.chars().count() > 128 {
+                return Err(AssetServiceError::bad_request(
+                    "ProjectName must be at most 128 characters",
+                ));
+            }
+            Ok(value.to_string())
+        }
+        Some(Value::String(_)) => Err(AssetServiceError::bad_request(
+            "ProjectName must not be empty",
+        )),
+        Some(_) => Err(AssetServiceError::bad_request(
+            "ProjectName must be a string",
+        )),
     }
-    Err(AssetServiceError::bad_request(
-        "ProjectName must be omitted or default",
-    ))
+}
+
+fn ensure_project_matches(body: &Value, expected: &str) -> Result<String, AssetServiceError> {
+    let project_name = native_project_name(body)?;
+    if project_name != expected {
+        return Err(AssetServiceError::bad_request(format!(
+            "ProjectName must be {expected} for this resource"
+        )));
+    }
+    Ok(project_name)
 }
 
 fn body_user_id(value: &Value) -> Option<String> {
@@ -3845,12 +5634,13 @@ mod tests {
     fn stored_group(id: &str, user_id: &str) -> UpsertAssetGroupRecord {
         UpsertAssetGroupRecord {
             id: id.to_string(),
-            upstream_group_id: Some(format!("upstream-{id}")),
+            upstream_group_id: Some(format!("group-upstream-{id}")),
             user_id: user_id.to_string(),
             api_key_id: Some(format!("key-{user_id}")),
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "provider-key-1".to_string(),
+            project_name: "default".to_string(),
             group_type: "AIGC".to_string(),
             name: "group".to_string(),
             description: None,
@@ -3864,7 +5654,7 @@ mod tests {
     fn stored_asset(id: &str, group_id: &str, user_id: &str) -> UpsertAssetRecord {
         UpsertAssetRecord {
             id: id.to_string(),
-            upstream_asset_id: Some(format!("upstream-{id}")),
+            upstream_asset_id: Some(format!("asset-upstream-{id}")),
             group_id: group_id.to_string(),
             user_id: user_id.to_string(),
             api_key_id: Some(format!("key-{user_id}")),
@@ -4307,8 +6097,8 @@ mod tests {
         .expect_err("missing callback URL must be rejected before provider selection");
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.code, "InvalidParameter");
-        assert_eq!(error.message, "callback_url is required");
+        assert_eq!(error.code, "MissingParameter.CallbackURL");
+        assert_eq!(error.message, "CallbackURL is required");
     }
 
     #[tokio::test]
@@ -4342,17 +6132,17 @@ mod tests {
     }
 
     #[test]
-    fn create_asset_accepts_only_k23_image_type() {
-        assert_eq!(
-            required_asset_type(&json!({"AssetType": "image"})).unwrap(),
-            "Image"
-        );
-        for asset_type in ["Video", "Audio"] {
-            let error = required_asset_type(&json!({"AssetType": asset_type}))
-                .expect_err("k23 only accepts Image assets");
-            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{asset_type}");
-            assert_eq!(error.message, "AssetType must be Image", "{asset_type}");
+    fn create_asset_accepts_all_official_asset_types() {
+        for (input, expected) in [("image", "Image"), ("Video", "Video"), ("AUDIO", "Audio")] {
+            assert_eq!(
+                required_asset_type(&json!({"AssetType": input})).unwrap(),
+                expected
+            );
         }
+        let error = required_asset_type(&json!({"AssetType": "Document"}))
+            .expect_err("non-official asset types must be rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "AssetType must be Image, Video, or Audio");
     }
 
     #[tokio::test]
@@ -4809,7 +6599,6 @@ mod tests {
             "PageSize": 50,
             "Filter": {
                 "GroupIds": ["group-1", "group-2"],
-                "AssetType": "Image",
                 "Statuses": ["Active", "Processing"]
             }
         });
@@ -4827,7 +6616,6 @@ mod tests {
             string_list_field(filter, &["GroupIds"]),
             vec!["group-1", "group-2"]
         );
-        assert_eq!(string_field(filter, &["AssetType"]), Some("Image".into()));
         assert_eq!(
             string_list_field(filter, &["Statuses"]),
             vec!["Active", "Processing"]
@@ -4853,12 +6641,9 @@ mod tests {
         .unwrap();
         assert_eq!(groups[0].id, "older");
 
-        assert!(validate_native_project(&json!({"ProjectName": "default"})).is_ok());
         assert_eq!(
-            validate_native_project(&json!({"ProjectName": "another-project"}))
-                .expect_err("Aether does not persist Ark project bindings")
-                .message,
-            "ProjectName must be omitted or default"
+            native_project_name(&json!({"ProjectName": "another-project"})).unwrap(),
+            "another-project"
         );
     }
 
@@ -4925,12 +6710,8 @@ mod tests {
             Some("https://verify.example.com/session".into())
         );
         assert_eq!(
-            native_create_validation_payload(json!({"Result": validation})),
-            json!({
-                "BytedToken": "token-upstream",
-                "H5Link": "https://verify.example.com/session",
-                "CallbackURL": "https://example.com/callback"
-            })
+            json!({"ResponseMetadata": {}, "Result": validation})["Result"]["BytedToken"],
+            "token-upstream"
         );
 
         let headers = HeaderMap::new();
@@ -4963,11 +6744,91 @@ mod tests {
         assert_eq!(metadata["Version"], "2024-01-01");
         assert_eq!(metadata["Service"], "ark");
         assert_eq!(metadata["Region"], "cn-beijing");
-        let group_resource =
-            group_native_json(&stored_group("group-local", "user-1").into_stored());
-        assert_eq!(group_resource["Id"], "group-local");
-        assert!(group_resource.get("Group").is_none());
-        assert!(group_resource.get("GroupId").is_none());
+    }
+
+    #[tokio::test]
+    async fn upstream_project_name_is_mapped_to_the_bound_aether_project() {
+        let mut group = json!({
+            "Id": "group-20260825120000-a1b2c",
+            "Name": "products",
+            "GroupType": "AIGC",
+            "ProjectName": "provider-internal-project",
+            "CreateTime": "2026-08-25 12:00:00",
+            "UpdateTime": "2026-08-25 12:00:00"
+        });
+        normalize_upstream_project_name(&mut group, "default")
+            .expect("provider project name should be mapped");
+        validate_upstream_group_resource(&group).expect("mapped group should remain valid");
+        assert_eq!(group["ProjectName"], "default");
+
+        for mut value in [
+            json!({}),
+            json!({"ProjectName": ""}),
+            json!({"project_name": null}),
+        ] {
+            normalize_upstream_project_name(&mut value, "default")
+                .expect("missing or empty provider project name should be mapped");
+            assert_eq!(value, json!({"ProjectName": "default"}));
+        }
+
+        let mut asset = json!({
+            "Id": "asset-20260825120000-d3e4f",
+            "GroupId": "group-20260825120000-a1b2c",
+            "Name": "portrait",
+            "AssetType": "Image",
+            "Status": "Processing",
+            "project_name": 42,
+            "CreateTime": "2026-08-25 12:00:00",
+            "UpdateTime": "2026-08-25 12:00:00"
+        });
+        normalize_upstream_project_name(&mut asset, "default")
+            .expect("missing or non-canonical provider project name should be mapped");
+        validate_upstream_asset_resource(&asset).expect("mapped asset should remain valid");
+        assert_eq!(asset["ProjectName"], "default");
+        assert!(asset.get("project_name").is_none());
+
+        let mut active_without_url = asset.clone();
+        active_without_url["Status"] = Value::String("Active".to_string());
+        assert!(validate_upstream_asset_resource(&active_without_url).is_err());
+
+        let mut failed_without_url = asset.clone();
+        failed_without_url["Status"] = Value::String("Failed".to_string());
+        validate_upstream_asset_resource(&failed_without_url).expect("failed assets may omit URL");
+
+        let mut unsafe_url = asset.clone();
+        unsafe_url["URL"] = Value::String("http://127.0.0.1/private.png".to_string());
+        assert!(validate_upstream_asset_resource(&unsafe_url).is_err());
+
+        assert!(
+            validate_upstream_identity(&asset, "GroupId", "group-20260825120000-other").is_err()
+        );
+
+        let request_mismatch = ensure_project_matches(
+            &json!({"ProjectName": "another-logical-project"}),
+            "default",
+        )
+        .expect_err("request project must still match the bound resource");
+        assert_eq!(request_mismatch.status, StatusCode::BAD_REQUEST);
+
+        let repository = Arc::new(InMemoryAssetLibraryRepository::default());
+        let state = state_with_asset_repository(Arc::clone(&repository));
+        let persisted = persist_group_projection(
+            &state,
+            stored_group("group-local", "user-1").into_stored(),
+            &group,
+        )
+        .await
+        .expect("mapped group should be persisted");
+        assert_eq!(persisted.project_name, "default");
+        assert_eq!(
+            repository
+                .find_group_by_id("group-local")
+                .await
+                .expect("group lookup")
+                .expect("persisted group")
+                .project_name,
+            "default"
+        );
     }
 
     #[tokio::test]
@@ -4980,21 +6841,22 @@ mod tests {
         let state = state_with_asset_repository(Arc::clone(&repository));
         let item = json!({
             "Id": "asset-upstream",
-            "GroupId": "upstream-group-local",
+            "GroupId": "group-upstream-group-local",
             "Name": "face",
             "URL": "https://media.example.com/face.png?signature=secret",
             "AssetType": "Image",
             "Status": "Active",
+            "ProjectName": "default",
             "Width": 1024,
             "Height": 1024,
             "CreateTime": "2026-03-28T12:34:56Z",
             "UpdateTime": "2026-03-28T12:34:56Z"
         });
 
-        let first = upsert_validation_asset(&state, &group, "upstream-group-local", &item)
+        let first = upsert_validation_asset(&state, &group, "group-upstream-group-local", &item)
             .await
             .expect("first projection");
-        let second = upsert_validation_asset(&state, &group, "upstream-group-local", &item)
+        let second = upsert_validation_asset(&state, &group, "group-upstream-group-local", &item)
             .await
             .expect("idempotent projection");
         assert_eq!(first.id, second.id);
@@ -5015,22 +6877,17 @@ mod tests {
         assert_eq!(mismatch.status, StatusCode::BAD_GATEWAY);
 
         assert_eq!(
-            deterministic_validation_group_id("provider-1", "upstream-group-local"),
-            deterministic_validation_group_id("provider-1", "upstream-group-local")
+            deterministic_validation_group_id("provider-1", "group-upstream-group-local"),
+            deterministic_validation_group_id("provider-1", "group-upstream-group-local")
         );
         assert_ne!(
-            deterministic_validation_group_id("provider-1", "upstream-group-local"),
+            deterministic_validation_group_id("provider-1", "group-upstream-group-local"),
             deterministic_validation_group_id("provider-1", "another-upstream-group")
         );
-
-        assert!(!validation_asset_page_complete(100, 100, 101));
-        assert!(!validation_asset_page_complete(1, 100, 101));
-        assert!(!validation_asset_page_complete(0, 100, 101));
-        assert!(validation_asset_page_complete(1, 101, 101));
     }
 
     #[tokio::test]
-    async fn terminal_validation_result_keeps_k23_top_level_shape_on_repeated_queries() {
+    async fn terminal_validation_result_keeps_official_envelope_and_upstream_group_id() {
         let token = "token-upstream";
         let now = crate::clock::current_unix_secs();
         let repository = Arc::new(InMemoryAssetLibraryRepository::default());
@@ -5047,6 +6904,7 @@ mod tests {
                 provider_id: "provider-1".to_string(),
                 endpoint_id: "endpoint-1".to_string(),
                 key_id: "provider-key-1".to_string(),
+                project_name: "default".to_string(),
                 byted_token_hash: sha256_text(token),
                 encrypted_byted_token: "unused-terminal-ciphertext".to_string(),
                 callback_state_hash: "callback-hash".to_string(),
@@ -5054,7 +6912,7 @@ mod tests {
                 expires_at_unix_secs: now.saturating_add(60),
                 consumed_at_unix_secs: Some(now),
                 group_id: Some("group-local".to_string()),
-                sanitized_result: Some(json!({"GroupId": "group-local"})),
+                sanitized_result: Some(json!({"GroupId": "group-20260825120000-a1b2c"})),
                 created_at_unix_secs: 1,
                 updated_at_unix_secs: now,
             })
@@ -5083,88 +6941,40 @@ mod tests {
             )
             .await
             .expect("terminal validation result");
-            assert_eq!(result, json!({"GroupId": "group-local"}));
-            assert!(result.get("Result").is_none());
-            assert!(result.get("ResponseMetadata").is_none());
+            assert_eq!(
+                result["Result"],
+                json!({"GroupId": "group-20260825120000-a1b2c"})
+            );
+            assert_eq!(
+                result["ResponseMetadata"]["Action"],
+                "GetVisualValidateResult"
+            );
         }
     }
 
-    #[tokio::test]
-    async fn k23_native_lists_apply_plural_filters_before_pagination() {
-        let repository = Arc::new(InMemoryAssetLibraryRepository::default());
-        let mut active_group = stored_group("group-active", "user-1");
-        active_group.name = "产品人物".to_string();
-        let mut disabled_group = stored_group("group-disabled", "user-1");
-        disabled_group.status = "Disabled".to_string();
-        let mut face_group = stored_group("group-face", "user-1");
-        face_group.group_type = "LivenessFace".to_string();
-        for group in [active_group, disabled_group, face_group] {
-            repository.upsert_group(group).await.expect("group");
-        }
-        let mut active_asset = stored_asset("asset-active", "group-active", "user-1");
-        active_asset.status = "Active".to_string();
-        let mut disabled_asset = stored_asset("asset-disabled", "group-disabled", "user-1");
-        disabled_asset.status = "Disabled".to_string();
-        for asset in [active_asset, disabled_asset] {
-            repository.upsert_asset(asset).await.expect("asset");
-        }
-        let state = state_with_asset_repository(repository);
-        let headers = HeaderMap::new();
-        let context = GatewayPublicRequestContext::from_request_parts(
-            "trace-k23-lists",
-            &http::Method::POST,
-            &"/?Action=ListAssetGroups&Version=2024-01-01"
-                .parse()
-                .unwrap(),
-            &headers,
-            None,
+    #[test]
+    fn official_list_filters_are_strict() {
+        assert_eq!(
+            optional_string_array_field(
+                &json!({"GroupIds": ["group-1", "group-2"]}),
+                &["GroupIds"],
+                "Filter.GroupIds",
+            )
+            .unwrap(),
+            vec!["group-1", "group-2"]
         );
-
-        let groups = list_groups_native(
-            &state,
-            &context,
-            &caller("user-1"),
-            &json!({
-                "Filter": {
-                    "GroupType": "AIGC",
-                    "GroupIds": ["group-active", "group-disabled"],
-                    "Statuses": ["Active"]
-                },
-                "PageNumber": 1,
-                "PageSize": 10
-            }),
+        assert!(optional_string_array_field(
+            &json!({"GroupIds": "group-1"}),
+            &["GroupIds"],
+            "Filter.GroupIds",
         )
-        .await
-        .expect("group list");
-        assert_eq!(groups["Result"]["TotalCount"], 1);
-        assert_eq!(groups["Result"]["PageNumber"], 1);
-        assert_eq!(groups["Result"]["PageSize"], 10);
-        assert_eq!(groups["Result"]["Items"][0]["Id"], "group-active");
-        assert!(groups["Result"].get("Total").is_none());
-        assert!(groups["Result"].get("Groups").is_none());
-        assert!(groups["Result"]["Items"][0].get("GroupId").is_none());
-
-        let assets = list_assets_native(
-            &state,
-            &context,
-            &caller("user-1"),
-            &json!({
-                "Filter": {
-                    "GroupType": "AIGC",
-                    "GroupIds": ["group-active", "group-disabled"],
-                    "Statuses": ["Active"]
-                },
-                "PageNumber": 1,
-                "PageSize": 10
-            }),
+        .is_err());
+        assert!(reject_unknown_fields(
+            &json!({"AssetType": "Image"}),
+            &["GroupIds", "GroupType", "Name", "Statuses"],
+            "Filter",
         )
-        .await
-        .expect("asset list");
-        assert_eq!(assets["Result"]["TotalCount"], 1);
-        assert_eq!(assets["Result"]["Items"][0]["Id"], "asset-active");
-        assert!(assets["Result"].get("Total").is_none());
-        assert!(assets["Result"].get("Assets").is_none());
-        assert!(assets["Result"]["Items"][0].get("AssetId").is_none());
+        .is_err());
     }
 
     #[tokio::test]
@@ -5182,14 +6992,20 @@ mod tests {
             None,
         );
         for (body, message) in [
-            (json!({"Filter": {}}), "Filter.GroupType is required"),
-            (json!({"GroupType": "AIGC"}), "Filter.GroupType is required"),
             (
-                json!({"Filter": {"GroupType": "Unknown"}}),
+                json!({"Filter": {}, "PageNumber": 1, "PageSize": 10}),
+                "Filter.GroupType is required",
+            ),
+            (
+                json!({"PageNumber": 1, "PageSize": 10}),
+                "Filter is required",
+            ),
+            (
+                json!({"Filter": {"GroupType": "Unknown"}, "PageNumber": 1, "PageSize": 10}),
                 "Filter.GroupType must be AIGC or LivenessFace",
             ),
         ] {
-            let error = list_groups_native(&state, &context, &caller("user-1"), &body)
+            let error = list_groups_native(&state, &context, &headers, &caller("user-1"), &body)
                 .await
                 .expect_err("invalid GroupType filter must fail");
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -5200,19 +7016,16 @@ mod tests {
     #[test]
     fn validation_result_code_drives_terminal_status() {
         assert_eq!(
-            validation_result_status(&json!({"GroupId": "group-upstream"}), "Pending"),
+            validation_result_status(&json!({"GroupId": "group-upstream"}), "Pending").unwrap(),
             "Succeeded"
         );
+        assert!(validation_result_status(&json!({"resultCode": 10000}), "Pending").is_err());
         assert_eq!(
-            validation_result_status(&json!({"resultCode": 10000}), "Pending"),
-            "Succeeded"
-        );
-        assert_eq!(
-            validation_result_status(&json!({"ResultCode": 10001}), "Pending"),
+            validation_result_status(&json!({"ResultCode": 10001}), "Pending").unwrap(),
             "Failed"
         );
         assert_eq!(
-            validation_result_status(&json!({"Status": "Processing"}), "Pending"),
+            validation_result_status(&json!({"Status": "Processing"}), "Pending").unwrap(),
             "Processing"
         );
     }
@@ -5236,6 +7049,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "provider-key-1".to_string(),
+            project_name: "default".to_string(),
             byted_token_hash: "token-hash".to_string(),
             encrypted_byted_token: "encrypted-token".to_string(),
             callback_state_hash: "callback-hash".to_string(),
@@ -5260,15 +7074,15 @@ mod tests {
     }
 
     #[test]
-    fn recursively_rewrites_only_asset_references() {
+    fn rewrites_only_typed_media_asset_references() {
         let mut value = json!({
             "content": [
-                {"image_url": {"url": "asset://local-1"}},
-                {"text": "asset://local-2"},
+                {"type": "image_url", "image_url": {"url": "asset://local-1"}},
+                {"type": "text", "text": "asset://local-2"},
                 {"url": "https://example.test/asset://local-1"}
             ]
         });
-        replace_asset_reference_ids(
+        replace_asset_references(
             &mut value,
             &HashMap::from([
                 ("local-1".to_string(), "upstream-1".to_string()),
@@ -5279,7 +7093,7 @@ mod tests {
             value["content"][0]["image_url"]["url"],
             "asset://upstream-1"
         );
-        assert_eq!(value["content"][1]["text"], "asset://upstream-2");
+        assert_eq!(value["content"][1]["text"], "asset://local-2");
         assert_eq!(
             value["content"][2]["url"],
             "https://example.test/asset://local-1"
@@ -5310,11 +7124,23 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            load_asset(&state, &caller("user-2"), "asset-1", false)
+            load_asset(&state, &caller("user-2"), "asset-upstream-asset-1", false,)
                 .await
                 .expect_err("another user must not see the asset")
                 .status,
             StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            load_asset(&state, &caller("user-1"), "asset-1", false)
+                .await
+                .expect_err("internal asset IDs must not be accepted at the public boundary")
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            load_asset(&state, &caller("user-1"), "asset-upstream-asset-1", false,)
+                .await
+                .is_ok()
         );
 
         assert!(repository
@@ -5329,7 +7155,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            load_asset(&state, &caller("user-1"), "asset-1", false)
+            load_asset(&state, &caller("user-1"), "asset-upstream-asset-1", false,)
                 .await
                 .expect_err("group deletion must hide child assets")
                 .status,
@@ -5365,7 +7191,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            load_asset(&state, &caller, "asset-1", true)
+            load_asset(&state, &caller, "asset-upstream-asset-1", true)
                 .await
                 .expect_err("admin lookup must honor the selected owner")
                 .status,
@@ -5385,6 +7211,7 @@ mod tests {
                 provider_id: "provider-1".to_string(),
                 endpoint_id: "endpoint-1".to_string(),
                 key_id: "provider-key-1".to_string(),
+                project_name: "default".to_string(),
                 byted_token_hash: "token-hash".to_string(),
                 encrypted_byted_token: "deliberately-invalid-ciphertext".to_string(),
                 callback_state_hash: "callback-hash".to_string(),
@@ -5470,26 +7297,6 @@ mod tests {
     }
 
     #[test]
-    fn native_asset_projection_exposes_only_local_ids_and_proxy_url() {
-        let mut asset = stored_asset("asset-local", "group-local", "user-1").into_stored();
-        asset.upstream_asset_id = Some("asset-upstream-secret".to_string());
-        asset.provider_url =
-            Some("https://media.example.test/a.png?X-Signature=provider-secret".to_string());
-        asset.provider_url_expires_at_unix_secs = Some(99);
-
-        let projection = asset_native_json(&asset);
-        assert_eq!(projection["Id"], "asset-local");
-        assert_eq!(projection["GroupId"], "group-local");
-        assert_eq!(
-            projection["URL"],
-            "/api/material-assets/assets/asset-local/preview"
-        );
-        let serialized = serde_json::to_string(&projection).unwrap();
-        assert!(!serialized.contains("asset-upstream-secret"));
-        assert!(!serialized.contains("provider-secret"));
-    }
-
-    #[test]
     fn rest_validation_projection_does_not_expose_byted_token() {
         let state = AppState::new().expect("gateway state");
         let session = StoredArkVisualValidationSession {
@@ -5500,6 +7307,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "provider-key-1".to_string(),
+            project_name: "default".to_string(),
             byted_token_hash: "token-hash".to_string(),
             encrypted_byted_token: "encrypted-token".to_string(),
             callback_state_hash: "callback-hash".to_string(),

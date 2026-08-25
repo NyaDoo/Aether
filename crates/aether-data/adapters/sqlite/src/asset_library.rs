@@ -10,7 +10,7 @@ use crate::SqlitePool;
 
 const GROUP_COLUMNS: &str = r#"
 SELECT id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       group_type, name, description, status,
+       project_name, group_type, name, description, status,
        created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
 FROM asset_groups
 "#;
@@ -26,7 +26,7 @@ FROM assets
 
 const SESSION_COLUMNS: &str = r#"
 SELECT id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       byted_token_hash, encrypted_byted_token,
+       project_name, byted_token_hash, encrypted_byted_token,
        callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
        group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
 FROM ark_visual_validation_sessions
@@ -415,9 +415,9 @@ impl AssetLibraryWriteRepository for SqliteAssetLibraryRepository {
             r#"
 INSERT INTO asset_groups (
   id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  group_type, name, description, status,
+  project_name, group_type, name, description, status,
   created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
   api_key_id = excluded.api_key_id,
   name = excluded.name,
@@ -427,6 +427,7 @@ ON CONFLICT(id) DO UPDATE SET
 WHERE asset_groups.upstream_group_id IS excluded.upstream_group_id
   AND asset_groups.user_id = excluded.user_id
   AND asset_groups.provider_id = excluded.provider_id
+  AND asset_groups.project_name = excluded.project_name
   AND asset_groups.group_type = excluded.group_type
   AND asset_groups.deleted_at_unix_secs IS excluded.deleted_at_unix_secs
   AND (asset_groups.deleted_at_unix_secs IS NULL OR asset_groups.status = excluded.status)
@@ -439,6 +440,7 @@ WHERE asset_groups.upstream_group_id IS excluded.upstream_group_id
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
+        .bind(record.project_name)
         .bind(record.group_type)
         .bind(record.name)
         .bind(record.description)
@@ -668,6 +670,9 @@ WHERE assets.upstream_asset_id IS excluded.upstream_asset_id
         let group_id = record.group_id.clone();
         let user_id = record.user_id.clone();
         let provider_id = record.provider_id.clone();
+        let endpoint_id = record.endpoint_id.clone();
+        let key_id = record.key_id.clone();
+        let project_name = record.project_name.clone();
         let immutable_record = record.clone();
         let mut tx = self.pool.begin().await.map_sql_err()?;
         lock_active_catalog_binding(
@@ -684,11 +689,14 @@ WHERE assets.upstream_asset_id IS excluded.upstream_asset_id
                 .await
                 .map_sql_err()?;
             let valid_group = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM asset_groups WHERE id = ? AND user_id = ? AND provider_id = ? AND deleted_at_unix_secs IS NULL",
+                "SELECT id FROM asset_groups WHERE id = ? AND user_id = ? AND provider_id = ? AND endpoint_id = ? AND key_id = ? AND project_name = ? AND deleted_at_unix_secs IS NULL",
             )
             .bind(group_id)
             .bind(&record.user_id)
             .bind(&record.provider_id)
+            .bind(&record.endpoint_id)
+            .bind(&record.key_id)
+            .bind(&record.project_name)
             .fetch_optional(&mut *tx)
             .await
             .map_sql_err()?
@@ -720,13 +728,15 @@ WHERE assets.upstream_asset_id IS excluded.upstream_asset_id
             r#"
 INSERT INTO ark_visual_validation_sessions (
   id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  byted_token_hash, encrypted_byted_token,
+  project_name, byted_token_hash, encrypted_byted_token,
   callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
   group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
-) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
    WHERE ? IS NULL OR EXISTS (
      SELECT 1 FROM asset_groups
-      WHERE id = ? AND user_id = ? AND provider_id = ? AND deleted_at_unix_secs IS NULL
+      WHERE id = ? AND user_id = ? AND provider_id = ? AND endpoint_id = ?
+        AND key_id = ? AND project_name = ?
+        AND deleted_at_unix_secs IS NULL
    )
 ON CONFLICT(id) DO UPDATE SET
   api_key_id = excluded.api_key_id,
@@ -739,6 +749,7 @@ WHERE ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
   AND ark_visual_validation_sessions.session_id = excluded.session_id
   AND ark_visual_validation_sessions.user_id = excluded.user_id
   AND ark_visual_validation_sessions.provider_id = excluded.provider_id
+  AND ark_visual_validation_sessions.project_name = excluded.project_name
   AND ark_visual_validation_sessions.byted_token_hash = excluded.byted_token_hash
   AND ark_visual_validation_sessions.encrypted_byted_token = excluded.encrypted_byted_token
   AND ark_visual_validation_sessions.callback_state_hash = excluded.callback_state_hash
@@ -753,6 +764,7 @@ WHERE ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
+        .bind(record.project_name)
         .bind(record.byted_token_hash)
         .bind(record.encrypted_byted_token)
         .bind(record.callback_state_hash)
@@ -779,6 +791,9 @@ WHERE ark_visual_validation_sessions.consumed_at_unix_secs IS NULL
         .bind(&group_id)
         .bind(&user_id)
         .bind(&provider_id)
+        .bind(&endpoint_id)
+        .bind(&key_id)
+        .bind(&project_name)
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
@@ -999,6 +1014,7 @@ fn map_group(row: &SqliteRow) -> Result<StoredAssetGroup, DataLayerError> {
         provider_id: row.try_get("provider_id").map_sql_err()?,
         endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
         key_id: row.try_get("key_id").map_sql_err()?,
+        project_name: row.try_get("project_name").map_sql_err()?,
         group_type: row.try_get("group_type").map_sql_err()?,
         name: row.try_get("name").map_sql_err()?,
         description: row.try_get("description").map_sql_err()?,
@@ -1057,6 +1073,7 @@ fn map_session(row: &SqliteRow) -> Result<StoredArkVisualValidationSession, Data
         provider_id: row.try_get("provider_id").map_sql_err()?,
         endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
         key_id: row.try_get("key_id").map_sql_err()?,
+        project_name: row.try_get("project_name").map_sql_err()?,
         byted_token_hash: row.try_get("byted_token_hash").map_sql_err()?,
         encrypted_byted_token: row.try_get("encrypted_byted_token").map_sql_err()?,
         callback_state_hash: row.try_get("callback_state_hash").map_sql_err()?,
@@ -1220,6 +1237,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
             group_type: "AIGC".to_string(),
             name: "Portraits".to_string(),
             description: Some("Face references".to_string()),
@@ -1227,6 +1245,29 @@ mod tests {
             created_at_unix_secs: 10,
             updated_at_unix_secs: 10,
             deleted_at_unix_secs: None,
+        }
+    }
+
+    fn validation_session() -> UpsertArkVisualValidationSessionRecord {
+        UpsertArkVisualValidationSessionRecord {
+            id: "validation-1".to_string(),
+            session_id: "up-session-1".to_string(),
+            user_id: "user-1".to_string(),
+            api_key_id: None,
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
+            byted_token_hash: "token-hash".to_string(),
+            encrypted_byted_token: "encrypted-token".to_string(),
+            callback_state_hash: "state-hash".to_string(),
+            status: "pending".to_string(),
+            expires_at_unix_secs: 100,
+            consumed_at_unix_secs: None,
+            group_id: Some("group-1".to_string()),
+            sanitized_result: None,
+            created_at_unix_secs: 10,
+            updated_at_unix_secs: 10,
         }
     }
 
@@ -1240,7 +1281,8 @@ mod tests {
         run_migrations(&pool).await.expect("migrations");
         seed_dependencies(&pool).await;
         let repository = SqliteAssetLibraryRepository::new(pool);
-        repository.upsert_group(group()).await.expect("group");
+        let stored_group = repository.upsert_group(group()).await.expect("group");
+        assert_eq!(stored_group.project_name, "default");
         repository
             .upsert_asset(UpsertAssetRecord {
                 id: "asset-1".to_string(),
@@ -1278,28 +1320,34 @@ mod tests {
                 .total,
             1
         );
-        repository
-            .upsert_visual_validation_session(UpsertArkVisualValidationSessionRecord {
-                id: "validation-1".to_string(),
-                session_id: "up-session-1".to_string(),
-                user_id: "user-1".to_string(),
-                api_key_id: None,
-                provider_id: "provider-1".to_string(),
-                endpoint_id: "endpoint-1".to_string(),
-                key_id: "key-1".to_string(),
-                byted_token_hash: "token-hash".to_string(),
-                encrypted_byted_token: "encrypted-token".to_string(),
-                callback_state_hash: "state-hash".to_string(),
-                status: "pending".to_string(),
-                expires_at_unix_secs: 100,
-                consumed_at_unix_secs: None,
-                group_id: Some("group-1".to_string()),
-                sanitized_result: None,
-                created_at_unix_secs: 10,
-                updated_at_unix_secs: 10,
-            })
+        let session = validation_session();
+        let mut wrong_endpoint = session.clone();
+        wrong_endpoint.id = "validation-wrong-endpoint".to_string();
+        wrong_endpoint.session_id = "up-session-wrong-endpoint".to_string();
+        wrong_endpoint.byted_token_hash = "token-hash-wrong-endpoint".to_string();
+        wrong_endpoint.callback_state_hash = "state-hash-wrong-endpoint".to_string();
+        wrong_endpoint.endpoint_id = "endpoint-2".to_string();
+        assert!(repository
+            .upsert_visual_validation_session(wrong_endpoint)
+            .await
+            .is_err());
+
+        let mut wrong_key = session.clone();
+        wrong_key.id = "validation-wrong-key".to_string();
+        wrong_key.session_id = "up-session-wrong-key".to_string();
+        wrong_key.byted_token_hash = "token-hash-wrong-key".to_string();
+        wrong_key.callback_state_hash = "state-hash-wrong-key".to_string();
+        wrong_key.key_id = "key-2".to_string();
+        assert!(repository
+            .upsert_visual_validation_session(wrong_key)
+            .await
+            .is_err());
+
+        let stored_session = repository
+            .upsert_visual_validation_session(session.clone())
             .await
             .expect("session");
+        assert_eq!(stored_session.project_name, "default");
         let consume = ConsumeArkVisualValidationSessionRecord {
             callback_state_hash: "state-hash".to_string(),
             status: "succeeded".to_string(),
@@ -1312,25 +1360,8 @@ mod tests {
             .await
             .expect("consume")
             .is_some());
-        let mut retry = UpsertArkVisualValidationSessionRecord {
-            id: "validation-1".to_string(),
-            session_id: "up-session-1".to_string(),
-            user_id: "user-1".to_string(),
-            api_key_id: None,
-            provider_id: "provider-1".to_string(),
-            endpoint_id: "endpoint-1".to_string(),
-            key_id: "key-1".to_string(),
-            byted_token_hash: "token-hash".to_string(),
-            encrypted_byted_token: "encrypted-token".to_string(),
-            callback_state_hash: "state-hash".to_string(),
-            status: "pending".to_string(),
-            expires_at_unix_secs: 100,
-            consumed_at_unix_secs: None,
-            group_id: Some("group-1".to_string()),
-            sanitized_result: None,
-            created_at_unix_secs: 10,
-            updated_at_unix_secs: 60,
-        };
+        let mut retry = session;
+        retry.updated_at_unix_secs = 60;
         let stored = repository
             .upsert_visual_validation_session(retry.clone())
             .await
@@ -1427,6 +1458,7 @@ mod tests {
                 provider_id: "provider-1".to_string(),
                 endpoint_id: "endpoint-1".to_string(),
                 key_id: "key-1".to_string(),
+                project_name: "default".to_string(),
                 byted_token_hash: "token-hash".to_string(),
                 encrypted_byted_token: "encrypted-token".to_string(),
                 callback_state_hash: "state-hash".to_string(),
@@ -1595,6 +1627,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
             byted_token_hash: "token-hash-inactive-provider".to_string(),
             encrypted_byted_token: "encrypted-token-inactive-provider".to_string(),
             callback_state_hash: "state-hash-inactive-provider".to_string(),

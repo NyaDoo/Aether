@@ -78,6 +78,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             key_id: "key-1".to_string(),
+            project_name: "default".to_string(),
             group_type: "face".to_string(),
             name: "Faces".to_string(),
             description: None,

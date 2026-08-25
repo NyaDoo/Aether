@@ -162,6 +162,38 @@ async fn gateway_serves_frontend_routes_and_assets_without_shadowing_public_api(
     assert!(content_type.starts_with("text/html"));
     assert!(body.contains("Aether Frontend"));
 
+    for response in [
+        client
+            .get(format!(
+                "{gateway_url}/?Action=ListAssetGroups&Version=2024-01-01"
+            ))
+            .send()
+            .await
+            .expect("GET action request should succeed"),
+        client
+            .head(format!(
+                "{gateway_url}/?Action=ListAssetGroups&Version=2024-01-01"
+            ))
+            .send()
+            .await
+            .expect("HEAD action request should succeed"),
+    ] {
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response
+                .headers()
+                .get("allow")
+                .and_then(|value| value.to_str().ok()),
+            Some("POST")
+        );
+        let body = response
+            .text()
+            .await
+            .expect("method-not-allowed body should be readable");
+        assert!(body.is_empty());
+        assert!(!body.contains("Aether Frontend"));
+    }
+
     let response = client
         .get(format!("{gateway_url}/guide"))
         .send()

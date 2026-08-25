@@ -69,13 +69,14 @@ impl ProjectionFixture {
         writer
             .upsert_group(UpsertAssetGroupRecord {
                 id: group_id.clone(),
-                upstream_group_id: Some(format!("upstream-{group_id}")),
+                upstream_group_id: Some(format!("group-upstream-{asset_id}")),
                 user_id: user_id.to_string(),
                 api_key_id: None,
                 provider_id: provider_id.to_string(),
                 endpoint_id: endpoint_id.to_string(),
                 key_id: key_id.to_string(),
-                group_type: "character".to_string(),
+                project_name: "default".to_string(),
+                group_type: "AIGC".to_string(),
                 name: format!("Group for {asset_id}"),
                 description: None,
                 status: "Active".to_string(),
@@ -87,8 +88,8 @@ impl ProjectionFixture {
             .expect("asset group should be inserted");
         writer
             .upsert_asset(UpsertAssetRecord {
-                id: asset_id.to_string(),
-                upstream_asset_id: Some(format!("upstream-{asset_id}")),
+                id: format!("asset-internal-{asset_id}"),
+                upstream_asset_id: Some(asset_id.to_string()),
                 group_id,
                 user_id: user_id.to_string(),
                 api_key_id: None,
@@ -138,7 +139,7 @@ async fn video_asset_projection_replaces_nested_owned_active_asset_reference() {
 
     assert_eq!(
         projected["content"][0]["image_url"]["url"],
-        "asset://upstream-asset-success"
+        "asset://asset-success"
     );
     assert_eq!(
         projected["content"][1]["text"],
@@ -228,8 +229,27 @@ async fn video_asset_projection_preserves_optional_project_name() {
     assert_eq!(projected["ProjectName"], "project-overridden-by-request");
     assert_eq!(
         projected["content"][0]["image_url"]["url"],
-        "asset://upstream-asset-project-override"
+        "asset://asset-project-override"
     );
+}
+
+#[tokio::test]
+async fn video_asset_projection_rejects_internal_asset_id() {
+    let fixture = ProjectionFixture::new().await;
+    fixture
+        .insert_asset("asset-official", USER_ID, "Active")
+        .await;
+
+    let error = project_video_asset_references(
+        &fixture.state,
+        USER_ID,
+        &fixture.transport,
+        &body_for("asset-internal-asset-official"),
+    )
+    .await
+    .expect_err("public video requests must use the official upstream ID");
+
+    assert!(error.contains("不存在或不属于当前用户"), "{error}");
 }
 
 #[tokio::test]

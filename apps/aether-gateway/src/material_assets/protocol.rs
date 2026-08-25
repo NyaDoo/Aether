@@ -213,17 +213,36 @@ pub(crate) fn canonicalize_provider_body(
         ));
     };
     let mut canonical = source.clone();
+    canonicalize_string_alias(&mut canonical, "ProjectName", &["project_name"]);
     match action {
         ArkAssetAction::CreateAssetGroup => {
+            canonicalize_value_alias(&mut canonical, "Name", &["name"]);
+            canonicalize_value_alias(&mut canonical, "Description", &["description"]);
             canonicalize_create_group_type(&mut canonical)?;
         }
-        ArkAssetAction::GetAssetGroup
-        | ArkAssetAction::UpdateAssetGroup
-        | ArkAssetAction::DeleteAssetGroup => {
+        ArkAssetAction::ListAssetGroups | ArkAssetAction::ListAssets => {
+            canonicalize_list_body(&mut canonical, action)?;
+        }
+        ArkAssetAction::GetAssetGroup | ArkAssetAction::DeleteAssetGroup => {
             canonicalize_string_alias(&mut canonical, "Id", &["GroupId", "group_id", "id"]);
         }
-        ArkAssetAction::GetAsset | ArkAssetAction::UpdateAsset | ArkAssetAction::DeleteAsset => {
+        ArkAssetAction::UpdateAssetGroup => {
+            canonicalize_string_alias(&mut canonical, "Id", &["GroupId", "group_id", "id"]);
+            canonicalize_value_alias(&mut canonical, "Name", &["name"]);
+            canonicalize_value_alias(&mut canonical, "Description", &["description"]);
+        }
+        ArkAssetAction::GetAsset | ArkAssetAction::DeleteAsset => {
             canonicalize_string_alias(&mut canonical, "Id", &["AssetId", "asset_id", "id"]);
+        }
+        ArkAssetAction::UpdateAsset => {
+            canonicalize_string_alias(&mut canonical, "Id", &["AssetId", "asset_id", "id"]);
+            canonicalize_value_alias(&mut canonical, "Name", &["name"]);
+        }
+        ArkAssetAction::CreateAsset => {
+            canonicalize_string_alias(&mut canonical, "GroupId", &["group_id"]);
+            canonicalize_string_alias(&mut canonical, "URL", &["Url", "url"]);
+            canonicalize_string_alias(&mut canonical, "AssetType", &["asset_type", "type"]);
+            canonicalize_value_alias(&mut canonical, "Name", &["name"]);
         }
         ArkAssetAction::CreateVisualValidateSession => {
             canonicalize_string_alias(
@@ -232,14 +251,99 @@ pub(crate) fn canonicalize_provider_body(
                 &["callback_url", "ReturnUrl", "return_url"],
             );
         }
-        _ => {}
+        ArkAssetAction::GetVisualValidateResult => {
+            canonicalize_string_alias(
+                &mut canonical,
+                "BytedToken",
+                &["Token", "byted_token", "token"],
+            );
+        }
     }
-    canonical.retain(|name, value| {
-        !value.is_null()
-            && !name.eq_ignore_ascii_case("ProjectName")
-            && !name.eq_ignore_ascii_case("project_name")
-    });
+    canonical.retain(|_, value| !value.is_null());
     Ok(Value::Object(canonical))
+}
+
+fn canonicalize_list_body(
+    object: &mut Map<String, Value>,
+    action: ArkAssetAction,
+) -> Result<(), ArkAssetProtocolError> {
+    canonicalize_value_alias(
+        object,
+        "PageNumber",
+        &["page_number", "PageNum", "page_num"],
+    );
+    canonicalize_value_alias(object, "PageSize", &["page_size"]);
+    canonicalize_string_alias(object, "SortBy", &["sort_by"]);
+    canonicalize_string_alias(object, "SortOrder", &["sort_order"]);
+
+    let filter = take_alias_value(object, "Filter", &["filter"]);
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+    if filter.is_null() {
+        object.insert("Filter".to_string(), Value::Null);
+        return Ok(());
+    }
+    let mut filter = filter.as_object().cloned().ok_or_else(|| {
+        ArkAssetProtocolError::InvalidBody("Filter must be an object".to_string())
+    })?;
+    canonicalize_value_alias(&mut filter, "GroupIds", &["group_ids"]);
+    canonicalize_string_alias(&mut filter, "GroupType", &["group_type", "Type", "type"]);
+    canonicalize_string_alias(&mut filter, "Name", &["name"]);
+    if action == ArkAssetAction::ListAssets {
+        canonicalize_value_alias(&mut filter, "Statuses", &["statuses"]);
+    }
+    object.insert("Filter".to_string(), Value::Object(filter));
+    Ok(())
+}
+
+fn canonicalize_value_alias(
+    object: &mut Map<String, Value>,
+    canonical_name: &str,
+    aliases: &[&str],
+) {
+    if let Some(value) = take_alias_value(object, canonical_name, aliases) {
+        object.insert(canonical_name.to_string(), value);
+    }
+}
+
+fn take_alias_value(
+    object: &mut Map<String, Value>,
+    canonical_name: &str,
+    aliases: &[&str],
+) -> Option<Value> {
+    let selected_key = object
+        .keys()
+        .find(|name| name.as_str() == canonical_name)
+        .cloned()
+        .or_else(|| {
+            object
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case(canonical_name))
+                .cloned()
+        })
+        .or_else(|| {
+            object
+                .keys()
+                .find(|name| aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias)))
+                .cloned()
+        });
+    let value = selected_key
+        .as_ref()
+        .and_then(|key| object.get(key))
+        .cloned();
+    let alias_keys = object
+        .keys()
+        .filter(|name| {
+            name.eq_ignore_ascii_case(canonical_name)
+                || aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for alias in alias_keys {
+        object.remove(&alias);
+    }
+    value
 }
 
 fn canonicalize_create_group_type(
@@ -256,9 +360,9 @@ fn canonicalize_create_group_type(
             })
         });
     let group_type = match value {
-        None | Some(Value::Null) => "AIGC".to_string(),
-        Some(Value::String(value)) if value.trim().is_empty() => "AIGC".to_string(),
-        Some(Value::String(value)) if value.trim() == "AIGC" => "AIGC".to_string(),
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(Value::String(value)) if value.trim() == "AIGC" => Some("AIGC".to_string()),
         Some(Value::String(_)) => {
             return Err(ArkAssetProtocolError::InvalidBody(
                 "GroupType must be AIGC".to_string(),
@@ -282,7 +386,9 @@ fn canonicalize_create_group_type(
     for alias in aliases {
         object.remove(&alias);
     }
-    object.insert("GroupType".to_string(), Value::String(group_type));
+    if let Some(group_type) = group_type {
+        object.insert("GroupType".to_string(), Value::String(group_type));
+    }
     Ok(())
 }
 
@@ -457,7 +563,8 @@ mod tests {
                 serde_json::json!({
                     "Name": "products",
                     "Description": "references",
-                    "GroupType": "AIGC"
+                    "GroupType": "AIGC",
+                    "ProjectName": "default"
                 }),
             ),
             (
@@ -476,7 +583,7 @@ mod tests {
             (
                 ArkAssetAction::GetAssetGroup,
                 serde_json::json!({"GroupId": "group-1", "ProjectName": "default"}),
-                serde_json::json!({"Id": "group-1"}),
+                serde_json::json!({"Id": "group-1", "ProjectName": "default"}),
             ),
             (
                 ArkAssetAction::UpdateAssetGroup,
@@ -538,7 +645,7 @@ mod tests {
             (
                 ArkAssetAction::GetVisualValidateResult,
                 serde_json::json!({"BytedToken": "token-1", "ProjectName": "default"}),
-                serde_json::json!({"BytedToken": "token-1"}),
+                serde_json::json!({"BytedToken": "token-1", "ProjectName": "default"}),
             ),
         ] {
             let output = canonicalize_provider_body(action, &input).unwrap();
@@ -561,7 +668,69 @@ mod tests {
     }
 
     #[test]
-    fn create_group_defaults_group_type_in_canonical_upstream_body() {
+    fn compatibility_aliases_are_never_forwarded_to_ark() {
+        assert_eq!(
+            canonicalize_provider_body(
+                ArkAssetAction::ListAssets,
+                &serde_json::json!({
+                    "filter": {
+                        "group_ids": ["group-1"],
+                        "group_type": "AIGC",
+                        "name": "portrait",
+                        "statuses": ["Active"]
+                    },
+                    "page_number": 2,
+                    "page_size": 25,
+                    "sort_by": "UpdateTime",
+                    "sort_order": "Asc",
+                    "project_name": "project-a"
+                }),
+            )
+            .unwrap(),
+            serde_json::json!({
+                "Filter": {
+                    "GroupIds": ["group-1"],
+                    "GroupType": "AIGC",
+                    "Name": "portrait",
+                    "Statuses": ["Active"]
+                },
+                "PageNumber": 2,
+                "PageSize": 25,
+                "SortBy": "UpdateTime",
+                "SortOrder": "Asc",
+                "ProjectName": "project-a"
+            })
+        );
+        assert_eq!(
+            canonicalize_provider_body(
+                ArkAssetAction::CreateAsset,
+                &serde_json::json!({
+                    "group_id": "group-1",
+                    "url": "https://example.com/reference.mp4",
+                    "asset_type": "Video",
+                    "name": "reference"
+                }),
+            )
+            .unwrap(),
+            serde_json::json!({
+                "GroupId": "group-1",
+                "URL": "https://example.com/reference.mp4",
+                "AssetType": "Video",
+                "Name": "reference"
+            })
+        );
+        assert_eq!(
+            canonicalize_provider_body(
+                ArkAssetAction::GetVisualValidateResult,
+                &serde_json::json!({"token": "token-1"}),
+            )
+            .unwrap(),
+            serde_json::json!({"BytedToken": "token-1"})
+        );
+    }
+
+    #[test]
+    fn create_group_keeps_optional_group_type_omitted_upstream() {
         for input in [
             serde_json::json!({"Name": "products"}),
             serde_json::json!({"Name": "products", "GroupType": null}),
@@ -570,7 +739,7 @@ mod tests {
         ] {
             assert_eq!(
                 canonicalize_provider_body(ArkAssetAction::CreateAssetGroup, &input).unwrap(),
-                serde_json::json!({"Name": "products", "GroupType": "AIGC"})
+                serde_json::json!({"Name": "products"})
             );
         }
     }

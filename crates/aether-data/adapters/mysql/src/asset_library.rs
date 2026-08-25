@@ -10,7 +10,7 @@ use crate::MysqlPool;
 
 const GROUP_COLUMNS: &str = r#"
 SELECT id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       group_type, name, description, status,
+       project_name, group_type, name, description, status,
        created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
 FROM asset_groups
 "#;
@@ -26,7 +26,7 @@ FROM assets
 
 const SESSION_COLUMNS: &str = r#"
 SELECT id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-       byted_token_hash, encrypted_byted_token,
+       project_name, byted_token_hash, encrypted_byted_token,
        callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
        group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
 FROM ark_visual_validation_sessions
@@ -428,9 +428,9 @@ impl AssetLibraryWriteRepository for MysqlAssetLibraryRepository {
             r#"
 INSERT INTO asset_groups (
   id, upstream_group_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  group_type, name, description, status,
+  project_name, group_type, name, description, status,
   created_at_unix_secs, updated_at_unix_secs, deleted_at_unix_secs
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON DUPLICATE KEY UPDATE
   api_key_id = IF(id = VALUES(id), VALUES(api_key_id), api_key_id),
   name = IF(id = VALUES(id), VALUES(name), name),
@@ -446,6 +446,7 @@ ON DUPLICATE KEY UPDATE
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
+        .bind(record.project_name)
         .bind(record.group_type)
         .bind(record.name)
         .bind(record.description)
@@ -671,6 +672,9 @@ ON DUPLICATE KEY UPDATE
         let group_id = record.group_id.clone();
         let user_id = record.user_id.clone();
         let provider_id = record.provider_id.clone();
+        let endpoint_id = record.endpoint_id.clone();
+        let key_id = record.key_id.clone();
+        let project_name = record.project_name.clone();
         let immutable_record = record.clone();
         let mut tx = self.pool.begin().await.map_sql_err()?;
         lock_active_catalog_binding(
@@ -682,11 +686,14 @@ ON DUPLICATE KEY UPDATE
         .await?;
         if let Some(group_id) = group_id.as_deref() {
             let valid_group = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM asset_groups WHERE id = ? AND user_id = ? AND provider_id = ? AND deleted_at_unix_secs IS NULL FOR UPDATE",
+                "SELECT id FROM asset_groups WHERE id = ? AND user_id = ? AND provider_id = ? AND endpoint_id = ? AND key_id = ? AND project_name = ? AND deleted_at_unix_secs IS NULL FOR UPDATE",
             )
             .bind(group_id)
             .bind(&record.user_id)
             .bind(&record.provider_id)
+            .bind(&record.endpoint_id)
+            .bind(&record.key_id)
+            .bind(&record.project_name)
             .fetch_optional(&mut *tx)
             .await
             .map_sql_err()?
@@ -720,13 +727,15 @@ ON DUPLICATE KEY UPDATE
             r#"
 INSERT INTO ark_visual_validation_sessions (
   id, session_id, user_id, api_key_id, provider_id, endpoint_id, key_id,
-  byted_token_hash, encrypted_byted_token,
+  project_name, byted_token_hash, encrypted_byted_token,
   callback_state_hash, status, expires_at_unix_secs, consumed_at_unix_secs,
   group_id, sanitized_result, created_at_unix_secs, updated_at_unix_secs
-) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
    WHERE ? IS NULL OR EXISTS (
      SELECT 1 FROM asset_groups
-      WHERE id = ? AND user_id = ? AND provider_id = ? AND deleted_at_unix_secs IS NULL
+      WHERE id = ? AND user_id = ? AND provider_id = ? AND endpoint_id = ?
+        AND key_id = ? AND project_name = ?
+        AND deleted_at_unix_secs IS NULL
    )
 ON DUPLICATE KEY UPDATE
   api_key_id = IF(id = VALUES(id) AND consumed_at_unix_secs IS NULL, VALUES(api_key_id), api_key_id),
@@ -744,6 +753,7 @@ ON DUPLICATE KEY UPDATE
         .bind(record.provider_id)
         .bind(record.endpoint_id)
         .bind(record.key_id)
+        .bind(record.project_name)
         .bind(record.byted_token_hash)
         .bind(record.encrypted_byted_token)
         .bind(record.callback_state_hash)
@@ -770,6 +780,9 @@ ON DUPLICATE KEY UPDATE
         .bind(&group_id)
         .bind(&user_id)
         .bind(&provider_id)
+        .bind(&endpoint_id)
+        .bind(&key_id)
+        .bind(&project_name)
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
@@ -995,6 +1008,7 @@ fn map_group(row: &MySqlRow) -> Result<StoredAssetGroup, DataLayerError> {
         provider_id: row.try_get("provider_id").map_sql_err()?,
         endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
         key_id: row.try_get("key_id").map_sql_err()?,
+        project_name: row.try_get("project_name").map_sql_err()?,
         group_type: row.try_get("group_type").map_sql_err()?,
         name: row.try_get("name").map_sql_err()?,
         description: row.try_get("description").map_sql_err()?,
@@ -1053,6 +1067,7 @@ fn map_session(row: &MySqlRow) -> Result<StoredArkVisualValidationSession, DataL
         provider_id: row.try_get("provider_id").map_sql_err()?,
         endpoint_id: row.try_get("endpoint_id").map_sql_err()?,
         key_id: row.try_get("key_id").map_sql_err()?,
+        project_name: row.try_get("project_name").map_sql_err()?,
         byted_token_hash: row.try_get("byted_token_hash").map_sql_err()?,
         encrypted_byted_token: row.try_get("encrypted_byted_token").map_sql_err()?,
         callback_state_hash: row.try_get("callback_state_hash").map_sql_err()?,

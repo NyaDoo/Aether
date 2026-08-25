@@ -68,6 +68,7 @@ async fn frontend_static_middleware(
     let path = request.uri().path().to_string();
     if !matches!(request.method(), &Method::GET | &Method::HEAD)
         || frontend_path_bypasses_static(&path)
+        || api::root_query_targets_action(&path, request.uri().query())
     {
         return next.run(request).await;
     }
