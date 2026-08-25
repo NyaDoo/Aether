@@ -46,7 +46,7 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
     } = attempt;
     let upstream_is_stream = upstream_is_stream && eligible.candidate.supports_streaming;
     let payload_started_at = std::time::Instant::now();
-    let Some(resolved) = resolve_local_openai_chat_candidate_payload_parts(
+    let Some(mut resolved) = resolve_local_openai_chat_candidate_payload_parts(
         state,
         parts,
         trace_id,
@@ -82,6 +82,14 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
             false,
         );
 
+    crate::ai_serving::planner::cache_affinity::inject_provider_prompt_cache_affinity_key(
+        state,
+        &input.auth_context,
+        &input.requested_model,
+        resolved.provider_api_format.as_str(),
+        &mut resolved.provider_request_body,
+    )
+    .await;
     let prompt_cache_key = resolved
         .provider_request_body
         .get("prompt_cache_key")
