@@ -65,6 +65,39 @@ describe('usageApi contract alignment', () => {
     })
   })
 
+  it('preserves minute-precision custom datetime bounds for current-user records', async () => {
+    getMock.mockResolvedValueOnce({
+      data: {
+        records: [{ id: 'record-minute-boundary' }],
+        pagination: {
+          total: 1,
+          limit: 20,
+          offset: 0,
+        },
+      },
+    })
+
+    await usageApi.getUsageRecords({
+      page: 1,
+      page_size: 20,
+      start_date: '2026-05-06T09:07',
+      end_date: '2026-05-06T18:42',
+      timezone: 'Asia/Shanghai',
+      tz_offset_minutes: 480,
+    })
+
+    expect(getMock).toHaveBeenCalledWith('/api/users/me/usage', {
+      params: {
+        limit: 20,
+        offset: 0,
+        start_date: '2026-05-06T09:07',
+        end_date: '2026-05-06T18:42',
+        timezone: 'Asia/Shanghai',
+        tz_offset_minutes: 480,
+      },
+    })
+  })
+
   it('loads admin usage for a specific user from admin usage endpoints', async () => {
     getMock
       .mockResolvedValueOnce({
@@ -111,6 +144,101 @@ describe('usageApi contract alignment', () => {
         total_tokens: 99,
         total_cost: 12.34,
         avg_response_time: 456,
+      },
+    })
+  })
+
+  it('preserves minute-precision custom datetime bounds for admin records and stats', async () => {
+    getMock
+      .mockResolvedValueOnce({
+        data: {
+          total_requests: 1,
+          total_tokens: 10,
+          total_cost: 0.1,
+          avg_response_time: 100,
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          records: [{ id: 'admin-record-minute-boundary' }],
+          total: 1,
+          limit: 20,
+          offset: 0,
+        },
+      })
+
+    await usageApi.getUserUsage('user-123', {
+      page: 1,
+      page_size: 20,
+      start_date: '2026-05-06T09:07',
+      end_date: '2026-05-06T18:42',
+      timezone: 'Asia/Shanghai',
+      tz_offset_minutes: 480,
+    })
+
+    const expectedBounds = {
+      start_date: '2026-05-06T09:07',
+      end_date: '2026-05-06T18:42',
+      timezone: 'Asia/Shanghai',
+      tz_offset_minutes: 480,
+    }
+    expect(getMock).toHaveBeenNthCalledWith(1, '/api/admin/usage/stats', {
+      params: {
+        user_id: 'user-123',
+        ...expectedBounds,
+      },
+    })
+    expect(getMock).toHaveBeenNthCalledWith(2, '/api/admin/usage/records', {
+      params: {
+        user_id: 'user-123',
+        limit: 20,
+        offset: 0,
+        ...expectedBounds,
+      },
+    })
+  })
+
+  it('passes minute-precision bounds to the paged admin records and total queries', async () => {
+    getMock
+      .mockResolvedValueOnce({
+        data: {
+          records: [{ id: 'record-minute-page' }],
+          total: 1,
+          limit: 20,
+          offset: 0,
+        },
+      })
+      .mockResolvedValueOnce({ data: { total: 1 } })
+
+    const bounds = {
+      start_date: '2026-05-06T09:07',
+      end_date: '2026-05-06T18:42',
+      timezone: 'Asia/Shanghai',
+      tz_offset_minutes: 480,
+    }
+    await usageApi.getAllUsageRecords({
+      ...bounds,
+      limit: 20,
+      offset: 0,
+      include_total: false,
+    })
+    await usageApi.getAllUsageRecordTotal(bounds)
+
+    expect(getMock).toHaveBeenNthCalledWith(1, '/api/admin/usage/records', {
+      params: {
+        ...bounds,
+        limit: 20,
+        offset: 0,
+        include_total: false,
+      },
+    })
+    expect(getMock).toHaveBeenNthCalledWith(2, '/api/admin/usage/records', {
+      params: {
+        ...bounds,
+        include_total: true,
+        total_only: true,
+        limit: 1,
+        offset: 0,
       },
     })
   })

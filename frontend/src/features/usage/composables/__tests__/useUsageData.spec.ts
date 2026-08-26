@@ -121,6 +121,28 @@ describe('useUsageData', () => {
     expect(totalRecords.value).toBe(1)
   })
 
+  it('forwards minute-precision custom bounds through the admin records query', async () => {
+    const isAdminPage = ref(true)
+    const { loadRecords } = useUsageData({ isAdminPage })
+    const dateRange = {
+      start_date: '2026-05-06T09:07',
+      end_date: '2026-05-06T18:42',
+      timezone: 'Asia/Shanghai',
+      tz_offset_minutes: 480,
+    }
+
+    await loadRecords({ page: 1, pageSize: 20 }, undefined, dateRange)
+
+    expect(getAllUsageRecordsMock).toHaveBeenCalledWith(expect.objectContaining({
+      start_date: '2026-05-06T09:07',
+      end_date: '2026-05-06T18:42',
+      timezone: 'Asia/Shanghai',
+      tz_offset_minutes: 480,
+      limit: 20,
+      offset: 0,
+    }))
+  })
+
   it('keeps locally resolved failure fields when a stale active record refreshes', async () => {
     const isAdminPage = ref(true)
     const { loadRecords, currentRecords } = useUsageData({ isAdminPage })
