@@ -380,42 +380,50 @@ INSERT INTO video_tasks (
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
-  short_id = VALUES(short_id),
-  request_id = VALUES(request_id),
-  user_id = VALUES(user_id),
-  api_key_id = VALUES(api_key_id),
-  username = VALUES(username),
-  api_key_name = VALUES(api_key_name),
-  external_task_id = VALUES(external_task_id),
-  provider_id = VALUES(provider_id),
-  endpoint_id = VALUES(endpoint_id),
-  key_id = VALUES(key_id),
-  client_api_format = VALUES(client_api_format),
-  provider_api_format = VALUES(provider_api_format),
-  format_converted = VALUES(format_converted),
-  model = VALUES(model),
-  prompt = VALUES(prompt),
-  original_request_body = VALUES(original_request_body),
-  duration_seconds = VALUES(duration_seconds),
-  resolution = VALUES(resolution),
-  aspect_ratio = VALUES(aspect_ratio),
-  size = VALUES(size),
-  status = VALUES(status),
-  progress_percent = VALUES(progress_percent),
-  progress_message = VALUES(progress_message),
-  retry_count = VALUES(retry_count),
-  poll_interval_seconds = VALUES(poll_interval_seconds),
-  next_poll_at = VALUES(next_poll_at),
-  poll_count = VALUES(poll_count),
-  max_poll_count = VALUES(max_poll_count),
-  video_url = VALUES(video_url),
-  error_code = VALUES(error_code),
-  error_message = VALUES(error_message),
-  request_metadata = VALUES(request_metadata),
-  created_at = VALUES(created_at),
-  submitted_at = VALUES(submitted_at),
-  completed_at = VALUES(completed_at),
-  updated_at = VALUES(updated_at)
+  short_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), short_id, VALUES(short_id)),
+  request_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), request_id, VALUES(request_id)),
+  user_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), user_id, VALUES(user_id)),
+  api_key_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), api_key_id, VALUES(api_key_id)),
+  username = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), username, VALUES(username)),
+  api_key_name = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), api_key_name, VALUES(api_key_name)),
+  external_task_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), external_task_id, VALUES(external_task_id)),
+  provider_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), provider_id, VALUES(provider_id)),
+  endpoint_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), endpoint_id, VALUES(endpoint_id)),
+  key_id = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), key_id, VALUES(key_id)),
+  client_api_format = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), client_api_format, VALUES(client_api_format)),
+  provider_api_format = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), provider_api_format, VALUES(provider_api_format)),
+  format_converted = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), format_converted, VALUES(format_converted)),
+  model = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), model, VALUES(model)),
+  prompt = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), prompt, VALUES(prompt)),
+  original_request_body = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), original_request_body, VALUES(original_request_body)),
+  duration_seconds = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), duration_seconds, VALUES(duration_seconds)),
+  resolution = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), resolution, VALUES(resolution)),
+  aspect_ratio = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), aspect_ratio, VALUES(aspect_ratio)),
+  size = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), size, VALUES(size)),
+  progress_percent = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), progress_percent, VALUES(progress_percent)),
+  progress_message = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), progress_message, VALUES(progress_message)),
+  retry_count = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), retry_count, VALUES(retry_count)),
+  poll_interval_seconds = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), poll_interval_seconds, VALUES(poll_interval_seconds)),
+  next_poll_at = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), next_poll_at, VALUES(next_poll_at)),
+  poll_count = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), poll_count, VALUES(poll_count)),
+  max_poll_count = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), max_poll_count, VALUES(max_poll_count)),
+  video_url = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), video_url, VALUES(video_url)),
+  error_code = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), error_code, VALUES(error_code)),
+  error_message = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), error_message, VALUES(error_message)),
+  request_metadata = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), request_metadata, VALUES(request_metadata)),
+  created_at = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), created_at, VALUES(created_at)),
+  submitted_at = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), submitted_at, VALUES(submitted_at)),
+  completed_at = IF(status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted'), completed_at, VALUES(completed_at)),
+  updated_at = CASE
+    WHEN status IN ('completed', 'failed', 'cancelled', 'expired') AND VALUES(status) = 'deleted' THEN VALUES(updated_at)
+    WHEN status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN updated_at
+    ELSE VALUES(updated_at)
+  END,
+  status = CASE
+    WHEN status IN ('completed', 'failed', 'cancelled', 'expired') AND VALUES(status) = 'deleted' THEN 'deleted'
+    WHEN status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN status
+    ELSE VALUES(status)
+  END
 "#;
 
 const UPDATE_IF_ACTIVE_SQL: &str = r#"

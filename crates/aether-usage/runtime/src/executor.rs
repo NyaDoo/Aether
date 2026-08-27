@@ -13,7 +13,10 @@ const USAGE_BACKGROUND_RUNTIME_BLOCKING_THREADS_ENV: &str = "AETHER_USAGE_RUNTIM
 const USAGE_BACKGROUND_RUNTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
 const USAGE_BACKGROUND_RUNTIME_THREAD_NAME: &str = "aether-usage-runtime";
 
-pub(crate) fn spawn_on_usage_background_runtime<F>(task: F) -> tokio::task::JoinHandle<F::Output>
+/// Spawn a durable usage/lifecycle continuation on the process-lifetime
+/// runtime.  Gateway terminal guards use this when their owning Tokio runtime
+/// is already gone (for example, a dropped request future during shutdown).
+pub fn spawn_on_usage_background_runtime<F>(task: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,

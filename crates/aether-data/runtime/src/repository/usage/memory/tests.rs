@@ -633,7 +633,7 @@ async fn upsert_allows_completed_recovery_after_void_failure() {
             provider_request_body_state: None,
             response_body_state: None,
             client_response_body_state: None,
-            candidate_id: None,
+            candidate_id: Some("cand-1".to_string()),
             candidate_index: None,
             key_name: None,
             planner_kind: None,
@@ -739,6 +739,71 @@ async fn upsert_allows_completed_recovery_after_void_failure() {
         Some(json!({ "trace_id": "trace-recovered" }))
     );
     assert_eq!(stored.total_tokens, 10);
+}
+
+#[tokio::test]
+async fn upsert_keeps_terminal_billing_state_monotonic() {
+    let repository = InMemoryUsageReadRepository::default();
+    repository
+        .upsert(UpsertUsageRecord {
+            request_id: "req-billing-monotonic-memory".to_string(),
+            status: "completed".to_string(),
+            billing_status: "settled".to_string(),
+            input_tokens: Some(12),
+            output_tokens: Some(4),
+            total_tokens: Some(16),
+            total_cost_usd: Some(0.42),
+            actual_total_cost_usd: Some(0.42),
+            status_code: Some(200),
+            response_headers: Some(json!({"x-authoritative": "yes"})),
+            finalized_at_unix_secs: Some(100),
+            updated_at_unix_secs: 100,
+            ..sample_upsert_usage_record("req-billing-monotonic-memory")
+        })
+        .await
+        .expect("initial settled usage should upsert");
+
+    // A late same-lifecycle write must not reopen or void the settled row,
+    // even when it is sparse and carries a newer timestamp.
+    let stored = repository
+        .upsert(UpsertUsageRecord {
+            request_id: "req-billing-monotonic-memory".to_string(),
+            status: "completed".to_string(),
+            billing_status: "pending".to_string(),
+            status_code: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            total_cost_usd: None,
+            actual_total_cost_usd: None,
+            response_headers: None,
+            finalized_at_unix_secs: None,
+            updated_at_unix_secs: 101,
+            ..sample_upsert_usage_record("req-billing-monotonic-memory")
+        })
+        .await
+        .expect("late pending usage should be ignored");
+    assert_eq!(stored.billing_status, "settled");
+    assert_eq!(stored.total_tokens, 16);
+    assert_eq!(stored.total_cost_usd, 0.42);
+    assert_eq!(stored.finalized_at_unix_secs, Some(100));
+    assert_eq!(
+        stored.response_headers,
+        Some(json!({"x-authoritative": "yes"}))
+    );
+
+    let stored = repository
+        .upsert(UpsertUsageRecord {
+            request_id: "req-billing-monotonic-memory".to_string(),
+            status: "completed".to_string(),
+            billing_status: "void".to_string(),
+            updated_at_unix_secs: 102,
+            ..sample_upsert_usage_record("req-billing-monotonic-memory")
+        })
+        .await
+        .expect("late void usage should be ignored");
+    assert_eq!(stored.billing_status, "settled");
+    assert_eq!(stored.finalized_at_unix_secs, Some(100));
 }
 
 #[tokio::test]

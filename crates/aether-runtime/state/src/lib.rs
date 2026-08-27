@@ -173,6 +173,14 @@ pub struct RuntimeState {
     backend: Arc<RuntimeStateBackend>,
 }
 
+/// A short-lived realtime dashboard counter bucket. Values are clamped at
+/// zero by the backend so terminal compensation is idempotent-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RealtimeBucket {
+    pub requests: i64,
+    pub tokens: i64,
+}
+
 #[derive(Debug)]
 enum RuntimeStateBackend {
     Memory(Box<MemoryRuntimeBackend>),
@@ -366,6 +374,34 @@ impl RuntimeState {
         }
     }
 
+    /// Set a KV marker only when it does not already exist. This is used for
+    /// idempotent realtime admission reservations shared by gateway nodes.
+    pub async fn kv_set_if_absent(
+        &self,
+        key: &str,
+        value: impl Into<String> + Send,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        if key.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "runtime kv key cannot be empty".to_string(),
+            ));
+        }
+        if ttl.is_zero() {
+            return Err(DataLayerError::InvalidInput(
+                "runtime kv ttl must be positive".to_string(),
+            ));
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.kv_set_if_absent(key, value.into(), Some(ttl)).await)
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis.runtime.kv_set_if_absent(key, value.into(), ttl).await
+            }
+        }
+    }
+
     pub async fn kv_get(&self, key: &str) -> Result<Option<String>, DataLayerError> {
         match self.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => Ok(memory.kv_get(key).await),
@@ -427,6 +463,350 @@ impl RuntimeState {
         match self.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => Ok(memory.kv_ttl_seconds(key).await),
             RuntimeStateBackend::Redis(redis) => redis.runtime.kv_ttl_seconds(key).await,
+        }
+    }
+
+    /// Atomically apply a request/token delta to a short-lived bucket.
+    ///
+    /// Redis implementations use a Lua `HINCRBY`-equivalent script and set
+    /// the bucket TTL on every write; memory implementations use a dedicated
+    /// mutex. Keeping this primitive in RuntimeState makes dashboard metrics
+    /// shared across gateway instances when Redis is configured.
+    pub async fn realtime_bucket_add(
+        &self,
+        key: &str,
+        request_delta: i64,
+        token_delta: i64,
+        ttl: Duration,
+    ) -> Result<RealtimeBucket, DataLayerError> {
+        if key.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "realtime bucket key cannot be empty".to_string(),
+            ));
+        }
+        if ttl.is_zero() {
+            return Err(DataLayerError::InvalidInput(
+                "realtime bucket ttl must be positive".to_string(),
+            ));
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                let bucket = memory.realtime_bucket_add(key, request_delta, token_delta, ttl);
+                Ok(RealtimeBucket {
+                    requests: bucket.requests,
+                    tokens: bucket.tokens,
+                })
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                let (requests, tokens) = redis
+                    .runtime
+                    .realtime_bucket_add(key, request_delta, token_delta, ttl)
+                    .await?;
+                Ok(RealtimeBucket { requests, tokens })
+            }
+        }
+    }
+
+    /// Read one realtime bucket. A missing/expired bucket is represented as
+    /// `None`.
+    pub async fn realtime_bucket_read(
+        &self,
+        key: &str,
+    ) -> Result<Option<RealtimeBucket>, DataLayerError> {
+        if key.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "realtime bucket key cannot be empty".to_string(),
+            ));
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory
+                    .realtime_bucket_read(key)
+                    .map(|bucket| RealtimeBucket {
+                        requests: bucket.requests,
+                        tokens: bucket.tokens,
+                    }))
+            }
+            RuntimeStateBackend::Redis(redis) => Ok(redis
+                .runtime
+                .realtime_bucket_read(key)
+                .await?
+                .map(|(requests, tokens)| RealtimeBucket { requests, tokens })),
+        }
+    }
+
+    /// Sum a set of realtime buckets. Redis executes the sum in one Lua
+    /// invocation; memory computes it under the bucket lock.
+    pub async fn realtime_buckets_sum(
+        &self,
+        keys: &[String],
+    ) -> Result<RealtimeBucket, DataLayerError> {
+        if keys.is_empty() {
+            return Ok(RealtimeBucket::default());
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                let bucket = memory.realtime_buckets_sum(keys);
+                Ok(RealtimeBucket {
+                    requests: bucket.requests,
+                    tokens: bucket.tokens,
+                })
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                let (requests, tokens) = redis.runtime.realtime_buckets_sum(keys).await?;
+                Ok(RealtimeBucket { requests, tokens })
+            }
+        }
+    }
+
+    /// Add one idempotent, exact-timestamp event to a realtime collection.
+    ///
+    /// `event_id` is the lifecycle/idempotency identity.  A live event with
+    /// the same identity is not overwritten and the method returns `false`;
+    /// a newly stored event returns `true`.  The event remains available for
+    /// at most `ttl` (the backend may evict it sooner under explicit cleanup).
+    /// Redis stores the collection as a hash-tagged sorted-set + hash pair and
+    /// performs the duplicate check and write in one Lua invocation.
+    pub async fn realtime_event_add(
+        &self,
+        collection_key: &str,
+        event_id: &str,
+        timestamp_ms: u64,
+        request_delta: i64,
+        token_delta: i64,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        validate_realtime_event_inputs(collection_key, event_id, ttl)?;
+        if timestamp_ms > i64::MAX as u64 {
+            return Err(DataLayerError::InvalidInput(
+                "realtime event timestamp must fit in a signed 64-bit score".to_string(),
+            ));
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => Ok(memory.realtime_event_add(
+                collection_key,
+                event_id,
+                timestamp_ms,
+                request_delta,
+                token_delta,
+                ttl,
+            )),
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .realtime_event_add(
+                        collection_key,
+                        event_id,
+                        timestamp_ms,
+                        request_delta,
+                        token_delta,
+                        ttl,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Remove one realtime event by collection and idempotency identity.
+    /// Removal is atomic with the Redis sorted-set index and payload hash.
+    /// The return value is `true` only when a live event was removed.
+    pub async fn realtime_event_remove(
+        &self,
+        collection_key: &str,
+        event_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        validate_realtime_event_key(collection_key, "collection key")?;
+        validate_realtime_event_key(event_id, "event id")?;
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.realtime_event_remove(collection_key, event_id))
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .realtime_event_remove(collection_key, event_id)
+                    .await
+            }
+        }
+    }
+
+    /// Sum realtime events in the exact `(start_ms, end_ms]` interval.
+    /// Events outside the range are not included, including one whose
+    /// timestamp equals the lower bound.  An empty/reversed interval returns
+    /// a zero bucket.
+    pub async fn realtime_events_sum(
+        &self,
+        collection_key: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<RealtimeBucket, DataLayerError> {
+        validate_realtime_event_key(collection_key, "collection key")?;
+        if start_ms > i64::MAX as u64 || end_ms > i64::MAX as u64 {
+            return Err(DataLayerError::InvalidInput(
+                "realtime event range timestamps must fit in a signed 64-bit score".to_string(),
+            ));
+        }
+        if start_ms >= end_ms {
+            return Ok(RealtimeBucket::default());
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                let bucket = memory.realtime_events_sum(collection_key, start_ms, end_ms);
+                Ok(RealtimeBucket {
+                    requests: bucket.requests,
+                    tokens: bucket.tokens,
+                })
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                let (requests, tokens) = redis
+                    .runtime
+                    .realtime_events_sum(collection_key, start_ms, end_ms)
+                    .await?;
+                Ok(RealtimeBucket { requests, tokens })
+            }
+        }
+    }
+
+    /// Atomically add a live stream token delta to the reconciliation ledger
+    /// identified by `identity`.
+    ///
+    /// The returned value is the delta accepted for realtime accounting.  A
+    /// terminal cumulative claim closes the ledger; stream observations that
+    /// arrive after that point return zero so a late frame cannot double count
+    /// the terminal usage.  Callers should invoke this only after their own
+    /// stream-event idempotency check has accepted the observation.
+    pub async fn realtime_token_stream_add(
+        &self,
+        identity: &str,
+        token_delta: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        validate_realtime_token_ledger_inputs(identity, ttl)?;
+        if token_delta == 0 {
+            return Ok(0);
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.realtime_token_stream_add(identity, token_delta, ttl))
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .realtime_token_stream_add(identity, token_delta, ttl)
+                    .await
+            }
+        }
+    }
+
+    /// Atomically add one idempotent live stream token delta to the
+    /// reconciliation ledger.  `event_id` is remembered for the lifetime of
+    /// the ledger, so a replayed sequence cannot increment the stream total a
+    /// second time.  The returned value is the delta accepted for accounting;
+    /// it is zero for duplicates and for frames arriving after a terminal
+    /// claim.
+    pub async fn realtime_token_stream_add_once(
+        &self,
+        identity: &str,
+        event_id: &str,
+        token_delta: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        validate_realtime_token_ledger_inputs(identity, ttl)?;
+        validate_realtime_token_event_id(event_id)?;
+        if token_delta == 0 {
+            return Ok(0);
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.realtime_token_stream_add_once(identity, event_id, token_delta, ttl))
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .realtime_token_stream_add_once(identity, event_id, token_delta, ttl)
+                    .await
+            }
+        }
+    }
+
+    /// Atomically claim the unobserved remainder of a terminal cumulative
+    /// token total.  A positive claim is one-shot per identity and returns
+    /// `max(terminal_total - streamed_tokens, 0)`.  A zero total is not a
+    /// claim, which permits a later lifecycle enrichment to contribute usage.
+    pub async fn realtime_token_terminal_claim(
+        &self,
+        identity: &str,
+        terminal_total: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        validate_realtime_token_ledger_inputs(identity, ttl)?;
+        if terminal_total == 0 {
+            return Ok(0);
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.realtime_token_terminal_claim(identity, terminal_total, ttl))
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .realtime_token_terminal_claim(identity, terminal_total, ttl)
+                    .await
+            }
+        }
+    }
+
+    /// Prepare a terminal cumulative token reconciliation with a stable event
+    /// identity.  Unlike the legacy one-shot claim, this leaves a durable
+    /// pending remainder until [`Self::realtime_token_terminal_commit`] is
+    /// called.  If the subsequent exact-event write fails (or the process is
+    /// restarted), repeating `prepare` with the same identity/event returns
+    /// the same remainder so the event can be retried without losing TPM.
+    pub async fn realtime_token_terminal_prepare(
+        &self,
+        identity: &str,
+        event_id: &str,
+        terminal_total: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        validate_realtime_token_ledger_inputs(identity, ttl)?;
+        validate_realtime_token_event_id(event_id)?;
+        if terminal_total == 0 {
+            return Ok(0);
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.realtime_token_terminal_prepare(identity, event_id, terminal_total, ttl))
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .realtime_token_terminal_prepare(identity, event_id, terminal_total, ttl)
+                    .await
+            }
+        }
+    }
+
+    /// Commit a previously prepared terminal token reconciliation.  The
+    /// operation is idempotent for the matching event identity and returns
+    /// `false` when no matching pending terminal exists.
+    pub async fn realtime_token_terminal_commit(
+        &self,
+        identity: &str,
+        event_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        validate_realtime_token_ledger_inputs(identity, Duration::from_millis(1))?;
+        validate_realtime_token_event_id(event_id)?;
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => {
+                Ok(memory.realtime_token_terminal_commit(identity, event_id))
+            }
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .realtime_token_terminal_commit(identity, event_id)
+                    .await
+            }
         }
     }
 
@@ -786,6 +1166,56 @@ fn validate_runtime_queue_name(value: &str, field: &str) -> Result<(), DataLayer
         return Err(DataLayerError::InvalidInput(format!(
             "{field} cannot be empty"
         )));
+    }
+    Ok(())
+}
+
+fn validate_realtime_event_key(value: &str, field: &str) -> Result<(), DataLayerError> {
+    if value.trim().is_empty() {
+        return Err(DataLayerError::InvalidInput(format!(
+            "realtime event {field} cannot be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_realtime_event_inputs(
+    collection_key: &str,
+    event_id: &str,
+    ttl: Duration,
+) -> Result<(), DataLayerError> {
+    validate_realtime_event_key(collection_key, "collection key")?;
+    validate_realtime_event_key(event_id, "event id")?;
+    if ttl.is_zero() {
+        return Err(DataLayerError::InvalidInput(
+            "realtime event ttl must be positive".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_realtime_token_ledger_inputs(
+    identity: &str,
+    ttl: Duration,
+) -> Result<(), DataLayerError> {
+    if identity.trim().is_empty() {
+        return Err(DataLayerError::InvalidInput(
+            "realtime token ledger identity cannot be empty".to_string(),
+        ));
+    }
+    if ttl.is_zero() {
+        return Err(DataLayerError::InvalidInput(
+            "realtime token ledger ttl must be positive".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_realtime_token_event_id(event_id: &str) -> Result<(), DataLayerError> {
+    if event_id.trim().is_empty() {
+        return Err(DataLayerError::InvalidInput(
+            "realtime token stream event id cannot be empty".to_string(),
+        ));
     }
     Ok(())
 }
@@ -2120,6 +2550,9 @@ mod tests {
     }
 
     async fn assert_kv_score_and_queue_contract(runtime: &RuntimeState) {
+        assert_realtime_event_contract(runtime).await;
+        assert_realtime_token_ledger_contract(runtime).await;
+
         runtime
             .kv_set("contract:ttl:set", "value", Some(Duration::from_millis(30)))
             .await
@@ -2327,7 +2760,110 @@ mod tests {
         .is_empty());
     }
 
+    async fn assert_realtime_event_contract(runtime: &RuntimeState) {
+        let collection = "contract:realtime-events";
+        let ttl = Duration::from_secs(60);
+        assert!(runtime
+            .realtime_event_add(collection, "lower", 1_000, 1, 10, ttl)
+            .await
+            .expect("event add"));
+        assert!(runtime
+            .realtime_event_add(collection, "upper", 2_000, 2, 20, ttl)
+            .await
+            .expect("event add"));
+        assert!(!runtime
+            .realtime_event_add(collection, "upper", 2_000, 99, 99, ttl)
+            .await
+            .expect("duplicate event add"));
+        assert_eq!(
+            runtime
+                .realtime_events_sum(collection, 1_000, 2_000)
+                .await
+                .expect("event sum"),
+            RealtimeBucket {
+                requests: 2,
+                tokens: 20,
+            }
+        );
+        assert!(runtime
+            .realtime_event_remove(collection, "upper")
+            .await
+            .expect("event remove"));
+        assert!(!runtime
+            .realtime_event_remove(collection, "upper")
+            .await
+            .expect("duplicate event remove"));
+        assert_eq!(
+            runtime
+                .realtime_events_sum(collection, 999, 2_001)
+                .await
+                .expect("event sum after remove"),
+            RealtimeBucket {
+                requests: 1,
+                tokens: 10,
+            }
+        );
+    }
+
+    async fn assert_realtime_token_ledger_contract(runtime: &RuntimeState) {
+        let identity = "contract:realtime-token-ledger";
+        let ttl = Duration::from_secs(60);
+        assert_eq!(
+            runtime
+                .realtime_token_stream_add(identity, 40, ttl)
+                .await
+                .expect("stream token add"),
+            40
+        );
+        assert_eq!(
+            runtime
+                .realtime_token_terminal_claim(identity, 100, ttl)
+                .await
+                .expect("terminal token claim"),
+            60
+        );
+        assert_eq!(
+            runtime
+                .realtime_token_stream_add(identity, 10, ttl)
+                .await
+                .expect("late stream token add"),
+            0
+        );
+        assert_eq!(
+            runtime
+                .realtime_token_terminal_claim(identity, 120, ttl)
+                .await
+                .expect("duplicate terminal token claim"),
+            0
+        );
+    }
+
     async fn assert_invalid_shared_inputs(runtime: &RuntimeState) {
+        assert!(matches!(
+            runtime
+                .realtime_event_add("", "event", 1, 1, 1, Duration::from_secs(1))
+                .await,
+            Err(DataLayerError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            runtime
+                .realtime_event_add("collection", "", 1, 1, 1, Duration::from_secs(1))
+                .await,
+            Err(DataLayerError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            runtime
+                .realtime_event_add("collection", "event", 1, 1, 1, Duration::ZERO)
+                .await,
+            Err(DataLayerError::InvalidInput(_))
+        ));
+        assert_eq!(
+            runtime
+                .realtime_events_sum("collection", 100, 100)
+                .await
+                .expect("empty event range"),
+            RealtimeBucket::default()
+        );
         assert!(matches!(
             runtime
                 .score_set("contract:invalid-score", "nan", f64::NAN)

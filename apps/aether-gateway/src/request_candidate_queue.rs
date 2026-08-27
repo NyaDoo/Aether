@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aether_data_contracts::repository::candidates::{
-    RequestCandidateStatus, RequestCandidateWriteRepository, UpsertRequestCandidateRecord,
+    request_candidate_lifecycle_should_preserve_existing, RequestCandidateStatus,
+    RequestCandidateWriteRepository, UpsertRequestCandidateRecord,
 };
 use aether_runtime::{MetricKind, MetricSample};
 use tokio::sync::{mpsc, Semaphore};
@@ -2378,22 +2379,58 @@ fn merge_request_candidate_record_for_flush(
 ) {
     let target_status = target.status;
     let incoming_status = incoming.status;
+    // The repository adapters enforce the same lifecycle contract at the
+    // database boundary.  Compaction must apply it before batching as well:
+    // otherwise a late 499/failed report can replace an already durable
+    // success (or vice versa) while both records are still in one queue
+    // batch, and the adapter never gets a chance to preserve the first
+    // terminal outcome.
+    let preserve_existing_lifecycle =
+        request_candidate_lifecycle_should_preserve_existing(target_status, incoming_status);
     let next_status = merged_request_candidate_status(target_status, incoming_status);
+
+    // Preserve the lifecycle payload, not only the enum.  Keeping the status
+    // while allowing the incoming status_code/error/latency/finished_at to
+    // overwrite it would produce a self-contradictory candidate row (for
+    // example `failed` with a success HTTP code), and would diverge from the
+    // SQL and in-memory repository merge implementations.
+    let preserved_terminal_fields = preserve_existing_lifecycle.then(|| {
+        (
+            target.id.clone(),
+            target.status_code.take(),
+            target.error_type.take(),
+            target.error_message.take(),
+            target.latency_ms.take(),
+            target.finished_at_unix_ms.take(),
+        )
+    });
     merge_request_candidate_record(target, incoming);
     target.status = next_status;
+    if let Some((id, status_code, error_type, error_message, latency_ms, finished_at_unix_ms)) =
+        preserved_terminal_fields
+    {
+        // `id` is the primary key in every candidate adapter and is not
+        // updated by an upsert conflict. Keep the first non-empty id when a
+        // conflicting terminal report is compacted before the first insert.
+        if !id.trim().is_empty() {
+            target.id = id;
+        }
+        target.status_code = status_code;
+        target.error_type = error_type;
+        target.error_message = error_message;
+        target.latency_ms = latency_ms;
+        target.finished_at_unix_ms = finished_at_unix_ms;
+    }
 }
 
 fn merged_request_candidate_status(
     current: RequestCandidateStatus,
     incoming: RequestCandidateStatus,
 ) -> RequestCandidateStatus {
-    match (
-        request_candidate_status_is_terminal(current),
-        request_candidate_status_is_terminal(incoming),
-    ) {
-        (_, true) => incoming,
-        (true, false) => current,
-        (false, false) => incoming,
+    if request_candidate_lifecycle_should_preserve_existing(current, incoming) {
+        current
+    } else {
+        incoming
     }
 }
 
@@ -3113,6 +3150,7 @@ mod tests {
     fn compact_merges_same_slot_without_losing_terminal_fields() {
         let mut first_success = record("req", 0, 0, RequestCandidateStatus::Success);
         first_success.provider_id = Some("provider-a".to_string());
+        first_success.status_code = Some(200);
         first_success.extra_data = Some(serde_json::json!({"first": true}));
         let mut second_success = record("req", 0, 0, RequestCandidateStatus::Success);
         second_success.latency_ms = Some(123);
@@ -3153,6 +3191,54 @@ mod tests {
             RequestCandidateStatus::Failed
         );
         assert_eq!(compacted.terminal[1].source_count, 1);
+    }
+
+    #[test]
+    fn compact_preserves_first_terminal_payload_across_conflicting_statuses() {
+        let mut first_failed = record(
+            "req-terminal-conflict",
+            0,
+            0,
+            RequestCandidateStatus::Failed,
+        );
+        first_failed.status_code = Some(502);
+        first_failed.error_type = Some("upstream".to_string());
+        first_failed.error_message = Some("provider unavailable".to_string());
+        first_failed.latency_ms = Some(900);
+        first_failed.finished_at_unix_ms = Some(1_700_000_000_100);
+        first_failed.extra_data = Some(serde_json::json!({"first": true}));
+
+        let mut late_success = record(
+            "req-terminal-conflict",
+            0,
+            0,
+            RequestCandidateStatus::Success,
+        );
+        late_success.status_code = Some(200);
+        late_success.error_type = Some("late-success-report".to_string());
+        late_success.error_message = Some("should not replace failure".to_string());
+        late_success.latency_ms = Some(1_200);
+        late_success.finished_at_unix_ms = Some(1_700_000_000_200);
+        late_success.extra_data = Some(serde_json::json!({"late": true}));
+
+        let compacted = compact_records_for_flush(vec![first_failed, late_success]);
+        assert_eq!(compacted.terminal.len(), 1);
+        let persisted = &compacted.terminal[0].record;
+        assert_eq!(persisted.id, "req-terminal-conflict-0-0-Failed");
+        assert_eq!(persisted.status, RequestCandidateStatus::Failed);
+        assert_eq!(persisted.status_code, Some(502));
+        assert_eq!(persisted.error_type.as_deref(), Some("upstream"));
+        assert_eq!(
+            persisted.error_message.as_deref(),
+            Some("provider unavailable")
+        );
+        assert_eq!(persisted.latency_ms, Some(900));
+        assert_eq!(persisted.finished_at_unix_ms, Some(1_700_000_000_100));
+        assert_eq!(
+            persisted.extra_data,
+            Some(serde_json::json!({"first": true, "late": true}))
+        );
+        assert_eq!(compacted.terminal[0].source_count, 2);
     }
 
     #[test]
@@ -4913,7 +4999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_lane_preserves_fifo_last_write_wins_for_same_slot() {
+    async fn terminal_lane_preserves_first_terminal_for_same_slot() {
         let repository = Arc::new(RecordingBatchRequestCandidateRepository::default());
         let runtime = RequestCandidateQueueRuntime::spawn(
             repository.clone(),
@@ -4929,14 +5015,23 @@ mod tests {
             },
         );
 
+        let mut first_failed = record("terminal-last-write", 0, 0, RequestCandidateStatus::Failed);
+        first_failed.status_code = Some(502);
+        let mut late_success = record("terminal-last-write", 0, 0, RequestCandidateStatus::Success);
+        late_success.status_code = Some(200);
         for status in [
-            RequestCandidateStatus::Pending,
-            RequestCandidateStatus::Streaming,
-            RequestCandidateStatus::Failed,
-            RequestCandidateStatus::Success,
+            record("terminal-last-write", 0, 0, RequestCandidateStatus::Pending),
+            record(
+                "terminal-last-write",
+                0,
+                0,
+                RequestCandidateStatus::Streaming,
+            ),
+            first_failed,
+            late_success,
         ] {
             runtime
-                .try_enqueue_priority_status(record("terminal-last-write", 0, 0, status))
+                .try_enqueue_priority_status(status)
                 .expect("lifecycle status should enter its split lane");
         }
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -4953,7 +5048,8 @@ mod tests {
             .await
             .expect("terminal last-write candidate should be readable");
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].status, RequestCandidateStatus::Success);
+        assert_eq!(stored[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(stored[0].status_code, Some(502));
         let terminal_statuses = repository
             .batches()
             .into_iter()
@@ -4961,7 +5057,7 @@ mod tests {
             .filter(|candidate| super::request_candidate_status_is_terminal(candidate.status))
             .map(|candidate| candidate.status)
             .collect::<Vec<_>>();
-        assert_eq!(terminal_statuses, vec![RequestCandidateStatus::Success]);
+        assert_eq!(terminal_statuses, vec![RequestCandidateStatus::Failed]);
         assert_eq!(runtime.metrics.compacted_total.load(Ordering::Acquire), 1);
         assert_eq!(
             runtime

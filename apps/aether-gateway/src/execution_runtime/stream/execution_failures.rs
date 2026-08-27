@@ -19,20 +19,26 @@ use crate::clock::current_unix_ms as current_request_candidate_unix_ms;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::ai_attempt_retry_scope_from_failure_disposition;
 use crate::execution_runtime::submission::{
-    resolve_core_error_background_report_kind, submit_local_core_error_or_sync_finalize,
+    resolve_core_error_background_report_kind,
+    submit_local_core_error_or_sync_finalize_after_terminal_usage,
 };
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
-    apply_local_execution_effect, classify_failure_disposition,
-    resolve_local_failover_analysis_for_attempt,
+    apply_local_execution_effect, apply_local_stream_failure_effects_with_analysis,
+    classify_failure_disposition, resolve_local_failover_analysis_for_attempt,
     resolve_local_transport_failover_analysis_for_attempt, with_upstream_response_report_context,
     LocalAdaptiveRateLimitEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
     LocalExecutionEffectContext, LocalFailoverAnalysis, LocalFailoverDecision,
     LocalHealthFailureEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+    LocalStreamFailureEffect,
 };
-use crate::request_candidate_runtime::record_report_request_candidate_status;
+use crate::request_candidate_runtime::{
+    record_local_request_candidate_status, record_report_request_candidate_status,
+    spawn_report_candidate_persistence_retry_after_usage_handoff,
+    spawn_terminal_candidate_reconciliation,
+};
 use crate::request_diagnostics::attach_current_request_diagnostics_and_candidate_timing_to_report_context;
-use crate::usage::submit_sync_report;
+use crate::usage::submit_sync_report_after_terminal_usage;
 use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
 
 #[derive(Debug, Clone)]
@@ -350,7 +356,7 @@ async fn record_stream_sync_failure(
     candidate_status_code: Option<u16>,
     started_at_unix_ms: Option<u64>,
     handling: StreamFailureHandling,
-) -> LocalFailoverAnalysis {
+) -> (LocalFailoverAnalysis, bool, bool) {
     let error_type = stream_failure_body_field(payload, "type").unwrap_or("internal");
     let error_message = stream_failure_body_field(payload, "message").unwrap_or_default();
     let error_body = payload
@@ -365,86 +371,63 @@ async fn record_stream_sync_failure(
         error_body.as_deref(),
     )
     .await;
+    let retrying_next_candidate = matches!(
+        failure_analysis.decision,
+        LocalFailoverDecision::RetryNextCandidate
+    );
+    // Resolve the owner once and carry the exact Arc through the terminal
+    // usage write. A second request-id lookup can miss a concurrent registry
+    // entry transition and let a terminal helper bypass the ownership CAS.
+    let watchdog_progress =
+        crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        );
+    // Only the prefetch path that explicitly honors local failover has an
+    // outer candidate owner.  Mid-stream terminal failures still settle the
+    // request even when the policy classification happens to say
+    // `RetryNextCandidate`; treating those as intermediate here would put
+    // proxy/provider effects ahead of the terminal usage handoff.
+    let intermediate_retry = matches!(handling, StreamFailureHandling::HonorLocalFailover)
+        && retrying_next_candidate
+        && crate::execution_runtime::stream_candidate_watchdog_allows_intermediate_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        )
+        && crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        );
+    let mut failure_effect =
+        LocalStreamFailureEffect::new(payload.status_code, &payload.headers, error_body.as_deref());
     if matches!(error_type, "first_byte_timeout" | "read_timeout") {
-        apply_local_execution_effect(
+        failure_effect = failure_effect.with_stream_timeout();
+    }
+    // A retrying candidate has no request-level terminal usage yet, so retain
+    // the historical intermediate-effect ordering.  True terminal paths do
+    // this only after the durable usage handoff below.
+    if intermediate_retry {
+        apply_local_stream_failure_effects_with_analysis(
             state,
             LocalExecutionEffectContext {
                 plan,
                 report_context,
             },
-            LocalExecutionEffect::PoolStreamTimeout,
+            failure_effect,
+            failure_analysis,
         )
         .await;
     }
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::AttemptFailure(LocalAttemptFailureEffect {
-            status_code: payload.status_code,
-            classification: failure_analysis.classification,
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
-            status_code: payload.status_code,
-            classification: failure_analysis.classification,
-            headers: Some(&payload.headers),
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
-            status_code: payload.status_code,
-            classification: failure_analysis.classification,
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
-            status_code: payload.status_code,
-            response_text: error_body.as_deref(),
-        }),
-    )
-    .await;
-    apply_local_execution_effect(
-        state,
-        LocalExecutionEffectContext {
-            plan,
-            report_context,
-        },
-        LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
-            status_code: payload.status_code,
-            classification: failure_analysis.classification,
-            headers: &payload.headers,
-            error_body: error_body.as_deref(),
-        }),
-    )
-    .await;
-    let retrying_next_candidate = matches!(
-        failure_analysis.decision,
-        LocalFailoverDecision::RetryNextCandidate
-    );
-    if !matches!(handling, StreamFailureHandling::HonorLocalFailover) || !retrying_next_candidate {
-        crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
+    let terminal_owner_claimed = !intermediate_retry
+        && crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started_with_progress(
+            watchdog_progress.as_ref(),
+        );
+    let usage_handoff_persisted = if intermediate_retry {
+        // A retrying candidate intentionally has no terminal usage event yet;
+        // its candidate failure is part of failover bookkeeping, not the final
+        // attempt settlement.
+        true
+    } else if terminal_owner_claimed {
         let report_context_with_diagnostics =
             attach_current_request_diagnostics_and_candidate_timing_to_report_context(
                 report_context,
@@ -462,34 +445,131 @@ async fn record_stream_sync_failure(
             report_context_with_diagnostics.as_ref().or(report_context),
         );
         let payload_seed = build_sync_terminal_usage_payload_seed(payload);
-        state
+        let persisted = state
             .usage_runtime
-            .record_sync_terminal(
+            .record_sync_terminal_with_handoff(
                 state.usage_lifecycle_data_state().as_ref(),
                 context_seed,
                 payload_seed,
             )
             .await;
+        persisted
+    } else {
+        // Another watchdog owner (for example a 499 cancellation fallback)
+        // won the terminal race.  This path must not project a failed
+        // candidate or effects as if its usage handoff had succeeded.
+        false
+    };
+    if !intermediate_retry && usage_handoff_persisted {
+        // Usage is the billing source of truth.  Project provider/key effects
+        // only after its terminal handoff has at least been attempted, so a
+        // slow effect cannot recreate the old "candidate finished, usage only
+        // has first-byte timing" race.
+        apply_local_stream_failure_effects_with_analysis(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context,
+            },
+            failure_effect,
+            failure_analysis,
+        )
+        .await;
     }
     let terminal_unix_secs = current_request_candidate_unix_ms();
-    record_report_request_candidate_status(
-        state,
-        report_context,
-        SchedulerRequestCandidateStatusUpdate {
-            status: RequestCandidateStatus::Failed,
-            status_code: candidate_status_code,
-            error_type: Some(error_type.to_string()),
-            error_message: Some(error_message.to_string()),
-            latency_ms: payload
-                .telemetry
-                .as_ref()
-                .and_then(|telemetry| telemetry.elapsed_ms),
-            started_at_unix_ms: started_at_unix_ms.or(Some(terminal_unix_secs)),
-            finished_at_unix_ms: Some(terminal_unix_secs),
+    // Keep the intended terminal transition separate from the in-band
+    // candidate update.  When the usage runtime cannot confirm its terminal
+    // handoff, the candidate must remain streaming in this critical path, but
+    // a detached reconciliation task still needs the original Failed update
+    // so it can promote the candidate once the usage row becomes durable.
+    let reconciliation_update = SchedulerRequestCandidateStatusUpdate {
+        status: RequestCandidateStatus::Failed,
+        status_code: candidate_status_code,
+        error_type: Some(error_type.to_string()),
+        error_message: Some(error_message.to_string()),
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms),
+        started_at_unix_ms: started_at_unix_ms.or(Some(terminal_unix_secs)),
+        finished_at_unix_ms: Some(terminal_unix_secs),
+    };
+    if !usage_handoff_persisted {
+        spawn_terminal_candidate_reconciliation(
+            state.clone(),
+            plan.clone(),
+            report_context.cloned(),
+            reconciliation_update.clone(),
+        );
+    }
+    let candidate_status = if usage_handoff_persisted {
+        RequestCandidateStatus::Failed
+    } else {
+        RequestCandidateStatus::Streaming
+    };
+    let candidate_update = SchedulerRequestCandidateStatusUpdate {
+        status: candidate_status,
+        status_code: candidate_status_code,
+        error_type: if usage_handoff_persisted {
+            Some(error_type.to_string())
+        } else {
+            Some("usage_terminal_handoff_unconfirmed".to_string())
         },
+        error_message: if usage_handoff_persisted {
+            Some(error_message.to_string())
+        } else {
+            Some(
+                "terminal usage persistence was not confirmed before candidate finalization"
+                    .to_string(),
+            )
+        },
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms),
+        started_at_unix_ms: started_at_unix_ms.or(Some(terminal_unix_secs)),
+        finished_at_unix_ms: usage_handoff_persisted.then_some(terminal_unix_secs),
+    };
+    let candidate_persisted = if intermediate_retry {
+        // This is deliberately an intermediate candidate failure.  The request-level
+        // usage row must remain pending so the next candidate can own the terminal
+        // settlement; the report-driven durability gate is only for true request
+        // terminal outcomes and would otherwise defer this diagnostic transition until
+        // a later request terminal exists.
+        record_local_request_candidate_status(state, plan, report_context, candidate_update.clone())
+            .await
+    } else {
+        record_report_request_candidate_status(state, report_context, candidate_update.clone())
+            .await
+    };
+    if terminal_owner_claimed && usage_handoff_persisted && candidate_persisted {
+        if let Some(progress) = watchdog_progress {
+            // Keep the owner registered through the candidate handoff.  A
+            // terminal usage write can finish before this status update; only
+            // now is it safe to let a later scope create a new owner.
+            crate::execution_runtime::unregister_stream_candidate_watchdog_progress(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+                &progress,
+            );
+        }
+    } else if terminal_owner_claimed && usage_handoff_persisted && !candidate_persisted {
+        // Usage is terminal but the candidate side channel was not accepted.
+        // Keep the same owner reservation while reconciliation retries; a late
+        // disconnect must not install a second terminal owner in this gap.
+        spawn_report_candidate_persistence_retry_after_usage_handoff(
+            state.clone(),
+            plan.clone(),
+            report_context.cloned(),
+            reconciliation_update,
+            watchdog_progress,
+        );
+    }
+    (
+        failure_analysis,
+        usage_handoff_persisted,
+        intermediate_retry,
     )
-    .await;
-    failure_analysis
 }
 
 #[allow(clippy::too_many_arguments)] // internal helper for prefetch error handling
@@ -528,20 +608,27 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
             .then(|| base64::engine::general_purpose::STANDARD.encode(buffered_body)),
         telemetry,
     };
-    let failure_analysis = record_stream_sync_failure(
-        state,
-        plan,
-        payload.report_context.as_ref(),
-        &payload,
-        Some(status_code),
-        None,
-        StreamFailureHandling::HonorLocalFailover,
-    )
-    .await;
-    if matches!(
-        failure_analysis.decision,
-        LocalFailoverDecision::RetryNextCandidate
-    ) {
+    // A direct/internal prefetch invocation has no outer candidate owner.  It
+    // must settle request-level usage even when policy classification says
+    // RetryNextCandidate; only the candidate-loop variant may leave usage
+    // pending and return `None` for failover.
+    let honor_local_failover = retry_scope_out.is_some();
+    let (failure_analysis, usage_handoff_persisted, intermediate_retry) =
+        record_stream_sync_failure(
+            state,
+            plan,
+            payload.report_context.as_ref(),
+            &payload,
+            Some(status_code),
+            None,
+            if honor_local_failover {
+                StreamFailureHandling::HonorLocalFailover
+            } else {
+                StreamFailureHandling::Terminal
+            },
+        )
+        .await;
+    if intermediate_retry {
         let failure_disposition = classify_failure_disposition(
             &plan.provider_api_format,
             failure_analysis.classification,
@@ -578,8 +665,14 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
         return Ok(None);
     }
 
-    let response =
-        submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
+    let response = submit_local_core_error_or_sync_finalize_after_terminal_usage(
+        state,
+        trace_id,
+        decision,
+        payload,
+        usage_handoff_persisted,
+    )
+    .await?;
     Ok(Some(attach_control_metadata_headers(
         response,
         Some(request_id),
@@ -639,26 +732,22 @@ pub(super) async fn handle_prefetch_stream_failure(
         .await;
     }
     let honor_local_failover = honor_http_failover && retry_scope_out.is_some();
-    let failure_analysis = record_stream_sync_failure(
-        state,
-        plan,
-        payload.report_context.as_ref(),
-        &payload,
-        candidate_status_code,
-        None,
-        if honor_local_failover {
-            StreamFailureHandling::HonorLocalFailover
-        } else {
-            StreamFailureHandling::Terminal
-        },
-    )
-    .await;
-    if honor_local_failover
-        && matches!(
-            failure_analysis.decision,
-            LocalFailoverDecision::RetryNextCandidate
+    let (failure_analysis, usage_handoff_persisted, intermediate_retry) =
+        record_stream_sync_failure(
+            state,
+            plan,
+            payload.report_context.as_ref(),
+            &payload,
+            candidate_status_code,
+            None,
+            if honor_local_failover {
+                StreamFailureHandling::HonorLocalFailover
+            } else {
+                StreamFailureHandling::Terminal
+            },
         )
-    {
+        .await;
+    if intermediate_retry {
         let failure_disposition = classify_failure_disposition(
             &plan.provider_api_format,
             failure_analysis.classification,
@@ -680,8 +769,14 @@ pub(super) async fn handle_prefetch_stream_failure(
         return Ok(None);
     }
 
-    let response =
-        submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
+    let response = submit_local_core_error_or_sync_finalize_after_terminal_usage(
+        state,
+        trace_id,
+        decision,
+        payload,
+        usage_handoff_persisted,
+    )
+    .await?;
     Ok(Some(attach_control_metadata_headers(
         response,
         Some(request_id),
@@ -704,7 +799,29 @@ async fn handle_prefetch_transport_stream_failure(
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let error_type = stream_failure_body_field(&payload, "type").unwrap_or("internal");
     let error_message = stream_failure_body_field(&payload, "message").unwrap_or_default();
-    if matches!(error_type, "first_byte_timeout" | "read_timeout") {
+    let analysis = resolve_local_transport_failover_analysis_for_attempt(
+        state,
+        plan,
+        payload.report_context.as_ref(),
+    )
+    .await;
+    let watchdog_progress =
+        crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        );
+    let retrying_next_candidate = retry_scope_out.is_some()
+        && matches!(analysis.decision, LocalFailoverDecision::RetryNextCandidate)
+        && crate::execution_runtime::stream_candidate_watchdog_allows_intermediate_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        )
+        && crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        );
+    let timeout_failure = matches!(error_type, "first_byte_timeout" | "read_timeout");
+    if retrying_next_candidate && timeout_failure {
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {
@@ -715,17 +832,13 @@ async fn handle_prefetch_transport_stream_failure(
         )
         .await;
     }
-
-    let analysis = resolve_local_transport_failover_analysis_for_attempt(
-        state,
-        plan,
-        payload.report_context.as_ref(),
-    )
-    .await;
-    let retrying_next_candidate = retry_scope_out.is_some()
-        && matches!(analysis.decision, LocalFailoverDecision::RetryNextCandidate);
-    if !retrying_next_candidate {
-        crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
+    let terminal_owner_claimed = !retrying_next_candidate
+        && crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started_with_progress(
+            watchdog_progress.as_ref(),
+        );
+    let usage_handoff_persisted = if retrying_next_candidate {
+        true
+    } else if terminal_owner_claimed {
         let report_context_with_diagnostics =
             attach_current_request_diagnostics_and_candidate_timing_to_report_context(
                 payload.report_context.as_ref(),
@@ -746,35 +859,118 @@ async fn handle_prefetch_transport_stream_failure(
                 .or(payload.report_context.as_ref()),
         );
         let payload_seed = build_sync_terminal_usage_payload_seed(&payload);
-        state
+        let persisted = state
             .usage_runtime
-            .record_sync_terminal(
+            .record_sync_terminal_with_handoff(
                 state.usage_lifecycle_data_state().as_ref(),
                 context_seed,
                 payload_seed,
             )
             .await;
+        persisted
+    } else {
+        // The terminal owner was already claimed by another path; leave this
+        // candidate non-terminal until that durable outcome is observed.
+        false
+    };
+    if !retrying_next_candidate && timeout_failure && usage_handoff_persisted {
+        // Keep the terminal usage handoff ahead of timeout/lease side effects;
+        // otherwise a stalled pool write can strand the request at streaming.
+        apply_local_execution_effect(
+            state,
+            LocalExecutionEffectContext {
+                plan,
+                report_context: payload.report_context.as_ref(),
+            },
+            LocalExecutionEffect::PoolStreamTimeout,
+        )
+        .await;
     }
 
     let terminal_unix_ms = current_request_candidate_unix_ms();
-    record_report_request_candidate_status(
-        state,
-        payload.report_context.as_ref(),
-        SchedulerRequestCandidateStatusUpdate {
-            status: RequestCandidateStatus::Failed,
-            status_code: None,
-            error_type: Some(error_type.to_string()),
-            error_message: Some(error_message.to_string()),
-            latency_ms: payload
-                .telemetry
-                .as_ref()
-                .and_then(|telemetry| telemetry.elapsed_ms)
-                .or(Some(candidate_elapsed_ms)),
-            started_at_unix_ms: Some(candidate_started_unix_ms),
-            finished_at_unix_ms: Some(terminal_unix_ms),
+    let reconciliation_update = SchedulerRequestCandidateStatusUpdate {
+        status: RequestCandidateStatus::Failed,
+        status_code: None,
+        error_type: Some(error_type.to_string()),
+        error_message: Some(error_message.to_string()),
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms)
+            .or(Some(candidate_elapsed_ms)),
+        started_at_unix_ms: Some(candidate_started_unix_ms),
+        finished_at_unix_ms: Some(terminal_unix_ms),
+    };
+    if !usage_handoff_persisted {
+        spawn_terminal_candidate_reconciliation(
+            state.clone(),
+            plan.clone(),
+            payload.report_context.clone(),
+            reconciliation_update.clone(),
+        );
+    }
+    let candidate_status = if usage_handoff_persisted {
+        RequestCandidateStatus::Failed
+    } else {
+        RequestCandidateStatus::Streaming
+    };
+    let candidate_update = SchedulerRequestCandidateStatusUpdate {
+        status: candidate_status,
+        status_code: None,
+        error_type: if usage_handoff_persisted {
+            Some(error_type.to_string())
+        } else {
+            Some("usage_terminal_handoff_unconfirmed".to_string())
         },
-    )
-    .await;
+        error_message: if usage_handoff_persisted {
+            Some(error_message.to_string())
+        } else {
+            Some(
+                "terminal usage persistence was not confirmed before candidate finalization"
+                    .to_string(),
+            )
+        },
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms)
+            .or(Some(candidate_elapsed_ms)),
+        started_at_unix_ms: Some(candidate_started_unix_ms),
+        finished_at_unix_ms: usage_handoff_persisted.then_some(terminal_unix_ms),
+    };
+    let candidate_persisted = if retrying_next_candidate {
+        record_local_request_candidate_status(
+            state,
+            plan,
+            payload.report_context.as_ref(),
+            candidate_update.clone(),
+        )
+        .await
+    } else {
+        record_report_request_candidate_status(
+            state,
+            payload.report_context.as_ref(),
+            candidate_update.clone(),
+        )
+        .await
+    };
+    if terminal_owner_claimed && usage_handoff_persisted && candidate_persisted {
+        if let Some(progress) = watchdog_progress {
+            crate::execution_runtime::unregister_stream_candidate_watchdog_progress(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+                &progress,
+            );
+        }
+    } else if terminal_owner_claimed && usage_handoff_persisted && !candidate_persisted {
+        spawn_report_candidate_persistence_retry_after_usage_handoff(
+            state.clone(),
+            plan.clone(),
+            payload.report_context.clone(),
+            reconciliation_update,
+            watchdog_progress,
+        );
+    }
 
     if retrying_next_candidate {
         if let Some(retry_scope) = retry_scope_out {
@@ -792,8 +988,14 @@ async fn handle_prefetch_transport_stream_failure(
         return Ok(None);
     }
 
-    let response =
-        submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
+    let response = submit_local_core_error_or_sync_finalize_after_terminal_usage(
+        state,
+        trace_id,
+        decision,
+        payload,
+        usage_handoff_persisted,
+    )
+    .await?;
     Ok(Some(attach_control_metadata_headers(
         response,
         Some(request_id),
@@ -801,11 +1003,60 @@ async fn handle_prefetch_transport_stream_failure(
     )?))
 }
 
+const FALLBACK_STREAM_TERMINAL_ERROR_REPORT_KIND: &str = "stream_terminal_error";
+
+/// Resolve the report kind used by the mid-stream terminal path without
+/// making usage persistence conditional on a planner/report mapping.  The
+/// direct-finalize kind is preferred because it carries the exact client
+/// contract.  Older/custom attempt sources may omit it (and sometimes only
+/// provide a success stream kind); those paths still need a terminal usage
+/// event, so map the known success aliases to their sync error counterparts
+/// and retain a neutral kind for completely unknown formats.
+fn resolve_midstream_stream_error_report_kind(
+    direct_stream_finalize_kind: Option<&str>,
+    fallback_report_kind: Option<&str>,
+) -> String {
+    if let Some(report_kind) =
+        direct_stream_finalize_kind.and_then(resolve_core_error_background_report_kind)
+    {
+        return report_kind;
+    }
+
+    let Some(report_kind) = fallback_report_kind
+        .map(str::trim)
+        .filter(|report_kind| !report_kind.is_empty())
+    else {
+        return FALLBACK_STREAM_TERMINAL_ERROR_REPORT_KIND.to_string();
+    };
+
+    let mapped = match report_kind {
+        "openai_chat_stream_success" | "openai_chat_sync_success" => "openai_chat_sync_error",
+        "claude_chat_stream_success" | "claude_chat_sync_success" => "claude_chat_sync_error",
+        "gemini_chat_stream_success" | "gemini_chat_sync_success" => "gemini_chat_sync_error",
+        "gemini_interactions_stream_success" | "gemini_interactions_sync_success" => {
+            "gemini_interactions_sync_error"
+        }
+        "openai_responses_stream_success" | "openai_responses_sync_success" => {
+            "openai_responses_sync_error"
+        }
+        "openai_responses_compact_stream_success" | "openai_responses_compact_sync_success" => {
+            "openai_responses_compact_sync_error"
+        }
+        "openai_image_stream_success" | "openai_image_sync_success" => "openai_image_sync_error",
+        "openai_cli_stream_success" => "openai_cli_sync_error",
+        "claude_cli_stream_success" => "claude_cli_sync_error",
+        "gemini_cli_stream_success" => "gemini_cli_sync_error",
+        _ => report_kind,
+    };
+    mapped.to_string()
+}
+
 pub(super) async fn submit_midstream_stream_failure(
     state: &AppState,
     trace_id: &str,
     plan: &ExecutionPlan,
     direct_stream_finalize_kind: Option<&str>,
+    fallback_report_kind: Option<&str>,
     report_context: Option<Value>,
     headers: std::collections::BTreeMap<String, String>,
     telemetry: Option<ExecutionTelemetry>,
@@ -813,11 +1064,10 @@ pub(super) async fn submit_midstream_stream_failure(
     started_at_unix_ms: u64,
     failure: StreamFailureReport,
 ) {
-    let Some(report_kind) =
-        direct_stream_finalize_kind.and_then(resolve_core_error_background_report_kind)
-    else {
-        return;
-    };
+    let report_kind = resolve_midstream_stream_error_report_kind(
+        direct_stream_finalize_kind,
+        fallback_report_kind,
+    );
 
     let candidate_status_code = failure.upstream_status_code;
     let payload = build_stream_failure_sync_payload(
@@ -829,17 +1079,20 @@ pub(super) async fn submit_midstream_stream_failure(
         buffered_body,
         failure,
     );
-    record_stream_sync_failure(
-        state,
-        plan,
-        payload.report_context.as_ref(),
-        &payload,
-        candidate_status_code,
-        Some(started_at_unix_ms),
-        StreamFailureHandling::Terminal,
-    )
-    .await;
-    if let Err(err) = submit_sync_report(state, payload).await {
+    let (_failure_analysis, usage_handoff_persisted, _intermediate_retry) =
+        record_stream_sync_failure(
+            state,
+            plan,
+            payload.report_context.as_ref(),
+            &payload,
+            candidate_status_code,
+            Some(started_at_unix_ms),
+            StreamFailureHandling::Terminal,
+        )
+        .await;
+    if let Err(err) =
+        submit_sync_report_after_terminal_usage(state, payload, usage_handoff_persisted).await
+    {
         let request_id = short_request_id(plan.request_id.as_str());
         warn!(
             event_name = "execution_report_submit_failed",
@@ -865,7 +1118,30 @@ mod tests {
     use super::{
         build_stream_failure_from_execution_error, build_stream_failure_from_provider_error_body,
         build_stream_failure_sync_payload, build_stream_transport_failure_report,
+        resolve_midstream_stream_error_report_kind,
     };
+
+    #[test]
+    fn midstream_failure_report_kind_has_a_terminal_fallback_without_mapping() {
+        assert_eq!(
+            resolve_midstream_stream_error_report_kind(None, None),
+            "stream_terminal_error"
+        );
+        assert_eq!(
+            resolve_midstream_stream_error_report_kind(
+                None,
+                Some("openai_responses_stream_success")
+            ),
+            "openai_responses_sync_error"
+        );
+        assert_eq!(
+            resolve_midstream_stream_error_report_kind(
+                Some("openai_chat_sync_finalize"),
+                Some("gemini_chat_stream_success")
+            ),
+            "openai_chat_sync_error"
+        );
+    }
 
     #[test]
     fn committed_transport_failure_has_no_upstream_status() {

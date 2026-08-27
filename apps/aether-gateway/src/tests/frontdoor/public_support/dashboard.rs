@@ -1235,3 +1235,108 @@ async fn gateway_handles_dashboard_provider_status_locally_without_proxying_upst
     gateway_handle.abort();
     upstream_handle.abort();
 }
+
+#[tokio::test]
+async fn gateway_dashboard_realtime_returns_contract_and_disables_http_caching() {
+    let now = stable_dashboard_now();
+    let admin = StoredUserAuthRecord::new(
+        "admin-realtime-1".to_string(),
+        Some("admin-realtime@example.com".to_string()),
+        true,
+        "realtime-admin".to_string(),
+        Some("$2y$10$.OBQfixAECpsb8V/VS3csOMf00x2E/jD/gnud20t6RG0yiQosyOZ2".to_string()),
+        "admin".to_string(),
+        "local".to_string(),
+        None,
+        None,
+        None,
+        true,
+        false,
+        Some(now),
+        Some(now),
+    )
+    .expect("admin auth user should build");
+    let access_token = build_test_auth_token(
+        "access",
+        serde_json::Map::from_iter([
+            ("user_id".to_string(), json!(admin.id)),
+            ("role".to_string(), json!(admin.role)),
+            (
+                "created_at".to_string(),
+                json!(admin.created_at.map(|value| value.to_rfc3339())),
+            ),
+            (
+                "session_id".to_string(),
+                json!("session-dashboard-realtime-admin"),
+            ),
+        ]),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let session = sample_auth_session(
+        "admin-realtime-1",
+        "session-dashboard-realtime-admin",
+        "device-dashboard-realtime-admin",
+        "refresh-dashboard-realtime-admin",
+        now,
+    );
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![],
+        vec![],
+        vec![],
+    ));
+    let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+        start_auth_dashboard_gateway_with_state(
+            admin,
+            sample_auth_wallet("admin-realtime-1", now),
+            [session],
+            usage_repository,
+            provider_catalog_repository,
+        )
+        .await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/dashboard/realtime"))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-dashboard-realtime-admin")
+        .header("user-agent", "AetherTest/1.0")
+        .send()
+        .await
+        .expect("realtime request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let cache_control = response
+        .headers()
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(cache_control.contains("no-store"));
+    assert!(cache_control.contains("no-cache"));
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .expect("realtime response should be json");
+    assert_eq!(payload["rpm"], json!(0));
+    assert_eq!(payload["tpm"], json!(0));
+    assert_eq!(payload["window_seconds"], json!(60));
+    assert!(payload["as_of"]
+        .as_str()
+        .is_some_and(|value| { chrono::DateTime::parse_from_rfc3339(value).is_ok() }));
+    assert_eq!(
+        payload["semantics"],
+        json!({
+            "rpm": "accepted_non_failed_requests",
+            "tpm": "observed_token_deltas_including_failed",
+            "window": "trailing_60_seconds",
+            "failed_requests": "excluded_from_rpm_only",
+        })
+    );
+    assert!(matches!(
+        payload["storage_scope"].as_str(),
+        Some("shared" | "process")
+    ));
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}

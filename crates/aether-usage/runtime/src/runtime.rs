@@ -37,6 +37,44 @@ pub trait UsageBillingEventEnricher: Send + Sync {
     async fn enrich_usage_event(&self, event: &mut UsageEvent) -> Result<(), DataLayerError>;
 }
 
+/// Optional observer for lightweight, realtime usage accounting.
+///
+/// The observer is called after a lifecycle event has been materialized and
+/// before it is queued or persisted.  Implementations must be non-blocking
+/// (or hand work off to their own runtime) because usage accounting is kept
+/// off the request response critical path.
+pub trait UsageRealtimeMetricsSink: Send + Sync + std::fmt::Debug {
+    fn observe_usage_event(&self, event: &UsageEvent);
+
+    /// Observe a token increment emitted directly by a streaming transport.
+    ///
+    /// Most usage accounting arrives as a materialized `UsageEvent`, but
+    /// providers may expose cumulative usage snapshots while a response is
+    /// still in flight.  Transports can forward the de-duplicated increment
+    /// immediately without manufacturing a terminal event.  The default is
+    /// intentionally a no-op so existing sink implementations remain source
+    /// compatible.
+    fn observe_token_delta(&self, _observation: UsageRealtimeTokenDelta) {}
+}
+
+/// A lightweight token increment for realtime TPM accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRealtimeTokenDelta {
+    pub request_id: String,
+    pub admission_id: Option<String>,
+    pub candidate_id: Option<String>,
+    /// Transport-attempt identity. A retry may reuse request/candidate IDs;
+    /// including this value prevents its legitimate token increments from
+    /// colliding with an earlier attempt's local sequence numbers.
+    pub attempt_id: Option<String>,
+    pub timestamp_ms: u64,
+    pub token_delta: u64,
+    /// Sequence assigned by the transport for providers that emit streaming
+    /// increments.  It is optional because cumulative lifecycle snapshots may
+    /// not carry a provider sequence number.
+    pub sequence: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsageRequestRecordLevel {
     Basic,
@@ -86,6 +124,7 @@ pub trait UsageRuntimeAccess:
 #[derive(Debug, Clone)]
 pub struct UsageRuntime {
     config: UsageRuntimeConfig,
+    realtime_metrics_sink: Option<Arc<dyn UsageRealtimeMetricsSink>>,
     body_policy_cache: Arc<tokio::sync::Mutex<Option<UsageBodyCapturePolicyCacheEntry>>>,
     enqueue_retry: Arc<UsageEnqueueRetryDispatcher>,
     worker_supervisor_state: Arc<UsageWorkerSupervisorState>,
@@ -556,6 +595,10 @@ const USAGE_BODY_CAPTURE_POLICY_ERROR_CACHE_TTL: Duration = Duration::from_secs(
 const LIFECYCLE_ENQUEUE_CIRCUIT_OPEN_MS: u64 = 1_000;
 const LIFECYCLE_COALESCER_CLOSE_TTL: Duration = Duration::from_secs(30);
 const LIFECYCLE_COALESCER_COMPACT_INTERVAL: Duration = Duration::from_secs(1);
+// Bound the time a request handler waits for terminal usage admission and
+// persistence.  The detached continuation retains the complete event after
+// this deadline, while the caller can return and schedule reconciliation.
+const TERMINAL_HANDOFF_CALLER_WAIT: Duration = Duration::from_secs(30);
 const TERMINAL_SUBMISSION_MAX_LIMIT: usize = 1_048_576;
 const TERMINAL_DIRECT_FALLBACK_DEFAULT_MAX_IN_FLIGHT: usize = 32;
 const LIFECYCLE_SUBMISSION_MAX_BUFFER: usize = 1_048_576;
@@ -572,6 +615,10 @@ const PENDING_PERSISTENCE_SINGLE_WRITE_CONCURRENCY_PER_BATCH: usize =
 const PENDING_PERSISTENCE_BATCH_RETRIES_BEFORE_ISOLATION: u64 = 2;
 const PENDING_PERSISTENCE_SINGLE_RETRIES_BEFORE_DEGRADE: u64 = 3;
 const ORDERED_INTERMEDIATE_RETRIES_BEFORE_DEGRADE: u64 = 3;
+// A terminal handoff is a correctness barrier, not a best-effort enqueue.  Give a transient
+// database failure a few bounded retries before falling back to the normal terminal retry
+// machinery.  Callers only publish a successful candidate after this barrier returns true.
+const ORDERED_TERMINAL_DIRECT_RETRIES: u64 = 3;
 const FIRST_BYTE_PERSISTENCE_DEFAULT_CONCURRENCY: usize = 32;
 const FIRST_BYTE_PERSISTENCE_MAX_BUFFER: usize = 32_768;
 // Keep the first-byte path off the request task while amortizing the single
@@ -1189,11 +1236,13 @@ enum LifecycleSubmissionPayload {
     TerminalSeed {
         seed: LifecycleTerminalUsageSeed,
         observed_at_unix_ms: u64,
+        direct: bool,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     Terminal {
         event: UsageEvent,
         direct: bool,
-        completion: Option<tokio::sync::oneshot::Sender<()>>,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
 }
 
@@ -1267,11 +1316,13 @@ enum TerminalExecutionPayload {
     Seed {
         seed: LifecycleTerminalUsageSeed,
         observed_at_unix_ms: u64,
+        direct: bool,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     Event {
         event: UsageEvent,
         direct: bool,
-        completion: Option<tokio::sync::oneshot::Sender<()>>,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
 }
 
@@ -1329,6 +1380,18 @@ where
             .begin_registered_terminal_submission(&request_id, pending_guard)
             .await
         else {
+            // The completion channel is the caller's durability handoff.  An
+            // admission race must resolve it explicitly; otherwise the
+            // caller waits forever and may leave its candidate in an
+            // indeterminate state even though this item has already been
+            // discarded.
+            let completion = match payload {
+                TerminalExecutionPayload::Seed { completion, .. }
+                | TerminalExecutionPayload::Event { completion, .. } => completion,
+            };
+            if let Some(completion) = completion {
+                let _ = completion.send(false);
+            }
             return;
         };
 
@@ -1336,12 +1399,17 @@ where
             TerminalExecutionPayload::Seed {
                 seed,
                 observed_at_unix_ms,
+                direct,
+                completion,
             } => {
                 let Ok(mut event) = seed.build(&request_id).await else {
+                    if let Some(completion) = completion {
+                        let _ = completion.send(false);
+                    }
                     return;
                 };
                 event.timestamp_ms = observed_at_unix_ms;
-                (event, false, None)
+                (event, direct, completion)
             }
             TerminalExecutionPayload::Event {
                 event,
@@ -1354,11 +1422,30 @@ where
         runtime
             .apply_body_capture_policy_from_data(&data, &mut event)
             .await;
+        // Direct terminal items are enriched in `persist_ordered_terminal_event`
+        // before they are observed by the realtime sink.  Queue-backed items
+        // do not pass through that enrichment path, so keep their single
+        // pre-dispatch observation here.  This avoids racing a zero/partial
+        // direct snapshot against the enriched terminal total.
+        if !direct {
+            runtime.notify_realtime_metrics(&event);
+        }
         let persistence_outcome = runtime
             .persist_ordered_terminal_event(&data, event, direct)
             .await;
         drop(submission_permit);
-        if persistence_outcome == TerminalPersistenceOutcome::Failed {
+        // Queue admission is not the durability barrier.  The caller may
+        // publish a terminal candidate only after the usage row itself was
+        // written; queued/buffered outcomes remain available to the retry
+        // machinery but must report `false` here.
+        let persistence_succeeded = matches!(
+            persistence_outcome,
+            TerminalPersistenceOutcome::PersistedDirectly
+        );
+        if let Some(completion) = completion {
+            let _ = completion.send(persistence_succeeded);
+        }
+        if !persistence_succeeded {
             warn!(
                 event_name = "usage_ordered_terminal_persistence_failed",
                 log_type = "ops",
@@ -1369,9 +1456,6 @@ where
             return;
         }
         ordered_completion.complete();
-        if let Some(completion) = completion {
-            let _ = completion.send(());
-        }
     }
 }
 
@@ -1521,6 +1605,8 @@ where
             LifecycleSubmissionPayload::TerminalSeed {
                 seed,
                 observed_at_unix_ms,
+                direct,
+                completion,
             } => {
                 let ordered_lifecycle = Arc::clone(&runtime.ordered_lifecycle);
                 ordered_lifecycle.dispatch(
@@ -1531,6 +1617,8 @@ where
                         payload: OrderedLifecyclePayload::TerminalSeed {
                             seed,
                             observed_at_unix_ms,
+                            direct,
+                            completion,
                         },
                     }),
                     admission,
@@ -1564,6 +1652,7 @@ where
                 runtime
                     .apply_body_capture_policy_from_data(&data, &mut event)
                     .await;
+                runtime.notify_realtime_metrics(&event);
                 let payload = if event.event_type == crate::UsageEventType::Pending {
                     OrderedLifecyclePayload::Pending { event }
                 } else {
@@ -1874,11 +1963,13 @@ enum OrderedLifecyclePayload {
     TerminalSeed {
         seed: LifecycleTerminalUsageSeed,
         observed_at_unix_ms: u64,
+        direct: bool,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     Terminal {
         event: UsageEvent,
         direct: bool,
-        completion: Option<tokio::sync::oneshot::Sender<()>>,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
 }
 
@@ -1956,6 +2047,8 @@ where
             OrderedLifecyclePayload::TerminalSeed {
                 seed,
                 observed_at_unix_ms,
+                direct,
+                completion,
             } => {
                 let pending_guard = runtime.terminal_submission_state.register_pending();
                 let terminal_execution = Arc::clone(&runtime.terminal_execution);
@@ -1966,6 +2059,8 @@ where
                     payload: TerminalExecutionPayload::Seed {
                         seed,
                         observed_at_unix_ms,
+                        direct,
+                        completion,
                     },
                     pending_guard,
                     ordered_completion,
@@ -3289,6 +3384,7 @@ impl UsageRuntime {
         let terminal_execution = TerminalExecutionDispatcher::disabled();
         Self {
             config: UsageRuntimeConfig::disabled(),
+            realtime_metrics_sink: None,
             body_policy_cache: Arc::new(tokio::sync::Mutex::new(None)),
             enqueue_retry: UsageEnqueueRetryDispatcher::disabled(),
             worker_supervisor_state: Arc::new(UsageWorkerSupervisorState::default()),
@@ -3345,6 +3441,7 @@ impl UsageRuntime {
         let first_byte_persistence = FirstBytePersistenceDispatcher::spawn(&config);
         Ok(Self {
             config,
+            realtime_metrics_sink: None,
             body_policy_cache: Arc::new(tokio::sync::Mutex::new(None)),
             enqueue_retry,
             worker_supervisor_state: Arc::new(UsageWorkerSupervisorState::default()),
@@ -3361,6 +3458,79 @@ impl UsageRuntime {
             pending_persistence,
             first_byte_persistence,
         })
+    }
+
+    /// Attach a realtime observer to lifecycle events emitted by this
+    /// runtime.  The observer is deliberately optional so queue-only and
+    /// disabled usage configurations retain their existing behavior.
+    pub fn with_realtime_metrics_sink(mut self, sink: Arc<dyn UsageRealtimeMetricsSink>) -> Self {
+        self.realtime_metrics_sink = Some(sink);
+        self
+    }
+
+    /// Replace the observer on an already constructed runtime.  Gateway
+    /// state uses this when its shared RuntimeState backend is swapped in a
+    /// test or during bootstrap.
+    pub fn set_realtime_metrics_sink(&mut self, sink: Arc<dyn UsageRealtimeMetricsSink>) {
+        self.realtime_metrics_sink = Some(sink);
+    }
+
+    fn notify_realtime_metrics(&self, event: &UsageEvent) {
+        if let Some(sink) = self.realtime_metrics_sink.as_ref() {
+            sink.observe_usage_event(event);
+        }
+    }
+
+    /// Forward a token increment to the optional realtime metrics sink.  This
+    /// call is synchronous and intentionally tiny; concrete sinks must hand
+    /// persistence work to their own background runtime.
+    pub fn record_realtime_token_delta(
+        &self,
+        request_id: impl Into<String>,
+        admission_id: Option<String>,
+        candidate_id: Option<String>,
+        timestamp_ms: u64,
+        token_delta: u64,
+        sequence: Option<u64>,
+    ) {
+        self.record_realtime_token_delta_with_attempt(
+            request_id,
+            admission_id,
+            candidate_id,
+            None,
+            timestamp_ms,
+            token_delta,
+            sequence,
+        );
+    }
+
+    /// Variant of [`Self::record_realtime_token_delta`] that carries a
+    /// per-transport-attempt identity for replay-safe streaming sequences.
+    pub fn record_realtime_token_delta_with_attempt(
+        &self,
+        request_id: impl Into<String>,
+        admission_id: Option<String>,
+        candidate_id: Option<String>,
+        attempt_id: Option<String>,
+        timestamp_ms: u64,
+        token_delta: u64,
+        sequence: Option<u64>,
+    ) {
+        if token_delta == 0 {
+            return;
+        }
+        let Some(sink) = self.realtime_metrics_sink.as_ref() else {
+            return;
+        };
+        sink.observe_token_delta(UsageRealtimeTokenDelta {
+            request_id: request_id.into(),
+            admission_id,
+            candidate_id,
+            attempt_id,
+            timestamp_ms,
+            token_delta,
+            sequence,
+        });
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -3837,7 +4007,7 @@ impl UsageRuntime {
         data: &T,
         event: UsageEvent,
         direct: bool,
-        completion: Option<tokio::sync::oneshot::Sender<()>>,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
     ) where
         T: UsageRuntimeAccess + Clone + 'static,
     {
@@ -3864,6 +4034,22 @@ impl UsageRuntime {
     ) where
         T: UsageRuntimeAccess + Clone + 'static,
     {
+        let _ = self
+            .dispatch_terminal_seed_with_options(data, request_id, seed, false, None)
+            .await;
+    }
+
+    async fn dispatch_terminal_seed_with_options<T>(
+        &self,
+        data: &T,
+        request_id: String,
+        seed: LifecycleTerminalUsageSeed,
+        direct: bool,
+        completion: Option<tokio::sync::oneshot::Sender<bool>>,
+    ) -> bool
+    where
+        T: UsageRuntimeAccess + Clone + 'static,
+    {
         self.lifecycle_submission
             .dispatch_terminal(Box::new(LifecycleSubmissionItemImpl {
                 runtime: self.clone(),
@@ -3872,9 +4058,11 @@ impl UsageRuntime {
                 payload: LifecycleSubmissionPayload::TerminalSeed {
                     seed,
                     observed_at_unix_ms: now_unix_ms(),
+                    direct,
+                    completion,
                 },
             }))
-            .await;
+            .await
     }
 
     async fn await_lifecycle_submission_turn(
@@ -4022,6 +4210,69 @@ impl UsageRuntime {
         .await;
     }
 
+    /// Submit a sync terminal event and wait until the usage runtime has either
+    /// persisted it (or accepted it through its configured terminal queue) or
+    /// definitively failed.  Callers use this as the ordering handoff before
+    /// publishing a terminal request-candidate status; otherwise cleanup can
+    /// observe `success` while the usage row is still only skeletal.
+    pub async fn record_sync_terminal_with_handoff<T>(
+        &self,
+        data: &T,
+        context_seed: TerminalUsageContextSeed,
+        payload_seed: SyncTerminalUsagePayloadSeed,
+    ) -> bool
+    where
+        T: UsageRuntimeAccess + Clone + 'static,
+    {
+        if !self.is_enabled() {
+            return true;
+        }
+        let request_id = context_seed.request_id.clone();
+        let log_request_id = request_id.clone();
+        let runtime = self.clone();
+        let data = T::clone(data);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        // Keep the admission permit, event seed, and completion receiver on a
+        // process-lifetime runtime.  Dropping the HTTP future must not cancel
+        // this continuation while it is waiting for a saturated dispatcher.
+        spawn_on_usage_background_runtime(async move {
+            let (completion, completed) = tokio::sync::oneshot::channel();
+            let accepted = runtime
+                .dispatch_terminal_seed_with_options(
+                    &data,
+                    request_id.clone(),
+                    LifecycleTerminalUsageSeed::Sync {
+                        context: context_seed,
+                        payload: payload_seed,
+                    },
+                    true,
+                    Some(completion),
+                )
+                .await;
+            let result = if accepted {
+                completed.await.unwrap_or(false)
+            } else {
+                false
+            };
+            let _ = result_tx.send(result);
+        });
+        match tokio::time::timeout(TERMINAL_HANDOFF_CALLER_WAIT, result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                warn!(
+                    event_name = "usage_sync_terminal_handoff_wait_timeout",
+                    log_type = "event",
+                    request_id = %log_request_id,
+                    wait_ms = TERMINAL_HANDOFF_CALLER_WAIT.as_millis() as u64,
+                    fallback = "detached_reconciliation",
+                    "request returned before the detached sync usage handoff completed"
+                );
+                false
+            }
+        }
+    }
+
     pub async fn record_stream_terminal<T>(
         &self,
         data: &T,
@@ -4045,6 +4296,67 @@ impl UsageRuntime {
             },
         )
         .await;
+    }
+
+    /// Stream equivalent of [`Self::record_sync_terminal_with_handoff`].  The
+    /// handoff is deliberately explicit so legacy/background callers can keep
+    /// their non-blocking queue semantics while HTTP terminal paths can order
+    /// candidate persistence behind usage persistence.
+    pub async fn record_stream_terminal_with_handoff<T>(
+        &self,
+        data: &T,
+        context_seed: TerminalUsageContextSeed,
+        payload_seed: StreamTerminalUsagePayloadSeed,
+        cancelled: bool,
+    ) -> bool
+    where
+        T: UsageRuntimeAccess + Clone + 'static,
+    {
+        if !self.is_enabled() {
+            return true;
+        }
+        let request_id = context_seed.request_id.clone();
+        let log_request_id = request_id.clone();
+        let runtime = self.clone();
+        let data = T::clone(data);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        spawn_on_usage_background_runtime(async move {
+            let (completion, completed) = tokio::sync::oneshot::channel();
+            let accepted = runtime
+                .dispatch_terminal_seed_with_options(
+                    &data,
+                    request_id.clone(),
+                    LifecycleTerminalUsageSeed::Stream {
+                        context: context_seed,
+                        payload: payload_seed,
+                        cancelled,
+                    },
+                    true,
+                    Some(completion),
+                )
+                .await;
+            let result = if accepted {
+                completed.await.unwrap_or(false)
+            } else {
+                false
+            };
+            let _ = result_tx.send(result);
+        });
+        match tokio::time::timeout(TERMINAL_HANDOFF_CALLER_WAIT, result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                warn!(
+                    event_name = "usage_stream_terminal_handoff_wait_timeout",
+                    log_type = "event",
+                    request_id = %log_request_id,
+                    wait_ms = TERMINAL_HANDOFF_CALLER_WAIT.as_millis() as u64,
+                    fallback = "detached_reconciliation",
+                    "request returned before the detached stream usage handoff completed"
+                );
+                false
+            }
+        }
     }
 
     pub async fn submit_terminal_event<T>(&self, data: &T, event: UsageEvent)
@@ -4073,6 +4385,7 @@ impl UsageRuntime {
         };
         self.apply_body_capture_policy_from_data(data, &mut event)
             .await;
+        self.notify_realtime_metrics(&event);
         let persistence_outcome = self.enqueue_or_write_terminal(data, event).await;
         if persistence_outcome != TerminalPersistenceOutcome::Failed {
             if let Some(completion) = ordered_completion {
@@ -4081,19 +4394,75 @@ impl UsageRuntime {
         }
     }
 
-    pub async fn record_terminal_event_direct<T>(&self, data: &T, mut event: UsageEvent)
+    pub async fn record_terminal_event_direct<T>(&self, data: &T, event: UsageEvent)
+    where
+        T: UsageRuntimeAccess,
+    {
+        let _ = self
+            .record_terminal_event_direct_with_mode(data, event, false)
+            .await;
+    }
+
+    /// Persist a terminal event synchronously and report whether the usage
+    /// writer accepted the complete terminal transition.  This is used by
+    /// cancellation/drop guards that must publish a candidate outcome only
+    /// after the usage row has had a chance to become durable.
+    pub async fn record_terminal_event_direct_with_handoff<T>(
+        &self,
+        data: &T,
+        event: UsageEvent,
+    ) -> bool
+    where
+        T: UsageRuntimeAccess + Clone + 'static,
+    {
+        if !self.is_enabled() {
+            return true;
+        }
+        let runtime = self.clone();
+        let data = T::clone(data);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let request_id = event.request_id.clone();
+        spawn_on_usage_background_runtime(async move {
+            let result = runtime
+                .record_terminal_event_direct_with_mode(&data, event, true)
+                .await;
+            let _ = result_tx.send(result);
+        });
+        match tokio::time::timeout(TERMINAL_HANDOFF_CALLER_WAIT, result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                warn!(
+                    event_name = "usage_terminal_event_handoff_wait_timeout",
+                    log_type = "event",
+                    request_id = %request_id,
+                    wait_ms = TERMINAL_HANDOFF_CALLER_WAIT.as_millis() as u64,
+                    fallback = "detached_reconciliation",
+                    "request returned before the detached direct usage handoff completed"
+                );
+                false
+            }
+        }
+    }
+
+    async fn record_terminal_event_direct_with_mode<T>(
+        &self,
+        data: &T,
+        mut event: UsageEvent,
+        require_durable_row: bool,
+    ) -> bool
     where
         T: UsageRuntimeAccess,
     {
         if !self.is_enabled() {
-            return;
+            return true;
         }
         let ordered_completion = self
             .await_lifecycle_submission_turn(&event.request_id)
             .await;
         let Some(_submission_permit) = self.begin_terminal_submission(&event.request_id).await
         else {
-            return;
+            return false;
         };
         self.apply_body_capture_policy_from_data(data, &mut event)
             .await;
@@ -4106,14 +4475,57 @@ impl UsageRuntime {
                 "usage runtime failed to enrich terminal usage event with billing"
             );
         }
+        self.notify_realtime_metrics(&event);
         let request_id = event.request_id.clone();
-        if self.write_event_direct(data, &event).await {
-            self.lifecycle_coalescer
-                .cancel_delayed_for_queued_terminal(&request_id)
-                .await;
-            if let Some(completion) = ordered_completion {
-                completion.complete();
+        let mut attempts = 0_u64;
+        loop {
+            if self
+                .write_event_direct_with_mode(data, &event, require_durable_row)
+                .await
+            {
+                self.lifecycle_coalescer
+                    .cancel_delayed_for_queued_terminal(&request_id)
+                    .await;
+                if let Some(completion) = ordered_completion {
+                    completion.complete();
+                }
+                return true;
             }
+            attempts = attempts.saturating_add(1);
+            if attempts >= ORDERED_TERMINAL_DIRECT_RETRIES {
+                warn!(
+                    event_name = "usage_terminal_direct_handoff_failed",
+                    log_type = "event",
+                    request_id = %request_id,
+                    retry_attempts = attempts,
+                    fallback = "terminal_retry_queue",
+                    "usage runtime could not durably persist a direct terminal event"
+                );
+                // Keep the fully enriched event in the same bounded retry
+                // machinery used by ordered terminal seeds.  Returning false
+                // is still important (the candidate must not be finalized
+                // ahead of a durable row), but dropping the event here was
+                // the last direct-terminal path that could lose billing
+                // permanently when the database was briefly unavailable.
+                let fallback_outcome = self
+                    .enqueue_or_write_terminal_with_mode(data, event, require_durable_row)
+                    .await;
+                if matches!(
+                    fallback_outcome,
+                    TerminalPersistenceOutcome::PersistedDirectly
+                ) {
+                    self.lifecycle_coalescer
+                        .cancel_delayed_for_queued_terminal(&request_id)
+                        .await;
+                    if let Some(completion) = ordered_completion {
+                        completion.complete();
+                    }
+                    return true;
+                }
+                return false;
+            }
+            let delay = usage_enqueue_retry_delay(&self.config, attempts);
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -4187,9 +4599,28 @@ impl UsageRuntime {
     where
         T: UsageRuntimeAccess,
     {
+        self.enqueue_or_write_terminal_with_mode(data, event, false)
+            .await
+    }
+
+    async fn enqueue_or_write_terminal_with_mode<T>(
+        &self,
+        data: &T,
+        event: UsageEvent,
+        require_durable_row: bool,
+    ) -> TerminalPersistenceOutcome
+    where
+        T: UsageRuntimeAccess,
+    {
         let request_id = event.request_id.clone();
         let outcome = self
-            .enqueue_or_write_event(data, event, "terminal", self.config.queue_terminal_events)
+            .enqueue_or_write_event_with_mode(
+                data,
+                event,
+                "terminal",
+                self.config.queue_terminal_events,
+                require_durable_row,
+            )
             .await;
         // A direct terminal fallback can race the already-dispatched first-byte
         // write. Keep the delayed-terminal marker used by the queue path so an
@@ -4314,15 +4745,85 @@ impl UsageRuntime {
                 "usage runtime failed to enrich ordered direct terminal usage event"
             );
         }
+        // Billing/usage enrichment may fill a terminal token total that was
+        // absent from the initial lifecycle skeleton. The realtime observer
+        // uses a stable terminal identity, so this second notification is
+        // idempotent while allowing a zero-token event to be corrected.
+        self.notify_realtime_metrics(&event);
         let request_id = event.request_id.clone();
-        if self.write_event_direct(data, &event).await {
+        if !data.has_usage_writer() {
+            warn!(
+                event_name = "usage_ordered_terminal_writer_unavailable",
+                log_type = "event",
+                request_id = %request_id,
+                fallback = "terminal_retry_queue",
+                "usage runtime cannot confirm an ordered terminal event without a usage writer"
+            );
+        } else {
+            let mut attempts = 0_u64;
+            loop {
+                let write_succeeded = if let Some(gate) = &self.worker_record_gate {
+                    let _permit = gate.acquire().await;
+                    self.write_event_direct_with_mode(data, &event, true).await
+                } else {
+                    self.write_event_direct_with_mode(data, &event, true).await
+                };
+                if write_succeeded {
+                    if attempts > 0 {
+                        info!(
+                            event_name = "usage_ordered_terminal_persistence_recovered",
+                            log_type = "ops",
+                            request_id = %request_id,
+                            retry_attempts = attempts,
+                            "ordered terminal persistence recovered before candidate finalization"
+                        );
+                    }
+                    self.lifecycle_coalescer
+                        .cancel_delayed_for_queued_terminal(&request_id)
+                        .await;
+                    return TerminalPersistenceOutcome::PersistedDirectly;
+                }
+
+                attempts = attempts.saturating_add(1);
+                if attempts >= ORDERED_TERMINAL_DIRECT_RETRIES {
+                    break;
+                }
+                let delay = usage_enqueue_retry_delay(&self.config, attempts);
+                warn!(
+                    event_name = "usage_ordered_terminal_persistence_retry",
+                    log_type = "ops",
+                    request_id = %request_id,
+                    retry_attempt = attempts,
+                    retry_delay_ms = delay.as_millis() as u64,
+                    "ordered terminal persistence failed; retaining the candidate behind a retry"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        // Preserve the terminal payload for the regular bounded retry path.  Queue admission is
+        // deliberately *not* reported as a successful handoff: a queue append is not durable
+        // usage settlement and must never unlock a success candidate by itself.
+        let fallback_outcome = self
+            .enqueue_or_write_terminal_with_mode(data, event, true)
+            .await;
+        if matches!(
+            fallback_outcome,
+            TerminalPersistenceOutcome::PersistedDirectly
+        ) {
             self.lifecycle_coalescer
                 .cancel_delayed_for_queued_terminal(&request_id)
                 .await;
-            TerminalPersistenceOutcome::PersistedDirectly
-        } else {
-            TerminalPersistenceOutcome::Failed
+            return fallback_outcome;
         }
+        warn!(
+            event_name = "usage_ordered_terminal_handoff_deferred",
+            log_type = "event",
+            request_id = %request_id,
+            fallback_outcome = ?fallback_outcome,
+            "usage terminal payload was retained for retry but was not durably persisted"
+        );
+        TerminalPersistenceOutcome::Failed
     }
 
     async fn enqueue_first_byte_lifecycle_event<T>(&self, data: &T, event: UsageEvent)
@@ -4468,12 +4969,13 @@ impl UsageRuntime {
         .await
     }
 
-    async fn enqueue_or_write_event<T>(
+    async fn enqueue_or_write_event_with_mode<T>(
         &self,
         data: &T,
         mut event: UsageEvent,
         event_phase: &'static str,
         queue_enabled: bool,
+        require_durable_row: bool,
     ) -> TerminalPersistenceOutcome
     where
         T: UsageRuntimeAccess,
@@ -4484,7 +4986,12 @@ impl UsageRuntime {
                     Ok(queue) => {
                         if event_phase == "terminal" {
                             return self
-                                .enqueue_terminal_event_or_fallback(data, queue, event)
+                                .enqueue_terminal_event_or_fallback(
+                                    data,
+                                    queue,
+                                    event,
+                                    require_durable_row,
+                                )
                                 .await;
                         }
                         match queue.enqueue(&event).await {
@@ -4523,7 +5030,7 @@ impl UsageRuntime {
             let usage_event_type = event.event_type;
             let request_id = event.request_id.clone();
             let direct_write_succeeded = self
-                .try_write_terminal_direct_fallback(data, &mut event)
+                .try_write_terminal_direct_fallback(data, &mut event, require_durable_row)
                 .await;
             let deferred_fallback = if direct_write_succeeded {
                 DeferredEnqueueFallback::DirectWrite
@@ -4546,7 +5053,10 @@ impl UsageRuntime {
         if event_phase == "terminal" {
             enrich_terminal_event(data, &mut event).await;
         }
-        if self.write_event_direct(data, &event).await {
+        if self
+            .write_event_direct_with_mode(data, &event, require_durable_row)
+            .await
+        {
             TerminalPersistenceOutcome::PersistedDirectly
         } else {
             TerminalPersistenceOutcome::Failed
@@ -4558,6 +5068,7 @@ impl UsageRuntime {
         data: &T,
         queue: UsageQueue,
         event: UsageEvent,
+        require_durable_row: bool,
     ) -> TerminalPersistenceOutcome
     where
         T: UsageRuntimeAccess,
@@ -4569,6 +5080,7 @@ impl UsageRuntime {
                     data,
                     queue,
                     event,
+                    require_durable_row,
                     "circuit_open",
                     DataLayerError::TimedOut("terminal enqueue circuit is open".to_string()),
                 )
@@ -4584,6 +5096,7 @@ impl UsageRuntime {
                     data,
                     queue,
                     event,
+                    require_durable_row,
                     "in_flight_limit",
                     DataLayerError::TimedOut("terminal enqueue in-flight limit".to_string()),
                 )
@@ -4609,7 +5122,14 @@ impl UsageRuntime {
                 );
             }
             return self
-                .defer_terminal_event(data, queue, event, "primary_enqueue_failed", err)
+                .defer_terminal_event(
+                    data,
+                    queue,
+                    event,
+                    require_durable_row,
+                    "primary_enqueue_failed",
+                    err,
+                )
                 .await;
         }
         TerminalPersistenceOutcome::Queued
@@ -4620,6 +5140,7 @@ impl UsageRuntime {
         data: &T,
         queue: UsageQueue,
         mut event: UsageEvent,
+        require_durable_row: bool,
         reason: &'static str,
         cause: DataLayerError,
     ) -> TerminalPersistenceOutcome
@@ -4629,7 +5150,7 @@ impl UsageRuntime {
         let usage_event_type = event.event_type;
         let request_id = event.request_id.clone();
         let direct_write_succeeded = self
-            .try_write_terminal_direct_fallback(data, &mut event)
+            .try_write_terminal_direct_fallback(data, &mut event, require_durable_row)
             .await;
         let (deferred_fallback, outcome) = if direct_write_succeeded {
             (
@@ -4657,7 +5178,12 @@ impl UsageRuntime {
         outcome
     }
 
-    async fn try_write_terminal_direct_fallback<T>(&self, data: &T, event: &mut UsageEvent) -> bool
+    async fn try_write_terminal_direct_fallback<T>(
+        &self,
+        data: &T,
+        event: &mut UsageEvent,
+        require_durable_row: bool,
+    ) -> bool
     where
         T: UsageRuntimeAccess,
     {
@@ -4729,7 +5255,8 @@ impl UsageRuntime {
             );
             false
         } else {
-            self.write_event_direct(data, event).await
+            self.write_event_direct_with_mode(data, event, require_durable_row)
+                .await
         };
         if write_succeeded {
             let succeeded = self.terminal_direct_fallback_state.record_succeeded();
@@ -4765,39 +5292,112 @@ impl UsageRuntime {
     where
         T: UsageRuntimeAccess,
     {
+        self.write_event_direct_with_mode(data, event, false).await
+    }
+
+    async fn write_event_direct_with_mode<T>(
+        &self,
+        data: &T,
+        event: &UsageEvent,
+        require_durable_row: bool,
+    ) -> bool
+    where
+        T: UsageRuntimeAccess,
+    {
+        // `GatewayDataState` represents an unavailable writer as
+        // `upsert_usage_record -> Ok(None)`.  That result is useful for the
+        // ordinary best-effort lifecycle path, but it cannot satisfy a
+        // terminal durability handoff: treating it as success would unlock a
+        // terminal candidate while no usage row exists.  Queue-only test and
+        // production nodes are handled by the caller's retry/queue path.
+        if !data.has_usage_writer() {
+            return false;
+        }
         match build_upsert_usage_record_from_event(event) {
-            Ok(record) => match catch_usage_writer_panic(
-                "direct usage upsert",
-                data.upsert_usage_record(record),
-            )
-            .await
-            {
-                Ok(Some(stored)) => {
-                    if let Err(err) = settle_usage_if_needed(data, &stored).await {
+            Ok(record) => {
+                // A repository upsert may legitimately return the existing row
+                // when a late terminal event loses the request-level terminal
+                // race.  For ordinary queue writes that is fine, but a caller
+                // waiting on the terminal handoff must not treat the losing
+                // write as success: it would then mark a different candidate
+                // terminal even though the durable usage row belongs to the
+                // earlier owner.  Validate the read-back row against the
+                // exact terminal identity before releasing that handoff.
+                let terminal_write_identity = if require_durable_row
+                    && matches!(
+                        event.event_type,
+                        crate::UsageEventType::Completed
+                            | crate::UsageEventType::Failed
+                            | crate::UsageEventType::Cancelled
+                    ) {
+                    Some((
+                        record.status.clone(),
+                        record.candidate_id.clone(),
+                        event.request_id.clone(),
+                    ))
+                } else {
+                    None
+                };
+                match catch_usage_writer_panic(
+                    "direct usage upsert",
+                    data.upsert_usage_record(record),
+                )
+                .await
+                {
+                    Ok(Some(stored)) => {
+                        if let Some((incoming_status, incoming_candidate_id, request_id)) =
+                            terminal_write_identity.as_ref()
+                        {
+                            if !terminal_usage_readback_matches_identity(
+                                &stored,
+                                incoming_status,
+                                incoming_candidate_id.as_deref(),
+                            ) {
+                                warn!(
+                                    event_name = "usage_terminal_handoff_readback_mismatch",
+                                    log_type = "ops",
+                                    request_id = %request_id,
+                                    incoming_status,
+                                    stored_status = %stored.status,
+                                    incoming_candidate_id = ?incoming_candidate_id,
+                                    stored_candidate_id = ?stored.routing_candidate_id(),
+                                    fallback = "defer_candidate_reconciliation",
+                                    "usage terminal upsert read back a different terminal owner"
+                                );
+                                return false;
+                            }
+                        }
+                        if let Err(err) = settle_usage_if_needed(data, &stored).await {
+                            warn!(
+                                event_name = "usage_terminal_settlement_failed",
+                                log_type = "event",
+                                request_id = %event.request_id,
+                                error = %err,
+                                "usage runtime failed to settle terminal usage directly"
+                            );
+                            return false;
+                        }
+                        true
+                    }
+                    // The legacy best-effort direct path historically treated
+                    // `Ok(None)` as an accepted write (some adapters do not
+                    // return a read-back row).  The terminal handoff path is
+                    // stricter: it must see a concrete persisted row before it
+                    // unlocks a terminal candidate.
+                    Ok(None) => !require_durable_row,
+                    Err(err) => {
                         warn!(
-                            event_name = "usage_terminal_settlement_failed",
+                            event_name = "usage_event_upsert_failed",
                             log_type = "event",
+                            usage_event_type = ?event.event_type,
                             request_id = %event.request_id,
                             error = %err,
-                            "usage runtime failed to settle terminal usage directly"
+                            "usage runtime failed to upsert usage event directly"
                         );
-                        return false;
+                        false
                     }
-                    true
                 }
-                Ok(None) => true,
-                Err(err) => {
-                    warn!(
-                        event_name = "usage_event_upsert_failed",
-                        log_type = "event",
-                        usage_event_type = ?event.event_type,
-                        request_id = %event.request_id,
-                        error = %err,
-                        "usage runtime failed to upsert usage event directly"
-                    );
-                    false
-                }
-            },
+            }
             Err(err) => {
                 warn!(
                     event_name = "usage_event_upsert_build_failed",
@@ -4810,6 +5410,38 @@ impl UsageRuntime {
                 false
             }
         }
+    }
+}
+
+/// Verify that a terminal direct-upsert read-back still represents the event
+/// that requested the durability handoff.  Adapters intentionally return the
+/// existing row for a losing terminal race; without this check that `Ok(Some)`
+/// would be mistaken for a successful write and could project candidate B as
+/// successful while usage is finalized for candidate A.
+fn terminal_usage_readback_matches_identity(
+    stored: &aether_data_contracts::repository::usage::StoredRequestUsageAudit,
+    incoming_status: &str,
+    incoming_candidate_id: Option<&str>,
+) -> bool {
+    if !stored.status.eq_ignore_ascii_case(incoming_status)
+        || stored.finalized_at_unix_secs.is_none()
+    {
+        return false;
+    }
+    let incoming_candidate_id = incoming_candidate_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let stored_candidate_id = stored
+        .routing_candidate_id()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match incoming_candidate_id {
+        // Legacy terminal events may not carry a candidate id.  They can
+        // still confirm the request-level terminal row, but an event that
+        // names a candidate must match it exactly (including the case where
+        // the stored row has no candidate id).
+        None => true,
+        Some(incoming) => stored_candidate_id == Some(incoming),
     }
 }
 
@@ -7629,6 +8261,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_terminal_handoff_rejects_repository_ok_none() {
+        // A repository can expose the writer capability while returning
+        // `Ok(None)` when no row was actually persisted (for example during a
+        // transient data-layer outage).  That result must not satisfy the
+        // candidate/usage ordering barrier.
+        let runtime = UsageRuntime::new(UsageRuntimeConfig {
+            enabled: true,
+            ..UsageRuntimeConfig::default()
+        })
+        .expect("usage runtime should build");
+        let store = NoRedisUsageStore::default();
+        let event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-direct-handoff-no-row",
+            UsageEventData {
+                provider_name: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                total_tokens: Some(12),
+                status_code: Some(200),
+                ..UsageEventData::default()
+            },
+        );
+
+        assert!(
+            !runtime
+                .write_event_direct_with_mode(&store, &event, true)
+                .await,
+            "Ok(None) must not unlock terminal candidate persistence"
+        );
+        assert_eq!(store.records.lock().expect("records lock").len(), 1);
+    }
+
+    #[tokio::test]
     async fn pending_usage_is_persisted_before_later_lifecycle_events() {
         let config = UsageRuntimeConfig {
             enabled: true,
@@ -8702,6 +9367,8 @@ mod tests {
             enabled: true,
             worker_record_concurrency_limit: Some(1),
             enqueue_retry_workers: 1,
+            enqueue_retry_initial_backoff_ms: 1,
+            enqueue_retry_max_backoff_ms: 2,
             ..UsageRuntimeConfig::default()
         };
         let upsert_attempts = Arc::new(AtomicUsize::new(0));
@@ -8756,9 +9423,8 @@ mod tests {
         )
         .await
         .expect("a later terminal attempt must not remain behind a failed write");
-        assert_eq!(
-            upsert_attempts.load(Ordering::Acquire),
-            2,
+        assert!(
+            upsert_attempts.load(Ordering::Acquire) >= 2,
             "the later direct caller should receive its own bounded write attempt"
         );
         let snapshot = runtime.metrics_snapshot();

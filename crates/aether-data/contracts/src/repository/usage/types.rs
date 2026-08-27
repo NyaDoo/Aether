@@ -2006,6 +2006,16 @@ pub struct UpsertUsageRecord {
 }
 
 impl UpsertUsageRecord {
+    pub fn routing_candidate_id(&self) -> Option<&str> {
+        self.candidate_id.as_deref().or_else(|| {
+            self.request_metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("candidate_id"))
+                .and_then(Value::as_str)
+        })
+    }
+
     pub fn outcome_class(&self) -> super::RequestOutcomeClass {
         super::classify_request_outcome(
             self.status.as_str(),

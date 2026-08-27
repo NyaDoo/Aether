@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io::Error as IoError;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aether_contracts::{
@@ -27,16 +28,40 @@ use crate::execution_runtime::transport::{
 };
 use crate::execution_runtime::DirectUpstreamStreamExecution;
 use crate::GatewayError;
+use aether_usage_runtime::UsageRuntime;
 
 const STREAM_USAGE_OBSERVER_MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Optional realtime sink context for a direct streaming response.
+///
+/// The direct transport is also used by the standalone execution-runtime
+/// service, where no gateway `AppState` (and therefore no usage sink) exists.
+/// Keeping this context optional preserves that service's existing behavior
+/// while allowing the in-process gateway to publish token increments as soon
+/// as a provider usage snapshot is observed.
+#[derive(Clone)]
+pub(crate) struct RealtimeStreamContext {
+    pub(crate) usage_runtime: Arc<UsageRuntime>,
+    pub(crate) request_id: String,
+    pub(crate) admission_id: Option<String>,
+    pub(crate) candidate_id: Option<String>,
+    pub(crate) attempt_id: Option<String>,
+}
 
 pub(crate) fn build_direct_execution_frame_stream(
     execution: DirectUpstreamStreamExecution,
 ) -> impl Stream<Item = Result<Bytes, IoError>> + Send + 'static {
+    build_direct_execution_frame_stream_with_realtime(execution, None)
+}
+
+pub(crate) fn build_direct_execution_frame_stream_with_realtime(
+    execution: DirectUpstreamStreamExecution,
+    realtime_context: Option<RealtimeStreamContext>,
+) -> impl Stream<Item = Result<Bytes, IoError>> + Send + 'static {
     stream! {
         let DirectUpstreamStreamExecution {
-            request_id: _,
-            candidate_id: _,
+            request_id,
+            candidate_id,
             status_code,
             headers,
             provider_api_format,
@@ -50,6 +75,7 @@ pub(crate) fn build_direct_execution_frame_stream(
             upstream_target_permit,
         } = execution;
         let _upstream_target_permit = upstream_target_permit;
+        let realtime_attempt_id = response_observation.request_order_id.clone();
 
         let mut observer_context = stream_summary_report_context;
         if observer_context
@@ -73,6 +99,10 @@ pub(crate) fn build_direct_execution_frame_stream(
             maybe_build_provider_private_stream_normalizer(Some(&observer_context));
         let mut stream_terminal_observer = StreamingStandardTerminalObserver::default();
         let mut observer_buffered = Vec::new();
+        // Keep the context optional: the standalone execution-runtime service
+        // has no gateway usage sink and continues to emit frames normally.
+        let realtime_context = realtime_context;
+        let mut realtime_token_sequence = 0_u64;
 
         if should_buffer_non_stream_response(&headers, &observer_context) {
             let original_headers = headers.clone();
@@ -242,6 +272,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                         &mut observer_buffered,
                         chunk.as_ref(),
                     );
+                    drain_stream_token_deltas(
+                        &mut stream_terminal_observer,
+                        realtime_context.as_ref(),
+                        &request_id,
+                        &candidate_id,
+                        Some(realtime_attempt_id.as_str()),
+                        &mut realtime_token_sequence,
+                    );
                     match encode_data_frame(&chunk) {
                         Ok(frame) => yield Ok(frame),
                         Err(err) => {
@@ -325,6 +363,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 &mut observer_buffered,
                                 chunk.as_ref(),
                             );
+                            drain_stream_token_deltas(
+                                &mut stream_terminal_observer,
+                                realtime_context.as_ref(),
+                                &request_id,
+                                &candidate_id,
+                                Some(realtime_attempt_id.as_str()),
+                                &mut realtime_token_sequence,
+                            );
                             match encode_data_frame(&chunk) {
                                 Ok(frame) => yield Ok(frame),
                                 Err(err) => {
@@ -406,6 +452,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 private_stream_normalizer.as_mut(),
                                 &mut observer_buffered,
                                 chunk.as_ref(),
+                            );
+                            drain_stream_token_deltas(
+                                &mut stream_terminal_observer,
+                                realtime_context.as_ref(),
+                                &request_id,
+                                &candidate_id,
+                                Some(realtime_attempt_id.as_str()),
+                                &mut realtime_token_sequence,
                             );
                             match encode_data_frame(&chunk) {
                                 Ok(frame) => yield Ok(frame),
@@ -489,6 +543,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 &mut observer_buffered,
                                 chunk.as_ref(),
                             );
+                            drain_stream_token_deltas(
+                                &mut stream_terminal_observer,
+                                realtime_context.as_ref(),
+                                &request_id,
+                                &candidate_id,
+                                Some(realtime_attempt_id.as_str()),
+                                &mut realtime_token_sequence,
+                            );
                             match encode_data_frame(&chunk) {
                                 Ok(frame) => yield Ok(frame),
                                 Err(err) => {
@@ -566,6 +628,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                             &mut observer_buffered,
                             chunk.as_ref(),
                         );
+                        drain_stream_token_deltas(
+                            &mut stream_terminal_observer,
+                            realtime_context.as_ref(),
+                            &request_id,
+                            &candidate_id,
+                            Some(realtime_attempt_id.as_str()),
+                            &mut realtime_token_sequence,
+                        );
                         match encode_data_frame(&chunk) {
                             Ok(frame) => yield Ok(frame),
                             Err(err) => {
@@ -603,6 +673,17 @@ pub(crate) fn build_direct_execution_frame_stream(
             private_stream_normalizer.as_mut(),
             &mut observer_buffered,
         );
+        // A provider may place its final usage object in a line that was
+        // buffered until `finish`; drain after normalization/finish as well
+        // so the terminal increment is visible even when no data frame follows.
+        drain_stream_token_deltas(
+            &mut stream_terminal_observer,
+            realtime_context.as_ref(),
+            &request_id,
+            &candidate_id,
+            Some(realtime_attempt_id.as_str()),
+            &mut realtime_token_sequence,
+        );
 
         match encode_telemetry_frame(
             ttfb_ms,
@@ -619,6 +700,60 @@ pub(crate) fn build_direct_execution_frame_stream(
             Ok(frame) => yield Ok(frame),
             Err(err) => yield Err(err),
         }
+    }
+}
+
+/// Drain provider usage snapshots immediately after a stream chunk has been
+/// parsed.  The observer's queue contains only positive high-water deltas, so
+/// forwarding each item here gives TPM a live view while the response remains
+/// in flight.  Sequence numbers are local to this attempt and make retries of
+/// the same normalized frame idempotent in the shared event store.
+fn drain_stream_token_deltas(
+    observer: &mut StreamingStandardTerminalObserver,
+    realtime_context: Option<&RealtimeStreamContext>,
+    fallback_request_id: &str,
+    fallback_candidate_id: &Option<String>,
+    attempt_id: Option<&str>,
+    sequence: &mut u64,
+) {
+    let deltas = observer.take_token_deltas();
+    let Some(context) = realtime_context else {
+        return;
+    };
+    let request_id = if context.request_id.trim().is_empty() {
+        fallback_request_id
+    } else {
+        context.request_id.as_str()
+    };
+    let candidate_id = context
+        .candidate_id
+        .as_ref()
+        .or(fallback_candidate_id.as_ref())
+        .cloned();
+    for delta in deltas {
+        let token_delta = delta.inclusive_token_total();
+        if token_delta == 0 {
+            continue;
+        }
+        let current_sequence = *sequence;
+        *sequence = (*sequence).saturating_add(1);
+        context
+            .usage_runtime
+            .record_realtime_token_delta_with_attempt(
+                // Use the attempt-aware variant so a retry that reuses a
+                // candidate ID cannot collide with this stream's sequence.
+                request_id.to_string(),
+                context.admission_id.clone(),
+                candidate_id.clone(),
+                context
+                    .attempt_id
+                    .as_deref()
+                    .or(attempt_id)
+                    .map(ToOwned::to_owned),
+                crate::clock::current_unix_ms(),
+                token_delta,
+                Some(current_sequence),
+            );
     }
 }
 

@@ -270,42 +270,50 @@ fn upsert_sql() -> String {
   TO_TIMESTAMP($37)
 )
 ON CONFLICT (id) DO UPDATE SET
-  short_id = EXCLUDED.short_id,
-  request_id = EXCLUDED.request_id,
-  user_id = EXCLUDED.user_id,
-  api_key_id = EXCLUDED.api_key_id,
-  username = EXCLUDED.username,
-  api_key_name = EXCLUDED.api_key_name,
-  external_task_id = EXCLUDED.external_task_id,
-  provider_id = EXCLUDED.provider_id,
-  endpoint_id = EXCLUDED.endpoint_id,
-  key_id = EXCLUDED.key_id,
-  client_api_format = EXCLUDED.client_api_format,
-  provider_api_format = EXCLUDED.provider_api_format,
-  format_converted = EXCLUDED.format_converted,
-  model = EXCLUDED.model,
-  prompt = EXCLUDED.prompt,
-  original_request_body = EXCLUDED.original_request_body,
-  duration_seconds = EXCLUDED.duration_seconds,
-  resolution = EXCLUDED.resolution,
-  aspect_ratio = EXCLUDED.aspect_ratio,
-  size = EXCLUDED.size,
-  status = EXCLUDED.status,
-  progress_percent = EXCLUDED.progress_percent,
-  progress_message = EXCLUDED.progress_message,
-  retry_count = EXCLUDED.retry_count,
-  poll_interval_seconds = EXCLUDED.poll_interval_seconds,
-  next_poll_at = EXCLUDED.next_poll_at,
-  poll_count = EXCLUDED.poll_count,
-  max_poll_count = EXCLUDED.max_poll_count,
-  video_url = EXCLUDED.video_url,
-  error_code = EXCLUDED.error_code,
-  error_message = EXCLUDED.error_message,
-  request_metadata = EXCLUDED.request_metadata,
-  created_at = EXCLUDED.created_at,
-  submitted_at = EXCLUDED.submitted_at,
-  completed_at = EXCLUDED.completed_at,
-  updated_at = EXCLUDED.updated_at
+  short_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.short_id ELSE EXCLUDED.short_id END,
+  request_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.request_id ELSE EXCLUDED.request_id END,
+  user_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.user_id ELSE EXCLUDED.user_id END,
+  api_key_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.api_key_id ELSE EXCLUDED.api_key_id END,
+  username = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.username ELSE EXCLUDED.username END,
+  api_key_name = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.api_key_name ELSE EXCLUDED.api_key_name END,
+  external_task_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.external_task_id ELSE EXCLUDED.external_task_id END,
+  provider_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.provider_id ELSE EXCLUDED.provider_id END,
+  endpoint_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.endpoint_id ELSE EXCLUDED.endpoint_id END,
+  key_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.key_id ELSE EXCLUDED.key_id END,
+  client_api_format = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.client_api_format ELSE EXCLUDED.client_api_format END,
+  provider_api_format = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.provider_api_format ELSE EXCLUDED.provider_api_format END,
+  format_converted = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.format_converted ELSE EXCLUDED.format_converted END,
+  model = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.model ELSE EXCLUDED.model END,
+  prompt = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.prompt ELSE EXCLUDED.prompt END,
+  original_request_body = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.original_request_body ELSE EXCLUDED.original_request_body END,
+  duration_seconds = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.duration_seconds ELSE EXCLUDED.duration_seconds END,
+  resolution = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.resolution ELSE EXCLUDED.resolution END,
+  aspect_ratio = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.aspect_ratio ELSE EXCLUDED.aspect_ratio END,
+  size = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.size ELSE EXCLUDED.size END,
+  progress_percent = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.progress_percent ELSE EXCLUDED.progress_percent END,
+  progress_message = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.progress_message ELSE EXCLUDED.progress_message END,
+  retry_count = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.retry_count ELSE EXCLUDED.retry_count END,
+  poll_interval_seconds = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.poll_interval_seconds ELSE EXCLUDED.poll_interval_seconds END,
+  next_poll_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.next_poll_at ELSE EXCLUDED.next_poll_at END,
+  poll_count = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.poll_count ELSE EXCLUDED.poll_count END,
+  max_poll_count = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.max_poll_count ELSE EXCLUDED.max_poll_count END,
+  video_url = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.video_url ELSE EXCLUDED.video_url END,
+  error_code = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.error_code ELSE EXCLUDED.error_code END,
+  error_message = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.error_message ELSE EXCLUDED.error_message END,
+  request_metadata = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.request_metadata ELSE EXCLUDED.request_metadata END,
+  created_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.created_at ELSE EXCLUDED.created_at END,
+  submitted_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.submitted_at ELSE EXCLUDED.submitted_at END,
+  completed_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.completed_at ELSE EXCLUDED.completed_at END,
+  updated_at = CASE
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired') AND EXCLUDED.status = 'deleted' THEN EXCLUDED.updated_at
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.updated_at
+    ELSE EXCLUDED.updated_at
+  END,
+  status = CASE
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired') AND EXCLUDED.status = 'deleted' THEN 'deleted'
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.status
+    ELSE EXCLUDED.status
+  END
 RETURNING
 {columns}
 "

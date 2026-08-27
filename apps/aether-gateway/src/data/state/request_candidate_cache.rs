@@ -95,6 +95,17 @@ impl RequestCandidateReadRepository for CachedRequestCandidateReadRepository {
         Ok(rows)
     }
 
+    async fn list_active_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, aether_data::DataLayerError> {
+        self.inner
+            .list_active_after(after_created_at_unix_ms, after_id, limit)
+            .await
+    }
+
     async fn list_by_provider_id(
         &self,
         provider_id: &str,

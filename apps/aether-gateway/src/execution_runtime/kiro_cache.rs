@@ -14,6 +14,10 @@ use crate::clock::current_unix_ms;
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
 const MAX_ENTRIES: usize = 2048;
+/// Prompt-cache enrichment is optional accounting metadata.  It must not be
+/// allowed to hold a terminal usage handoff behind a stuck KV/database call.
+/// Callers use this bound and fall back to the already-estimated input tokens.
+pub(crate) const TERMINAL_KIRO_CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
 const KIRO_PROMPT_CACHE_INDEX_KEY: &str = "kiro:prompt-cache:index";
 const PREFIX_LOOKBACK_WINDOW: usize = 20;
 const TOKENS_PER_TOOL: u64 = 150;

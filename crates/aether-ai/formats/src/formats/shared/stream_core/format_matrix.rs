@@ -17,8 +17,10 @@ use crate::formats::shared::error_body::{
 };
 use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::common::{
-    decode_json_data_line, openai_stream_terminal_error_body, openai_stream_terminal_error_message,
-    unsupported_stream_event_message, CanonicalStreamEvent, CanonicalStreamFrame, CanonicalUsage,
+    canonical_usage_from_claude_usage, canonical_usage_from_gemini_usage,
+    canonical_usage_from_openai_usage, decode_json_data_line, openai_stream_terminal_error_body,
+    openai_stream_terminal_error_message, unsupported_stream_event_message, CanonicalStreamEvent,
+    CanonicalStreamFrame, CanonicalUsage,
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
 
@@ -218,6 +220,18 @@ pub struct StreamingStandardTerminalObserver {
     provider: Option<TerminalStreamParser>,
     latest_summary: Option<ExecutionStreamTerminalSummary>,
     pending_sse_event: Option<String>,
+    /// Highest cumulative token usage observed for each usage dimension.
+    ///
+    /// Providers commonly repeat the same usage object in more than one
+    /// terminal event.  Keeping a component-wise high-water mark lets the
+    /// observer expose a single increment for each newly observed snapshot
+    /// without double counting those repeats.
+    usage_high_water: Option<CanonicalUsage>,
+    /// Cumulative-usage deltas waiting to be consumed by the execution
+    /// runtime.  This is deliberately a queue rather than one accumulator so
+    /// callers can attribute each provider usage event to the time at which it
+    /// was received.
+    pending_token_deltas: Vec<CanonicalUsage>,
 }
 
 impl StreamingStandardTerminalObserver {
@@ -228,6 +242,12 @@ impl StreamingStandardTerminalObserver {
     ) -> Result<(), AiSurfaceFinalizeError> {
         self.ensure_initialized(report_context);
         let line = apply_sse_event_type(&mut self.pending_sse_event, line);
+        // Observe usage before handing the line to the protocol parser.  Most
+        // providers only put usage on the final frame, but a few emit
+        // cumulative snapshots while a stream is still running.  Capturing
+        // the raw payload here keeps those snapshots available to the
+        // real-time TPM consumer without changing any provider state machine.
+        self.observe_usage_line(report_context, &line);
         let Some(provider) = self.provider.as_mut() else {
             return Ok(());
         };
@@ -266,6 +286,13 @@ impl StreamingStandardTerminalObserver {
         event: &Value,
     ) -> Result<(), AiSurfaceFinalizeError> {
         self.ensure_initialized(report_context);
+        let standard_provider = matches!(
+            self.provider.as_ref(),
+            Some(TerminalStreamParser::Standard(_))
+        );
+        if standard_provider {
+            self.observe_usage_payload(report_context, event);
+        }
         let Some(provider) = self.provider.as_mut() else {
             return Ok(());
         };
@@ -330,6 +357,43 @@ impl StreamingStandardTerminalObserver {
         self.latest_summary.as_ref()
     }
 
+    /// Record a cumulative provider usage snapshot.
+    ///
+    /// The snapshot is compared component-by-component with the previous
+    /// high-water mark.  Only positive changes are queued by
+    /// [`Self::take_token_deltas`], so repeated terminal events are harmless.
+    /// This method is public for transports which already decode provider
+    /// events and can provide usage without going through the SSE line parser.
+    pub fn observe_usage_snapshot(&mut self, usage: CanonicalUsage) {
+        self.observe_cumulative_usage(usage);
+    }
+
+    /// Record a token increment which is already expressed as a delta.
+    ///
+    /// This is useful for providers that expose lifecycle token increments
+    /// instead of cumulative usage snapshots.  The increment is added to the
+    /// high-water mark so a later cumulative terminal snapshot can still be
+    /// de-duplicated correctly.
+    pub fn record_token_delta(&mut self, delta: CanonicalUsage) {
+        let delta = canonical_usage_with_effective_total(delta);
+        if !canonical_usage_has_positive_tokens(&delta) {
+            return;
+        }
+        let previous = self.usage_high_water.take().unwrap_or_default();
+        self.usage_high_water = Some(canonical_usage_add(previous, &delta));
+        self.pending_token_deltas.push(delta);
+    }
+
+    /// Drain usage increments observed since the previous call.
+    pub fn take_token_deltas(&mut self) -> Vec<CanonicalUsage> {
+        std::mem::take(&mut self.pending_token_deltas)
+    }
+
+    /// Return the component-wise cumulative usage high-water mark, if any.
+    pub fn cumulative_usage(&self) -> Option<&CanonicalUsage> {
+        self.usage_high_water.as_ref()
+    }
+
     fn ensure_initialized(&mut self, report_context: &Value) {
         if self.provider.is_some() || self.latest_summary.is_some() {
             return;
@@ -344,8 +408,61 @@ impl StreamingStandardTerminalObserver {
         }
     }
 
+    fn observe_usage_line(&mut self, report_context: &Value, line: &[u8]) {
+        let Some(payload) = decode_json_data_line(line) else {
+            return;
+        };
+        self.observe_usage_payload(report_context, &payload);
+    }
+
+    fn observe_usage_payload(&mut self, report_context: &Value, payload: &Value) {
+        // Unsupported formats and an observer disabled after a parser error
+        // intentionally have no active provider state.  Do not let a generic
+        // `usage` field in their payloads create token metrics after parsing
+        // has been declined.
+        if self.provider.is_none() {
+            return;
+        }
+        let provider_api_format = provider_api_format_for_context(report_context);
+        let Some(usage) = usage_snapshot_from_payload(&provider_api_format, payload) else {
+            return;
+        };
+        self.observe_cumulative_usage(usage);
+    }
+
+    fn observe_cumulative_usage(&mut self, usage: CanonicalUsage) {
+        // `total_tokens` is optional on intermediate provider frames.  Store
+        // the same effective total that the realtime consumer will export so
+        // a later frame which merely fills in the redundant total field does
+        // not look like a second token increment.
+        let usage = canonical_usage_with_effective_total(usage);
+        if !canonical_usage_has_positive_tokens(&usage) {
+            return;
+        }
+
+        let previous = self.usage_high_water.clone().unwrap_or_default();
+        let delta = canonical_usage_subtract(&usage, &previous);
+        self.usage_high_water = Some(canonical_usage_max(previous, usage));
+        if canonical_usage_has_positive_tokens(&delta) {
+            self.pending_token_deltas.push(delta);
+        }
+    }
+
     fn observe_frame(&mut self, frame: CanonicalStreamFrame) {
         let CanonicalStreamFrame { id, model, event } = frame;
+        // Capture finish-frame usage before borrowing `latest_summary`.  The
+        // usage high-water mark lives on this parser as well, so updating it
+        // while a mutable summary borrow is active would create overlapping
+        // mutable borrows (and, more importantly, make the ordering subtle).
+        if let CanonicalStreamEvent::Finish {
+            usage: Some(usage), ..
+        } = &event
+        {
+            // The raw payload hook normally sees this first.  Keep the frame
+            // hook as a fallback for synthetic/provider parser frames and let
+            // the high-water mark de-duplicate the common case.
+            self.observe_cumulative_usage(usage.clone());
+        }
         let summary = self
             .latest_summary
             .get_or_insert_with(|| ExecutionStreamTerminalSummary {
@@ -381,6 +498,285 @@ impl StreamingStandardTerminalObserver {
             }
             _ => {}
         }
+    }
+}
+
+/// Parse the first provider usage object from a stream payload.
+///
+/// Usage locations differ between provider protocols (`usage`,
+/// `usageMetadata`, `response.usage`, Claude's `message.usage`, and image
+/// `tool_usage` children).  Keep the traversal intentionally bounded and
+/// ordered so an unrelated nested object cannot win over the provider's
+/// canonical location.
+fn usage_snapshot_from_payload(
+    provider_api_format: &str,
+    payload: &Value,
+) -> Option<CanonicalUsage> {
+    let mut candidates = Vec::with_capacity(8);
+
+    // Keep candidate paths aligned with the selected provider parser.  In
+    // particular, an OpenAI Chat stream can contain an unrelated nested
+    // `response.usage` object in a future/unknown event; accepting that here
+    // would violate the observer's existing rule that the explicit provider
+    // stream format is authoritative.
+    match FormatId::parse(provider_api_format) {
+        Some(FormatId::OpenAiChat) => {
+            push_usage_candidate(&mut candidates, payload.get("usage"));
+        }
+        Some(FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact) => {
+            if let Some(response) = payload.get("response") {
+                push_usage_candidate(&mut candidates, response.get("usage"));
+                push_usage_candidate(&mut candidates, response.get("usageMetadata"));
+                push_usage_candidate(&mut candidates, response.get("usage_metadata"));
+                append_tool_usage_candidates(&mut candidates, response.get("tool_usage"));
+            }
+            // A normalized Responses event may expose usage at the root.
+            push_usage_candidate(&mut candidates, payload.get("usage"));
+        }
+        Some(FormatId::ClaudeMessages) => {
+            push_usage_candidate(&mut candidates, payload.get("usage"));
+            if let Some(message) = payload.get("message") {
+                push_usage_candidate(&mut candidates, message.get("usage"));
+            }
+        }
+        Some(FormatId::GeminiGenerateContent | FormatId::GeminiInteractions) => {
+            push_usage_candidate(&mut candidates, payload.get("usageMetadata"));
+            push_usage_candidate(&mut candidates, payload.get("usage_metadata"));
+        }
+        None if provider_api_format
+            .trim()
+            .eq_ignore_ascii_case("openai:image") =>
+        {
+            push_usage_candidate(&mut candidates, payload.get("usage"));
+            if let Some(response) = payload.get("response") {
+                push_usage_candidate(&mut candidates, response.get("usage"));
+                append_tool_usage_candidates(&mut candidates, response.get("tool_usage"));
+            }
+            append_tool_usage_candidates(&mut candidates, payload.get("tool_usage"));
+        }
+        _ => {
+            // Unknown/private formats retain the broad compatibility fallback
+            // used before the observer gained incremental usage reporting.
+            push_usage_candidate(&mut candidates, payload.get("usage"));
+            push_usage_candidate(&mut candidates, payload.get("usageMetadata"));
+            push_usage_candidate(&mut candidates, payload.get("usage_metadata"));
+            if let Some(response) = payload.get("response") {
+                push_usage_candidate(&mut candidates, response.get("usage"));
+                push_usage_candidate(&mut candidates, response.get("usageMetadata"));
+                push_usage_candidate(&mut candidates, response.get("usage_metadata"));
+                append_tool_usage_candidates(&mut candidates, response.get("tool_usage"));
+            }
+            if let Some(message) = payload.get("message") {
+                push_usage_candidate(&mut candidates, message.get("usage"));
+            }
+            append_tool_usage_candidates(&mut candidates, payload.get("tool_usage"));
+        }
+    }
+
+    // A private stream normalizer may wrap an *unknown* protocol event in
+    // `data` or another envelope.  Search only known usage key names in a
+    // shallow, bounded fallback traversal for that case.  Known formats skip
+    // this broad walk so a mismatched `response.usage` cannot be counted as an
+    // OpenAI Chat snapshot (see the explicit-path guard above).
+    if FormatId::parse(provider_api_format).is_none()
+        && !provider_api_format
+            .trim()
+            .eq_ignore_ascii_case("openai:image")
+    {
+        append_nested_usage_candidates(payload, &mut candidates, 2);
+    }
+
+    candidates
+        .into_iter()
+        .find_map(|candidate| parse_usage_for_provider(provider_api_format, candidate))
+}
+
+fn push_usage_candidate<'a>(candidates: &mut Vec<&'a Value>, candidate: Option<&'a Value>) {
+    if let Some(candidate) = candidate {
+        candidates.push(candidate);
+    }
+}
+
+fn append_tool_usage_candidates<'a>(
+    candidates: &mut Vec<&'a Value>,
+    tool_usage: Option<&'a Value>,
+) {
+    let Some(tool_usage) = tool_usage.and_then(Value::as_object) else {
+        return;
+    };
+    for value in tool_usage.values() {
+        if value.is_object() {
+            candidates.push(value);
+            // Some providers add one more tool-specific envelope (for
+            // example `tool_usage.image_gen.usage`).  Include that level but
+            // do not recurse through arbitrary response content.
+            if let Some(object) = value.as_object() {
+                push_usage_candidate(candidates, object.get("usage"));
+                push_usage_candidate(candidates, object.get("usageMetadata"));
+            }
+        }
+    }
+}
+
+fn append_nested_usage_candidates<'a>(
+    value: &'a Value,
+    candidates: &mut Vec<&'a Value>,
+    depth: u8,
+) {
+    if depth == 0 {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for (key, child) in object {
+        if matches!(
+            key.as_str(),
+            "usage" | "usageMetadata" | "usage_metadata" | "token_usage" | "tokenUsage"
+        ) {
+            candidates.push(child);
+        }
+        if matches!(
+            key.as_str(),
+            "data" | "event" | "response" | "message" | "result" | "output"
+        ) {
+            append_nested_usage_candidates(child, candidates, depth - 1);
+        }
+    }
+}
+
+fn parse_usage_for_provider(provider_api_format: &str, value: &Value) -> Option<CanonicalUsage> {
+    let usage = match FormatId::parse(provider_api_format) {
+        Some(FormatId::ClaudeMessages) => canonical_usage_from_claude_usage(Some(value)),
+        Some(FormatId::GeminiGenerateContent | FormatId::GeminiInteractions) => {
+            canonical_usage_from_gemini_usage(Some(value))
+        }
+        Some(
+            FormatId::OpenAiChat | FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact,
+        ) => canonical_usage_from_openai_usage(Some(value)),
+        // `openai:image` is intentionally not a FormatId because it has a
+        // dedicated image stream state machine, but its token object follows
+        // the OpenAI usage shape.
+        None if provider_api_format
+            .trim()
+            .eq_ignore_ascii_case("openai:image") =>
+        {
+            canonical_usage_from_openai_usage(Some(value))
+        }
+        // Unknown/private formats: use field-shape fallbacks.  The first
+        // parser that sees a positive token signal wins.  The conversion
+        // helpers intentionally return `Some(default)` for an empty object,
+        // so filter each result before trying the next parser.
+        _ => {
+            return [
+                canonical_usage_from_openai_usage(Some(value)),
+                canonical_usage_from_claude_usage(Some(value)),
+                canonical_usage_from_gemini_usage(Some(value)),
+            ]
+            .into_iter()
+            .flatten()
+            .find(canonical_usage_has_positive_tokens);
+        }
+    }?;
+
+    canonical_usage_has_positive_tokens(&usage).then_some(usage)
+}
+
+fn canonical_usage_has_positive_tokens(usage: &CanonicalUsage) -> bool {
+    usage.input_tokens > 0
+        || usage.output_tokens > 0
+        || usage.total_tokens > 0
+        || usage.cache_creation_tokens > 0
+        || usage.cache_creation_ephemeral_5m_tokens > 0
+        || usage.cache_creation_ephemeral_1h_tokens > 0
+        || usage.cache_read_tokens > 0
+        || usage.reasoning_tokens > 0
+}
+
+/// Normalize the redundant total dimension before component-wise high-water
+/// comparison. The canonical helper also repairs Claude-style provider totals,
+/// which exclude separately represented cache input.
+fn canonical_usage_with_effective_total(mut usage: CanonicalUsage) -> CanonicalUsage {
+    usage.total_tokens = usage.inclusive_token_total();
+    usage
+}
+
+fn canonical_usage_subtract(current: &CanonicalUsage, previous: &CanonicalUsage) -> CanonicalUsage {
+    CanonicalUsage {
+        input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
+        input_tokens_include_cache: current.input_tokens_include_cache,
+        output_tokens: current.output_tokens.saturating_sub(previous.output_tokens),
+        total_tokens: current.total_tokens.saturating_sub(previous.total_tokens),
+        cache_creation_tokens: current
+            .cache_creation_tokens
+            .saturating_sub(previous.cache_creation_tokens),
+        cache_creation_ephemeral_5m_tokens: current
+            .cache_creation_ephemeral_5m_tokens
+            .saturating_sub(previous.cache_creation_ephemeral_5m_tokens),
+        cache_creation_ephemeral_1h_tokens: current
+            .cache_creation_ephemeral_1h_tokens
+            .saturating_sub(previous.cache_creation_ephemeral_1h_tokens),
+        cache_read_tokens: current
+            .cache_read_tokens
+            .saturating_sub(previous.cache_read_tokens),
+        reasoning_tokens: current
+            .reasoning_tokens
+            .saturating_sub(previous.reasoning_tokens),
+    }
+}
+
+fn canonical_usage_max(previous: CanonicalUsage, current: CanonicalUsage) -> CanonicalUsage {
+    // `input_tokens_include_cache` describes the input high-water value, so
+    // carry the flag from whichever snapshot supplied that value.  An OR
+    // would incorrectly retain `true` if a provider legitimately switches
+    // from an inclusive to an uncached input representation while the count
+    // increases.
+    let input_tokens_include_cache = if current.input_tokens >= previous.input_tokens {
+        current.input_tokens_include_cache
+    } else {
+        previous.input_tokens_include_cache
+    };
+    CanonicalUsage {
+        input_tokens: previous.input_tokens.max(current.input_tokens),
+        input_tokens_include_cache,
+        output_tokens: previous.output_tokens.max(current.output_tokens),
+        total_tokens: previous.total_tokens.max(current.total_tokens),
+        cache_creation_tokens: previous
+            .cache_creation_tokens
+            .max(current.cache_creation_tokens),
+        cache_creation_ephemeral_5m_tokens: previous
+            .cache_creation_ephemeral_5m_tokens
+            .max(current.cache_creation_ephemeral_5m_tokens),
+        cache_creation_ephemeral_1h_tokens: previous
+            .cache_creation_ephemeral_1h_tokens
+            .max(current.cache_creation_ephemeral_1h_tokens),
+        cache_read_tokens: previous.cache_read_tokens.max(current.cache_read_tokens),
+        reasoning_tokens: previous.reasoning_tokens.max(current.reasoning_tokens),
+    }
+}
+
+fn canonical_usage_add(previous: CanonicalUsage, delta: &CanonicalUsage) -> CanonicalUsage {
+    CanonicalUsage {
+        input_tokens: previous.input_tokens.saturating_add(delta.input_tokens),
+        input_tokens_include_cache: previous.input_tokens_include_cache
+            || delta.input_tokens_include_cache,
+        output_tokens: previous.output_tokens.saturating_add(delta.output_tokens),
+        total_tokens: previous.total_tokens.saturating_add(delta.total_tokens),
+        cache_creation_tokens: previous
+            .cache_creation_tokens
+            .saturating_add(delta.cache_creation_tokens),
+        cache_creation_ephemeral_5m_tokens: previous
+            .cache_creation_ephemeral_5m_tokens
+            .saturating_add(delta.cache_creation_ephemeral_5m_tokens),
+        cache_creation_ephemeral_1h_tokens: previous
+            .cache_creation_ephemeral_1h_tokens
+            .saturating_add(delta.cache_creation_ephemeral_1h_tokens),
+        cache_read_tokens: previous
+            .cache_read_tokens
+            .saturating_add(delta.cache_read_tokens),
+        reasoning_tokens: previous
+            .reasoning_tokens
+            .saturating_add(delta.reasoning_tokens),
     }
 }
 
@@ -745,7 +1141,7 @@ fn parse_gemini_error(payload: &Value) -> Option<(String, Option<String>, LocalC
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamingStandardFormatMatrix, StreamingStandardTerminalObserver};
+    use super::{CanonicalUsage, StreamingStandardFormatMatrix, StreamingStandardTerminalObserver};
     use crate::formats::{context::FormatContext, registry::convert_request};
     use serde_json::{json, Value};
 
@@ -2215,6 +2611,10 @@ mod tests {
             observer.latest_summary().is_none(),
             "provider stream parser selection must come from report context, not event sniffing"
         );
+        assert!(
+            observer.take_token_deltas().is_empty(),
+            "usage extraction must follow the selected provider format too"
+        );
     }
 
     #[test]
@@ -2543,6 +2943,187 @@ mod tests {
         assert_eq!(
             usage.dimensions.get("image_quality"),
             Some(&json!("medium"))
+        );
+    }
+
+    #[test]
+    fn terminal_observer_exposes_monotonic_usage_deltas_before_finish() {
+        let context = report_context("openai:chat", "openai:chat");
+        let mut observer = StreamingStandardTerminalObserver::default();
+
+        // OpenAI Chat can attach a cumulative usage snapshot to a non-final
+        // chunk.  The terminal summary parser intentionally ignores that
+        // snapshot until a finish frame, while the realtime API must expose it
+        // immediately.
+        observer
+            .push_line(
+                &context,
+                data_line(json!({
+                    "id": "chat_delta_1",
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "hello"},
+                        "finish_reason": null,
+                    }],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 1,
+                        "total_tokens": 6,
+                    },
+                })),
+            )
+            .expect("the non-terminal usage chunk should parse");
+
+        let first = observer.take_token_deltas();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            (
+                first[0].input_tokens,
+                first[0].output_tokens,
+                first[0].total_tokens,
+            ),
+            (5, 1, 6)
+        );
+
+        // A repeated cumulative snapshot must not be counted twice; only the
+        // newly accumulated output tokens are returned.
+        observer
+            .push_line(
+                &context,
+                data_line(json!({
+                    "id": "chat_delta_1",
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "world"},
+                        "finish_reason": null,
+                    }],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 3,
+                        "total_tokens": 8,
+                    },
+                })),
+            )
+            .expect("the second usage chunk should parse");
+
+        let second = observer.take_token_deltas();
+        assert_eq!(second.len(), 1);
+        assert_eq!((second[0].input_tokens, second[0].output_tokens), (0, 2));
+        assert_eq!(second[0].total_tokens, 2);
+        assert!(observer.take_token_deltas().is_empty());
+        assert_eq!(
+            observer.cumulative_usage().map(|usage| usage.total_tokens),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn terminal_observer_direct_delta_and_snapshot_apis_compose() {
+        let mut observer = StreamingStandardTerminalObserver::default();
+        observer.record_token_delta(CanonicalUsage {
+            output_tokens: 2,
+            total_tokens: 2,
+            ..CanonicalUsage::default()
+        });
+        assert_eq!(
+            observer.cumulative_usage().map(|usage| usage.output_tokens),
+            Some(2)
+        );
+
+        // The later terminal snapshot includes the direct increment.  The
+        // high-water mark therefore emits only the unseen remainder.
+        observer.observe_usage_snapshot(CanonicalUsage {
+            input_tokens: 4,
+            output_tokens: 5,
+            total_tokens: 9,
+            ..CanonicalUsage::default()
+        });
+        let deltas = observer.take_token_deltas();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!((deltas[0].output_tokens, deltas[0].total_tokens), (2, 2));
+        assert_eq!(
+            (
+                deltas[1].input_tokens,
+                deltas[1].output_tokens,
+                deltas[1].total_tokens,
+            ),
+            (4, 3, 7)
+        );
+    }
+
+    #[test]
+    fn terminal_observer_does_not_recount_a_late_redundant_total() {
+        let mut observer = StreamingStandardTerminalObserver::default();
+
+        // Some providers omit (or temporarily report zero for) the redundant
+        // total on an intermediate frame, then fill it in at terminal time.
+        // The components already accounted for all six tokens.
+        observer.observe_usage_snapshot(CanonicalUsage {
+            input_tokens: 4,
+            output_tokens: 2,
+            total_tokens: 0,
+            ..CanonicalUsage::default()
+        });
+        let first = observer.take_token_deltas();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].total_tokens, 6);
+
+        observer.observe_usage_snapshot(CanonicalUsage {
+            input_tokens: 4,
+            output_tokens: 2,
+            total_tokens: 6,
+            ..CanonicalUsage::default()
+        });
+        assert!(observer.take_token_deltas().is_empty());
+        assert_eq!(
+            observer.cumulative_usage().map(|usage| usage.total_tokens),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn terminal_observer_counts_claude_cache_once_across_cumulative_snapshots() {
+        let mut observer = StreamingStandardTerminalObserver::default();
+        let first_snapshot = CanonicalUsage {
+            input_tokens: 6,
+            input_tokens_include_cache: false,
+            output_tokens: 2,
+            // Claude's provider total excludes the separate cache dimensions.
+            total_tokens: 8,
+            cache_creation_tokens: 30,
+            cache_creation_ephemeral_5m_tokens: 10,
+            cache_creation_ephemeral_1h_tokens: 20,
+            cache_read_tokens: 100,
+            reasoning_tokens: 1,
+        };
+
+        observer.observe_usage_snapshot(first_snapshot.clone());
+        let first = observer.take_token_deltas();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].total_tokens, 138);
+        assert_eq!(first[0].inclusive_token_total(), 138);
+
+        // Replaying the same cumulative provider snapshot is idempotent.
+        observer.observe_usage_snapshot(first_snapshot.clone());
+        assert!(observer.take_token_deltas().is_empty());
+
+        let terminal_snapshot = CanonicalUsage {
+            output_tokens: 5,
+            total_tokens: 11,
+            reasoning_tokens: 2,
+            ..first_snapshot
+        };
+        observer.observe_usage_snapshot(terminal_snapshot);
+        let terminal = observer.take_token_deltas();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].output_tokens, 3);
+        assert_eq!(terminal[0].total_tokens, 3);
+        assert_eq!(terminal[0].inclusive_token_total(), 3);
+        assert_eq!(
+            observer.cumulative_usage().map(|usage| usage.total_tokens),
+            Some(141)
         );
     }
 }

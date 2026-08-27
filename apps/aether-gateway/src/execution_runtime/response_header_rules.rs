@@ -16,6 +16,9 @@ const PROVIDER_RESPONSE_HEADERS_OBSERVED_AT_UNIX_MS_CONTEXT_KEY: &str =
     "provider_response_headers_observed_at_unix_ms";
 const RESPONSE_HEADER_RULE_PROTECTED_KEYS: &[&str] = &["content-length"];
 const RESPONSE_HEADER_RULES_CACHE_TTL: Duration = Duration::from_secs(5);
+// Endpoint configuration is an optional response decoration.  It must never
+// hold a terminal usage handoff hostage when the catalog/database is slow.
+const RESPONSE_HEADER_RULES_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn endpoint_response_header_rules_from_config(config: Option<&Value>) -> Option<&Value> {
     let config = config?.as_object()?;
@@ -33,9 +36,10 @@ async fn read_endpoint_response_header_rules(state: &AppState, endpoint_id: &str
     let endpoint_id = endpoint_id.to_string();
 
     let endpoint_id_for_load = endpoint_id.clone();
-    match state
-        .endpoint_response_header_rules_cache
-        .get_or_load(endpoint_id, RESPONSE_HEADER_RULES_CACHE_TTL, || async {
+    let read = state.endpoint_response_header_rules_cache.get_or_load(
+        endpoint_id,
+        RESPONSE_HEADER_RULES_CACHE_TTL,
+        || async {
             state
                 .read_provider_catalog_endpoints_by_ids(std::slice::from_ref(&endpoint_id_for_load))
                 .await
@@ -45,17 +49,27 @@ async fn read_endpoint_response_header_rules(state: &AppState, endpoint_id: &str
                             .cloned()
                     })
                 })
-        })
-        .await
-    {
-        Ok(rules) => rules,
-        Err(err) => {
+        },
+    );
+    match tokio::time::timeout(RESPONSE_HEADER_RULES_READ_TIMEOUT, read).await {
+        Ok(Ok(rules)) => rules,
+        Ok(Err(err)) => {
             warn!(
                 event_name = "response_header_rules_endpoint_read_failed",
                 log_type = "ops",
                 endpoint_id = %endpoint_id_for_load,
                 error = ?err,
                 "gateway failed to read endpoint response header rules; skipping response header edits"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                event_name = "response_header_rules_endpoint_read_timeout",
+                log_type = "ops",
+                endpoint_id = %endpoint_id_for_load,
+                timeout_ms = RESPONSE_HEADER_RULES_READ_TIMEOUT.as_millis() as u64,
+                "gateway timed out reading endpoint response header rules; skipping response header edits"
             );
             None
         }
@@ -99,6 +113,31 @@ pub(crate) async fn apply_endpoint_response_header_rules(
     Ok(())
 }
 
+/// Apply endpoint response header rules without allowing optional decoration
+/// failures to abort a terminal request.  Header rules are intentionally
+/// best-effort here: usage/candidate durability has already been prioritized
+/// by the caller's terminal path, and an invalid rule should leave the
+/// provider headers unchanged rather than turn a billable response into an
+/// unrecorded gateway error.
+pub(crate) async fn apply_endpoint_response_header_rules_best_effort(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    headers: &mut BTreeMap<String, String>,
+    response_body: Option<&Value>,
+) {
+    if let Err(err) =
+        apply_endpoint_response_header_rules(state, plan, headers, response_body).await
+    {
+        warn!(
+            event_name = "response_header_rules_apply_failed_best_effort",
+            log_type = "ops",
+            endpoint_id = %plan.endpoint_id,
+            error = ?err,
+            "gateway skipped endpoint response header edits after a local rule failure"
+        );
+    }
+}
+
 pub(crate) fn attach_provider_response_headers_to_report_context(
     report_context: Option<Value>,
     provider_headers: &BTreeMap<String, String>,
@@ -140,7 +179,35 @@ pub(crate) fn attach_provider_response_headers_to_report_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_contracts::RequestBody;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogEndpoint;
     use serde_json::json;
+    use std::sync::Arc;
+
+    fn response_header_rules_test_plan(endpoint_id: &str) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "response-header-rules-test".to_string(),
+            candidate_id: None,
+            provider_name: Some("test-provider".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({})),
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("test-model".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
 
     #[test]
     fn provider_response_observation_is_first_write_wins() {
@@ -206,5 +273,55 @@ mod tests {
             .get("provider_response_headers_observed_at_unix_ms")
             .is_none());
         assert!(report_context.get("provider_request_order_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_header_rule_application_is_best_effort() {
+        let endpoint_id = "endpoint-response-header-rules-test";
+        let endpoint = StoredProviderCatalogEndpoint::new(
+            endpoint_id.to_string(),
+            "provider-1".to_string(),
+            "openai:chat".to_string(),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            "https://example.com".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "response_header_rules": [{
+                    "action": "set",
+                    "key": "x-terminal-rule",
+                    "value": "applied"
+                }]
+            })),
+            None,
+            None,
+        )
+        .expect("endpoint transport fields should build");
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            Vec::new(),
+            vec![endpoint],
+            Vec::new(),
+        ));
+        let data_state =
+            crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(repository);
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(data_state);
+        let plan = response_header_rules_test_plan(endpoint_id);
+        let mut headers = BTreeMap::new();
+
+        apply_endpoint_response_header_rules_best_effort(&state, &plan, &mut headers, None).await;
+
+        assert_eq!(
+            headers.get("x-terminal-rule").map(String::as_str),
+            Some("applied")
+        );
     }
 }

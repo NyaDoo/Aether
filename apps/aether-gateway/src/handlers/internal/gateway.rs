@@ -690,7 +690,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                         )));
                     }
                 };
-                crate::usage::submit_sync_report(state, payload).await?;
+                crate::usage::submit_sync_report_after_durable_usage(state, payload).await?;
                 return Ok(Some(Json(json!({ "ok": true })).into_response()));
             }
             Some("report_stream")
@@ -713,7 +713,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                         )));
                     }
                 };
-                crate::usage::submit_stream_report(state, payload).await?;
+                crate::usage::submit_stream_report_after_durable_usage(state, payload).await?;
                 return Ok(Some(Json(json!({ "ok": true })).into_response()));
             }
             Some("finalize_sync")
@@ -749,7 +749,10 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                     &payload,
                 )? {
                     if let Some(background_report) = outcome.background_report {
-                        crate::usage::spawn_sync_report(state.clone(), background_report);
+                        crate::usage::spawn_sync_report_after_durable_usage(
+                            state.clone(),
+                            background_report,
+                        );
                     }
                     let mut response = outcome.response;
                     response.headers_mut().insert(

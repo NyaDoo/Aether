@@ -19,6 +19,7 @@ use crate::ai_serving::{
 use crate::client_session_affinity::{
     client_session_affinity_report_context_value, CLIENT_SESSION_AFFINITY_REPORT_CONTEXT_FIELD,
 };
+use crate::constants::REALTIME_ADMISSION_ID_HEADER;
 use crate::orchestration::{
     insert_pool_key_lease_report_context_fields, ExecutionAttemptIdentity,
     ROUTING_POOL_POLICY_OVERRIDE_REPORT_FIELD, SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
@@ -81,6 +82,22 @@ pub(crate) fn build_local_execution_report_context(
         parts.original_request_body_base64,
     );
     let mut extra_fields = parts.extra_fields;
+    // The outer frontdoor gives every accepted HTTP request a private
+    // admission identity. Carry it through the execution report context so
+    // terminal lifecycle events can settle the same realtime RPM event even
+    // when the public trace ID is reused by a caller.
+    if let Some(realtime_admission_id) = parts
+        .original_headers
+        .get(REALTIME_ADMISSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        extra_fields.insert(
+            "realtime_admission_id".to_string(),
+            Value::String(realtime_admission_id.to_string()),
+        );
+    }
     if let Some(value) = parts
         .client_session_affinity
         .and_then(client_session_affinity_report_context_value)

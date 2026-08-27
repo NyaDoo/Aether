@@ -23,6 +23,28 @@ pub struct InMemoryVideoTaskRepository {
 }
 
 impl InMemoryVideoTaskRepository {
+    fn apply_snapshot_upsert(
+        existing: Option<&StoredVideoTask>,
+        incoming: StoredVideoTask,
+    ) -> StoredVideoTask {
+        let Some(existing) = existing else {
+            return incoming;
+        };
+        if !existing
+            .status
+            .allows_snapshot_replacement_with(incoming.status)
+        {
+            return existing.clone();
+        }
+        if !existing.status.is_active() && incoming.status == VideoTaskStatus::Deleted {
+            let mut deleted = existing.clone();
+            deleted.status = VideoTaskStatus::Deleted;
+            deleted.updated_at_unix_secs = incoming.updated_at_unix_secs;
+            return deleted;
+        }
+        incoming
+    }
+
     fn store_locked(index: &mut MemoryVideoTaskIndex, task: StoredVideoTask) -> StoredVideoTask {
         if let Some(previous) = index.by_id.insert(task.id.clone(), task.clone()) {
             if let Some(short_id) = previous.short_id {
@@ -316,7 +338,9 @@ impl VideoTaskReadRepository for InMemoryVideoTaskRepository {
 impl VideoTaskWriteRepository for InMemoryVideoTaskRepository {
     async fn upsert(&self, task: UpsertVideoTask) -> Result<StoredVideoTask, DataLayerError> {
         let mut index = self.index.write().expect("video task repository lock");
-        Ok(Self::store_locked(&mut index, task.into_stored()))
+        let incoming = task.into_stored();
+        let stored = Self::apply_snapshot_upsert(index.by_id.get(&incoming.id), incoming);
+        Ok(Self::store_locked(&mut index, stored))
     }
 
     async fn update_if_active(
@@ -595,6 +619,93 @@ mod tests {
             .expect("update should succeed");
 
         assert!(updated.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_upsert_preserves_billing_terminals_and_allows_metadata_safe_delete() {
+        for (index, terminal_status) in [
+            VideoTaskStatus::Completed,
+            VideoTaskStatus::Failed,
+            VideoTaskStatus::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let repo = InMemoryVideoTaskRepository::default();
+            let task_id = format!("terminal-{index}");
+            let terminal = UpsertVideoTask {
+                completed_at_unix_secs: Some(100),
+                video_url: Some("https://assets.example/final.mp4".to_string()),
+                error_code: Some("terminal-code".to_string()),
+                error_message: Some("terminal-message".to_string()),
+                request_metadata: Some(serde_json::json!({
+                    "completion_tokens": 41,
+                    "total_tokens": 42,
+                })),
+                ..sample_task(&task_id, terminal_status, 100)
+            };
+            repo.upsert(terminal.clone())
+                .await
+                .expect("terminal task should insert");
+
+            let blocked = repo
+                .upsert(UpsertVideoTask {
+                    video_url: None,
+                    error_code: None,
+                    error_message: None,
+                    request_metadata: None,
+                    ..sample_task(&task_id, VideoTaskStatus::Processing, 200)
+                })
+                .await
+                .expect("stale active upsert should return stored truth");
+            assert_eq!(blocked.status, terminal_status);
+            assert_eq!(blocked.video_url, terminal.video_url);
+            assert_eq!(blocked.error_code, terminal.error_code);
+            assert_eq!(blocked.error_message, terminal.error_message);
+            assert_eq!(blocked.request_metadata, terminal.request_metadata);
+            assert_eq!(blocked.completed_at_unix_secs, Some(100));
+
+            let conflicting_terminal_status = if terminal_status == VideoTaskStatus::Failed {
+                VideoTaskStatus::Completed
+            } else {
+                VideoTaskStatus::Failed
+            };
+            let conflicting_terminal = repo
+                .upsert(UpsertVideoTask {
+                    video_url: None,
+                    error_code: None,
+                    error_message: None,
+                    request_metadata: None,
+                    ..sample_task(&task_id, conflicting_terminal_status, 250)
+                })
+                .await
+                .expect("conflicting terminal upsert should return stored truth");
+            assert_eq!(conflicting_terminal, blocked);
+
+            let deleted = repo
+                .upsert(UpsertVideoTask {
+                    video_url: None,
+                    error_code: None,
+                    error_message: None,
+                    request_metadata: None,
+                    ..sample_task(&task_id, VideoTaskStatus::Deleted, 300)
+                })
+                .await
+                .expect("explicit delete should tombstone terminal task");
+            assert_eq!(deleted.status, VideoTaskStatus::Deleted);
+            assert_eq!(deleted.updated_at_unix_secs, 300);
+            assert_eq!(deleted.video_url, terminal.video_url);
+            assert_eq!(deleted.error_code, terminal.error_code);
+            assert_eq!(deleted.error_message, terminal.error_message);
+            assert_eq!(deleted.request_metadata, terminal.request_metadata);
+            assert_eq!(deleted.completed_at_unix_secs, Some(100));
+
+            let still_deleted = repo
+                .upsert(sample_task(&task_id, VideoTaskStatus::Completed, 400))
+                .await
+                .expect("deleted task should remain immutable");
+            assert_eq!(still_deleted, deleted);
+        }
     }
 
     #[tokio::test]

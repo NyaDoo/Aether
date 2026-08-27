@@ -83,6 +83,22 @@ where
         Ok(())
     }
 
+    /// Synchronous ownership hook invoked as soon as an attempt returns a
+    /// retry outcome, before the loop performs another await. Gateway ports
+    /// use it to keep request-level terminal ownership across candidates.
+    fn record_retry_terminal_gap(&self, _attempt: &Attempt) {}
+
+    /// Synchronous ownership hook invoked for the selected candidate before
+    /// `record_attempt_started` can await. Implementations refresh any
+    /// request-gap snapshot so cancellation cannot use the previous
+    /// candidate's identity while the new per-attempt owner is arming.
+    fn record_starting_attempt_terminal_gap(&self, _attempt: &Attempt) {}
+
+    /// Synchronous ownership-transfer hook invoked before cleanup awaits for
+    /// a response. Implementations must transfer only when the response
+    /// carries explicit proof of a durable/body terminal owner.
+    fn transfer_responded_terminal_owner(&self, _response: &Self::Response) {}
+
     async fn mark_unused_attempts(&self, attempts: Vec<Attempt>) -> Result<(), Self::Error>;
 
     async fn build_exhaustion(
@@ -112,6 +128,7 @@ where
             port.mark_unused_attempts(vec![attempt]).await?;
             continue;
         }
+        port.record_starting_attempt_terminal_gap(&attempt);
         port.record_attempt_started(&attempt).await?;
         let execution = match port.execute_attempt(&attempt).await {
             Ok(execution) => execution,
@@ -122,6 +139,7 @@ where
         };
         match execution {
             AiAttemptExecutionOutcome::Responded(response) => {
+                port.transfer_responded_terminal_owner(&response);
                 port.mark_unused_attempts(remaining.collect()).await?;
                 return Ok(AiAttemptLoopOutcome::Responded(response));
             }
@@ -129,6 +147,7 @@ where
                 scope,
                 fallback_response: attempt_fallback_response,
             } => {
+                port.record_retry_terminal_gap(&attempt);
                 port.record_attempt_failed(&attempt).await?;
                 if attempt_fallback_response.is_some() {
                     fallback_response = attempt_fallback_response;

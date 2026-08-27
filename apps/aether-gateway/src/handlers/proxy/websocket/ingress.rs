@@ -17,6 +17,7 @@ use crate::api::response::{
     build_local_auth_rejection_response, build_local_http_error_response,
     build_local_overloaded_response,
 };
+use crate::constants::{REALTIME_ADMISSION_AT_MS_HEADER, REALTIME_ADMISSION_ID_HEADER};
 use crate::control::{
     trusted_auth_local_rejection, GatewayControlDecision, GatewayCredentialCarrier,
     GatewayLocalAuthRejection,
@@ -38,10 +39,24 @@ pub(crate) struct WebSocketRequestContext {
     /// turn re-checks live API-key/admin IP policy against this immutable fact.
     pub(crate) client_ip: IpAddr,
     pub(crate) decision: GatewayControlDecision,
+    /// Canonical realtime identity established at the authenticated Upgrade.
+    /// The identity is copied into each turn's typed planning extension; it
+    /// is never sent to a provider as a client header.
+    pub(crate) realtime_admission_id: String,
+    pub(crate) realtime_admission_at_ms: u64,
     /// Held for the lifetime of the upgraded socket. The Responses session
     /// polls its health and closes the client when a distributed lease is
     /// revoked or expires.
     pub(crate) websocket_connection_permit: Option<aether_runtime::AdmissionPermit>,
+}
+
+/// Per-turn realtime identity carried through planner-owned request parts.
+/// Keeping this in extensions avoids leaking gateway bookkeeping headers into
+/// provider passthrough/header-rule evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebSocketRealtimeAdmission {
+    pub(crate) id: String,
+    pub(crate) at_ms: u64,
 }
 
 /// Adapter-specific wording and event identifiers for generic upgrade checks.
@@ -61,6 +76,7 @@ pub(crate) async fn upgrade_authenticated_ai_websocket<F, Fut>(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     uri: Uri,
+    accepted_wall_clock_ms: Option<u64>,
     limits: WebSocketSessionLimits,
     spec: WebSocketIngressSpec,
     run_session: F,
@@ -176,9 +192,52 @@ where
     // API key from the query string nor client authentication/handshake
     // headers.  Provider authentication is added independently by the
     // planner and is therefore unaffected by this boundary.
+    let trusted_owner_forward =
+        crate::control::verify_trusted_auth_forward_headers(&headers, &Method::GET, &uri);
     let uri = websocket_planning_uri(&uri);
     decision.public_query_string = uri.query().map(ToOwned::to_owned);
-    let headers = websocket_planning_headers(headers);
+    // A WebSocket upgrade does not pass through the ordinary HTTP proxy
+    // handler, so establish the realtime identity here.  Caller-supplied
+    // private headers are ignored unless the complete owner-forward HMAC is
+    // valid; otherwise every connection gets a fresh per-connection identity
+    // and the wall clock captured by the frontdoor middleware.  This keeps
+    // the later per-turn reservation anchored to true ingress rather than
+    // planner/provider time, and prevents a client from moving an event into
+    // or out of the rolling window by spoofing the headers.
+    let realtime_admission_id = if trusted_owner_forward {
+        headers
+            .get(REALTIME_ADMISSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    let realtime_admission_at_ms = if trusted_owner_forward {
+        headers
+            .get(REALTIME_ADMISSION_AT_MS_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    } else {
+        None
+    }
+    .or(accepted_wall_clock_ms)
+    .unwrap_or_else(crate::clock::current_unix_ms);
+    let mut headers = websocket_planning_headers(headers);
+    if let Ok(value) = http::HeaderValue::from_str(&realtime_admission_id) {
+        headers.insert(
+            http::HeaderName::from_static(REALTIME_ADMISSION_ID_HEADER),
+            value,
+        );
+    }
+    if let Ok(value) = http::HeaderValue::from_str(&realtime_admission_at_ms.to_string()) {
+        headers.insert(
+            http::HeaderName::from_static(REALTIME_ADMISSION_AT_MS_HEADER),
+            value,
+        );
+    }
     let context = WebSocketRequestContext {
         trace_id,
         headers,
@@ -186,6 +245,8 @@ where
         remote_addr,
         client_ip,
         decision,
+        realtime_admission_id,
+        realtime_admission_at_ms,
         websocket_connection_permit,
     };
     Ok(ws

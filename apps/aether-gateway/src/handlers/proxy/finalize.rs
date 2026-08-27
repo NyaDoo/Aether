@@ -56,7 +56,36 @@ pub(super) fn finalize_gateway_response(
     execution_path: &'static str,
     started_at: &Instant,
     request_permit: Option<AdmissionPermit>,
+    realtime_admission_id: Option<&str>,
 ) -> Response<Body> {
+    let realtime_failed = !response.status().is_success();
+    let realtime_runtime = state.runtime_state().clone();
+    let realtime_request_id = realtime_admission_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(trace_id)
+        .to_string();
+    if realtime_failed {
+        // Keep the finalizer synchronous for all existing callers, but move
+        // the shared-store GETDEL/decrement off the response path.  Usage
+        // terminal events perform the same idempotent operation, so this is
+        // safe for streams and for duplicate failure reporting.
+        aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+            if let Err(err) = crate::dashboard_realtime::rollback_admission(
+                &realtime_runtime,
+                &realtime_request_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    event_name = "dashboard_realtime_response_rollback_failed",
+                    log_type = "ops",
+                    request_id = %realtime_request_id,
+                    error = %err,
+                    "failed to compensate realtime admission for failed response"
+                );
+            }
+        });
+    }
     attach_control_decision_headers(&mut response, control_decision);
     if !response.headers().contains_key(TRACE_ID_HEADER) {
         response.headers_mut().insert(
@@ -130,9 +159,9 @@ pub(super) fn finalize_gateway_response(
         );
     } else if should_downgrade_access_log(method, sanitized_path_and_query.as_str()) {
         trace!(
-            event_name = "http_request_completed",
+            event_name = "http_response_headers_ready",
             log_type = "access",
-            status = "completed",
+            status = "headers_ready",
             status_code,
             trace_id = %trace_id,
             request_id,
@@ -146,13 +175,13 @@ pub(super) fn finalize_gateway_response(
             dependency_reason = dependency_reason.as_str(),
             local_execution_runtime_miss_reason = local_execution_runtime_miss_reason.as_str(),
             elapsed_ms,
-            "gateway completed request"
+            "gateway response headers ready"
         );
     } else {
         info!(
-            event_name = "http_request_completed",
+            event_name = "http_response_headers_ready",
             log_type = "access",
-            status = "completed",
+            status = "headers_ready",
             status_code,
             trace_id = %trace_id,
             request_id,
@@ -166,7 +195,7 @@ pub(super) fn finalize_gateway_response(
             dependency_reason = dependency_reason.as_str(),
             local_execution_runtime_miss_reason = local_execution_runtime_miss_reason.as_str(),
             elapsed_ms,
-            "gateway completed request"
+            "gateway response headers ready"
         );
     }
     response.extensions_mut().insert(RequestLogEmitted);
@@ -258,6 +287,7 @@ pub(super) fn finalize_gateway_response_with_context(
         execution_path,
         started_at,
         request_permit,
+        request_context.realtime_admission_id.as_deref(),
     )
 }
 
@@ -315,6 +345,7 @@ mod tests {
     fn request_wants_stream_reads_zstd_encoded_json_body() {
         let request_context = GatewayPublicRequestContext {
             trace_id: "trace-zstd-stream".to_string(),
+            realtime_admission_id: None,
             request_method: Method::POST,
             request_path: "/v1/responses".to_string(),
             request_query_string: None,
@@ -379,10 +410,13 @@ mod tests {
             "execution_runtime_sync",
             &Instant::now(),
             None,
+            None,
         );
 
         let logs = writer.lines();
         assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["event_name"], "http_response_headers_ready");
+        assert_eq!(logs[0]["status"], "headers_ready");
         assert_eq!(
             logs[0]["path"],
             "/v1beta/models/gemini-3-flash-preview:generateContent?alt=sse"

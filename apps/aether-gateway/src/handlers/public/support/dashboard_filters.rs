@@ -19,7 +19,6 @@ use chrono::Datelike;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-const DASHBOARD_SITE_RATE_WINDOW_SECS: u64 = 60;
 const DASHBOARD_ONLINE_USER_WINDOW_SECS: u64 = 300;
 const DASHBOARD_ONLINE_USER_AGGREGATION_LIMIT: usize = 100_000;
 
@@ -1038,19 +1037,12 @@ pub(super) async fn handle_dashboard_stats_get(
 
     if is_admin {
         let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
-        let site_rate_summary = match dashboard_summary_for_unix_range_raw(
-            state,
-            now_unix_secs.saturating_sub(DASHBOARD_SITE_RATE_WINDOW_SECS),
-            now_unix_secs.saturating_add(1),
-            None,
-            "dashboard realtime site stats lookup failed",
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-        let site_rate_totals = dashboard_usage_totals_from_summary(&site_rate_summary);
+        // Site-wide RPM/TPM is intentionally not calculated here.  This is
+        // the historical, heavyweight dashboard response and its persisted
+        // usage rows cannot represent in-flight requests or token deltas.
+        // The lightweight `/api/dashboard/realtime` endpoint owns that exact
+        // rolling-window calculation; retain a compatibility card shell for
+        // clients that still render this response while they upgrade.
         let online_users = match dashboard_load_online_user_count(state, now_unix_secs).await {
             Ok(value) => value,
             Err(err) => {
@@ -1108,12 +1100,8 @@ pub(super) async fn handle_dashboard_stats_get(
             },
             {
                 "name": "全站 RPM / TPM",
-                "value": format!(
-                    "{} / {}",
-                    dashboard_format_integer(site_rate_totals.requests),
-                    dashboard_format_token_compact(site_rate_totals.total_tokens)
-                ),
-                "subValue": "最近 60 秒",
+                "value": "-- / --",
+                "subValue": "实时指标见 /api/dashboard/realtime",
                 "icon": "Activity",
             },
             {

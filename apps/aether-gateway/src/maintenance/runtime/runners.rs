@@ -15,9 +15,10 @@ use super::{
     perform_db_maintenance_once, perform_manual_usage_cleanup_once, perform_provider_checkin_once,
     perform_stats_aggregation_once, perform_stats_hourly_aggregation_once,
     perform_usage_cleanup_once, perform_wallet_daily_usage_aggregation_once,
-    record_admin_cleanup_run, record_completed_cleanup_run, record_failed_cleanup_run,
-    record_proxy_upgrade_traffic_success, summarize_database_pool, AdminCleanupRunRecord,
-    ManualUsageCleanupOptions,
+    reconcile_active_request_candidates_from_terminal_usage_once, record_admin_cleanup_run,
+    record_completed_cleanup_run, record_failed_cleanup_run, record_proxy_upgrade_traffic_success,
+    summarize_database_pool, AdminCleanupRunRecord, ManualUsageCleanupOptions,
+    RequestCandidateTerminalSweepCursor,
 };
 
 pub(super) async fn run_audit_cleanup_once(data: &GatewayDataState) -> Result<(), DataLayerError> {
@@ -599,6 +600,7 @@ pub(super) fn run_pool_monitor_once(data: &GatewayDataState) {
 
 pub(super) async fn run_pending_cleanup_once(
     data: &GatewayDataState,
+    candidate_cursor: &mut Option<RequestCandidateTerminalSweepCursor>,
 ) -> Result<(), DataLayerError> {
     let summary = cleanup_stale_pending_requests_once(data).await?;
     if summary.failed > 0 || summary.recovered > 0 {
@@ -609,6 +611,26 @@ pub(super) async fn run_pending_cleanup_once(
             failed = summary.failed,
             recovered = summary.recovered,
             "gateway cleaned stale pending and streaming requests"
+        );
+    }
+    let candidate_summary =
+        reconcile_active_request_candidates_from_terminal_usage_once(data, candidate_cursor)
+            .await?;
+    if candidate_summary.reconciled > 0
+        || candidate_summary.identity_mismatches > 0
+        || candidate_summary.usage_not_terminal > 0
+        || candidate_summary.write_conflicts > 0
+    {
+        info!(
+            event_name = "request_candidate_terminal_reconciliation_completed",
+            log_type = "ops",
+            worker = "pending_cleanup",
+            scanned = candidate_summary.scanned,
+            reconciled = candidate_summary.reconciled,
+            identity_mismatches = candidate_summary.identity_mismatches,
+            usage_not_terminal = candidate_summary.usage_not_terminal,
+            write_conflicts = candidate_summary.write_conflicts,
+            "gateway reconciled active request candidates from durable terminal usage"
         );
     }
     Ok(())

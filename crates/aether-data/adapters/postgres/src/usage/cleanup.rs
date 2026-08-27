@@ -19,8 +19,21 @@ WITH doomed AS (
     SELECT id
     FROM usage
     WHERE created_at < $1
+      -- Cleanup retains forensic evidence until both the legacy usage mirror
+      -- and any settlement snapshot stop looking pending/unfinalized.
+      AND NOT (
+        (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+        OR EXISTS (
+          SELECT 1
+          FROM usage_settlement_snapshots AS cleanup_settlement
+          WHERE cleanup_settlement.request_id = usage.request_id
+            AND cleanup_settlement.billing_status = 'pending'
+            AND cleanup_settlement.finalized_at IS NULL
+        )
+      )
     ORDER BY created_at ASC, id ASC
     LIMIT $2
+    FOR UPDATE OF usage SKIP LOCKED
 )
 DELETE FROM usage AS usage_rows
 USING doomed
@@ -31,6 +44,16 @@ SELECT id, request_id, request_metadata
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND request_metadata IS NOT NULL
   AND (
     request_metadata::jsonb ? 'request_body_ref'
@@ -46,6 +69,16 @@ SELECT id, request_id
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_headers IS NOT NULL
     OR response_headers IS NOT NULL
@@ -65,6 +98,7 @@ WHERE created_at < $1
   )
 ORDER BY created_at ASC, id ASC
 LIMIT $3
+FOR UPDATE OF usage SKIP LOCKED
 "#;
 const CLEAR_USAGE_HEADER_FIELDS_SQL: &str = r#"
 UPDATE usage
@@ -73,6 +107,16 @@ SET request_headers = NULL,
     provider_request_headers = NULL,
     client_response_headers = NULL
 WHERE id = ANY($1)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
 "#;
 const CLEAR_USAGE_HTTP_AUDIT_HEADERS_SQL: &str = r#"
 UPDATE usage_http_audits
@@ -82,10 +126,40 @@ SET request_headers = NULL,
     client_response_headers = NULL,
     updated_at = NOW()
 WHERE request_id = ANY($1)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage
+    WHERE usage.request_id = usage_http_audits.request_id
+      AND (
+        (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+        OR EXISTS (
+          SELECT 1
+          FROM usage_settlement_snapshots AS cleanup_settlement
+          WHERE cleanup_settlement.request_id = usage.request_id
+            AND cleanup_settlement.billing_status = 'pending'
+            AND cleanup_settlement.finalized_at IS NULL
+        )
+      )
+  )
 "#;
 const DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL: &str = r#"
 DELETE FROM usage_http_audits
 WHERE request_id = ANY($1)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage
+    WHERE usage.request_id = usage_http_audits.request_id
+      AND (
+        (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+        OR EXISTS (
+          SELECT 1
+          FROM usage_settlement_snapshots AS cleanup_settlement
+          WHERE cleanup_settlement.request_id = usage.request_id
+            AND cleanup_settlement.billing_status = 'pending'
+            AND cleanup_settlement.finalized_at IS NULL
+        )
+      )
+  )
   AND request_headers IS NULL
   AND response_headers IS NULL
   AND provider_request_headers IS NULL
@@ -100,6 +174,16 @@ SELECT id, request_id
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -128,11 +212,22 @@ WHERE created_at < $1
   )
 ORDER BY created_at ASC, id ASC
 LIMIT $3
+FOR UPDATE OF usage SKIP LOCKED
 "#;
 const SELECT_USAGE_RAW_BODY_BATCH_SQL: &str = r#"
 SELECT id, request_id
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -141,6 +236,7 @@ WHERE created_at < $1
   )
 ORDER BY created_at ASC, id ASC
 LIMIT $2
+FOR UPDATE OF usage SKIP LOCKED
 "#;
 const CLEAR_USAGE_RAW_BODY_FIELDS_SQL: &str = r#"
 UPDATE usage
@@ -149,11 +245,31 @@ SET request_body = NULL,
     provider_request_body = NULL,
     client_response_body = NULL
 WHERE id = ANY($1)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
 "#;
 const SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL: &str = r#"
 SELECT id, request_id
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body_compressed IS NOT NULL
     OR response_body_compressed IS NOT NULL
@@ -178,6 +294,7 @@ WHERE created_at < $1
   )
 ORDER BY created_at ASC, id ASC
 LIMIT $2
+FOR UPDATE OF usage SKIP LOCKED
 "#;
 const CLEAR_USAGE_COMPRESSED_BODY_FIELDS_SQL: &str = r#"
 UPDATE usage
@@ -186,6 +303,16 @@ SET request_body_compressed = NULL,
     provider_request_body_compressed = NULL,
     client_response_body_compressed = NULL
 WHERE id = ANY($1)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
 "#;
 const CLEAR_USAGE_BODY_FIELDS_SQL: &str = r#"
 UPDATE usage
@@ -198,10 +325,35 @@ SET request_body = NULL,
     provider_request_body_compressed = NULL,
     client_response_body_compressed = NULL
 WHERE id = ANY($1)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
 "#;
 const DELETE_USAGE_BODY_BLOBS_SQL: &str = r#"
 DELETE FROM usage_body_blobs
 WHERE request_id = ANY($1)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage
+    WHERE usage.request_id = usage_body_blobs.request_id
+      AND (
+        (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+        OR EXISTS (
+          SELECT 1
+          FROM usage_settlement_snapshots AS cleanup_settlement
+          WHERE cleanup_settlement.request_id = usage.request_id
+            AND cleanup_settlement.billing_status = 'pending'
+            AND cleanup_settlement.finalized_at IS NULL
+        )
+      )
+  )
 "#;
 const CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL: &str = r#"
 UPDATE usage_http_audits
@@ -212,6 +364,21 @@ SET request_body_ref = NULL,
     body_capture_mode = 'none',
     updated_at = NOW()
 WHERE request_id = ANY($1)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage
+    WHERE usage.request_id = usage_http_audits.request_id
+      AND (
+        (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+        OR EXISTS (
+          SELECT 1
+          FROM usage_settlement_snapshots AS cleanup_settlement
+          WHERE cleanup_settlement.request_id = usage.request_id
+            AND cleanup_settlement.billing_status = 'pending'
+            AND cleanup_settlement.finalized_at IS NULL
+        )
+      )
+  )
 "#;
 const SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL: &str = r#"
 SELECT
@@ -219,6 +386,16 @@ SELECT
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR request_body_compressed IS NOT NULL
@@ -246,6 +423,16 @@ SELECT
   client_response_body_compressed
 FROM usage
 WHERE id = $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
 LIMIT 1
 "#;
 const SELECT_EXPIRED_ACTIVE_API_KEYS_SQL: &str = r#"
@@ -609,12 +796,27 @@ pub async fn preview_usage_cleanup_impl(
         0
     };
     let log = if targets.records {
-        let log: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage WHERE created_at < $1")
-                .bind(window.log_cutoff)
-                .fetch_one(pool)
-                .await
-                .map_err(postgres_error)?;
+        let log: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)::bigint
+FROM usage
+WHERE created_at < $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
+"#,
+        )
+        .bind(window.log_cutoff)
+        .fetch_one(pool)
+        .await
+        .map_err(postgres_error)?;
         u64::try_from(log).unwrap_or(0)
     } else {
         0
@@ -635,23 +837,26 @@ async fn cleanup_usage_raw_body_fields(
 ) -> Result<usize, DataLayerError> {
     let mut total_cleaned = 0usize;
     loop {
+        let mut tx = pool.begin().await.map_err(postgres_error)?;
         let rows = fetch_usage_body_cleanup_rows(
-            pool,
+            &mut tx,
             SELECT_USAGE_RAW_BODY_BATCH_SQL,
             cutoff_time,
             batch_size,
         )
         .await?;
         if rows.is_empty() {
+            tx.rollback().await.map_err(postgres_error)?;
             break;
         }
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
         let cleaned = sqlx::query(CLEAR_USAGE_RAW_BODY_FIELDS_SQL)
             .bind(ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?
             .rows_affected();
+        tx.commit().await.map_err(postgres_error)?;
         let cleaned = usize::try_from(cleaned).unwrap_or(usize::MAX);
         total_cleaned += cleaned;
         if rows.len() < batch_size {
@@ -668,14 +873,16 @@ async fn cleanup_usage_compressed_body_fields(
 ) -> Result<usize, DataLayerError> {
     let mut total_cleaned = 0usize;
     loop {
+        let mut tx = pool.begin().await.map_err(postgres_error)?;
         let rows = fetch_usage_body_cleanup_rows(
-            pool,
+            &mut tx,
             SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL,
             cutoff_time,
             batch_size,
         )
         .await?;
         if rows.is_empty() {
+            tx.rollback().await.map_err(postgres_error)?;
             break;
         }
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
@@ -686,25 +893,26 @@ async fn cleanup_usage_compressed_body_fields(
 
         let cleaned = sqlx::query(CLEAR_USAGE_COMPRESSED_BODY_FIELDS_SQL)
             .bind(ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?
             .rows_affected();
         sqlx::query(DELETE_USAGE_BODY_BLOBS_SQL)
             .bind(&request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
         sqlx::query(CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
             .bind(&request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
         sqlx::query(DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL)
             .bind(request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
         let cleaned = usize::try_from(cleaned).unwrap_or(usize::MAX);
         total_cleaned += cleaned;
         if rows.len() < batch_size {
@@ -715,7 +923,7 @@ async fn cleanup_usage_compressed_body_fields(
 }
 
 async fn fetch_usage_body_cleanup_rows(
-    pool: &PostgresPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sql: &str,
     cutoff_time: DateTime<Utc>,
     batch_size: usize,
@@ -723,7 +931,7 @@ async fn fetch_usage_body_cleanup_rows(
     let rows = sqlx::query(sql)
         .bind(cutoff_time)
         .bind(i64::try_from(batch_size).unwrap_or(i64::MAX))
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .map_err(postgres_error)?
         .into_iter()
@@ -761,6 +969,16 @@ async fn count_usage_raw_body_candidates(
 SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -785,6 +1003,16 @@ async fn count_usage_compressed_body_candidates(
 SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body_compressed IS NOT NULL
     OR response_body_compressed IS NOT NULL
@@ -830,6 +1058,16 @@ SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR request_body_compressed IS NOT NULL
@@ -873,6 +1111,16 @@ SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_body IS NOT NULL
     OR response_body IS NOT NULL
@@ -923,6 +1171,16 @@ SELECT COUNT(*)::bigint
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
   AND (
     request_headers IS NOT NULL
     OR response_headers IS NOT NULL
@@ -1073,11 +1331,12 @@ async fn cleanup_usage_header_fields(
 
     let mut total_cleaned = 0usize;
     loop {
+        let mut tx = pool.begin().await.map_err(postgres_error)?;
         let mut stream = sqlx::query(SELECT_USAGE_HEADER_BATCH_SQL)
             .bind(cutoff_time)
             .bind(newer_than)
             .bind(i64::try_from(batch_size).unwrap_or(i64::MAX))
-            .fetch(pool);
+            .fetch(&mut *tx);
         let mut rows = Vec::new();
         while let Some(row) = stream.try_next().await.map_err(postgres_error)? {
             rows.push(UsageBodyCleanupRow {
@@ -1087,7 +1346,9 @@ async fn cleanup_usage_header_fields(
                     .map_err(postgres_error)?,
             });
         }
+        drop(stream);
         if rows.is_empty() {
+            tx.rollback().await.map_err(postgres_error)?;
             break;
         }
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
@@ -1098,20 +1359,21 @@ async fn cleanup_usage_header_fields(
 
         let cleaned = sqlx::query(CLEAR_USAGE_HEADER_FIELDS_SQL)
             .bind(ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?
             .rows_affected();
         sqlx::query(CLEAR_USAGE_HTTP_AUDIT_HEADERS_SQL)
             .bind(&request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
         sqlx::query(DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL)
             .bind(request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
         let cleaned = usize::try_from(cleaned).unwrap_or(usize::MAX);
         total_cleaned += cleaned;
         if rows.len() < batch_size {
@@ -1138,11 +1400,12 @@ async fn cleanup_usage_stale_body_fields(
 
     let mut total_cleaned = 0usize;
     loop {
+        let mut tx = pool.begin().await.map_err(postgres_error)?;
         let mut stream = sqlx::query(SELECT_USAGE_STALE_BODY_BATCH_SQL)
             .bind(cutoff_time)
             .bind(newer_than)
             .bind(i64::try_from(batch_size).unwrap_or(i64::MAX))
-            .fetch(pool);
+            .fetch(&mut *tx);
         let mut rows = Vec::new();
         while let Some(row) = stream.try_next().await.map_err(postgres_error)? {
             rows.push(UsageBodyCleanupRow {
@@ -1152,7 +1415,9 @@ async fn cleanup_usage_stale_body_fields(
                     .map_err(postgres_error)?,
             });
         }
+        drop(stream);
         if rows.is_empty() {
+            tx.rollback().await.map_err(postgres_error)?;
             break;
         }
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
@@ -1163,25 +1428,26 @@ async fn cleanup_usage_stale_body_fields(
 
         let cleaned = sqlx::query(CLEAR_USAGE_BODY_FIELDS_SQL)
             .bind(ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?
             .rows_affected();
         sqlx::query(DELETE_USAGE_BODY_BLOBS_SQL)
             .bind(&request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
         sqlx::query(CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
             .bind(&request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
         sqlx::query(DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL)
             .bind(request_ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(postgres_error)?;
+        tx.commit().await.map_err(postgres_error)?;
         let cleaned = usize::try_from(cleaned).unwrap_or(usize::MAX);
         total_cleaned += cleaned;
         if rows.len() < batch_size {
@@ -1447,6 +1713,16 @@ UPDATE usage
 SET request_metadata = $2::json,
     updated_at = NOW()
 WHERE id = $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
 "#;
 
 const UPDATE_USAGE_BODY_COMPRESSION_SQL: &str = r#"
@@ -1460,6 +1736,16 @@ SET request_body = NULL,
     provider_request_body_compressed = NULL,
     client_response_body_compressed = NULL
 WHERE id = $1
+  AND NOT (
+    (usage.billing_status = 'pending' AND usage.finalized_at IS NULL)
+    OR EXISTS (
+      SELECT 1
+      FROM usage_settlement_snapshots AS cleanup_settlement
+      WHERE cleanup_settlement.request_id = usage.request_id
+        AND cleanup_settlement.billing_status = 'pending'
+        AND cleanup_settlement.finalized_at IS NULL
+    )
+  )
 "#;
 
 #[cfg(test)]
@@ -1472,7 +1758,15 @@ mod tests {
     use super::{
         build_usage_body_externalization, compress_usage_json_value,
         migrate_legacy_body_ref_metadata_plan, UsageBodyCompressionRow,
-        SELECT_USAGE_LEGACY_BODY_REF_METADATA_BATCH_SQL,
+        CLEAR_USAGE_BODY_FIELDS_SQL, CLEAR_USAGE_COMPRESSED_BODY_FIELDS_SQL,
+        CLEAR_USAGE_HEADER_FIELDS_SQL, CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL,
+        CLEAR_USAGE_HTTP_AUDIT_HEADERS_SQL, CLEAR_USAGE_RAW_BODY_FIELDS_SQL,
+        DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL, DELETE_OLD_USAGE_RECORDS_SQL,
+        DELETE_USAGE_BODY_BLOBS_SQL, SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL,
+        SELECT_USAGE_BODY_COMPRESSION_ROW_SQL, SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL,
+        SELECT_USAGE_HEADER_BATCH_SQL, SELECT_USAGE_LEGACY_BODY_REF_METADATA_BATCH_SQL,
+        SELECT_USAGE_RAW_BODY_BATCH_SQL, SELECT_USAGE_STALE_BODY_BATCH_SQL,
+        UPDATE_USAGE_BODY_COMPRESSION_SQL, UPDATE_USAGE_REQUEST_METADATA_SQL,
     };
 
     fn inflate_json(bytes: &[u8]) -> serde_json::Value {
@@ -1529,6 +1823,56 @@ mod tests {
             index_sql.matches("request_metadata::jsonb ? '").count(),
             LEGACY_BODY_REF_KEYS.len()
         );
+    }
+
+    #[test]
+    fn cleanup_queries_retain_pending_unfinalized_evidence() {
+        for sql in [
+            DELETE_OLD_USAGE_RECORDS_SQL,
+            SELECT_USAGE_LEGACY_BODY_REF_METADATA_BATCH_SQL,
+            SELECT_USAGE_HEADER_BATCH_SQL,
+            CLEAR_USAGE_HEADER_FIELDS_SQL,
+            CLEAR_USAGE_HTTP_AUDIT_HEADERS_SQL,
+            DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL,
+            SELECT_USAGE_STALE_BODY_BATCH_SQL,
+            SELECT_USAGE_RAW_BODY_BATCH_SQL,
+            CLEAR_USAGE_RAW_BODY_FIELDS_SQL,
+            SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL,
+            CLEAR_USAGE_COMPRESSED_BODY_FIELDS_SQL,
+            CLEAR_USAGE_BODY_FIELDS_SQL,
+            DELETE_USAGE_BODY_BLOBS_SQL,
+            CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL,
+            SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL,
+            SELECT_USAGE_BODY_COMPRESSION_ROW_SQL,
+            UPDATE_USAGE_REQUEST_METADATA_SQL,
+            UPDATE_USAGE_BODY_COMPRESSION_SQL,
+        ] {
+            assert!(
+                sql.contains("cleanup_settlement.billing_status = 'pending'"),
+                "cleanup query must retain a pending settlement snapshot: {sql}"
+            );
+            assert!(
+                sql.contains("cleanup_settlement.finalized_at IS NULL"),
+                "cleanup query must retain an unfinalized settlement snapshot: {sql}"
+            );
+            assert!(
+                sql.contains("usage.billing_status = 'pending'")
+                    && sql.contains("usage.finalized_at IS NULL"),
+                "cleanup query must retain a pending/unfinalized usage mirror: {sql}"
+            );
+        }
+
+        for selector in [
+            SELECT_USAGE_HEADER_BATCH_SQL,
+            SELECT_USAGE_STALE_BODY_BATCH_SQL,
+            SELECT_USAGE_RAW_BODY_BATCH_SQL,
+            SELECT_USAGE_COMPRESSED_BODY_BATCH_SQL,
+        ] {
+            assert!(
+                selector.contains("FOR UPDATE OF usage SKIP LOCKED"),
+                "destructive cleanup selection must lock the retained usage row: {selector}"
+            );
+        }
     }
 
     #[test]

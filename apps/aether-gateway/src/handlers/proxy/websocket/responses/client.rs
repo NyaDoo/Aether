@@ -19,9 +19,9 @@ use super::ownership::{
 use super::quota::mark_active_response_retry_unsafe;
 use super::redaction::redact_responses_websocket_client_event;
 use super::request::{
-    build_planning_parts, changed_followup_response_create_model, planned_response_create_event,
-    provider_model_from_decision, response_create_has_previous_response_id,
-    response_create_model_or_current,
+    build_planning_parts_at, changed_followup_response_create_model, planned_response_create_event,
+    provider_model_from_decision, realtime_admission_timestamp_from_parts,
+    response_create_has_previous_response_id, response_create_model_or_current,
 };
 use super::state::BoundResponsesConnection;
 use super::turn::{
@@ -33,7 +33,7 @@ use super::upstream::{
     bind_responses_upstream, decision_bound_upstream_change_fields, decision_reuses_bound_upstream,
 };
 use crate::ai_serving::ResponsesWebSocketPinnedCandidate;
-use crate::clock::current_unix_secs;
+use crate::clock::{current_unix_ms, current_unix_secs};
 use crate::control::GatewayControlDecision;
 use crate::handlers::proxy::websocket::ingress::WebSocketRequestContext;
 use crate::handlers::proxy::websocket::session::{CLOSE_INTERNAL_ERROR, WEBSOCKET_LOG_TRANSPORT};
@@ -146,6 +146,11 @@ pub(super) async fn forward_client_message(
     state: &AppState,
     context: &WebSocketRequestContext,
 ) -> RelayDisposition {
+    // Capture the frame arrival instant before parsing/planning.  Each
+    // `response.create` is a billable request even when it shares one socket;
+    // using the connection handshake time would place idle follow-ups in the
+    // wrong rolling window.
+    let turn_accepted_at_ms = current_unix_ms();
     match client_message {
         AxumWsMessage::Text(text) => {
             let text = text.to_string();
@@ -195,7 +200,7 @@ pub(super) async fn forward_client_message(
             // derive one strong live control snapshot that every stage below
             // shares. The connection's Upgrade-time decision is only the
             // immutable identity seed.
-            let planning_parts = build_planning_parts(context);
+            let planning_parts = build_planning_parts_at(context, turn_accepted_at_ms);
             let turn_control = match resolve_responses_websocket_turn_control(
                 state,
                 context,
@@ -494,6 +499,8 @@ async fn forward_pinned_continuation(
         planning_parts,
         planned_lease,
     } = planned;
+    let realtime_admission_at_ms =
+        realtime_admission_timestamp_from_parts(&planning_parts).unwrap_or_else(current_unix_ms);
     let adapter = resolve_responses_websocket_adapter(planned.adapter);
     let normalization = planned.normalization;
     let decision = planned.execution;
@@ -628,7 +635,9 @@ async fn forward_pinned_continuation(
     bound.decision_template = decision;
     bound.body_normalization = normalization;
     bound.turn_state.begin(
-        LogicalTurn::new(client_event, turn_index, logical_turn_id).with_turn_control(turn_control),
+        LogicalTurn::new(client_event, turn_index, logical_turn_id)
+            .with_turn_control(turn_control)
+            .with_realtime_admission_at_ms(realtime_admission_at_ms),
         turn,
     );
     bound.next_turn_index = bound.next_turn_index.saturating_add(1);
@@ -721,6 +730,8 @@ async fn forward_replanned_response_create(
         planning_parts,
         planned_lease,
     } = planned;
+    let realtime_admission_at_ms =
+        realtime_admission_timestamp_from_parts(&planning_parts).unwrap_or_else(current_unix_ms);
     let adapter = resolve_responses_websocket_adapter(planned.adapter);
     let normalization = planned.normalization;
     let decision = planned.execution;
@@ -838,7 +849,8 @@ async fn forward_replanned_response_create(
         bound.body_normalization = normalization;
         bound.turn_state.begin(
             LogicalTurn::new(client_event.clone(), turn_index, logical_turn_id.clone())
-                .with_turn_control(turn_control),
+                .with_turn_control(turn_control)
+                .with_realtime_admission_at_ms(realtime_admission_at_ms),
             turn,
         );
         bound.next_turn_index = bound.next_turn_index.saturating_add(1);
@@ -910,7 +922,9 @@ async fn forward_replanned_response_create(
     bound.body_normalization = replacement.body_normalization;
     bound.binding_identity = replacement.binding_identity;
     bound.turn_state.begin(
-        LogicalTurn::new(client_event, turn_index, logical_turn_id).with_turn_control(turn_control),
+        LogicalTurn::new(client_event, turn_index, logical_turn_id)
+            .with_turn_control(turn_control)
+            .with_realtime_admission_at_ms(realtime_admission_at_ms),
         turn,
     );
     bound.next_turn_index = bound.next_turn_index.saturating_add(1);

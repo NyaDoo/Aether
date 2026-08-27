@@ -64,17 +64,17 @@ pub(crate) async fn cleanup_stale_pending_requests_once(
 
 pub(super) fn plan_pending_cleanup_batch(
     stale_rows: Vec<StalePendingUsageRow>,
-    completed_request_ids: &HashSet<String>,
+    _completed_request_ids: &HashSet<String>,
     timeout_minutes: u64,
 ) -> PendingCleanupBatchPlan {
     let mut plan = PendingCleanupBatchPlan::default();
     for row in stale_rows {
-        if completed_request_ids.contains(&row.request_id) {
-            plan.recovered_usage_ids.push(row.id);
-            plan.recovered_request_ids.push(row.request_id);
-            continue;
-        }
-
+        // A request-candidate success marker is not an accounting terminal.  A
+        // real terminal usage event always carries `finalized_at`; promoting a
+        // stale row here would recreate the false-success/no-token bug.  Keep
+        // the legacy `completed_request_ids` argument for API compatibility,
+        // but deliberately ignore it and route every stale row through the
+        // conservative failure/void plan.
         plan.failed_request_ids.push(row.request_id);
         plan.failed_usage_rows.push(FailedPendingUsageRow {
             id: row.id,

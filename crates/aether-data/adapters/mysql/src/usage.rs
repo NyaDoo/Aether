@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
@@ -6,11 +6,13 @@ use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
 
 use aether_data_contracts::repository::usage::{
-    strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
-    usage_request_metadata_client_family, PendingUsageCleanupSummary, StoredRequestUsageAudit,
-    StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardSummary,
-    StoredUsageUserTotals, UpsertUsageRecord, UsageCleanupExecutionMode, UsageCleanupPreviewCounts,
-    UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow, UsageDailyHeatmapQuery,
+    strip_deprecated_usage_display_fields, usage_billing_status_conflict_preserves_existing,
+    usage_can_recover_terminal_failure, usage_can_recover_terminal_failure_for_candidate,
+    usage_request_metadata_client_family, usage_terminal_status_conflict_preserves_existing,
+    PendingUsageCleanupSummary, StoredRequestUsageAudit, StoredUsageDailySummary,
+    StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardSummary, StoredUsageUserTotals,
+    UpsertUsageRecord, UsageCleanupExecutionMode, UsageCleanupPreviewCounts, UsageCleanupSummary,
+    UsageCleanupTargets, UsageCleanupWindow, UsageDailyHeatmapQuery,
     UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery, UsageWriteRepository,
 };
 use aether_data_contracts::DataLayerError;
@@ -334,56 +336,81 @@ ON DUPLICATE KEY UPDATE
   upstream_is_stream = CASE WHEN (status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming')) OR (status = 'streaming' AND VALUES(status) = 'pending') THEN upstream_is_stream ELSE VALUES(upstream_is_stream) END,
   input_tokens = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN input_tokens
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(input_tokens, 0), COALESCE(VALUES(input_tokens), 0))
     ELSE VALUES(input_tokens)
   END,
   output_tokens = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN output_tokens
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(output_tokens, 0), COALESCE(VALUES(output_tokens), 0))
     ELSE VALUES(output_tokens)
   END,
   total_tokens = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN total_tokens
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(total_tokens, 0), COALESCE(VALUES(total_tokens), 0))
     ELSE VALUES(total_tokens)
   END,
   cache_creation_input_tokens = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN cache_creation_input_tokens
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(cache_creation_input_tokens, 0), COALESCE(VALUES(cache_creation_input_tokens), 0))
     ELSE VALUES(cache_creation_input_tokens)
   END,
   cache_creation_ephemeral_5m_input_tokens = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN cache_creation_ephemeral_5m_input_tokens
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(cache_creation_ephemeral_5m_input_tokens, 0), COALESCE(VALUES(cache_creation_ephemeral_5m_input_tokens), 0))
     ELSE VALUES(cache_creation_ephemeral_5m_input_tokens)
   END,
   cache_creation_ephemeral_1h_input_tokens = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN cache_creation_ephemeral_1h_input_tokens
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(cache_creation_ephemeral_1h_input_tokens, 0), COALESCE(VALUES(cache_creation_ephemeral_1h_input_tokens), 0))
     ELSE VALUES(cache_creation_ephemeral_1h_input_tokens)
   END,
   cache_read_input_tokens = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN cache_read_input_tokens
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(cache_read_input_tokens, 0), COALESCE(VALUES(cache_read_input_tokens), 0))
     ELSE VALUES(cache_read_input_tokens)
   END,
   cache_creation_cost_usd = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN cache_creation_cost_usd
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(cache_creation_cost_usd, 0), COALESCE(VALUES(cache_creation_cost_usd), 0))
     ELSE VALUES(cache_creation_cost_usd)
   END,
   cache_read_cost_usd = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN cache_read_cost_usd
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(cache_read_cost_usd, 0), COALESCE(VALUES(cache_read_cost_usd), 0))
     ELSE VALUES(cache_read_cost_usd)
   END,
   output_price_per_1m = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN output_price_per_1m
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN COALESCE(VALUES(output_price_per_1m), output_price_per_1m)
     ELSE VALUES(output_price_per_1m)
   END,
   total_cost_usd = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN total_cost_usd
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(total_cost_usd, 0), COALESCE(VALUES(total_cost_usd), 0))
     ELSE VALUES(total_cost_usd)
   END,
   actual_total_cost_usd = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN actual_total_cost_usd
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(actual_total_cost_usd, 0), COALESCE(VALUES(actual_total_cost_usd), 0))
     ELSE VALUES(actual_total_cost_usd)
   END,
   status_code = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN status_code
     WHEN status = 'streaming' AND VALUES(status) = 'pending' THEN status_code
     WHEN status = 'streaming' AND VALUES(status) = 'streaming' AND VALUES(status_code) IS NULL THEN status_code
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status AND VALUES(status_code) IS NULL THEN status_code
     ELSE VALUES(status_code)
   END,
   outcome_class = CASE
@@ -399,11 +426,13 @@ ON DUPLICATE KEY UPDATE
   error_message = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN error_message
     WHEN status = 'streaming' AND VALUES(status) = 'pending' THEN error_message
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status AND VALUES(error_message) IS NULL THEN error_message
     ELSE VALUES(error_message)
   END,
   error_category = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN error_category
     WHEN status = 'streaming' AND VALUES(status) = 'pending' THEN error_category
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status AND VALUES(error_category) IS NULL THEN error_category
     ELSE VALUES(error_category)
   END,
   response_time_ms = CASE
@@ -422,7 +451,13 @@ ON DUPLICATE KEY UPDATE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN billing_status
     ELSE VALUES(billing_status)
   END,
-  request_metadata = CASE WHEN (status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming')) OR (status = 'streaming' AND VALUES(status) = 'pending') THEN request_metadata ELSE VALUES(request_metadata) END,
+  request_metadata = CASE
+    WHEN (status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming'))
+      OR (status = 'streaming' AND VALUES(status) = 'pending') THEN request_metadata
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN COALESCE(VALUES(request_metadata), request_metadata)
+    ELSE VALUES(request_metadata)
+  END,
   candidate_id = CASE WHEN (status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming')) OR (status = 'streaming' AND VALUES(status) = 'pending') THEN candidate_id ELSE VALUES(candidate_id) END,
   candidate_index = CASE WHEN (status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming')) OR (status = 'streaming' AND VALUES(status) = 'pending') THEN candidate_index ELSE VALUES(candidate_index) END,
   key_name = CASE WHEN (status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming')) OR (status = 'streaming' AND VALUES(status) = 'pending') THEN key_name ELSE VALUES(key_name) END,
@@ -433,10 +468,13 @@ ON DUPLICATE KEY UPDATE
   local_execution_runtime_miss_reason = CASE WHEN (status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming')) OR (status = 'streaming' AND VALUES(status) = 'pending') THEN local_execution_runtime_miss_reason ELSE VALUES(local_execution_runtime_miss_reason) END,
   finalized_at = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN finalized_at
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status AND VALUES(finalized_at) IS NULL THEN finalized_at
     ELSE VALUES(finalized_at)
   END,
   updated_at_unix_secs = CASE
     WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) IN ('pending', 'streaming') THEN updated_at_unix_secs
+    WHEN status IN ('completed', 'failed', 'cancelled') AND VALUES(status) = status
+      THEN GREATEST(COALESCE(updated_at_unix_secs, 0), COALESCE(VALUES(updated_at_unix_secs), 0))
     ELSE VALUES(updated_at_unix_secs)
   END,
   status = CASE
@@ -455,22 +493,86 @@ const SELECT_STALE_PENDING_USAGE_BATCH_SQL: &str = r#"
 SELECT
   `usage`.request_id,
   `usage`.status,
-  COALESCE(usage_settlement_snapshots.billing_status, `usage`.billing_status) AS billing_status
+  CASE
+    WHEN usage_routing_snapshots.request_id IS NOT NULL
+      THEN usage_routing_snapshots.candidate_id
+    ELSE `usage`.candidate_id
+  END AS candidate_id
 FROM `usage`
 LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = `usage`.request_id
-WHERE `usage`.status IN ('pending', 'streaming')
+LEFT JOIN usage_routing_snapshots
+  ON usage_routing_snapshots.request_id = `usage`.request_id
+WHERE `usage`.status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')
+  AND `usage`.billing_status = 'pending'
+  AND `usage`.finalized_at IS NULL
   AND `usage`.created_at_unix_ms < ?
-  AND COALESCE(`usage`.request_type, '') <> 'video'
+  -- Video contracts are asynchronous and may be represented by any of the
+  -- normalized request/endpoint fields (for example `openai:video`), not only
+  -- request_type='video'. Keep this predicate in lockstep with the runtime
+  -- `is_video_contract` helper: trim/case-fold each field and reject an exact
+  -- `video` value or a value whose final colon-delimited kind is `video`.
+  -- Strip SQL whitespace conservatively so values such as `openai: video` and
+  -- `openai:\tvideo` cannot fall through this fail-closed exclusion.
+  AND NOT (
+    LOWER(REGEXP_REPLACE(COALESCE(`usage`.request_type, ''), '[[:space:]]', '')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.request_type, ''), '[[:space:]]', '')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.api_format, ''), '[[:space:]]', '')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.api_format, ''), '[[:space:]]', '')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.endpoint_kind, ''), '[[:space:]]', '')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.endpoint_kind, ''), '[[:space:]]', '')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.endpoint_api_format, ''), '[[:space:]]', '')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.endpoint_api_format, ''), '[[:space:]]', '')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.provider_endpoint_kind, ''), '[[:space:]]', '')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(`usage`.provider_endpoint_kind, ''), '[[:space:]]', '')) LIKE '%:video'
+  )
+  -- A settlement snapshot is authoritative even while the legacy usage row is
+  -- still in flight.  Leave settled/void/finalized snapshots for the terminal
+  -- settlement path instead of converting them into a timeout failure.
+  AND COALESCE(usage_settlement_snapshots.billing_status, `usage`.billing_status) = 'pending'
+  AND COALESCE(usage_settlement_snapshots.finalized_at, `usage`.finalized_at) IS NULL
 ORDER BY `usage`.created_at_unix_ms ASC, `usage`.request_id ASC
 LIMIT ?
 "#;
 
-const SELECT_COMPLETED_REQUEST_CANDIDATES_SQL: &str = r#"
-SELECT status, extra_data
-FROM request_candidates
+// A stale row is never promoted from a request-candidate marker.  Candidate success is only
+// diagnostic: the authoritative usage event must have persisted both a terminal billing state
+// and `finalized_at`.  Any row that still has pending billing after the timeout is failed and
+// voided, including a row whose status was already `completed`.
+const UPDATE_FAILED_VOID_STALE_USAGE_SQL: &str = r#"
+UPDATE `usage`
+SET status = 'failed',
+    status_code = ?,
+    error_message = ?,
+    outcome_class = ?,
+    sla_eligible = ?,
+    billing_status = 'void',
+    finalized_at = ?,
+    total_cost_usd = 0,
+    actual_total_cost_usd = 0
 WHERE request_id = ?
-  AND status IN ('streaming', 'success')
+  AND status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')
+  AND billing_status = 'pending'
+  AND finalized_at IS NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage_settlement_snapshots AS settlement
+    WHERE settlement.request_id = ?
+      AND (
+        settlement.billing_status <> 'pending'
+        OR settlement.finalized_at IS NOT NULL
+      )
+  )
+"#;
+
+const UPDATE_FAILED_PENDING_CANDIDATES_SQL: &str = r#"
+UPDATE request_candidates
+SET status = 'failed',
+    finished_at = ?,
+    error_message = '请求超时（服务器可能已重启）'
+WHERE request_id = ?
+  AND id = ?
+  AND status IN ('pending', 'streaming')
 "#;
 
 const MYSQL_USAGE_CANONICAL_TOTAL_TOKENS_EXPR: &str = r#"
@@ -1066,7 +1168,7 @@ impl UsageWriteRepository for MysqlUsageWriteRepository {
         let prepared_capture = http_capture::prepare_usage_http_capture(&mut usage)?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
         let existing = counters::lock_and_load_usage(&mut tx, &usage.request_id).await?;
-        let recovers_terminal_failure = existing.as_ref().is_some_and(|existing| {
+        let attempts_terminal_failure_recovery = existing.as_ref().is_some_and(|existing| {
             usage_can_recover_terminal_failure(
                 &existing.status,
                 &existing.billing_status,
@@ -1074,10 +1176,36 @@ impl UsageWriteRepository for MysqlUsageWriteRepository {
                 &usage.billing_status,
             )
         });
+        let recovers_terminal_failure = existing.as_ref().is_some_and(|existing| {
+            usage_can_recover_terminal_failure_for_candidate(
+                &existing.status,
+                &existing.billing_status,
+                existing.routing_candidate_id(),
+                &usage.status,
+                &usage.billing_status,
+                usage.routing_candidate_id(),
+            )
+        });
+        if existing.as_ref().is_some_and(|existing| {
+            (attempts_terminal_failure_recovery && !recovers_terminal_failure)
+                || usage_terminal_status_conflict_preserves_existing(
+                    &existing.status,
+                    &existing.billing_status,
+                    &usage.status,
+                    &usage.billing_status,
+                )
+        }) {
+            let existing = existing.clone().expect("existing usage should be present");
+            tx.rollback().await.map_sql_err()?;
+            return http_capture::hydrate_usage_body_refs(&self.pool, existing).await;
+        }
         if let Some(existing) = existing.as_ref() {
-            if (existing.billing_status == "settled" || existing.billing_status == "void")
-                && !recovers_terminal_failure
-            {
+            if usage_billing_status_conflict_preserves_existing(
+                &existing.status,
+                &existing.billing_status,
+                &usage.status,
+                &usage.billing_status,
+            ) {
                 let existing = existing.clone();
                 tx.rollback().await.map_sql_err()?;
                 return http_capture::hydrate_usage_body_refs(&self.pool, existing).await;
@@ -1107,7 +1235,14 @@ impl UsageWriteRepository for MysqlUsageWriteRepository {
                 &usage.request_id,
                 routing_snapshot,
                 settlement_snapshot,
-                matches!(usage.status.as_str(), "completed" | "failed" | "cancelled"),
+                matches!(usage.status.as_str(), "completed" | "failed" | "cancelled")
+                    && !existing.as_ref().is_some_and(|previous| {
+                        previous.status == usage.status
+                            && matches!(
+                                previous.status.as_str(),
+                                "completed" | "failed" | "cancelled"
+                            )
+                    }),
             )
             .await?;
         }
@@ -1286,49 +1421,12 @@ SET provider_api_keys.request_count = aggregated.request_count,
                     Ok(StalePendingUsageRow {
                         request_id: row.try_get("request_id").map_sql_err()?,
                         status: row.try_get("status").map_sql_err()?,
-                        billing_status: row.try_get("billing_status").map_sql_err()?,
+                        candidate_id: row.try_get("candidate_id").map_sql_err()?,
                     })
                 })
                 .collect::<Result<Vec<_>, DataLayerError>>()?;
-            let completed_request_ids =
-                completed_request_ids_mysql(&mut tx, stale_rows.iter().map(|row| &row.request_id))
-                    .await?;
-
+            let mut cleanup_conflict = false;
             for row in stale_rows {
-                if completed_request_ids.contains(&row.request_id) {
-                    sqlx::query(
-                        r#"
-UPDATE `usage`
-SET status = 'completed',
-    status_code = 200,
-    error_message = NULL,
-    outcome_class = 'success',
-    sla_eligible = TRUE
-WHERE request_id = ?
-"#,
-                    )
-                    .bind(&row.request_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_sql_err()?;
-                    sqlx::query(
-                        r#"
-UPDATE request_candidates
-SET status = 'success',
-    finished_at = ?
-WHERE request_id = ?
-  AND status = 'streaming'
-"#,
-                    )
-                    .bind(to_i64(now_unix_ms, "request candidate finished_at")?)
-                    .bind(&row.request_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_sql_err()?;
-                    summary.recovered += 1;
-                    continue;
-                }
-
                 let candidate_info =
                     latest_failed_candidate_mysql(&mut tx, &row.request_id).await?;
                 let (status_code, error_message) = resolve_stale_pending_failure(
@@ -1337,22 +1435,7 @@ WHERE request_id = ?
                     timeout_minutes,
                 );
                 let status_code_i64 = i64::from(status_code);
-                if row.billing_status == "pending" {
-                    sqlx::query(
-                        r#"
-UPDATE `usage`
-SET status = 'failed',
-    status_code = ?,
-    error_message = ?,
-    outcome_class = ?,
-    sla_eligible = ?,
-    billing_status = 'void',
-    finalized_at = ?,
-    total_cost_usd = 0,
-    actual_total_cost_usd = 0
-WHERE request_id = ?
-"#,
-                    )
+                let result = sqlx::query(UPDATE_FAILED_VOID_STALE_USAGE_SQL)
                     .bind(status_code_i64)
                     .bind(&error_message)
                     .bind(if status_code == 400 {
@@ -1363,60 +1446,39 @@ WHERE request_id = ?
                     .bind(status_code != 400)
                     .bind(to_i64(now_unix_secs, "usage finalized_at")?)
                     .bind(&row.request_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_sql_err()?;
-                    upsert_void_usage_settlement_snapshot_mysql(
-                        &mut tx,
-                        &row.request_id,
-                        now_unix_secs,
-                    )
-                    .await?;
-                } else {
-                    sqlx::query(
-                        r#"
-UPDATE `usage`
-SET status = 'failed',
-    status_code = ?,
-    error_message = ?,
-    outcome_class = ?,
-    sla_eligible = ?
-WHERE request_id = ?
-"#,
-                    )
-                    .bind(status_code_i64)
-                    .bind(&error_message)
-                    .bind(if status_code == 400 {
-                        "user_error"
-                    } else {
-                        "service_error"
-                    })
-                    .bind(status_code != 400)
                     .bind(&row.request_id)
                     .execute(&mut *tx)
                     .await
                     .map_sql_err()?;
+                let usage_mutated = result.rows_affected() > 0;
+                if !usage_mutated {
+                    cleanup_conflict = true;
+                    continue;
                 }
-
-                sqlx::query(
-                    r#"
-UPDATE request_candidates
-SET status = 'failed',
-    finished_at = ?,
-    error_message = '请求超时（服务器可能已重启）'
-WHERE request_id = ?
-  AND status IN ('pending', 'streaming')
-"#,
+                upsert_void_usage_settlement_snapshot_mysql(
+                    &mut tx,
+                    &row.request_id,
+                    now_unix_secs,
                 )
-                .bind(to_i64(now_unix_ms, "request candidate finished_at")?)
-                .bind(&row.request_id)
-                .execute(&mut *tx)
-                .await
-                .map_sql_err()?;
+                .await?;
+
+                if let Some(candidate_id) = row.candidate_id.as_deref() {
+                    sqlx::query(UPDATE_FAILED_PENDING_CANDIDATES_SQL)
+                        .bind(to_i64(now_unix_ms, "request candidate finished_at")?)
+                        .bind(&row.request_id)
+                        .bind(candidate_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_sql_err()?;
+                }
                 summary.failed += 1;
             }
 
             tx.commit().await.map_sql_err()?;
+            // Do not spin forever when a guarded cleanup update loses a terminal race.
+            if cleanup_conflict {
+                break;
+            }
         }
 
         Ok(summary)
@@ -1491,55 +1553,7 @@ WHERE request_id = ?
 struct StalePendingUsageRow {
     request_id: String,
     status: String,
-    billing_status: String,
-}
-
-async fn completed_request_ids_mysql<'a>(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    request_ids: impl Iterator<Item = &'a String>,
-) -> Result<HashSet<String>, DataLayerError> {
-    let mut completed = HashSet::new();
-    for request_id in request_ids {
-        let rows = sqlx::query(SELECT_COMPLETED_REQUEST_CANDIDATES_SQL)
-            .bind(request_id)
-            .fetch_all(&mut **tx)
-            .await
-            .map_sql_err()?;
-        let mut is_completed = false;
-        for row in &rows {
-            if candidate_row_is_completed(row)? {
-                is_completed = true;
-                break;
-            }
-        }
-        if is_completed {
-            completed.insert(request_id.clone());
-        }
-    }
-    Ok(completed)
-}
-
-fn candidate_row_is_completed(row: &MySqlRow) -> Result<bool, DataLayerError> {
-    let status: String = row.try_get("status").map_sql_err()?;
-    if status == "streaming" {
-        return Ok(true);
-    }
-    if status != "success" {
-        return Ok(false);
-    }
-    let Some(extra_data) = row
-        .try_get::<Option<String>, _>("extra_data")
-        .map_sql_err()?
-    else {
-        return Ok(false);
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&extra_data) else {
-        return Ok(false);
-    };
-    Ok(value
-        .get("stream_completed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false))
+    candidate_id: Option<String>,
 }
 
 async fn upsert_void_usage_settlement_snapshot_mysql(

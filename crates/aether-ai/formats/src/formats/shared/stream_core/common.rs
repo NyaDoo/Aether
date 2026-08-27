@@ -604,7 +604,7 @@ pub fn build_openai_chat_usage_chunk_from_usage(
         model,
         input_tokens,
         usage.output_tokens,
-        inclusive_total_tokens_from_usage(usage, input_tokens),
+        usage.inclusive_token_total(),
         usage.reasoning_tokens,
         cache_creation_tokens_for_usage(usage),
         usage.cache_read_tokens,
@@ -621,7 +621,7 @@ pub fn openai_responses_usage_from_usage(usage: &CanonicalUsage) -> Value {
     );
     output.insert(
         "total_tokens".to_string(),
-        Value::from(inclusive_total_tokens_from_usage(usage, input_tokens)),
+        Value::from(usage.inclusive_token_total()),
     );
     if usage.reasoning_tokens > 0 {
         output.insert(
@@ -685,7 +685,7 @@ pub fn gemini_usage_metadata_from_usage(usage: &CanonicalUsage) -> Value {
     );
     output.insert(
         "totalTokenCount".to_string(),
-        Value::from(inclusive_total_tokens_from_usage(usage, input_tokens)),
+        Value::from(usage.inclusive_token_total()),
     );
     if usage.reasoning_tokens > 0 {
         output.insert(
@@ -755,19 +755,11 @@ fn insert_openai_token_details(
 }
 
 fn cache_creation_tokens_for_usage(usage: &CanonicalUsage) -> u64 {
-    if usage.cache_creation_tokens > 0 {
-        usage.cache_creation_tokens
-    } else {
-        usage
-            .cache_creation_ephemeral_5m_tokens
-            .saturating_add(usage.cache_creation_ephemeral_1h_tokens)
-    }
+    usage.effective_cache_creation_tokens()
 }
 
 fn cache_input_tokens_for_usage(usage: &CanonicalUsage) -> u64 {
-    usage
-        .cache_read_tokens
-        .saturating_add(cache_creation_tokens_for_usage(usage))
+    usage.effective_cache_input_tokens()
 }
 
 fn claude_input_tokens_from_usage(usage: &CanonicalUsage) -> u64 {
@@ -781,23 +773,7 @@ fn claude_input_tokens_from_usage(usage: &CanonicalUsage) -> u64 {
 }
 
 fn inclusive_input_tokens_from_usage(usage: &CanonicalUsage) -> u64 {
-    if usage.input_tokens_include_cache {
-        usage.input_tokens
-    } else {
-        usage
-            .input_tokens
-            .saturating_add(cache_input_tokens_for_usage(usage))
-    }
-}
-
-fn inclusive_total_tokens_from_usage(usage: &CanonicalUsage, input_tokens: u64) -> u64 {
-    if usage.total_tokens > 0
-        && (usage.input_tokens_include_cache || cache_input_tokens_for_usage(usage) == 0)
-    {
-        usage.total_tokens
-    } else {
-        input_tokens.saturating_add(usage.output_tokens)
-    }
+    usage.inclusive_input_tokens()
 }
 
 #[cfg(test)]

@@ -33,8 +33,9 @@ use super::{
     usage_cleanup_window_with_override, wallet_daily_usage_aggregation_target, AppState,
     DbMaintenanceRunSummary, FailedPendingUsageRow, GatewayDataState, ManualUsageCleanupMode,
     ProxyNodeMetricsCleanupSettings, ProxyUpgradeRolloutProbeConfig, StalePendingUsageRow,
-    UsageCleanupSettings, USAGE_CLEANUP_HOUR, USAGE_CLEANUP_MINUTE,
-    WALLET_DAILY_USAGE_AGGREGATION_HOUR, WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
+    UsageCleanupSettings, DEFAULT_PENDING_CLEANUP_TIMEOUT_MINUTES, USAGE_CLEANUP_HOUR,
+    USAGE_CLEANUP_MINUTE, WALLET_DAILY_USAGE_AGGREGATION_HOUR,
+    WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
 };
 
 #[tokio::test]
@@ -694,12 +695,39 @@ async fn pending_cleanup_settings_use_timeout_and_cap_batch_size() {
         .await
         .expect("batch size should resolve");
 
-    assert_eq!(timeout_minutes, 25);
+    assert_eq!(
+        timeout_minutes, DEFAULT_PENDING_CLEANUP_TIMEOUT_MINUTES,
+        "legacy values below the safety floor must not shorten cleanup"
+    );
     assert_eq!(batch_size, 200);
 }
 
+#[tokio::test]
+async fn pending_cleanup_timeout_defaults_to_two_hours_and_accepts_large_values() {
+    let default_data = GatewayDataState::disabled();
+    assert_eq!(
+        pending_cleanup_timeout_minutes(&default_data)
+            .await
+            .expect("default timeout should resolve"),
+        DEFAULT_PENDING_CLEANUP_TIMEOUT_MINUTES
+    );
+
+    // The setting is in minutes.  Keep the value as u64 end-to-end so deployments can choose
+    // windows beyond 7,200 seconds without an i32/JSON-number truncation.
+    let configured_data = GatewayDataState::disabled().with_system_config_values_for_tests([(
+        "pending_request_timeout_minutes".to_string(),
+        json!(121),
+    )]);
+    assert_eq!(
+        pending_cleanup_timeout_minutes(&configured_data)
+            .await
+            .expect("large timeout should resolve"),
+        121
+    );
+}
+
 #[test]
-fn pending_cleanup_plan_recovers_completed_requests_and_voids_failed_pending_billing() {
+fn pending_cleanup_plan_never_promotes_candidate_success_markers() {
     let plan = plan_pending_cleanup_batch(
         vec![
             StalePendingUsageRow {
@@ -725,15 +753,22 @@ fn pending_cleanup_plan_recovers_completed_requests_and_voids_failed_pending_bil
         10,
     );
 
-    assert_eq!(plan.recovered_usage_ids, vec!["usage-1".to_string()]);
-    assert_eq!(plan.recovered_request_ids, vec!["req-1".to_string()]);
     assert_eq!(
         plan.failed_request_ids,
-        vec!["req-2".to_string(), "req-3".to_string()]
+        vec![
+            "req-1".to_string(),
+            "req-2".to_string(),
+            "req-3".to_string()
+        ]
     );
     assert_eq!(
         plan.failed_usage_rows,
         vec![
+            FailedPendingUsageRow {
+                id: "usage-1".to_string(),
+                error_message: "请求超时: 状态 'streaming' 超过 10 分钟未完成".to_string(),
+                should_void_billing: true,
+            },
             FailedPendingUsageRow {
                 id: "usage-2".to_string(),
                 error_message: "请求超时: 状态 'pending' 超过 10 分钟未完成".to_string(),

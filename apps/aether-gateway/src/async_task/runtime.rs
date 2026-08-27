@@ -5,9 +5,7 @@ use aether_contracts::{ExecutionErrorKind, ExecutionResult};
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, UpsertVideoTask, VideoTaskStatus,
 };
-use aether_usage_runtime::{
-    billing_snapshot_status, build_upsert_usage_record_from_event, settle_usage_if_needed,
-};
+use aether_usage_runtime::billing_snapshot_status;
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -94,7 +92,6 @@ pub(crate) async fn execute_video_task_refresh_plan(
             let mut snapshot = runtime_snapshot;
             snapshot.apply_provider_body(&provider_body);
             let stored = state.upsert_video_task_snapshot(&snapshot).await?;
-            state.video_tasks.record_snapshot(snapshot);
             if let Some(stored) = stored.as_ref() {
                 finalize_video_task_if_terminal(state, stored).await;
             }
@@ -714,7 +711,14 @@ pub(crate) async fn finalize_video_task_if_terminal(state: &AppState, task: &Sto
         return;
     };
     let mut event = event;
-    if let Err(err) = enrich_usage_event_with_billing(state.data.as_ref(), &mut event).await {
+    // Lifecycle/usage writes must use the background data state when the
+    // gateway is configured with an isolated background pool.  Enriching
+    // against the foreground state here used to make an otherwise valid
+    // terminal video task look unpriced (or fail outright) during pool
+    // pressure, and the subsequent direct upsert could be lost on a transient
+    // write error.
+    let usage_data = state.usage_lifecycle_data_state();
+    if let Err(err) = enrich_usage_event_with_billing(usage_data.as_ref(), &mut event).await {
         warn!(
             event_name = "video_task_finalize_billing_enrichment_failed",
             log_type = "event",
@@ -737,41 +741,24 @@ pub(crate) async fn finalize_video_task_if_terminal(state: &AppState, task: &Sto
             "gateway left completed video usage pending because billing could not resolve a price"
         );
     }
-    match build_upsert_usage_record_from_event(&event) {
-        Ok(record) => match state.data.upsert_usage(record).await {
-            Ok(Some(stored)) => {
-                if billing_resolved {
-                    if let Err(err) = settle_usage_if_needed(state.data.as_ref(), &stored).await {
-                        warn!(
-                            event_name = "video_task_finalize_settlement_failed",
-                            log_type = "event",
-                            request_id = %short_request_id(task.request_id.as_str()),
-                            error = %err,
-                            "gateway video task finalize failed to settle usage"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!(
-                    event_name = "video_task_finalize_usage_upsert_failed",
-                    log_type = "event",
-                    request_id = %short_request_id(task.request_id.as_str()),
-                    error = %err,
-                    "gateway video task finalize failed to upsert usage"
-                );
-            }
-        },
-        Err(err) => {
-            warn!(
-                event_name = "video_task_finalize_usage_build_failed",
-                log_type = "event",
-                request_id = %short_request_id(task.request_id.as_str()),
-                error = %err,
-                "gateway video task finalize failed to build usage record"
-            );
-        }
+    // A terminal video task is a billing lifecycle boundary.  Route it
+    // through the usage runtime's durable handoff so transient DB failures
+    // are retried and retained in the terminal retry queue, and so callers do
+    // not accidentally publish a candidate terminal state before a concrete
+    // usage row exists.  This also centralizes idempotent settlement and body
+    // capture policy with the other request paths.
+    if !state
+        .usage_runtime
+        .record_terminal_event_direct_with_handoff(usage_data.as_ref(), event)
+        .await
+    {
+        warn!(
+            event_name = "video_task_finalize_usage_handoff_deferred",
+            log_type = "event",
+            request_id = %short_request_id(task.request_id.as_str()),
+            billing_resolved,
+            "gateway retained terminal video usage for durable retry; usage row was not confirmed yet"
+        );
     }
 }
 

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -22,6 +22,13 @@ pub struct RequestLogEmitted;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GatewayRequestAcceptedAt(pub Instant);
+
+/// Wall-clock timestamp captured at the same ingress boundary as
+/// [`GatewayRequestAcceptedAt`].  Realtime RPM events use this value rather
+/// than the terminal/completion timestamp, so a long-running request remains
+/// attributed to the instant it entered the gateway.
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayRequestAcceptedWallClockMs(pub u64);
 
 fn extract_or_generate_trace_id(headers: &http::HeaderMap) -> String {
     headers
@@ -77,6 +84,14 @@ pub async fn access_log_middleware(mut request: Request<Body>, next: Next) -> Re
     request
         .extensions_mut()
         .insert(GatewayRequestAcceptedAt(started_at));
+    let accepted_wall_clock_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    request
+        .extensions_mut()
+        .insert(GatewayRequestAcceptedWallClockMs(accepted_wall_clock_ms));
     let method = request.method().clone();
     let raw_path = request
         .uri()
@@ -147,9 +162,9 @@ pub async fn access_log_middleware(mut request: Request<Body>, next: Next) -> Re
             );
         } else if should_downgrade_access_log(&method, &path) {
             trace!(
-                event_name = "http_request_completed",
+                event_name = "http_response_headers_ready",
                 log_type = "access",
-                status = "completed",
+                status = "headers_ready",
                 status_code,
                 trace_id = %trace_id,
                 request_id,
@@ -158,13 +173,13 @@ pub async fn access_log_middleware(mut request: Request<Body>, next: Next) -> Re
                 route_class,
                 execution_path,
                 elapsed_ms,
-                "gateway completed request"
+                "gateway response headers ready"
             );
         } else {
             info!(
-                event_name = "http_request_completed",
+                event_name = "http_response_headers_ready",
                 log_type = "access",
-                status = "completed",
+                status = "headers_ready",
                 status_code,
                 trace_id = %trace_id,
                 request_id,
@@ -173,7 +188,7 @@ pub async fn access_log_middleware(mut request: Request<Body>, next: Next) -> Re
                 route_class,
                 execution_path,
                 elapsed_ms,
-                "gateway completed request"
+                "gateway response headers ready"
             );
         }
     }
@@ -287,7 +302,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn access_log_emits_completed_events_by_default() {
+    async fn access_log_emits_headers_ready_events_by_default() {
         let writer = SharedBuffer::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -337,8 +352,8 @@ mod tests {
 
         let logs = writer.lines();
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0]["event_name"], "http_request_completed");
-        assert_eq!(logs[0]["status"], "completed");
+        assert_eq!(logs[0]["event_name"], "http_response_headers_ready");
+        assert_eq!(logs[0]["status"], "headers_ready");
         assert_eq!(logs[0]["status_code"], 200);
         assert_eq!(logs[0]["request_id"], "req-123");
         assert_eq!(logs[0]["route_class"], "local");
@@ -494,7 +509,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn access_log_treats_client_errors_as_completed_events() {
+    async fn access_log_treats_client_errors_as_headers_ready_events() {
         let writer = SharedBuffer::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -534,15 +549,15 @@ mod tests {
 
         let logs = writer.lines();
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0]["event_name"], "http_request_completed");
-        assert_eq!(logs[0]["status"], "completed");
+        assert_eq!(logs[0]["event_name"], "http_response_headers_ready");
+        assert_eq!(logs[0]["status"], "headers_ready");
         assert_eq!(logs[0]["status_code"], 401);
         assert_eq!(logs[0]["route_class"], "auth");
         assert_eq!(logs[0]["execution_path"], "local_auth_denied");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn access_log_emits_completed_events_for_streaming_responses() {
+    async fn access_log_does_not_claim_streaming_response_completed_at_header_readiness() {
         let writer = SharedBuffer::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -589,11 +604,60 @@ mod tests {
 
         let logs = writer.lines();
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0]["event_name"], "http_request_completed");
+        assert_eq!(logs[0]["event_name"], "http_response_headers_ready");
+        assert_eq!(logs[0]["status"], "headers_ready");
         assert_eq!(logs[0]["status_code"], 200);
         assert_eq!(logs[0]["request_id"], "req-stream");
         assert_eq!(logs[0]["route_class"], "ai_public");
         assert_eq!(logs[0]["execution_path"], "execution_runtime_stream");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn access_log_does_not_claim_websocket_session_completed_at_upgrade() {
+        let writer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_writer(writer.clone())
+                .with_filter(LevelFilter::INFO),
+        );
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let app = Router::new()
+            .route(
+                "/v1/responses",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::SWITCHING_PROTOCOLS)
+                        .header(CONTROL_ROUTE_CLASS_HEADER, "ai_public")
+                        .header(EXECUTION_PATH_HEADER, "responses_websocket")
+                        .body(Body::empty())
+                        .expect("response should build")
+                }),
+            )
+            .layer(axum::middleware::from_fn(access_log_middleware));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/responses")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let logs = writer.lines();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["event_name"], "http_response_headers_ready");
+        assert_eq!(logs[0]["status"], "headers_ready");
+        assert_eq!(logs[0]["status_code"], 101);
+        assert_eq!(logs[0]["execution_path"], "responses_websocket");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -640,7 +704,8 @@ mod tests {
         assert_eq!(logs[0]["level"], "TRACE");
         assert_eq!(logs[0]["event_name"], "http_request_started");
         assert_eq!(logs[1]["level"], "TRACE");
-        assert_eq!(logs[1]["event_name"], "http_request_completed");
+        assert_eq!(logs[1]["event_name"], "http_response_headers_ready");
+        assert_eq!(logs[1]["status"], "headers_ready");
     }
 
     #[test]

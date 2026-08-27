@@ -17,13 +17,14 @@ use super::{
     run_proxy_node_metrics_cleanup_once, run_proxy_node_stale_cleanup_once,
     run_proxy_upgrade_rollout_once, run_request_candidate_cleanup_once, run_stats_aggregation_once,
     run_stats_hourly_aggregation_once, run_usage_cleanup_once, run_usage_counter_flush_once,
-    run_wallet_daily_usage_aggregation_once, AUDIT_LOG_CLEANUP_INTERVAL,
-    GEMINI_FILE_MAPPING_CLEANUP_INTERVAL, OAUTH_TOKEN_REFRESH_INTERVAL, PENDING_CLEANUP_INTERVAL,
-    POOL_MONITOR_INTERVAL, PROVIDER_CHECKIN_DEFAULT_TIME, PROVIDER_QUOTA_ALERT_INTERVAL,
-    PROXY_NODE_METRICS_CLEANUP_HOUR, PROXY_NODE_METRICS_CLEANUP_MINUTE,
-    PROXY_NODE_STALE_SWEEP_INTERVAL, PROXY_UPGRADE_ROLLOUT_INTERVAL,
-    REQUEST_CANDIDATE_CLEANUP_INTERVAL, USAGE_CLEANUP_HOUR, USAGE_CLEANUP_MINUTE,
-    WALLET_DAILY_USAGE_AGGREGATION_HOUR, WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
+    run_wallet_daily_usage_aggregation_once, RequestCandidateTerminalSweepCursor,
+    AUDIT_LOG_CLEANUP_INTERVAL, GEMINI_FILE_MAPPING_CLEANUP_INTERVAL, OAUTH_TOKEN_REFRESH_INTERVAL,
+    PENDING_CLEANUP_INTERVAL, POOL_MONITOR_INTERVAL, PROVIDER_CHECKIN_DEFAULT_TIME,
+    PROVIDER_QUOTA_ALERT_INTERVAL, PROXY_NODE_METRICS_CLEANUP_HOUR,
+    PROXY_NODE_METRICS_CLEANUP_MINUTE, PROXY_NODE_STALE_SWEEP_INTERVAL,
+    PROXY_UPGRADE_ROLLOUT_INTERVAL, REQUEST_CANDIDATE_CLEANUP_INTERVAL, USAGE_CLEANUP_HOUR,
+    USAGE_CLEANUP_MINUTE, WALLET_DAILY_USAGE_AGGREGATION_HOUR,
+    WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
 };
 use super::{UsageCounterFlushRuntimeMetrics, UsageCounterFlushWorkerConfig};
 
@@ -604,7 +605,8 @@ pub(crate) fn spawn_pending_cleanup_worker(app: AppState) -> Option<tokio::task:
         crate::task_runtime::TASK_KEY_PENDING_CLEANUP,
         |app| async move {
             let data = app.data;
-            if let Err(err) = run_pending_cleanup_once(&data).await {
+            let mut candidate_cursor: Option<RequestCandidateTerminalSweepCursor> = None;
+            if let Err(err) = run_pending_cleanup_once(&data, &mut candidate_cursor).await {
                 log_maintenance_worker_failure("pending_cleanup", "startup", &err);
             }
             let mut interval = tokio::time::interval(PENDING_CLEANUP_INTERVAL);
@@ -617,7 +619,7 @@ pub(crate) fn spawn_pending_cleanup_worker(app: AppState) -> Option<tokio::task:
                 {
                     continue;
                 }
-                if let Err(err) = run_pending_cleanup_once(&data).await {
+                if let Err(err) = run_pending_cleanup_once(&data, &mut candidate_cursor).await {
                     log_maintenance_worker_failure("pending_cleanup", "tick", &err);
                 }
             }

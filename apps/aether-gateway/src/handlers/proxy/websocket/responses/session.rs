@@ -29,7 +29,8 @@ use super::ownership::{
 use super::redaction::redact_responses_websocket_client_event;
 use super::relay_policy::{fatal_relay_policy, FatalRelaySignal};
 use super::request::{
-    build_planning_parts, planned_response_create_event, validated_response_create_model,
+    build_planning_parts_at, planned_response_create_event,
+    realtime_admission_timestamp_from_parts, validated_response_create_model,
 };
 use super::state::BoundResponsesConnection;
 use super::turn::{prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome};
@@ -356,24 +357,25 @@ async fn bootstrap_responses_websocket(
     context: &WebSocketRequestContext,
     upgraded_at: std::time::Instant,
 ) -> Option<BoundResponsesConnection> {
-    let (_first_text, first_event) = match receive_initial_response_create(client_socket).await {
-        Ok(value) => value,
-        Err(failure) => {
-            if let Some(client_message) = failure.error.client_message() {
-                log_initial_message_failure(context, failure, upgraded_at);
-                send_gateway_error(client_socket, failure.error.code(), client_message).await;
-                close_client_socket(
-                    client_socket,
-                    failure.error.close_code(),
-                    "invalid_initial_event",
-                )
-                .await;
+    let (_first_text, first_event, first_turn_accepted_at_ms) =
+        match receive_initial_response_create(client_socket).await {
+            Ok(value) => value,
+            Err(failure) => {
+                if let Some(client_message) = failure.error.client_message() {
+                    log_initial_message_failure(context, failure, upgraded_at);
+                    send_gateway_error(client_socket, failure.error.code(), client_message).await;
+                    close_client_socket(
+                        client_socket,
+                        failure.error.close_code(),
+                        "invalid_initial_event",
+                    )
+                    .await;
+                }
+                return None;
             }
-            return None;
-        }
-    };
+        };
 
-    let planning_parts = build_planning_parts(context);
+    let planning_parts = build_planning_parts_at(context, first_turn_accepted_at_ms);
     let turn_control = match resolve_responses_websocket_turn_control(
         &state,
         context,
@@ -547,6 +549,8 @@ async fn bootstrap_responses_websocket(
         planning_parts,
         planned_lease,
     } = planned;
+    let realtime_admission_at_ms = realtime_admission_timestamp_from_parts(&planning_parts)
+        .unwrap_or_else(crate::clock::current_unix_ms);
     let adapter = resolve_responses_websocket_adapter(planned.adapter);
     let normalization = planned.normalization;
     let decision = planned.execution;
@@ -653,7 +657,9 @@ async fn bootstrap_responses_websocket(
         bound.redaction_restorer.register(session);
     }
     bound.turn_state.begin(
-        LogicalTurn::new(first_event, 1, first_logical_turn_id).with_turn_control(turn_control),
+        LogicalTurn::new(first_event, 1, first_logical_turn_id)
+            .with_turn_control(turn_control)
+            .with_realtime_admission_at_ms(realtime_admission_at_ms),
         first_turn,
     );
 
@@ -757,7 +763,7 @@ async fn close_terminated_relay(
 /// 但不会重置计时器。防止客户端通过周期性 Ping 无限占用 connection permit。
 async fn receive_initial_response_create(
     client_socket: &mut WebSocket,
-) -> Result<(String, Value), InitialMessageFailure> {
+) -> Result<(String, Value, u64), InitialMessageFailure> {
     receive_initial_response_create_with_deadline(
         client_socket,
         RESPONSES_WEBSOCKET_SESSION_LIMITS.initial_message_timeout,
@@ -774,7 +780,7 @@ async fn receive_initial_response_create(
 async fn receive_initial_response_create_with_deadline<S>(
     socket: &mut S,
     deadline_budget: std::time::Duration,
-) -> Result<(String, Value), InitialMessageFailure>
+) -> Result<(String, Value, u64), InitialMessageFailure>
 where
     S: futures_util::Stream<Item = Result<AxumWsMessage, axum::Error>>
         + futures_util::Sink<AxumWsMessage, Error = axum::Error>
@@ -797,6 +803,7 @@ where
         };
         let message = message
             .map_err(|_| InitialMessageFailure::new(InitialMessageError::ClientRead, last_frame))?;
+        let frame_received_at_ms = crate::clock::current_unix_ms();
         last_frame = Some(InitialMessageFrameMetadata::from_message(&message));
         match message {
             AxumWsMessage::Ping(payload) => {
@@ -829,7 +836,7 @@ where
                 })?;
                 validate_initial_response_create(&event)
                     .map_err(|error| InitialMessageFailure::new(error, last_frame))?;
-                return Ok((text, event));
+                return Ok((text, event, frame_received_at_ms));
             }
         }
     }
@@ -1916,9 +1923,10 @@ mod tests {
             .await
             .expect("handle should finish within 2s")
             .expect("task should not panic");
-        let (text, event) = result.expect("should return Ok");
+        let (text, event, received_at_ms) = result.expect("should return Ok");
         assert_eq!(text, event_text);
         assert_eq!(event["type"], "response.create");
         assert_eq!(event["model"], "gpt-4o");
+        assert!(received_at_ms > 0);
     }
 }

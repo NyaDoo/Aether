@@ -307,6 +307,8 @@ mod tests {
                 .expect("remote address should parse"),
             client_ip: "127.0.0.1".parse().expect("client IP should parse"),
             decision,
+            realtime_admission_id: "ws-test-admission".to_string(),
+            realtime_admission_at_ms: 1_000,
             websocket_connection_permit: None,
         }
     }

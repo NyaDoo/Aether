@@ -377,6 +377,24 @@ async fn sync_settlement(
     if !snapshot.any_present() && !replace_existing {
         return Ok(());
     }
+    // The explicit failed/void -> completed recovery path reopens billing on
+    // the main usage row.  Clear the snapshot's terminal timestamp as well;
+    // readers intentionally COALESCE this column ahead of the usage row and
+    // would otherwise continue to expose the stale void finalization time.
+    if replace_existing
+        && snapshot
+            .billing_status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("pending"))
+    {
+        sqlx::query(
+            "UPDATE usage_settlement_snapshots SET finalized_at = NULL WHERE request_id = ? AND billing_status = 'void'",
+        )
+        .bind(request_id)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
     let now = unix_now()?;
     let settlement_json = json_text(snapshot.settlement_snapshot.as_ref())?;
     let dimensions_json = json_text(snapshot.billing_dimensions.as_ref())?;
@@ -430,8 +448,14 @@ async fn sync_settlement(
             .push_bind(now);
     }
     query.push(") ON CONFLICT (request_id) DO UPDATE SET ");
+    // `replace_existing` is set only for a lifecycle transition that owns the
+    // snapshot (including the explicit void-failure -> completed recovery).
+    // For sparse same-terminal writes, keep billing monotonic and never let a
+    // late pending event reopen an already settled/void row.
     if replace_existing {
         query.push("billing_status = excluded.billing_status, ");
+    } else {
+        query.push("billing_status = CASE WHEN excluded.billing_status = 'pending' THEN usage_settlement_snapshots.billing_status ELSE excluded.billing_status END, ");
     }
     push_sqlite_updates(
         &mut query,
@@ -468,9 +492,22 @@ async fn sync_settlement(
         replace_existing,
     );
     query.push(", updated_at = excluded.updated_at");
+    if !replace_existing {
+        // SQLite supports a conflict-target WHERE clause for DO UPDATE.  A
+        // conflicting terminal write is a complete no-op, preserving status,
+        // pricing/token facts and timestamps together; same-terminal sparse
+        // writes still take the COALESCE merge path above.
+        query.push(" WHERE NOT ");
+        query.push(SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL);
+    }
     query.build().execute(&mut **tx).await.map_sql_err()?;
     Ok(())
 }
+
+/// Existing settlement terminal rows are immutable for non-owner/sparse
+/// writes.  Keep this expression shared by the UPSERT guard and its tests.
+const SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL: &str =
+    "(usage_settlement_snapshots.billing_status IN ('settled', 'void', 'insufficient_quota') AND excluded.billing_status <> usage_settlement_snapshots.billing_status)";
 
 fn push_sqlite_updates(
     query: &mut QueryBuilder<'_, Sqlite>,
@@ -1044,4 +1081,18 @@ fn unix_now() -> Result<i64, DataLayerError> {
         .as_secs();
     i64::try_from(seconds)
         .map_err(|_| DataLayerError::UnexpectedValue("unix timestamp overflow".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL;
+
+    #[test]
+    fn non_replace_settlement_conflict_covers_every_terminal_state() {
+        assert!(SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("'settled'"));
+        assert!(SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("'void'"));
+        assert!(SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("'insufficient_quota'"));
+        assert!(SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("excluded.billing_status"));
+        assert!(SQLITE_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("<> usage_settlement_snapshots"));
+    }
 }

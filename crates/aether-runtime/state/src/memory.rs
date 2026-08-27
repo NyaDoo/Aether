@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -49,6 +49,57 @@ pub(crate) struct MemoryRuntimeBackend {
     locks: Mutex<HashMap<String, MemoryLockEntry>>,
     lock_fencing_seq: AtomicU64,
     semaphores: Mutex<HashMap<String, BTreeMap<String, u64>>>,
+    /// Short-lived counters used by realtime dashboard metrics. This uses a
+    /// synchronous lock so each bucket update is atomic without an await.
+    realtime_buckets: StdMutex<HashMap<String, MemoryRealtimeBucketEntry>>,
+    /// Exact-timestamp realtime events.  A collection is guarded by one
+    /// synchronous mutex so add/remove/sum operations have the same atomic
+    /// semantics as the Redis Lua implementation.
+    realtime_events: StdMutex<HashMap<String, MemoryRealtimeEventCollection>>,
+    /// Token accounting ledgers used to reconcile live stream deltas with a
+    /// terminal cumulative usage snapshot.  The whole ledger map is guarded
+    /// by one mutex so stream additions and terminal claims are linearizable,
+    /// matching the Redis Lua implementation.
+    realtime_token_ledgers: StdMutex<HashMap<String, MemoryRealtimeTokenLedgerEntry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemoryRealtimeBucket {
+    pub(crate) requests: i64,
+    pub(crate) tokens: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryRealtimeBucketEntry {
+    requests: i64,
+    tokens: i64,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct MemoryRealtimeEventCollection {
+    events: HashMap<String, MemoryRealtimeEventEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryRealtimeEventEntry {
+    timestamp_ms: u64,
+    requests: i64,
+    tokens: i64,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct MemoryRealtimeTokenLedgerEntry {
+    stream_tokens: u64,
+    terminal_claimed: bool,
+    terminal_event_id: Option<String>,
+    terminal_remainder: u64,
+    terminal_committed: bool,
+    expires_at: Instant,
+    /// Sequence/event identities already folded into `stream_tokens`.
+    /// Keeping this in the same entry makes the check and increment atomic.
+    seen_events: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +229,358 @@ impl MemoryRuntimeBackend {
         }
     }
 
+    pub(crate) fn realtime_bucket_add(
+        &self,
+        key: &str,
+        request_delta: i64,
+        token_delta: i64,
+        ttl: Duration,
+    ) -> MemoryRealtimeBucket {
+        let mut buckets = self
+            .realtime_buckets
+            .lock()
+            .expect("realtime bucket lock should not be poisoned");
+        let now = Instant::now();
+        buckets.retain(|_, entry| entry.expires_at > now);
+        let entry = buckets
+            .entry(key.to_string())
+            .or_insert(MemoryRealtimeBucketEntry {
+                requests: 0,
+                tokens: 0,
+                expires_at: now + ttl.max(Duration::from_secs(1)),
+            });
+        // A failed terminal can compensate an earlier admission. Never allow
+        // a duplicate/late compensation to make the exported counter
+        // negative.
+        entry.requests = entry.requests.saturating_add(request_delta).max(0);
+        entry.tokens = entry.tokens.saturating_add(token_delta).max(0);
+        entry.expires_at = now + ttl.max(Duration::from_secs(1));
+        MemoryRealtimeBucket {
+            requests: entry.requests,
+            tokens: entry.tokens,
+        }
+    }
+
+    pub(crate) fn realtime_bucket_read(&self, key: &str) -> Option<MemoryRealtimeBucket> {
+        let mut buckets = self
+            .realtime_buckets
+            .lock()
+            .expect("realtime bucket lock should not be poisoned");
+        let now = Instant::now();
+        buckets.retain(|_, entry| entry.expires_at > now);
+        buckets.get(key).map(|entry| MemoryRealtimeBucket {
+            requests: entry.requests,
+            tokens: entry.tokens,
+        })
+    }
+
+    pub(crate) fn realtime_buckets_sum(&self, keys: &[String]) -> MemoryRealtimeBucket {
+        let mut buckets = self
+            .realtime_buckets
+            .lock()
+            .expect("realtime bucket lock should not be poisoned");
+        let now = Instant::now();
+        buckets.retain(|_, entry| entry.expires_at > now);
+        keys.iter().fold(
+            MemoryRealtimeBucket {
+                requests: 0,
+                tokens: 0,
+            },
+            |mut total, key| {
+                if let Some(entry) = buckets.get(key) {
+                    total.requests = total.requests.saturating_add(entry.requests);
+                    total.tokens = total.tokens.saturating_add(entry.tokens);
+                }
+                total
+            },
+        )
+    }
+
+    /// Add one exact-timestamp event to a collection.  The event ID is the
+    /// idempotency key: a live event with the same ID is never overwritten and
+    /// returns `false`.  Expired events are removed before the lookup so a
+    /// later retry can be admitted again.
+    pub(crate) fn realtime_event_add(
+        &self,
+        collection_key: &str,
+        event_id: &str,
+        timestamp_ms: u64,
+        request_delta: i64,
+        token_delta: i64,
+        ttl: Duration,
+    ) -> bool {
+        let mut collections = self
+            .realtime_events
+            .lock()
+            .expect("realtime event lock should not be poisoned");
+        let now = Instant::now();
+        prune_realtime_event_collections(&mut collections, now);
+        let collection = collections.entry(collection_key.to_string()).or_default();
+        collection.events.retain(|_, event| event.expires_at > now);
+        if collection.events.contains_key(event_id) {
+            return false;
+        }
+        collection.events.insert(
+            event_id.to_string(),
+            MemoryRealtimeEventEntry {
+                timestamp_ms,
+                requests: request_delta,
+                tokens: token_delta,
+                expires_at: now + ttl.max(Duration::from_millis(1)),
+            },
+        );
+        true
+    }
+
+    /// Remove one exact-timestamp event by its idempotency key.  Removing a
+    /// missing/expired event is a no-op and returns `false`.
+    pub(crate) fn realtime_event_remove(&self, collection_key: &str, event_id: &str) -> bool {
+        let mut collections = self
+            .realtime_events
+            .lock()
+            .expect("realtime event lock should not be poisoned");
+        let now = Instant::now();
+        prune_realtime_event_collections(&mut collections, now);
+        let Some(collection) = collections.get_mut(collection_key) else {
+            return false;
+        };
+        collection.events.retain(|_, event| event.expires_at > now);
+        let removed = collection.events.remove(event_id).is_some();
+        if collection.events.is_empty() {
+            collections.remove(collection_key);
+        }
+        removed
+    }
+
+    /// Sum events whose timestamp is in the exact `(start_ms, end_ms]`
+    /// interval.  The aggregate is clamped at zero to preserve the dashboard
+    /// counter invariant when callers use signed compensation deltas.
+    pub(crate) fn realtime_events_sum(
+        &self,
+        collection_key: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> MemoryRealtimeBucket {
+        let mut collections = self
+            .realtime_events
+            .lock()
+            .expect("realtime event lock should not be poisoned");
+        let now = Instant::now();
+        prune_realtime_event_collections(&mut collections, now);
+        let Some(collection) = collections.get_mut(collection_key) else {
+            return MemoryRealtimeBucket {
+                requests: 0,
+                tokens: 0,
+            };
+        };
+        collection.events.retain(|_, event| event.expires_at > now);
+        if start_ms >= end_ms {
+            return MemoryRealtimeBucket {
+                requests: 0,
+                tokens: 0,
+            };
+        }
+        let mut total = MemoryRealtimeBucket {
+            requests: 0,
+            tokens: 0,
+        };
+        for event in collection.events.values() {
+            if event.timestamp_ms > start_ms && event.timestamp_ms <= end_ms {
+                total.requests = total.requests.saturating_add(event.requests);
+                total.tokens = total.tokens.saturating_add(event.tokens);
+            }
+        }
+        total.requests = total.requests.max(0);
+        total.tokens = total.tokens.max(0);
+        total
+    }
+
+    /// Add live stream tokens to a reconciliation ledger.  Once a terminal
+    /// cumulative snapshot has claimed the ledger, late stream observations
+    /// are ignored so they cannot double count the terminal total.
+    pub(crate) fn realtime_token_stream_add(
+        &self,
+        identity: &str,
+        token_delta: u64,
+        ttl: Duration,
+    ) -> u64 {
+        if token_delta == 0 {
+            return 0;
+        }
+        let mut ledgers = self
+            .realtime_token_ledgers
+            .lock()
+            .expect("realtime token ledger lock should not be poisoned");
+        let now = Instant::now();
+        ledgers.retain(|_, entry| entry.expires_at > now);
+        let entry = ledgers
+            .entry(identity.to_string())
+            .or_insert(MemoryRealtimeTokenLedgerEntry {
+                stream_tokens: 0,
+                terminal_claimed: false,
+                terminal_event_id: None,
+                terminal_remainder: 0,
+                terminal_committed: false,
+                expires_at: now + ttl.max(Duration::from_millis(1)),
+                seen_events: HashSet::new(),
+            });
+        if entry.terminal_claimed {
+            return 0;
+        }
+        entry.stream_tokens = entry.stream_tokens.saturating_add(token_delta);
+        entry.expires_at = now + ttl.max(Duration::from_millis(1));
+        token_delta
+    }
+
+    /// Add one idempotent live stream token delta.  The event identity is
+    /// checked and folded into the ledger under the same mutex, so a replay or
+    /// concurrent duplicate cannot increment `stream_tokens` twice.
+    pub(crate) fn realtime_token_stream_add_once(
+        &self,
+        identity: &str,
+        event_id: &str,
+        token_delta: u64,
+        ttl: Duration,
+    ) -> u64 {
+        if token_delta == 0 {
+            return 0;
+        }
+        let mut ledgers = self
+            .realtime_token_ledgers
+            .lock()
+            .expect("realtime token ledger lock should not be poisoned");
+        let now = Instant::now();
+        ledgers.retain(|_, entry| entry.expires_at > now);
+        let entry =
+            ledgers
+                .entry(identity.to_string())
+                .or_insert_with(|| MemoryRealtimeTokenLedgerEntry {
+                    stream_tokens: 0,
+                    terminal_claimed: false,
+                    terminal_event_id: None,
+                    terminal_remainder: 0,
+                    terminal_committed: false,
+                    expires_at: now + ttl.max(Duration::from_millis(1)),
+                    seen_events: HashSet::new(),
+                });
+        if entry.terminal_claimed || !entry.seen_events.insert(event_id.to_string()) {
+            return 0;
+        }
+        entry.stream_tokens = entry.stream_tokens.saturating_add(token_delta);
+        entry.expires_at = now + ttl.max(Duration::from_millis(1));
+        token_delta
+    }
+
+    /// Claim the remainder of a terminal cumulative token total.  The first
+    /// positive terminal claim returns `max(total - streamed, 0)` and marks
+    /// the ledger terminal.  Zero totals are deliberately not claimed so a
+    /// later enriched terminal event can still contribute its usage.
+    pub(crate) fn realtime_token_terminal_claim(
+        &self,
+        identity: &str,
+        terminal_total: u64,
+        ttl: Duration,
+    ) -> u64 {
+        if terminal_total == 0 {
+            return 0;
+        }
+        let mut ledgers = self
+            .realtime_token_ledgers
+            .lock()
+            .expect("realtime token ledger lock should not be poisoned");
+        let now = Instant::now();
+        ledgers.retain(|_, entry| entry.expires_at > now);
+        let entry = ledgers
+            .entry(identity.to_string())
+            .or_insert(MemoryRealtimeTokenLedgerEntry {
+                stream_tokens: 0,
+                terminal_claimed: false,
+                terminal_event_id: None,
+                terminal_remainder: 0,
+                terminal_committed: false,
+                expires_at: now + ttl.max(Duration::from_millis(1)),
+                seen_events: HashSet::new(),
+            });
+        if entry.terminal_claimed {
+            return 0;
+        }
+        let remainder = terminal_total.saturating_sub(entry.stream_tokens);
+        entry.terminal_claimed = true;
+        entry.terminal_event_id = None;
+        entry.terminal_remainder = 0;
+        entry.terminal_committed = true;
+        entry.expires_at = now + ttl.max(Duration::from_millis(1));
+        remainder
+    }
+
+    /// Prepare a retryable terminal claim.  The ledger is fenced against late
+    /// stream increments immediately, while the remainder and event identity
+    /// stay pending until the exact event store acknowledges the write.
+    pub(crate) fn realtime_token_terminal_prepare(
+        &self,
+        identity: &str,
+        event_id: &str,
+        terminal_total: u64,
+        ttl: Duration,
+    ) -> u64 {
+        if terminal_total == 0 {
+            return 0;
+        }
+        let mut ledgers = self
+            .realtime_token_ledgers
+            .lock()
+            .expect("realtime token ledger lock should not be poisoned");
+        let now = Instant::now();
+        ledgers.retain(|_, entry| entry.expires_at > now);
+        let entry = ledgers
+            .entry(identity.to_string())
+            .or_insert(MemoryRealtimeTokenLedgerEntry {
+                stream_tokens: 0,
+                terminal_claimed: false,
+                terminal_event_id: None,
+                terminal_remainder: 0,
+                terminal_committed: false,
+                expires_at: now + ttl.max(Duration::from_millis(1)),
+                seen_events: HashSet::new(),
+            });
+        if entry.terminal_claimed {
+            if entry.terminal_event_id.as_deref() == Some(event_id) && !entry.terminal_committed {
+                entry.expires_at = now + ttl.max(Duration::from_millis(1));
+                return entry.terminal_remainder;
+            }
+            return 0;
+        }
+        let remainder = terminal_total.saturating_sub(entry.stream_tokens);
+        entry.terminal_claimed = true;
+        entry.terminal_event_id = Some(event_id.to_string());
+        entry.terminal_remainder = remainder;
+        // A zero remainder has no exact event to commit, but it still fences
+        // late stream increments and is already fully settled.
+        entry.terminal_committed = remainder == 0;
+        entry.expires_at = now + ttl.max(Duration::from_millis(1));
+        remainder
+    }
+
+    /// Mark a prepared terminal event durable.  Matching repeated commits are
+    /// harmless, which lets callers recover from an ambiguous Redis response.
+    pub(crate) fn realtime_token_terminal_commit(&self, identity: &str, event_id: &str) -> bool {
+        let mut ledgers = self
+            .realtime_token_ledgers
+            .lock()
+            .expect("realtime token ledger lock should not be poisoned");
+        let now = Instant::now();
+        ledgers.retain(|_, entry| entry.expires_at > now);
+        let Some(entry) = ledgers.get_mut(identity) else {
+            return false;
+        };
+        if entry.terminal_event_id.as_deref() != Some(event_id) {
+            return false;
+        }
+        entry.terminal_committed = true;
+        entry.terminal_remainder = 0;
+        true
+    }
+
     pub(crate) async fn kv_set(&self, key: &str, value: String, ttl: Option<Duration>) {
         let mut kv = self.kv.lock().await;
         let now = Instant::now();
@@ -204,6 +607,42 @@ impl MemoryRuntimeBackend {
                 expires_at: ttl.map(|ttl| now + ttl),
             },
         );
+    }
+
+    pub(crate) async fn kv_set_if_absent(
+        &self,
+        key: &str,
+        value: String,
+        ttl: Option<Duration>,
+    ) -> bool {
+        let mut kv = self.kv.lock().await;
+        let now = Instant::now();
+        if ttl.is_some_and(|ttl| ttl.is_zero()) {
+            return false;
+        }
+        prune_kv(&mut kv, now);
+        if kv.get(key).is_some_and(|entry| !entry.is_expired(now)) {
+            return false;
+        }
+        while kv.len() >= self.config.max_kv_entries.max(1) {
+            let Some(oldest_key) = kv
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            kv.remove(&oldest_key);
+        }
+        kv.insert(
+            key.to_string(),
+            MemoryKvEntry {
+                value,
+                inserted_at: now,
+                expires_at: ttl.map(|ttl| now + ttl),
+            },
+        );
+        true
     }
 
     pub(crate) fn kv_set_nowait(&self, key: &str, value: String, ttl: Option<Duration>) -> bool {
@@ -1028,6 +1467,16 @@ fn get_fresh_locked(
 
 fn prune_kv(kv: &mut HashMap<String, MemoryKvEntry>, now: Instant) {
     kv.retain(|_, entry| !entry.is_expired(now));
+}
+
+fn prune_realtime_event_collections(
+    collections: &mut HashMap<String, MemoryRealtimeEventCollection>,
+    now: Instant,
+) {
+    collections.retain(|_, collection| {
+        collection.events.retain(|_, event| event.expires_at > now);
+        !collection.events.is_empty()
+    });
 }
 
 fn memory_rate_limit_counter_shard_index(key: &str) -> usize {

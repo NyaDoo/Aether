@@ -377,6 +377,24 @@ async fn sync_settlement(
     if !snapshot.any_present() && !replace_existing {
         return Ok(());
     }
+    // Keep the settlement snapshot in sync with the explicit failed/void ->
+    // completed recovery on the usage row.  Its finalized_at is preferred by
+    // read queries, so leaving the old void timestamp would make a recovered
+    // pending row look finalized and remain invisible to reconciliation.
+    if replace_existing
+        && snapshot
+            .billing_status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("pending"))
+    {
+        sqlx::query(
+            "UPDATE usage_settlement_snapshots SET finalized_at = NULL WHERE request_id = ? AND billing_status = 'void'",
+        )
+        .bind(request_id)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
     let now = unix_now()?;
     let settlement_json = json_text(snapshot.settlement_snapshot.as_ref())?;
     let dimensions_json = json_text(snapshot.billing_dimensions.as_ref())?;
@@ -430,10 +448,23 @@ async fn sync_settlement(
             .push_bind(now);
     }
     query.push(") ON DUPLICATE KEY UPDATE ");
+    // `replace_existing` is set only for a lifecycle transition that owns the
+    // snapshot (including the explicit void-failure -> completed recovery).
+    // For sparse same-terminal writes, keep billing monotonic and never let a
+    // late event from another terminal attempt rewrite the first terminal row.
+    //
+    // MySQL has no `DO UPDATE ... WHERE` clause.  The conflict predicate is
+    // therefore repeated in each assignment below (see
+    // `push_mysql_settlement_updates`) so a conflicting write is a complete
+    // no-op, including pricing/token facts and `updated_at`.
     if replace_existing {
         query.push("billing_status = VALUES(billing_status), ");
+    } else {
+        query.push("billing_status = CASE WHEN ");
+        query.push(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL);
+        query.push(" THEN billing_status ELSE VALUES(billing_status) END, ");
     }
-    push_mysql_updates(
+    push_mysql_settlement_updates(
         &mut query,
         &[
             "billing_snapshot_schema_version",
@@ -467,9 +498,53 @@ async fn sync_settlement(
         "usage_settlement_snapshots",
         replace_existing,
     );
-    query.push(", updated_at = VALUES(updated_at)");
+    if replace_existing {
+        query.push(", updated_at = VALUES(updated_at)");
+    } else {
+        query.push(", updated_at = CASE WHEN ");
+        query.push(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL);
+        query.push(" THEN usage_settlement_snapshots.updated_at ELSE VALUES(updated_at) END");
+    }
     query.build().execute(&mut **tx).await.map_sql_err()?;
     Ok(())
+}
+
+/// Existing settlement terminal rows are immutable for non-owner/sparse
+/// writes.  Keep this expression in one place so the status, facts and
+/// timestamp assignments cannot accidentally diverge.
+const MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL: &str =
+    "(billing_status IN ('settled', 'void', 'insufficient_quota') AND VALUES(billing_status) <> billing_status)";
+
+fn push_mysql_settlement_updates(
+    query: &mut QueryBuilder<'_, MySql>,
+    fields: &[&str],
+    table: &str,
+    replace_existing: bool,
+) {
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            query.push(", ");
+        }
+        query.push(*field).push(" = ");
+        if replace_existing {
+            query.push("VALUES(").push(*field).push(")");
+        } else {
+            query
+                .push("CASE WHEN ")
+                .push(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL)
+                .push(" THEN ")
+                .push(table)
+                .push(".")
+                .push(*field)
+                .push(" ELSE COALESCE(VALUES(")
+                .push(*field)
+                .push("), ")
+                .push(table)
+                .push(".")
+                .push(*field)
+                .push(") END");
+        }
+    }
 }
 
 fn push_mysql_updates(
@@ -1040,4 +1115,18 @@ fn unix_now() -> Result<i64, DataLayerError> {
         .as_secs();
     i64::try_from(seconds)
         .map_err(|_| DataLayerError::UnexpectedValue("unix timestamp overflow".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL;
+
+    #[test]
+    fn non_replace_settlement_conflict_covers_every_terminal_state() {
+        assert!(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("'settled'"));
+        assert!(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("'void'"));
+        assert!(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("'insufficient_quota'"));
+        assert!(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("VALUES(billing_status)"));
+        assert!(MYSQL_SETTLEMENT_TERMINAL_CONFLICT_SQL.contains("<> billing_status"));
+    }
 }

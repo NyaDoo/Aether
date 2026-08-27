@@ -40,6 +40,17 @@ impl VideoTaskStatus {
             Self::Pending | Self::Submitted | Self::Queued | Self::Processing
         )
     }
+
+    /// Whether a generic task-snapshot upsert may replace a row in this state.
+    ///
+    /// Provider refresh/create snapshots are allowed to advance an active row,
+    /// but must never resurrect or rewrite a billing terminal.  `Deleted` is
+    /// the one explicit administrative transition accepted from a non-deleted
+    /// terminal; callers use it to tombstone a task without changing the
+    /// generation outcome that was already billed.
+    pub fn allows_snapshot_replacement_with(self, next: Self) -> bool {
+        self.is_active() || (self != Self::Deleted && next == Self::Deleted)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

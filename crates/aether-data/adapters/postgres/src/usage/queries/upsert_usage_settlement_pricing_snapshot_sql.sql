@@ -61,7 +61,14 @@ INSERT INTO usage_settlement_snapshots (
 )
 ON CONFLICT (request_id)
 DO UPDATE SET
-  billing_status = CASE WHEN $30 THEN EXCLUDED.billing_status ELSE usage_settlement_snapshots.billing_status END,
+  -- Billing state is monotonic for sparse/non-owner writes.  `$30` is true
+  -- only for the lifecycle owner transition (including the explicit
+  -- failed/void -> completed recovery), so that path may replace the row.
+  billing_status = CASE
+    WHEN $30 THEN EXCLUDED.billing_status
+    WHEN EXCLUDED.billing_status = 'pending' THEN usage_settlement_snapshots.billing_status
+    ELSE EXCLUDED.billing_status
+  END,
   billing_snapshot_schema_version = CASE WHEN $30 THEN EXCLUDED.billing_snapshot_schema_version ELSE COALESCE(EXCLUDED.billing_snapshot_schema_version, usage_settlement_snapshots.billing_snapshot_schema_version) END,
   billing_snapshot_status = CASE WHEN $30 THEN EXCLUDED.billing_snapshot_status ELSE COALESCE(EXCLUDED.billing_snapshot_status, usage_settlement_snapshots.billing_snapshot_status) END,
   settlement_snapshot_schema_version = CASE WHEN $30 THEN EXCLUDED.settlement_snapshot_schema_version ELSE COALESCE(EXCLUDED.settlement_snapshot_schema_version, usage_settlement_snapshots.settlement_snapshot_schema_version) END,
@@ -90,3 +97,7 @@ DO UPDATE SET
   cache_read_price_per_1m = CASE WHEN $30 THEN EXCLUDED.cache_read_price_per_1m ELSE COALESCE(EXCLUDED.cache_read_price_per_1m, usage_settlement_snapshots.cache_read_price_per_1m) END,
   price_per_request = CASE WHEN $30 THEN EXCLUDED.price_per_request ELSE COALESCE(EXCLUDED.price_per_request, usage_settlement_snapshots.price_per_request) END,
   updated_at = NOW()
+WHERE $30 OR NOT (
+  usage_settlement_snapshots.billing_status IN ('settled', 'void', 'insufficient_quota')
+  AND EXCLUDED.billing_status <> usage_settlement_snapshots.billing_status
+)

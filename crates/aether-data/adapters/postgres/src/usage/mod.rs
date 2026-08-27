@@ -43,7 +43,9 @@ use crate::{
 use aether_data_contracts::repository::usage::{
     api_key_usage_contribution, incoming_usage_can_recover_terminal_failure,
     model_usage_contribution, provider_api_key_usage_contribution,
-    strip_deprecated_usage_display_fields, ApiKeyUsageDelta, ModelUsageDelta,
+    strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
+    usage_can_recover_terminal_failure_for_candidate,
+    usage_terminal_status_conflict_preserves_existing, ApiKeyUsageDelta, ModelUsageDelta,
     PendingUsageCleanupSummary, ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta,
     ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
     StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredRequestUsageAudit,
@@ -2046,39 +2048,47 @@ const SELECT_STALE_PENDING_USAGE_BATCH_SQL: &str = r#"
 SELECT
   usage.request_id,
   usage.status,
-  COALESCE(usage_settlement_snapshots.billing_status, usage.billing_status) AS billing_status
+  CASE
+    WHEN usage_routing_snapshots.request_id IS NOT NULL
+      THEN usage_routing_snapshots.candidate_id
+    ELSE usage.candidate_id
+  END AS candidate_id
 FROM usage
 LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = usage.request_id
-WHERE usage.status IN ('pending', 'streaming')
+LEFT JOIN usage_routing_snapshots
+  ON usage_routing_snapshots.request_id = usage.request_id
+WHERE usage.status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')
+  AND usage.billing_status = 'pending'
+  AND usage.finalized_at IS NULL
   AND usage.created_at < $1
-  AND COALESCE(usage.request_type, '') <> 'video'
+  -- Video contracts are asynchronous and may be represented by any of the
+  -- normalized request/endpoint fields (for example `openai:video`), not only
+  -- request_type='video'. Keep this predicate in lockstep with the runtime
+  -- `is_video_contract` helper: trim/case-fold each field and reject an exact
+  -- `video` value or a value whose final colon-delimited kind is `video`.
+  -- Strip SQL whitespace conservatively so values such as `openai: video` and
+  -- `openai:\tvideo` cannot fall through this fail-closed exclusion.
+  AND NOT (
+    LOWER(REGEXP_REPLACE(COALESCE(usage.request_type, ''), '[[:space:]]', '', 'g')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.request_type, ''), '[[:space:]]', '', 'g')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.api_format, ''), '[[:space:]]', '', 'g')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.api_format, ''), '[[:space:]]', '', 'g')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.endpoint_kind, ''), '[[:space:]]', '', 'g')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.endpoint_kind, ''), '[[:space:]]', '', 'g')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.endpoint_api_format, ''), '[[:space:]]', '', 'g')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.endpoint_api_format, ''), '[[:space:]]', '', 'g')) LIKE '%:video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.provider_endpoint_kind, ''), '[[:space:]]', '', 'g')) = 'video'
+    OR LOWER(REGEXP_REPLACE(COALESCE(usage.provider_endpoint_kind, ''), '[[:space:]]', '', 'g')) LIKE '%:video'
+  )
+  -- Settlement snapshots are authoritative once they carry a terminal billing
+  -- state or finalization timestamp.  Do not sweep an in-flight usage row whose
+  -- base columns have not caught up with that snapshot yet.
+  AND COALESCE(usage_settlement_snapshots.billing_status, usage.billing_status) = 'pending'
+  AND COALESCE(usage_settlement_snapshots.finalized_at, usage.finalized_at) IS NULL
 ORDER BY usage.created_at ASC, usage.request_id ASC
 LIMIT $2
 FOR UPDATE OF usage SKIP LOCKED
-"#;
-
-const SELECT_COMPLETED_PENDING_REQUEST_IDS_SQL: &str = r#"
-SELECT DISTINCT request_id
-FROM request_candidates
-WHERE request_id = ANY($1)
-  AND (
-    status = 'streaming'
-    OR (
-      status = 'success'
-      AND COALESCE(extra_data->>'stream_completed', 'false') = 'true'
-    )
-  )
-"#;
-
-const UPDATE_RECOVERED_STALE_USAGE_SQL: &str = r#"
-UPDATE usage
-SET status = 'completed',
-    status_code = 200,
-    error_message = NULL,
-    outcome_class = 'success',
-    sla_eligible = TRUE
-WHERE request_id = $1
 "#;
 
 const SELECT_LATEST_FAILED_CANDIDATE_FOR_STALE_REQUESTS_SQL: &str = r#"
@@ -2096,16 +2106,6 @@ ORDER BY request_id,
          created_at DESC
 "#;
 
-const UPDATE_FAILED_STALE_USAGE_SQL: &str = r#"
-UPDATE usage
-SET status = 'failed',
-    status_code = $3,
-    error_message = $2,
-    outcome_class = CASE WHEN $3 = 400 THEN 'user_error' ELSE 'service_error' END,
-    sla_eligible = CASE WHEN $3 = 400 THEN FALSE ELSE TRUE END
-WHERE request_id = $1
-"#;
-
 const UPDATE_FAILED_VOID_STALE_USAGE_SQL: &str = r#"
 WITH updated_usage AS (
     UPDATE usage
@@ -2121,6 +2121,18 @@ WITH updated_usage AS (
         actual_total_cost_usd = 0,
         actual_request_cost_usd = 0
     WHERE request_id = $1
+      AND status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')
+      AND billing_status = 'pending'
+      AND finalized_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM usage_settlement_snapshots AS settlement
+        WHERE settlement.request_id = usage.request_id
+          AND (
+            settlement.billing_status <> 'pending'
+            OR settlement.finalized_at IS NOT NULL
+          )
+      )
     RETURNING request_id
 )
 INSERT INTO usage_settlement_snapshots (
@@ -2140,20 +2152,13 @@ DO UPDATE SET
     updated_at = NOW()
 "#;
 
-const UPDATE_RECOVERED_STREAMING_CANDIDATES_SQL: &str = r#"
-UPDATE request_candidates
-SET status = 'success',
-    finished_at = $2
-WHERE request_id = $1
-  AND status = 'streaming'
-"#;
-
 const UPDATE_FAILED_PENDING_CANDIDATES_SQL: &str = r#"
 UPDATE request_candidates
 SET status = 'failed',
     finished_at = $2,
     error_message = '请求超时（服务器可能已重启）'
 WHERE request_id = $1
+  AND id = $3
   AND status IN ('pending', 'streaming')
 "#;
 
@@ -8505,6 +8510,35 @@ ORDER BY "usage".user_id ASC
                 Box::pin(async move {
                     lock_usage_request_id_in_tx(tx, &usage.request_id).await?;
 
+                    let mut previous_usage =
+                        find_usage_by_request_id_in_tx(tx, &usage.request_id).await?;
+                    if let Some(existing) = previous_usage.as_ref() {
+                        let attempts_terminal_failure_recovery = usage_can_recover_terminal_failure(
+                            &existing.status,
+                            &existing.billing_status,
+                            &usage.status,
+                            &usage.billing_status,
+                        );
+                        let recovers_same_candidate =
+                            usage_can_recover_terminal_failure_for_candidate(
+                                &existing.status,
+                                &existing.billing_status,
+                                existing.routing_candidate_id(),
+                                &usage.status,
+                                &usage.billing_status,
+                                usage.routing_candidate_id(),
+                            );
+                        if (attempts_terminal_failure_recovery && !recovers_same_candidate)
+                            || usage_terminal_status_conflict_preserves_existing(
+                                &existing.status,
+                                &existing.billing_status,
+                                &usage.status,
+                                &usage.billing_status,
+                            )
+                        {
+                            return Ok(existing.clone());
+                        }
+                    }
                     if incoming_usage_can_recover_terminal_failure(
                         usage.status.as_str(),
                         usage.billing_status.as_str(),
@@ -8519,18 +8553,31 @@ ORDER BY "usage".user_id ASC
                             .execute(&mut **tx)
                             .await
                             .map_postgres_err()?;
+                        // The reset intentionally changes billing state from `void` to `pending`;
+                        // refresh the snapshot used by the merge/capture guards before applying
+                        // the recovered terminal event.
+                        previous_usage =
+                            find_usage_by_request_id_in_tx(tx, &usage.request_id).await?;
                     }
-
-                    let previous_usage =
-                        find_usage_by_request_id_in_tx(tx, &usage.request_id).await?;
                     let capture_update_allowed = usage_capture_update_allowed(
                         previous_usage
                             .as_ref()
                             .map(|stored| (stored.status.as_str(), stored.billing_status.as_str())),
                         usage.status.as_str(),
                     );
+                    // A terminal transition (for example streaming -> completed) may replace
+                    // stale in-flight routing/pricing facts.  A repeated write for the same
+                    // terminal outcome is an enrichment and must not clear tokens/cost/headers
+                    // merely because the retry payload is sparse.
                     let replace_terminal_snapshots =
-                        matches!(usage.status.as_str(), "completed" | "failed" | "cancelled");
+                        matches!(usage.status.as_str(), "completed" | "failed" | "cancelled")
+                            && !previous_usage.as_ref().is_some_and(|previous| {
+                                previous.status == usage.status
+                                    && matches!(
+                                        previous.status.as_str(),
+                                        "completed" | "failed" | "cancelled"
+                                    )
+                            });
                     if capture_update_allowed
                         && request_metadata_value.is_none()
                         && (replace_terminal_snapshots
@@ -9480,6 +9527,10 @@ ON CONFLICT (request_id) DO UPDATE SET
   cache_read_price_per_1m = COALESCE(EXCLUDED.cache_read_price_per_1m, usage_settlement_snapshots.cache_read_price_per_1m),
   price_per_request = COALESCE(EXCLUDED.price_per_request, usage_settlement_snapshots.price_per_request),
   updated_at = NOW()
+-- Pending batch writes are enrichment only.  Once a settlement snapshot is
+-- terminal, a delayed batch item must not erase/replace its pricing or token
+-- facts (the single-row path applies the same guard).
+WHERE usage_settlement_snapshots.billing_status NOT IN ('settled', 'void', 'insufficient_quota')
 "#,
         );
         builder
@@ -10089,7 +10140,7 @@ RETURNING
                     Ok(StalePendingUsageRow {
                         request_id: row.try_get("request_id").map_postgres_err()?,
                         status: row.try_get("status").map_postgres_err()?,
-                        billing_status: row.try_get("billing_status").map_postgres_err()?,
+                        candidate_id: row.try_get("candidate_id").map_postgres_err()?,
                     })
                 })
                 .collect::<Result<Vec<_>, DataLayerError>>()?;
@@ -10097,17 +10148,9 @@ RETURNING
                 .iter()
                 .map(|row| row.request_id.clone())
                 .collect::<Vec<_>>();
-            let (completed_request_ids, failed_candidate_info) = if request_ids.is_empty() {
-                (Vec::new(), std::collections::HashMap::new())
+            let failed_candidate_info = if request_ids.is_empty() {
+                std::collections::HashMap::new()
             } else {
-                let completed = sqlx::query(SELECT_COMPLETED_PENDING_REQUEST_IDS_SQL)
-                    .bind(&request_ids)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_postgres_err()?
-                    .iter()
-                    .map(|row| row.try_get("request_id").map_postgres_err())
-                    .collect::<Result<Vec<String>, DataLayerError>>()?;
                 let failed_rows =
                     sqlx::query(SELECT_LATEST_FAILED_CANDIDATE_FOR_STALE_REQUESTS_SQL)
                         .bind(&request_ids)
@@ -10134,58 +10177,49 @@ RETURNING
                         },
                     );
                 }
-                (completed, failed_map)
+                failed_map
             };
 
+            let mut cleanup_conflict = false;
             for row in stale_rows {
-                if completed_request_ids.contains(&row.request_id) {
-                    sqlx::query(UPDATE_RECOVERED_STALE_USAGE_SQL)
-                        .bind(&row.request_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_postgres_err()?;
-                    sqlx::query(UPDATE_RECOVERED_STREAMING_CANDIDATES_SQL)
-                        .bind(&row.request_id)
-                        .bind(now)
-                        .execute(&mut *tx)
-                        .await
-                        .map_postgres_err()?;
-                    summary.recovered += 1;
-                    continue;
-                }
-
                 let candidate_info = failed_candidate_info.get(&row.request_id);
                 let (status_code, error_message) =
                     resolve_stale_pending_failure(candidate_info, &row.status, timeout_minutes);
                 let status_code_i32 = i32::from(status_code);
-                if row.billing_status == "pending" {
-                    sqlx::query(UPDATE_FAILED_VOID_STALE_USAGE_SQL)
+                let result = sqlx::query(UPDATE_FAILED_VOID_STALE_USAGE_SQL)
+                    .bind(&row.request_id)
+                    .bind(&error_message)
+                    .bind(now)
+                    .bind(status_code_i32)
+                    .execute(&mut *tx)
+                    .await
+                    .map_postgres_err()?;
+                let usage_mutated = result.rows_affected() > 0;
+                // A settlement/terminal writer may win after the stale batch was read.  Do not
+                // manufacture a void snapshot or mutate candidates unless the guarded usage
+                // update actually changed an active, unfinalized row.
+                if !usage_mutated {
+                    cleanup_conflict = true;
+                    continue;
+                }
+                if let Some(candidate_id) = row.candidate_id.as_deref() {
+                    sqlx::query(UPDATE_FAILED_PENDING_CANDIDATES_SQL)
                         .bind(&row.request_id)
-                        .bind(&error_message)
                         .bind(now)
-                        .bind(status_code_i32)
-                        .execute(&mut *tx)
-                        .await
-                        .map_postgres_err()?;
-                } else {
-                    sqlx::query(UPDATE_FAILED_STALE_USAGE_SQL)
-                        .bind(&row.request_id)
-                        .bind(&error_message)
-                        .bind(status_code_i32)
+                        .bind(candidate_id)
                         .execute(&mut *tx)
                         .await
                         .map_postgres_err()?;
                 }
-                sqlx::query(UPDATE_FAILED_PENDING_CANDIDATES_SQL)
-                    .bind(&row.request_id)
-                    .bind(now)
-                    .execute(&mut *tx)
-                    .await
-                    .map_postgres_err()?;
                 summary.failed += 1;
             }
 
             tx.commit().await.map_postgres_err()?;
+            // A guarded no-op can remain stale but is now owned by a terminal writer. Avoid
+            // spinning on the same row forever; the next scheduled sweep can re-evaluate it.
+            if cleanup_conflict {
+                break;
+            }
         }
 
         Ok(summary)
@@ -10698,7 +10732,7 @@ impl UsageWriteRepository for SqlxUsageReadRepository {
 struct StalePendingUsageRow {
     request_id: String,
     status: String,
-    billing_status: String,
+    candidate_id: Option<String>,
 }
 
 struct FailedCandidateCleanupInfo {

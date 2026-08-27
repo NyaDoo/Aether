@@ -3378,6 +3378,17 @@ fn usage_sql_writes_usage_settlement_pricing_snapshots() {
 #[test]
 fn usage_sql_settlement_pricing_snapshot_billing_values_use_authoritative_incoming_values() {
     let sql = super::UPSERT_USAGE_SETTLEMENT_PRICING_SNAPSHOT_SQL;
+    assert!(sql.contains(
+        "WHEN $30 THEN EXCLUDED.billing_status\n    WHEN EXCLUDED.billing_status = 'pending' THEN usage_settlement_snapshots.billing_status"
+    ));
+    assert!(sql.contains(
+        "WHERE $30 OR NOT (\n  usage_settlement_snapshots.billing_status IN ('settled', 'void', 'insufficient_quota')\n  AND EXCLUDED.billing_status <> usage_settlement_snapshots.billing_status\n)"
+    ));
+    // The optimized pending batch has a separate SQL writer; keep its
+    // terminal guard in lockstep with the single-row snapshot path.
+    assert!(include_str!("mod.rs").contains(
+        "WHERE usage_settlement_snapshots.billing_status NOT IN ('settled', 'void', 'insufficient_quota')"
+    ));
     for field in [
         "billing_input_tokens",
         "billing_effective_input_tokens",
@@ -3567,6 +3578,74 @@ fn stale_cleanup_failed_candidate_sql_orders_by_effective_timestamp() {
     assert!(sql.contains("COALESCE(finished_at, started_at, created_at) DESC"));
     assert!(!sql.contains("finished_at DESC NULLS LAST"));
     assert!(!sql.contains("started_at DESC NULLS LAST"));
+}
+
+#[test]
+fn stale_cleanup_never_promotes_from_a_candidate_marker() {
+    let source = include_str!("mod.rs");
+    assert!(!source.contains("SELECT_COMPLETED_PENDING_REQUEST_IDS_SQL"));
+    assert!(!source.contains("UPDATE_RECOVERED_STALE_USAGE_SQL"));
+    assert!(!source.contains("SET status = 'completed',\n    status_code = 200"));
+    assert!(super::SELECT_STALE_PENDING_USAGE_BATCH_SQL
+        .contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+    assert!(super::UPDATE_FAILED_VOID_STALE_USAGE_SQL
+        .contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+    let source = include_str!("../usage/mod.rs");
+    assert!(!source.contains("SET status = 'success',\n    finished_at = $2\nWHERE request_id"));
+}
+
+#[test]
+fn stale_cleanup_uses_snapshot_authoritative_exact_candidate_identity() {
+    let select = super::SELECT_STALE_PENDING_USAGE_BATCH_SQL;
+    assert!(select.contains("LEFT JOIN usage_routing_snapshots"));
+    assert!(select.contains("WHEN usage_routing_snapshots.request_id IS NOT NULL"));
+    assert!(select.contains("THEN usage_routing_snapshots.candidate_id"));
+    assert!(select.contains("ELSE usage.candidate_id"));
+    assert!(!select.contains("COALESCE(usage_routing_snapshots.candidate_id, usage.candidate_id)"));
+
+    let update = super::UPDATE_FAILED_PENDING_CANDIDATES_SQL;
+    assert!(update.contains("WHERE request_id = $1"));
+    assert!(update.contains("AND id = $3"));
+    assert!(update.contains("status IN ('pending', 'streaming')"));
+}
+
+#[test]
+fn stale_cleanup_guards_effective_settlement_snapshots_and_terminal_usage() {
+    let stale_sql = SELECT_STALE_PENDING_USAGE_BATCH_SQL;
+    for field in [
+        "request_type",
+        "api_format",
+        "endpoint_kind",
+        "endpoint_api_format",
+        "provider_endpoint_kind",
+    ] {
+        let normalized =
+            format!("LOWER(REGEXP_REPLACE(COALESCE(usage.{field}, ''), '[[:space:]]', '', 'g'))");
+        assert!(
+            stale_sql.contains(&format!("{normalized} = 'video'")),
+            "stale cleanup must exclude exact video contracts from {field}"
+        );
+        assert!(
+            stale_sql.contains(&format!("{normalized} LIKE '%:video'")),
+            "stale cleanup must exclude whitespace-normalized provider:video contracts from {field}"
+        );
+    }
+    assert!(stale_sql.contains(
+        "COALESCE(usage_settlement_snapshots.billing_status, usage.billing_status) = 'pending'"
+    ));
+    assert!(stale_sql
+        .contains("COALESCE(usage_settlement_snapshots.finalized_at, usage.finalized_at) IS NULL"));
+    assert!(stale_sql.contains("usage.billing_status = 'pending'"));
+    assert!(stale_sql.contains("usage.finalized_at IS NULL"));
+
+    let sql = super::UPDATE_FAILED_VOID_STALE_USAGE_SQL;
+    assert!(sql.contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+    assert!(sql.contains("billing_status = 'pending'"));
+    assert!(sql.contains("finalized_at IS NULL"));
+    assert!(sql.contains("billing_status = 'void'"));
+    assert!(sql.contains("NOT EXISTS"));
+    assert!(sql.contains("settlement.billing_status <> 'pending'"));
+    assert!(sql.contains("settlement.finalized_at IS NOT NULL"));
 }
 
 #[test]

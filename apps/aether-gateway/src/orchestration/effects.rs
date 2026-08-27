@@ -477,6 +477,22 @@ pub(crate) async fn apply_local_stream_failure_effects(
     )
     .await;
 
+    apply_local_stream_failure_effects_with_analysis(state, context, effect, analysis).await;
+
+    analysis
+}
+
+/// Apply the failed-attempt effects after the caller has already resolved the
+/// failover decision.  Keeping this second entry point separate is important
+/// for terminal paths: they must commit the usage terminal row before awaiting
+/// provider/key side effects, while retry paths can still project effects
+/// before returning their intermediate candidate failure.
+pub(crate) async fn apply_local_stream_failure_effects_with_analysis(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    effect: LocalStreamFailureEffect<'_>,
+    analysis: LocalFailoverAnalysis,
+) {
     if effect.stream_timeout {
         apply_local_execution_effect(state, context, LocalExecutionEffect::PoolStreamTimeout).await;
     }
@@ -528,8 +544,6 @@ pub(crate) async fn apply_local_stream_failure_effects(
         }),
     )
     .await;
-
-    analysis
 }
 
 pub(crate) async fn release_local_pool_key_lease(

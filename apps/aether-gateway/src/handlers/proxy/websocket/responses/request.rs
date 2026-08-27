@@ -9,7 +9,10 @@ use axum::http::Method;
 use serde_json::Value;
 
 use crate::ai_serving::{AiExecutionDecision, ResponsesWebSocketBodyNormalization};
-use crate::handlers::proxy::websocket::ingress::WebSocketRequestContext;
+use crate::constants::{REALTIME_ADMISSION_AT_MS_HEADER, REALTIME_ADMISSION_ID_HEADER};
+use crate::handlers::proxy::websocket::ingress::{
+    WebSocketRealtimeAdmission, WebSocketRequestContext,
+};
 use crate::headers::request_origin_from_headers_and_remote_addr;
 use crate::privacy::RedactionSessionSlot;
 
@@ -39,6 +42,17 @@ pub(super) fn validated_response_create_model(value: &Value) -> Result<&str, &'s
 /// （`ai_serving/planner/redaction.rs`），少插这一项等于整条 WS 链路静默绕过
 /// 已启用的 PII 脱敏。
 pub(super) fn build_planning_parts(context: &WebSocketRequestContext) -> http::request::Parts {
+    build_planning_parts_at(context, context.realtime_admission_at_ms)
+}
+
+/// Build planner input while binding this turn to the timestamp at which its
+/// `response.create` frame entered the gateway.  The connection-level
+/// timestamp remains the fallback for callers that construct planning parts
+/// outside the relay loop.
+pub(super) fn build_planning_parts_at(
+    context: &WebSocketRequestContext,
+    realtime_admission_at_ms: u64,
+) -> http::request::Parts {
     let mut request = http::Request::builder()
         .method(Method::POST)
         .uri(context.uri.clone())
@@ -56,6 +70,11 @@ pub(super) fn build_planning_parts(context: &WebSocketRequestContext) -> http::r
     headers.remove("sec-websocket-version");
     headers.remove("sec-websocket-protocol");
     headers.remove("sec-websocket-extensions");
+    // Realtime bookkeeping is gateway-internal.  It is carried as a typed
+    // request extension below so provider passthrough/header rules cannot
+    // accidentally relay or mutate it.
+    headers.remove(REALTIME_ADMISSION_ID_HEADER);
+    headers.remove(REALTIME_ADMISSION_AT_MS_HEADER);
     headers.insert(
         CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
@@ -75,7 +94,18 @@ pub(super) fn build_planning_parts(context: &WebSocketRequestContext) -> http::r
     request
         .extensions_mut()
         .insert(RedactionSessionSlot::default());
+    request.extensions_mut().insert(WebSocketRealtimeAdmission {
+        id: context.realtime_admission_id.clone(),
+        at_ms: realtime_admission_at_ms,
+    });
     request.into_parts().0
+}
+
+pub(super) fn realtime_admission_timestamp_from_parts(parts: &http::request::Parts) -> Option<u64> {
+    parts
+        .extensions
+        .get::<WebSocketRealtimeAdmission>()
+        .map(|value| value.at_ms)
 }
 
 pub(super) fn planned_response_create_event(
@@ -243,6 +273,8 @@ mod tests {
                 Some("responses_websocket".to_string()),
                 Some("openai:responses".to_string()),
             ),
+            realtime_admission_id: "ws-test-admission".to_string(),
+            realtime_admission_at_ms: 1_000,
             websocket_connection_permit: None,
         }
     }

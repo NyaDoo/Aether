@@ -125,6 +125,8 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
         matches!(
             key.as_str(),
             "trace_id"
+                | "realtime_admission_id"
+                | "provider_request_order_id"
                 | "client_ip"
                 | "user_agent"
                 | "client_family"
@@ -344,6 +346,17 @@ pub(crate) fn attach_provider_actual_service_tier_metadata(
 
 fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<String, Value>) {
     copy_non_empty_string(source, target, "trace_id");
+    copy_non_empty_string(source, target, "parent_request_id");
+    copy_non_empty_string(source, target, "client_request_id");
+    copy_non_empty_string(source, target, "client_trace_id");
+    copy_non_empty_string(source, target, "asset_action");
+    copy_non_empty_string(source, target, "usage_scope");
+    copy_non_empty_string(source, target, "client_capture_scope");
+    copy_non_empty_string(source, target, "provider_response_capture_state");
+    copy_non_empty_string(source, target, "client_response_capture_state");
+    copy_non_empty_string(source, target, "realtime_admission_id");
+    copy_non_empty_string(source, target, "provider_request_order_id");
+    copy_bool(source, target, "realtime_admission_defer_failure");
     copy_non_empty_string(source, target, "client_ip");
     copy_non_empty_string(source, target, "user_agent");
     copy_non_empty_string(source, target, "client_family");
@@ -373,6 +386,12 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_non_null_value(source, target, "billing_snapshot");
     copy_non_empty_string(source, target, "billing_snapshot_schema_version");
     copy_non_empty_string(source, target, "billing_snapshot_status");
+    // Positive proof that a client-disconnected stream was nevertheless
+    // drained to a semantic upstream terminal event.  This is billing audit
+    // evidence, not a caller-controlled routing hint, and is attached by the
+    // terminal usage builder before persistence.
+    copy_bool(source, target, "billing_treat_as_completed");
+    copy_bool(source, target, "billing_treat_as_void");
     copy_non_null_value(source, target, "settlement_snapshot");
     copy_non_empty_string(source, target, "settlement_snapshot_schema_version");
     copy_non_null_value(source, target, "billing_dimensions");
@@ -402,6 +421,17 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
 
 fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map<String, Value>) {
     remove_non_empty_string(&mut source, target, "trace_id");
+    remove_non_empty_string(&mut source, target, "parent_request_id");
+    remove_non_empty_string(&mut source, target, "client_request_id");
+    remove_non_empty_string(&mut source, target, "client_trace_id");
+    remove_non_empty_string(&mut source, target, "asset_action");
+    remove_non_empty_string(&mut source, target, "usage_scope");
+    remove_non_empty_string(&mut source, target, "client_capture_scope");
+    remove_non_empty_string(&mut source, target, "provider_response_capture_state");
+    remove_non_empty_string(&mut source, target, "client_response_capture_state");
+    remove_non_empty_string(&mut source, target, "realtime_admission_id");
+    remove_non_empty_string(&mut source, target, "provider_request_order_id");
+    remove_bool(&mut source, target, "realtime_admission_defer_failure");
     remove_non_empty_string(&mut source, target, "client_ip");
     remove_non_empty_string(&mut source, target, "user_agent");
     remove_non_empty_string(&mut source, target, "client_family");
@@ -435,6 +465,8 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_null_value(&mut source, target, "billing_snapshot");
     remove_non_empty_string(&mut source, target, "billing_snapshot_schema_version");
     remove_non_empty_string(&mut source, target, "billing_snapshot_status");
+    remove_bool(&mut source, target, "billing_treat_as_completed");
+    remove_bool(&mut source, target, "billing_treat_as_void");
     remove_non_null_value(&mut source, target, "settlement_snapshot");
     remove_non_empty_string(&mut source, target, "settlement_snapshot_schema_version");
     remove_non_null_value(&mut source, target, "billing_dimensions");
@@ -889,6 +921,17 @@ mod tests {
                 "db_timings_ms": db_timings_ms
             })
         );
+    }
+
+    #[test]
+    fn sanitizes_realtime_attempt_identity() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "provider_request_order_id": "attempt-1",
+            "untrusted": "drop-me",
+        })))
+        .expect("attempt identity should remain");
+
+        assert_eq!(metadata, json!({"provider_request_order_id": "attempt-1"}));
     }
 
     #[test]

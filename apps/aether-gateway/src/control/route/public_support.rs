@@ -237,6 +237,7 @@ pub(super) fn classify_public_support_route(
                 | "/api/dashboard/recent-requests"
                 | "/api/dashboard/provider-status"
                 | "/api/dashboard/daily-stats"
+                | "/api/dashboard/realtime"
         )
     {
         let route_kind = match normalized_path {
@@ -244,6 +245,7 @@ pub(super) fn classify_public_support_route(
             "/api/dashboard/recent-requests" => "recent_requests",
             "/api/dashboard/provider-status" => "provider_status",
             "/api/dashboard/daily-stats" => "daily_stats",
+            "/api/dashboard/realtime" => "realtime",
             _ => "stats",
         };
         Some(classified(

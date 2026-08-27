@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aether_contracts::{ExecutionPlan, RequestBody};
 use aether_data_contracts::repository::asset_library::{
@@ -18,6 +18,9 @@ use aether_provider_transport::{
 use aether_scheduler_core::{
     extract_global_priority_for_format, SchedulerMinimalCandidateSelectionCandidate,
     SchedulerRequestCandidateStatusUpdate,
+};
+use aether_usage_runtime::{
+    build_sync_terminal_usage_outcome, build_terminal_usage_event_from_outcome,
 };
 use axum::body::{Body, Bytes};
 use axum::http::{self, HeaderMap, Response, StatusCode, Uri};
@@ -202,6 +205,108 @@ struct AssetCandidateTerminalGuard {
     armed: bool,
 }
 
+#[derive(Clone, Default)]
+struct AssetResponseAuditCapture {
+    provider_headers: std::collections::BTreeMap<String, String>,
+    provider_body_json: Option<Value>,
+    provider_body_base64: Option<String>,
+    client_headers: std::collections::BTreeMap<String, String>,
+    client_body: Option<Value>,
+    telemetry: Option<aether_contracts::ExecutionTelemetry>,
+}
+
+impl AssetResponseAuditCapture {
+    fn from_execution_result(result: &aether_contracts::ExecutionResult) -> Self {
+        let provider_body_json = result
+            .body
+            .as_ref()
+            .and_then(|body| body.json_body.clone())
+            .or_else(|| execution_result_json(result));
+        let provider_body_base64 = result
+            .body
+            .as_ref()
+            .and_then(|body| body.body_bytes_b64.clone());
+        let client_body = provider_body_json.clone().or_else(|| {
+            provider_body_base64
+                .as_ref()
+                .map(|body| Value::String(body.clone()))
+        });
+        Self {
+            provider_headers: result.headers.clone(),
+            provider_body_json,
+            provider_body_base64,
+            client_headers: BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            client_body,
+            telemetry: result.telemetry.clone(),
+        }
+    }
+
+    fn with_client_body(mut self, body: Value) -> Self {
+        self.client_body = Some(body);
+        self
+    }
+}
+
+#[derive(Clone)]
+struct AssetCandidateTerminalOutcome {
+    status: RequestCandidateStatus,
+    status_code: u16,
+    error_type: Option<String>,
+    error_message: Option<String>,
+    response: AssetResponseAuditCapture,
+}
+
+impl AssetCandidateTerminalOutcome {
+    fn failed(
+        status_code: u16,
+        error_type: impl Into<String>,
+        error_message: impl Into<String>,
+        response: AssetResponseAuditCapture,
+    ) -> Self {
+        Self {
+            status: RequestCandidateStatus::Failed,
+            status_code,
+            error_type: Some(error_type.into()),
+            error_message: Some(error_message.into()),
+            response,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            status: RequestCandidateStatus::Cancelled,
+            status_code: 499,
+            error_type: Some("asset_request_cancelled".to_string()),
+            error_message: Some(
+                "Ark asset request was cancelled before terminal finalization".to_string(),
+            ),
+            response: AssetResponseAuditCapture::default(),
+        }
+    }
+
+    fn success(status_code: u16, response: AssetResponseAuditCapture) -> Self {
+        Self {
+            status: RequestCandidateStatus::Success,
+            status_code,
+            error_type: None,
+            error_message: None,
+            response,
+        }
+    }
+
+    fn report_kind(&self) -> &'static str {
+        match self.status {
+            RequestCandidateStatus::Success => "ark_asset_sync_success",
+            RequestCandidateStatus::Failed => "ark_asset_sync_failed",
+            RequestCandidateStatus::Cancelled => "ark_asset_sync_cancelled",
+            _ => "ark_asset_sync_failed",
+        }
+    }
+}
+
 impl AssetCandidateTerminalGuard {
     fn new(
         state: &AppState,
@@ -220,29 +325,24 @@ impl AssetCandidateTerminalGuard {
         }
     }
 
-    async fn finish(
-        &mut self,
-        status: RequestCandidateStatus,
-        status_code: Option<u16>,
-        error_type: Option<&str>,
-        error_message: Option<String>,
-    ) {
+    async fn finish(&mut self, outcome: AssetCandidateTerminalOutcome) {
         if !self.armed {
             return;
         }
-        record_asset_candidate_terminal(
-            &self.state,
-            &self.plan,
-            self.report_context.as_ref(),
+        // Transfer ownership before the first await. If the request is dropped
+        // while usage or candidate persistence is in flight, the process-
+        // lifetime continuation still completes the same candidate identity
+        // instead of racing it with a synthetic 499.
+        self.armed = false;
+        let handoff = spawn_asset_candidate_terminal(
+            self.state.clone(),
+            self.plan.clone(),
+            self.report_context.clone(),
             self.started_at_unix_ms,
             self.started_at,
-            status,
-            status_code,
-            error_type,
-            error_message,
-        )
-        .await;
-        self.armed = false;
+            outcome,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), handoff).await;
     }
 }
 
@@ -257,25 +357,39 @@ impl Drop for AssetCandidateTerminalGuard {
         let report_context = self.report_context.clone();
         let started_at_unix_ms = self.started_at_unix_ms;
         let started_at = self.started_at;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                record_asset_candidate_terminal(
-                    &state,
-                    &plan,
-                    report_context.as_ref(),
-                    started_at_unix_ms,
-                    started_at,
-                    RequestCandidateStatus::Cancelled,
-                    Some(499),
-                    Some("asset_request_cancelled"),
-                    Some(
-                        "Ark asset request was cancelled before terminal finalization".to_string(),
-                    ),
-                )
-                .await;
-            });
-        }
+        // Drop can run while the request runtime is being cancelled or shut
+        // down. The usage runtime is process-lifetime and owns both halves of
+        // the usage -> candidate handoff.
+        spawn_asset_candidate_terminal(
+            state,
+            plan,
+            report_context,
+            started_at_unix_ms,
+            started_at,
+            AssetCandidateTerminalOutcome::cancelled(),
+        );
     }
+}
+
+fn spawn_asset_candidate_terminal(
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    started_at_unix_ms: u64,
+    started_at: Instant,
+    outcome: AssetCandidateTerminalOutcome,
+) -> tokio::task::JoinHandle<()> {
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        record_asset_candidate_terminal(
+            &state,
+            &plan,
+            report_context.as_ref(),
+            started_at_unix_ms,
+            started_at,
+            outcome,
+        )
+        .await;
+    })
 }
 
 fn begin_asset_candidate_attempt(
@@ -292,6 +406,24 @@ fn begin_asset_candidate_attempt(
         report_context.clone(),
         started_at_unix_ms,
         started_at,
+    )
+}
+
+fn asset_action_lifecycle_request_id(parent_request_id: &str, action: ArkAssetAction) -> String {
+    let parent_fragment = parent_request_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(24)
+        .collect::<String>();
+    format!(
+        "asset-{}-{}-{}",
+        if parent_fragment.is_empty() {
+            "request"
+        } else {
+            parent_fragment.as_str()
+        },
+        action.as_str().to_ascii_lowercase(),
+        uuid::Uuid::new_v4().simple()
     )
 }
 
@@ -1335,8 +1467,10 @@ async fn execute_action(
     let proxy = state
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&transport.snapshot)
         .await;
+    let lifecycle_request_id =
+        asset_action_lifecycle_request_id(request_context.trace_id.as_str(), action);
     let mut plan = ExecutionPlan {
-        request_id: request_context.trace_id.clone(),
+        request_id: lifecycle_request_id.clone(),
         candidate_id: None,
         provider_name: Some(transport.snapshot.provider.name.clone()),
         provider_id: transport.snapshot.provider.id.clone(),
@@ -1357,7 +1491,7 @@ async fn execute_action(
         stream: false,
         client_api_format: ARK_ASSET_API_FORMAT.to_string(),
         provider_api_format: ARK_ASSET_API_FORMAT.to_string(),
-        model_name: None,
+        model_name: Some(ASSET_ROUTING_MODEL.to_string()),
         proxy,
         transport_profile: resolve_transport_profile(&transport.snapshot),
         timeouts: resolve_transport_execution_timeouts(&transport.snapshot),
@@ -1365,14 +1499,25 @@ async fn execute_action(
     let started_at = Instant::now();
     let started_at_unix_ms = crate::clock::current_unix_ms();
     let mut report_context = Some(json!({
-        "request_id": request_context.trace_id,
+        "request_id": lifecycle_request_id,
+        "parent_request_id": request_context.trace_id,
+        "client_request_id": request_context.trace_id,
+        "client_trace_id": request_context.trace_id,
         "user_id": caller.user_id,
         "api_key_id": caller.api_key_id,
         "client_api_format": ARK_ASSET_API_FORMAT,
         "provider_api_format": ARK_ASSET_API_FORMAT,
+        "model": ASSET_ROUTING_MODEL,
+        "mapped_model": ASSET_ROUTING_MODEL,
         "request_path": request_context.request_path,
         "request_query_string": request_context.request_query_string,
         "asset_action": action.as_str(),
+        "usage_scope": "asset_upstream_action",
+        "client_capture_scope": "asset_action_projection",
+        "original_headers": crate::headers::collect_control_headers(headers),
+        "original_request_body": body,
+        "provider_request_headers": &plan.headers,
+        "provider_request_body": provider_body,
     }));
     let mut terminal_guard = begin_asset_candidate_attempt(
         state,
@@ -1380,6 +1525,13 @@ async fn execute_action(
         &mut report_context,
         started_at_unix_ms,
         started_at,
+    );
+    // Seed the audit lifecycle immediately after the guard owns the exact
+    // child request/candidate identity. Ordered terminal handoff for that same
+    // child id cannot overtake this pending write, even if the HTTP task drops.
+    state.usage_runtime.record_pending(
+        state.usage_lifecycle_data_state().as_ref(),
+        aether_usage_runtime::build_lifecycle_usage_seed(&plan, report_context.as_ref()),
     );
     crate::request_candidate_runtime::record_local_request_candidate_status(
         state,
@@ -1406,12 +1558,12 @@ async fn execute_action(
             Ok(permit) => permit,
             Err(error) => {
                 terminal_guard
-                    .finish(
-                        RequestCandidateStatus::Failed,
-                        Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
-                        Some("gateway_admission_failed"),
-                        Some(error.into_message()),
-                    )
+                    .finish(AssetCandidateTerminalOutcome::failed(
+                        StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        "gateway_admission_failed",
+                        error.into_message(),
+                        AssetResponseAuditCapture::default(),
+                    ))
                     .await;
                 return Err(AssetServiceError::new(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -1423,7 +1575,7 @@ async fn execute_action(
     let result =
         match crate::execution_runtime::execute_execution_runtime_sync_plan_with_report_context(
             state,
-            Some(request_context.trace_id.as_str()),
+            Some(plan.request_id.as_str()),
             &plan,
             report_context.as_ref(),
         )
@@ -1432,18 +1584,19 @@ async fn execute_action(
             Ok(result) => result,
             Err(error) => {
                 terminal_guard
-                    .finish(
-                        RequestCandidateStatus::Failed,
-                        None,
-                        Some("execution_runtime_unavailable"),
-                        Some(error.into_message()),
-                    )
+                    .finish(AssetCandidateTerminalOutcome::failed(
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        "execution_runtime_unavailable",
+                        error.into_message(),
+                        AssetResponseAuditCapture::default(),
+                    ))
                     .await;
                 return Err(AssetServiceError::unavailable(
                     "Ark 素材库上游请求暂时不可用",
                 ));
             }
         };
+    let response_audit = AssetResponseAuditCapture::from_execution_result(&result);
     let mut status = StatusCode::from_u16(result.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut body = execution_result_json(&result).unwrap_or(Value::Null);
     if visual_validation_result_is_pending(action, &body) {
@@ -1462,12 +1615,12 @@ async fn execute_action(
                 )
             });
         terminal_guard
-            .finish(
-                RequestCandidateStatus::Failed,
-                Some(status.as_u16()),
-                Some(&error_type),
-                Some(error_message),
-            )
+            .finish(AssetCandidateTerminalOutcome::failed(
+                status.as_u16(),
+                error_type,
+                error_message,
+                response_audit.clone().with_client_body(body.clone()),
+            ))
             .await;
         return Err(AssetServiceError::provider(status, body));
     }
@@ -1477,22 +1630,20 @@ async fn execute_action(
             .filter(|status| !status.is_success())
             .unwrap_or(StatusCode::BAD_GATEWAY);
         terminal_guard
-            .finish(
-                RequestCandidateStatus::Failed,
-                Some(status.as_u16()),
-                Some("upstream_protocol_error"),
-                Some("Ark 素材库上游返回协议错误".to_string()),
-            )
+            .finish(AssetCandidateTerminalOutcome::failed(
+                status.as_u16(),
+                "upstream_protocol_error",
+                "Ark 素材库上游返回协议错误",
+                response_audit.clone().with_client_body(body.clone()),
+            ))
             .await;
         return Err(AssetServiceError::provider(status, body));
     }
     terminal_guard
-        .finish(
-            RequestCandidateStatus::Success,
-            Some(status.as_u16()),
-            None,
-            None,
-        )
+        .finish(AssetCandidateTerminalOutcome::success(
+            status.as_u16(),
+            response_audit.with_client_body(body.clone()),
+        ))
         .await;
     Ok(ActionResponse { body })
 }
@@ -1504,26 +1655,169 @@ async fn record_asset_candidate_terminal(
     report_context: Option<&Value>,
     started_at_unix_ms: u64,
     started_at: Instant,
-    status: RequestCandidateStatus,
-    status_code: Option<u16>,
-    error_type: Option<&str>,
-    error_message: Option<String>,
+    outcome: AssetCandidateTerminalOutcome,
 ) {
-    crate::request_candidate_runtime::record_local_request_candidate_status(
-        state,
-        plan,
-        report_context,
-        SchedulerRequestCandidateStatusUpdate {
-            status,
-            status_code,
-            error_type: error_type.map(ToOwned::to_owned),
-            error_message,
-            latency_ms: Some(started_at.elapsed().as_millis() as u64),
-            started_at_unix_ms: Some(started_at_unix_ms),
-            finished_at_unix_ms: Some(crate::clock::current_unix_ms()),
-        },
-    )
-    .await;
+    let latency_ms = started_at.elapsed().as_millis() as u64;
+    let mut telemetry =
+        outcome
+            .response
+            .telemetry
+            .clone()
+            .unwrap_or(aether_contracts::ExecutionTelemetry {
+                ttfb_ms: None,
+                elapsed_ms: None,
+                upstream_bytes: None,
+            });
+    telemetry.elapsed_ms = telemetry.elapsed_ms.or(Some(latency_ms));
+    let mut terminal_report_context = report_context.cloned().unwrap_or_else(|| json!({}));
+    if !terminal_report_context.is_object() {
+        terminal_report_context = json!({"report_context": terminal_report_context});
+    }
+    if let Some(context) = terminal_report_context.as_object_mut() {
+        context.insert(
+            "provider_response_headers".to_string(),
+            serde_json::to_value(&outcome.response.provider_headers).unwrap_or_else(|_| json!({})),
+        );
+        // Always insert this field, including an empty object. That explicitly
+        // represents no client response observation and prevents the sync
+        // builder from falling back to (and mislabelling) provider headers.
+        context.insert(
+            "client_response_headers".to_string(),
+            serde_json::to_value(&outcome.response.client_headers).unwrap_or_else(|_| json!({})),
+        );
+        context.insert(
+            "provider_response_capture_state".to_string(),
+            Value::String(
+                if outcome.response.provider_body_json.is_some()
+                    || outcome.response.provider_body_base64.is_some()
+                {
+                    "inline"
+                } else {
+                    "none"
+                }
+                .to_string(),
+            ),
+        );
+        context.insert(
+            "client_response_capture_state".to_string(),
+            Value::String(
+                if outcome.response.client_body.is_some() {
+                    "inline"
+                } else {
+                    "none"
+                }
+                .to_string(),
+            ),
+        );
+    }
+    let payload = crate::usage::GatewaySyncReportRequest {
+        trace_id: plan.request_id.clone(),
+        report_kind: outcome.report_kind().to_string(),
+        report_context: Some(terminal_report_context.clone()),
+        status_code: outcome.status_code,
+        headers: outcome.response.provider_headers.clone(),
+        body_json: outcome.response.provider_body_json.clone(),
+        client_body_json: outcome.response.client_body.clone(),
+        body_base64: outcome.response.provider_body_base64.clone(),
+        telemetry: Some(telemetry),
+    };
+
+    let usage_persisted = if !state.usage_runtime.is_enabled() {
+        true
+    } else {
+        let mut usage_outcome =
+            build_sync_terminal_usage_outcome(plan, Some(&terminal_report_context), &payload);
+        usage_outcome.request_type = "asset_library".to_string();
+        usage_outcome.terminal_error_message = outcome.error_message.clone();
+        usage_outcome.terminal_failure_category = outcome.error_type.clone();
+        usage_outcome.billing_treat_as_completed = false;
+        match build_terminal_usage_event_from_outcome(usage_outcome) {
+            Ok(mut event) => {
+                // Asset-library actions are audit lifecycle children, not AI
+                // inference units. Even a verified upstream 2xx is explicitly
+                // zero-cost/void and can never debit the parent request once
+                // per page or per internal action.
+                event.data.billing_treat_as_void = Some(true);
+                state
+                    .usage_runtime
+                    .record_terminal_event_direct_with_handoff(
+                        state.usage_lifecycle_data_state().as_ref(),
+                        event,
+                    )
+                    .await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event_name = "asset_usage_terminal_event_build_failed",
+                    log_type = "event",
+                    request_id = %plan.request_id,
+                    candidate_id = ?plan.candidate_id,
+                    error = %error,
+                    "gateway could not build the Ark asset terminal usage event"
+                );
+                false
+            }
+        }
+    };
+
+    let terminal_unix_ms = crate::clock::current_unix_ms();
+    let desired_update = SchedulerRequestCandidateStatusUpdate {
+        status: outcome.status,
+        status_code: Some(outcome.status_code),
+        error_type: outcome.error_type.clone(),
+        error_message: outcome.error_message.clone(),
+        latency_ms: Some(latency_ms),
+        started_at_unix_ms: Some(started_at_unix_ms),
+        finished_at_unix_ms: Some(terminal_unix_ms),
+    };
+
+    if !usage_persisted {
+        // Never publish a terminal candidate ahead of its audit/billing row.
+        // The durable usage runtime retains failed handoffs for retry; once the
+        // row is visible, reconciliation publishes this exact terminal state.
+        crate::request_candidate_runtime::record_local_request_candidate_status(
+            state,
+            plan,
+            report_context,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Streaming,
+                status_code: Some(outcome.status_code),
+                error_type: Some("usage_terminal_handoff_unconfirmed".to_string()),
+                error_message: Some(
+                    "Ark asset terminal usage persistence was not confirmed".to_string(),
+                ),
+                latency_ms: Some(latency_ms),
+                started_at_unix_ms: Some(started_at_unix_ms),
+                finished_at_unix_ms: None,
+            },
+        )
+        .await;
+        crate::request_candidate_runtime::spawn_terminal_candidate_reconciliation(
+            state.clone(),
+            plan.clone(),
+            report_context.cloned(),
+            desired_update,
+        );
+        return;
+    }
+
+    let candidate_persisted =
+        crate::request_candidate_runtime::record_local_request_candidate_status(
+            state,
+            plan,
+            report_context,
+            desired_update.clone(),
+        )
+        .await;
+    if !candidate_persisted {
+        crate::request_candidate_runtime::spawn_candidate_persistence_retry_after_usage_handoff(
+            state.clone(),
+            plan.clone(),
+            report_context.cloned(),
+            desired_update,
+            None,
+        );
+    }
 }
 
 async fn create_group(
@@ -5619,12 +5913,15 @@ mod tests {
         AssetLibraryReadRepository, AssetLibraryWriteRepository, InMemoryAssetLibraryRepository,
     };
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data::repository::users::{InMemoryUserReadRepository, StoredUserAuthRecord};
     use aether_data_contracts::repository::candidates::{
         PublicHealthStatusCount, PublicHealthTimelineBucket, RequestCandidateReadRepository,
         RequestCandidateWriteRepository, StoredRequestCandidate, UpsertRequestCandidateRecord,
     };
+    use aether_data_contracts::repository::usage::UsageReadRepository;
     use aether_data_contracts::DataLayerError;
+    use aether_usage_runtime::UsageRuntimeConfig;
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use tokio::sync::Notify;
@@ -5758,10 +6055,42 @@ mod tests {
         }
     }
 
+    fn enabled_usage_runtime_config() -> UsageRuntimeConfig {
+        UsageRuntimeConfig {
+            enabled: true,
+            enqueue_retry_initial_backoff_ms: 1,
+            enqueue_retry_max_backoff_ms: 1,
+            ..UsageRuntimeConfig::default()
+        }
+    }
+
+    async fn record_pending_candidate_for_test(
+        state: &AppState,
+        plan: &ExecutionPlan,
+        report_context: Option<&Value>,
+    ) {
+        crate::request_candidate_runtime::record_local_request_candidate_status(
+            state,
+            plan,
+            report_context,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Pending,
+                status_code: None,
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(1),
+                finished_at_unix_ms: None,
+            },
+        )
+        .await;
+    }
+
     #[derive(Default)]
     struct BlockingPendingRequestCandidateRepository {
         inner: InMemoryRequestCandidateRepository,
         block_next_pending: AtomicBool,
+        fail_next_terminal: AtomicBool,
         pending_persisted: Notify,
         release_pending: Notify,
     }
@@ -5770,6 +6099,13 @@ mod tests {
         fn blocking() -> Self {
             Self {
                 block_next_pending: AtomicBool::new(true),
+                ..Self::default()
+            }
+        }
+
+        fn fail_first_terminal() -> Self {
+            Self {
+                fail_next_terminal: AtomicBool::new(true),
                 ..Self::default()
             }
         }
@@ -5844,6 +6180,17 @@ mod tests {
             &self,
             candidate: UpsertRequestCandidateRecord,
         ) -> Result<StoredRequestCandidate, DataLayerError> {
+            if matches!(
+                candidate.status,
+                RequestCandidateStatus::Success
+                    | RequestCandidateStatus::Failed
+                    | RequestCandidateStatus::Cancelled
+            ) && self.fail_next_terminal.swap(false, Ordering::SeqCst)
+            {
+                return Err(DataLayerError::sql(
+                    "injected first terminal candidate write failure",
+                ));
+            }
             let should_block = candidate.status == RequestCandidateStatus::Pending
                 && self.block_next_pending.swap(false, Ordering::SeqCst);
             let stored = self.inner.upsert(candidate).await?;
@@ -5868,13 +6215,16 @@ mod tests {
     #[tokio::test]
     async fn dropped_asset_candidate_is_finalized_as_cancelled() {
         let repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let state = AppState::new()
             .expect("gateway state")
             .with_data_state_for_tests(
-                GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
-                    &repository,
-                )),
-            );
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(enabled_usage_runtime_config());
         let request_id = "asset-cancelled-request";
         let plan = candidate_plan(request_id, "asset-cancelled-candidate");
         let report_context = Some(json!({
@@ -5930,18 +6280,33 @@ mod tests {
             Some("asset_request_cancelled")
         );
         assert!(candidate.finished_at_unix_ms.is_some());
+        let usage = usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage read")
+            .expect("cancelled asset usage should exist before candidate terminal");
+        assert_eq!(usage.status, "cancelled");
+        assert_eq!(usage.billing_status, "void");
+        assert_eq!(usage.status_code, Some(499));
+        assert!(usage.response_headers.is_none());
+        assert!(usage.response_body.is_none());
+        assert!(usage.client_response_headers.is_none());
+        assert!(usage.client_response_body.is_none());
     }
 
     #[tokio::test]
     async fn cancellation_during_pending_persist_is_finalized_as_cancelled() {
         let repository = Arc::new(BlockingPendingRequestCandidateRepository::blocking());
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let state = AppState::new()
             .expect("gateway state")
             .with_data_state_for_tests(
-                GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
-                    &repository,
-                )),
-            );
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(enabled_usage_runtime_config());
         let request_id = "asset-cancelled-during-pending";
         let task = tokio::spawn({
             let state = state.clone();
@@ -6017,6 +6382,355 @@ mod tests {
             Some("asset_request_cancelled")
         );
         assert!(candidate.finished_at_unix_ms.is_some());
+        let usage = usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage read")
+            .expect("cancelled usage should survive request task cancellation");
+        assert_eq!(usage.status, "cancelled");
+        assert_eq!(usage.billing_status, "void");
+        assert_eq!(usage.status_code, Some(499));
+    }
+
+    #[tokio::test]
+    async fn asset_success_persists_full_usage_audit_before_candidate_terminal() {
+        let candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = AppState::new()
+            .expect("gateway state")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(enabled_usage_runtime_config());
+        let request_id = "asset-success-audit-request";
+        let plan = candidate_plan(request_id, "asset-success-audit-candidate");
+        let report_context = json!({
+            "candidate_id": "asset-success-audit-candidate",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-1",
+            "api_key_id": "api-key-1",
+            "client_api_format": ARK_ASSET_API_FORMAT,
+            "provider_api_format": ARK_ASSET_API_FORMAT,
+            "model": ASSET_ROUTING_MODEL,
+            "mapped_model": ASSET_ROUTING_MODEL,
+            "original_headers": {
+                "authorization": "Bearer secret-client-token",
+                "content-type": "application/json"
+            },
+            "original_request_body": {"GroupId": "group-1"},
+            "provider_request_headers": {
+                "authorization": "HMAC secret-provider-signature",
+                "content-type": "application/json"
+            },
+            "provider_request_body": {"GroupId": "group-1", "Action": "ListAssets"},
+            "asset_action": "ListAssets"
+        });
+        record_pending_candidate_for_test(&state, &plan, Some(&report_context)).await;
+
+        record_asset_candidate_terminal(
+            &state,
+            &plan,
+            Some(&report_context),
+            1,
+            Instant::now(),
+            AssetCandidateTerminalOutcome::success(
+                200,
+                AssetResponseAuditCapture {
+                    provider_headers: BTreeMap::from([
+                        ("content-type".to_string(), "application/json".to_string()),
+                        (
+                            "set-cookie".to_string(),
+                            "provider-secret-cookie".to_string(),
+                        ),
+                    ]),
+                    provider_body_json: Some(json!({"Result": {"Items": [1]}})),
+                    provider_body_base64: None,
+                    client_headers: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                    client_body: Some(json!({"Result": {"Items": [1]}})),
+                    telemetry: Some(aether_contracts::ExecutionTelemetry {
+                        ttfb_ms: Some(7),
+                        elapsed_ms: Some(11),
+                        upstream_bytes: Some(31),
+                    }),
+                },
+            ),
+        )
+        .await;
+
+        let usage = usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage read")
+            .expect("completed asset usage should be durable");
+        assert_eq!(usage.status, "completed");
+        assert_eq!(usage.status_code, Some(200));
+        assert_eq!(usage.request_type.as_deref(), Some("asset_library"));
+        assert_eq!(usage.billing_status, "void");
+        assert_eq!(usage.total_cost_usd, 0.0);
+        assert_eq!(usage.actual_total_cost_usd, 0.0);
+        assert_eq!(usage.model, ASSET_ROUTING_MODEL);
+        assert_eq!(usage.response_time_ms, Some(11));
+        assert_eq!(usage.first_byte_time_ms, Some(7));
+        assert_eq!(usage.request_body, Some(json!({"GroupId": "group-1"})));
+        assert_eq!(
+            usage.provider_request_body,
+            Some(json!({"GroupId": "group-1", "Action": "ListAssets"}))
+        );
+        assert_eq!(usage.response_body, Some(json!({"Result": {"Items": [1]}})));
+        assert_eq!(
+            usage.client_response_body,
+            Some(json!({"Result": {"Items": [1]}}))
+        );
+        assert_ne!(
+            usage
+                .request_headers
+                .as_ref()
+                .and_then(|headers| headers.get("authorization"))
+                .and_then(Value::as_str),
+            Some("Bearer secret-client-token")
+        );
+        assert_ne!(
+            usage
+                .response_headers
+                .as_ref()
+                .and_then(|headers| headers.get("set-cookie"))
+                .and_then(Value::as_str),
+            Some("provider-secret-cookie")
+        );
+        let candidates = candidate_repository
+            .list_by_request_id(request_id)
+            .await
+            .expect("candidate read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn asset_terminal_candidate_stays_non_terminal_when_usage_handoff_is_unconfirmed() {
+        let candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("gateway state")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
+                    &candidate_repository,
+                )),
+            )
+            .with_usage_runtime_for_tests(enabled_usage_runtime_config());
+        let request_id = "asset-usage-unconfirmed-request";
+        let plan = candidate_plan(request_id, "asset-usage-unconfirmed-candidate");
+        let report_context = json!({
+            "candidate_id": "asset-usage-unconfirmed-candidate",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-1",
+            "api_key_id": "api-key-1",
+            "client_api_format": ARK_ASSET_API_FORMAT,
+            "provider_api_format": ARK_ASSET_API_FORMAT,
+            "model": ASSET_ROUTING_MODEL,
+        });
+        record_pending_candidate_for_test(&state, &plan, Some(&report_context)).await;
+
+        record_asset_candidate_terminal(
+            &state,
+            &plan,
+            Some(&report_context),
+            1,
+            Instant::now(),
+            AssetCandidateTerminalOutcome::success(200, AssetResponseAuditCapture::default()),
+        )
+        .await;
+
+        let candidates = candidate_repository
+            .list_by_request_id(request_id)
+            .await
+            .expect("candidate read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Streaming);
+        assert!(candidates[0].finished_at_unix_ms.is_none());
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("usage_terminal_handoff_unconfirmed")
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_candidate_write_retries_after_durable_usage_handoff() {
+        let candidate_repository =
+            Arc::new(BlockingPendingRequestCandidateRepository::fail_first_terminal());
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = AppState::new()
+            .expect("gateway state")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(enabled_usage_runtime_config());
+        let request_id = "asset-candidate-retry-request";
+        let plan = candidate_plan(request_id, "asset-candidate-retry-candidate");
+        let report_context = json!({
+            "candidate_id": "asset-candidate-retry-candidate",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-1",
+            "api_key_id": "api-key-1",
+            "client_api_format": ARK_ASSET_API_FORMAT,
+            "provider_api_format": ARK_ASSET_API_FORMAT,
+            "model": ASSET_ROUTING_MODEL,
+        });
+        record_pending_candidate_for_test(&state, &plan, Some(&report_context)).await;
+
+        record_asset_candidate_terminal(
+            &state,
+            &plan,
+            Some(&report_context),
+            1,
+            Instant::now(),
+            AssetCandidateTerminalOutcome::success(200, AssetResponseAuditCapture::default()),
+        )
+        .await;
+
+        let candidate = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let candidates = candidate_repository
+                    .list_by_request_id(request_id)
+                    .await
+                    .expect("candidate read");
+                if let Some(candidate) = candidates
+                    .into_iter()
+                    .find(|candidate| candidate.status == RequestCandidateStatus::Success)
+                {
+                    break candidate;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate terminal retry should finish");
+        assert_eq!(candidate.status_code, Some(200));
+        let usage = usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage read")
+            .expect("usage must be durable before candidate retry");
+        assert_eq!(usage.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn repeated_asset_actions_under_one_client_trace_use_independent_lifecycles() {
+        let candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = AppState::new()
+            .expect("gateway state")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(enabled_usage_runtime_config());
+        let parent_request_id = "asset-client-trace-paginated";
+        let child_request_ids = [
+            asset_action_lifecycle_request_id(parent_request_id, ArkAssetAction::ListAssets),
+            asset_action_lifecycle_request_id(parent_request_id, ArkAssetAction::ListAssets),
+        ];
+        assert_ne!(child_request_ids[0], child_request_ids[1]);
+
+        for (index, child_request_id) in child_request_ids.iter().enumerate() {
+            let candidate_id = format!("asset-page-candidate-{index}");
+            let plan = candidate_plan(child_request_id, &candidate_id);
+            let report_context = json!({
+                "request_id": child_request_id,
+                "parent_request_id": parent_request_id,
+                "client_request_id": parent_request_id,
+                "client_trace_id": parent_request_id,
+                "candidate_id": candidate_id,
+                "candidate_index": index,
+                "retry_index": 0,
+                "user_id": "user-1",
+                "api_key_id": "api-key-1",
+                "client_api_format": ARK_ASSET_API_FORMAT,
+                "provider_api_format": ARK_ASSET_API_FORMAT,
+                "model": ASSET_ROUTING_MODEL,
+                "mapped_model": ASSET_ROUTING_MODEL,
+                "asset_action": "ListAssets",
+                "usage_scope": "asset_upstream_action",
+                "client_capture_scope": "asset_action_projection",
+            });
+            state.usage_runtime.record_pending(
+                state.usage_lifecycle_data_state().as_ref(),
+                aether_usage_runtime::build_lifecycle_usage_seed(&plan, Some(&report_context)),
+            );
+            record_pending_candidate_for_test(&state, &plan, Some(&report_context)).await;
+            record_asset_candidate_terminal(
+                &state,
+                &plan,
+                Some(&report_context),
+                1,
+                Instant::now(),
+                AssetCandidateTerminalOutcome::success(
+                    200,
+                    AssetResponseAuditCapture {
+                        provider_headers: BTreeMap::from([(
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        )]),
+                        provider_body_json: Some(json!({"Result": {"Page": index + 1}})),
+                        provider_body_base64: None,
+                        client_headers: BTreeMap::from([(
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        )]),
+                        client_body: Some(json!({"Result": {"Page": index + 1}})),
+                        telemetry: Some(aether_contracts::ExecutionTelemetry {
+                            ttfb_ms: Some(1),
+                            elapsed_ms: Some(2),
+                            upstream_bytes: Some(16),
+                        }),
+                    },
+                ),
+            )
+            .await;
+        }
+
+        for child_request_id in &child_request_ids {
+            let usage = usage_repository
+                .find_by_request_id(child_request_id)
+                .await
+                .expect("usage read")
+                .expect("each asset page should have its own terminal usage");
+            assert_eq!(usage.status, "completed");
+            assert_eq!(usage.billing_status, "void");
+            assert_eq!(usage.total_cost_usd, 0.0);
+            assert_eq!(usage.actual_total_cost_usd, 0.0);
+            let metadata = usage
+                .request_metadata
+                .as_ref()
+                .expect("parent request linkage should be auditable");
+            assert_eq!(
+                metadata.get("parent_request_id").and_then(Value::as_str),
+                Some(parent_request_id)
+            );
+            assert_eq!(
+                metadata.get("client_request_id").and_then(Value::as_str),
+                Some(parent_request_id)
+            );
+            let candidates = candidate_repository
+                .list_by_request_id(child_request_id)
+                .await
+                .expect("candidate read");
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].request_id.as_str(), child_request_id.as_str());
+            assert_eq!(candidates[0].status, RequestCandidateStatus::Success);
+        }
     }
 
     #[test]

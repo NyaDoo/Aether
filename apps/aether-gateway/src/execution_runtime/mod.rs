@@ -43,7 +43,8 @@ pub(crate) use self::fallback::{
     should_stop_local_candidate_failover_stream, should_stop_local_candidate_failover_sync,
 };
 pub(crate) use self::response_header_rules::{
-    apply_endpoint_response_header_rules, attach_provider_response_headers_to_report_context,
+    apply_endpoint_response_header_rules_best_effort,
+    attach_provider_response_headers_to_report_context,
 };
 pub(crate) use crate::orchestration::{
     append_local_failover_policy_to_value, LocalFailoverAnalysis, LocalFailoverDecision,
@@ -125,8 +126,12 @@ pub async fn prewarm_direct_h2c_sender_cache_from_env_for_startup(
 
 pub(crate) use stream::{
     execute_execution_runtime_stream, execute_execution_runtime_stream_with_retry_scope,
+    spawn_stream_attempt_cancelled_terminal_handoff,
 };
-pub(crate) use stream_pump::build_direct_execution_frame_stream;
+pub(crate) use stream_pump::{
+    build_direct_execution_frame_stream, build_direct_execution_frame_stream_with_realtime,
+    RealtimeStreamContext,
+};
 pub(crate) use sync::{
     execute_execution_runtime_sync, execute_execution_runtime_sync_with_retry_scope,
     maybe_build_local_sync_finalize_response, maybe_build_local_video_error_response,
@@ -140,8 +145,21 @@ pub(crate) use transport::{
     DirectSyncExecutionRuntime, DirectUpstreamStreamExecution, ExecutionRuntimeTransportError,
 };
 pub(crate) use transport_failure::{
-    build_transport_error_stop_response, mark_stream_candidate_watchdog_terminal_started,
-    StreamCandidateWatchdogProgress,
+    build_transport_error_client_response, build_transport_error_stop_response,
+    build_transport_error_stop_response_with_progress, current_stream_candidate_watchdog_progress,
+    get_or_register_stream_candidate_watchdog_progress,
+    mark_stream_candidate_watchdog_retry_handoff_complete_for_request,
+    mark_stream_candidate_watchdog_terminal_started,
+    mark_stream_candidate_watchdog_terminal_started_for_request,
+    mark_stream_candidate_watchdog_terminal_started_with_progress,
+    register_stream_candidate_watchdog_progress, rekey_stream_candidate_watchdog_progress,
+    spawn_transport_error_terminal_handoff,
+    stream_candidate_watchdog_allows_intermediate_for_request,
+    stream_candidate_watchdog_progress_for_current_or_request,
+    stream_candidate_watchdog_progress_for_request, stream_candidate_watchdog_retry_aborted,
+    stream_candidate_watchdog_stop_requested, stream_candidate_watchdog_terminal_started,
+    try_claim_stream_candidate_intermediate_for_request, try_claim_stream_candidate_terminal_owner,
+    unregister_stream_candidate_watchdog_progress, StreamCandidateWatchdogProgress,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

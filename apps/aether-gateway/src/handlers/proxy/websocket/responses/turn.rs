@@ -37,15 +37,17 @@ use super::observation::ResponsesStructuredTerminalObserver;
 use super::settlement::attempt_facts_for_outcome;
 use crate::ai_serving::{build_openai_responses_stream_plan_from_decision, AiExecutionDecision};
 use crate::clock::current_unix_ms;
+use crate::constants::{REALTIME_ADMISSION_AT_MS_HEADER, REALTIME_ADMISSION_ID_HEADER};
 use crate::control::{
     execution_plan_balance_capacity_rejection, GatewayControlDecision, GatewayLocalAuthRejection,
 };
 use crate::execution_runtime::attach_provider_response_headers_to_report_context;
 use crate::execution_runtime::attempt_lifecycle::{
-    attempt_billing_is_void, AttemptBodyCapture, AttemptClientDelivery, AttemptLifecycleSeed,
-    AttemptProviderOutcome, AttemptStageGuard, AttemptTerminalFacts, AttemptTerminalFactsInput,
-    ExecutionAttemptLifecycle,
+    attempt_billing_is_void, AttemptBeginTerminalGuard, AttemptBodyCapture, AttemptClientDelivery,
+    AttemptLifecycleSeed, AttemptProviderOutcome, AttemptStageGuard, AttemptTerminalFacts,
+    AttemptTerminalFactsInput, ExecutionAttemptLifecycle,
 };
+use crate::handlers::proxy::websocket::ingress::WebSocketRealtimeAdmission;
 use crate::orchestration::{
     apply_local_stream_failure_effects, apply_local_stream_success_effects,
     release_local_pool_key_lease, release_pool_key_lease_from_report_context,
@@ -54,7 +56,7 @@ use crate::orchestration::{
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_status,
 };
-use crate::usage::{submit_stream_report, GatewayStreamReportRequest};
+use crate::usage::GatewayStreamReportRequest;
 use crate::{AppState, GatewayError};
 
 const WEBSOCKET_CONNECTION_TRACE_REPORT_CONTEXT_FIELD: &str = "websocket_connection_trace_id";
@@ -243,6 +245,9 @@ pub(super) struct ResponsesProviderAttempt {
     provider_request_order_id: String,
     provider_headers: BTreeMap<String, String>,
     observer: ResponsesStructuredTerminalObserver,
+    /// Monotonic per-attempt sequence used to make direct streaming token
+    /// increments replay-safe in the shared realtime event store.
+    realtime_token_sequence: u64,
     provider_capture: AttemptBodyCapture,
     client_capture: AttemptBodyCapture,
     upstream_bytes: u64,
@@ -415,6 +420,105 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
         }
     };
 
+    // WebSocket upgrades bypass the ordinary HTTP proxy handler, so reserve
+    // the site-wide realtime admission at the per-turn boundary instead of at
+    // connection open.  Keep the guard armed until lifecycle ownership has
+    // been established: cancellation while the pending usage/candidate rows
+    // are being created then compensates the marker via `Drop`.  Once the
+    // attempt exists, terminal usage events own failure rollback and the
+    // marker remains for successful idempotency.
+    // A WebSocket connection can carry many response.create turns. Give each
+    // logical turn a deterministic private realtime identity.  The logical
+    // turn id is present in the prepared report context and remains unchanged
+    // when a quota retry creates a replacement provider attempt; using a new
+    // random id there would count one client request twice.
+    let realtime_extension = parts.extensions.get::<WebSocketRealtimeAdmission>();
+    let logical_turn_id = report_context
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|context| context.get(WEBSOCKET_LOGICAL_TURN_ID_REPORT_CONTEXT_FIELD))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let realtime_admission_id = realtime_extension
+        .map(|value| {
+            logical_turn_id
+                .map(|turn_id| format!("{}:ws:{turn_id}", value.id))
+                .unwrap_or_else(|| format!("{}:ws:{}", value.id, uuid::Uuid::now_v7()))
+        })
+        .or_else(|| {
+            parts
+                .headers
+                .get(REALTIME_ADMISSION_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|connection_id| {
+                    logical_turn_id
+                        .map(|turn_id| format!("{connection_id}:ws:{turn_id}"))
+                        .unwrap_or_else(|| format!("{connection_id}:ws:{}", uuid::Uuid::now_v7()))
+                })
+        })
+        .unwrap_or_else(|| format!("ws:{}", uuid::Uuid::now_v7()));
+    let realtime_admission_at_ms = realtime_extension
+        .map(|value| value.at_ms)
+        .or_else(|| {
+            parts
+                .headers
+                .get(REALTIME_ADMISSION_AT_MS_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .or_else(|| {
+            parts
+                .extensions
+                .get::<crate::middleware::GatewayRequestAcceptedWallClockMs>()
+                .map(|value| value.0)
+        })
+        .unwrap_or(candidate_started_at_unix_ms);
+    if let Some(Value::Object(context)) = report_context.as_mut() {
+        context.insert(
+            "realtime_admission_id".to_string(),
+            Value::String(realtime_admission_id.clone()),
+        );
+    }
+    let realtime_admission = match crate::dashboard_realtime::reserve_admission_at(
+        state.runtime_state(),
+        realtime_admission_id.as_str(),
+        realtime_admission_at_ms,
+    )
+    .await
+    {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => None,
+        Err(error) => {
+            // Realtime accounting is fail-open.  A shared-counter outage must
+            // not reject an otherwise valid WebSocket turn.
+            warn!(
+                event_name = "dashboard_realtime_ws_admission_record_failed",
+                log_type = "ops",
+                request_id = %realtime_admission_id,
+                error = %error,
+                "failed to record realtime WebSocket turn admission"
+            );
+            None
+        }
+    };
+
+    // `ExecutionAttemptLifecycle::begin` performs the pending usage write and
+    // initial candidate write.  Arm a fallback before entering it: the
+    // Responses WebSocket owner can time out/cancel this future before an
+    // `ActiveProviderAttempt` exists, in which case its Drop guard would not
+    // otherwise be able to close the pending usage row.
+    let mut begin_guard = AttemptBeginTerminalGuard::new(
+        state,
+        &plan,
+        plan.request_id.as_str(),
+        report_kind.as_str(),
+        report_context.as_ref(),
+        candidate_started_at_unix_ms,
+        Instant::now(),
+    );
     let lifecycle = ExecutionAttemptLifecycle::begin(
         state,
         AttemptLifecycleSeed {
@@ -427,6 +531,10 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
         },
     )
     .await;
+    if let Some(guard) = realtime_admission {
+        guard.handoff();
+    }
+    begin_guard.disarm();
 
     Ok(ResponsesProviderAttempt {
         lifecycle,
@@ -435,6 +543,7 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
         provider_request_order_id: uuid::Uuid::now_v7().to_string(),
         provider_headers: BTreeMap::new(),
         observer: ResponsesStructuredTerminalObserver::default(),
+        realtime_token_sequence: 0,
         provider_capture: AttemptBodyCapture::default(),
         client_capture: AttemptBodyCapture::default(),
         upstream_bytes: 0,
@@ -577,6 +686,26 @@ impl ResponsesProviderAttempt {
         }
     }
 
+    /// Mark this attempt's terminal failure as an intermediate provider
+    /// failure.  Transparent quota retry keeps the logical request's RPM
+    /// admission alive while the next provider attempt is planned; the
+    /// realtime usage observer reads this flag and defers rollback until the
+    /// logical retry either succeeds or is definitively abandoned.
+    pub(super) fn defer_realtime_admission_failure_rollback(&mut self) {
+        let mut report_context = self
+            .lifecycle
+            .take_report_context()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        if let Value::Object(object) = &mut report_context {
+            object.insert(
+                crate::dashboard_realtime::REALTIME_ADMISSION_DEFER_FAILURE_METADATA_KEY
+                    .to_string(),
+                Value::Bool(true),
+            );
+        }
+        self.lifecycle.set_report_context(Some(report_context));
+    }
+
     pub(super) fn set_provider_response_headers(&mut self, headers: BTreeMap<String, String>) {
         let observed_at_unix_ms = current_unix_ms();
         let report_context = attach_provider_response_headers_to_report_context(
@@ -677,6 +806,46 @@ impl ResponsesProviderAttempt {
         None
     }
 
+    /// Publish usage increments as soon as a structured upstream frame is
+    /// observed.  Responses WebSocket turns can remain open for minutes, so
+    /// waiting for `settle` would make the dashboard TPM lag and would omit
+    /// tokens from an in-flight response entirely.
+    pub(super) fn drain_realtime_token_deltas(&mut self, state: &AppState) {
+        let deltas = self.observer.take_token_deltas();
+        if deltas.is_empty() {
+            return;
+        }
+        let request_id = self.lifecycle.trace_id().to_string();
+        let admission_id = self
+            .lifecycle
+            .report_context()
+            .and_then(|context| context.get("realtime_admission_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let candidate_id = self.lifecycle.plan().candidate_id.clone();
+        for delta in deltas {
+            let token_delta = delta.inclusive_token_total();
+            if token_delta == 0 {
+                continue;
+            }
+            let sequence = self.realtime_token_sequence;
+            self.realtime_token_sequence = self.realtime_token_sequence.saturating_add(1);
+            state
+                .usage_runtime
+                .record_realtime_token_delta_with_attempt(
+                    request_id.clone(),
+                    admission_id.clone(),
+                    candidate_id.clone(),
+                    Some(self.provider_request_order_id.clone()),
+                    current_unix_ms(),
+                    token_delta,
+                    Some(sequence),
+                );
+        }
+    }
+
     pub(super) fn observe_invalid_upstream_text(
         &mut self,
         text: &str,
@@ -742,6 +911,11 @@ impl ResponsesProviderAttempt {
             self.lifecycle.set_report_context(report_context);
         }
         let summary = self.finish_summary(facts);
+        // `finish` can parse a usage object from a final buffered event. Drain
+        // once more after summary construction so the terminal increment is
+        // visible even when the final frame did not pass through the relay
+        // loop's per-frame hook.
+        self.drain_realtime_token_deltas(state);
         let telemetry = self.telemetry();
         let terminal_error_body = self.terminal_error_body.take();
 

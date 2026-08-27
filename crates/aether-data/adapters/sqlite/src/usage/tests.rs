@@ -84,6 +84,117 @@ fn sqlite_usage_upsert_guards_candidate_identity_metadata_and_routing_from_late_
         .contains("OR (\"usage\".status = 'streaming' AND excluded.status = 'pending')"));
 }
 
+#[test]
+fn sqlite_stale_cleanup_never_promotes_from_a_candidate_marker() {
+    let source = include_str!("../usage.rs");
+    assert!(!source.contains("SELECT_COMPLETED_REQUEST_CANDIDATES_SQL"));
+    assert!(!source.contains("UPDATE_RECOVERED_STALE_USAGE_SQL"));
+    assert!(!source.contains("SET status = 'completed',\n    status_code = 200"));
+    assert!(super::SELECT_STALE_PENDING_USAGE_BATCH_SQL
+        .contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+    assert!(super::UPDATE_FAILED_VOID_STALE_USAGE_SQL
+        .contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+}
+
+#[test]
+fn sqlite_stale_cleanup_uses_snapshot_authoritative_exact_candidate_identity() {
+    let select = super::SELECT_STALE_PENDING_USAGE_BATCH_SQL;
+    assert!(select.contains("LEFT JOIN usage_routing_snapshots"));
+    assert!(select.contains("WHEN usage_routing_snapshots.request_id IS NOT NULL"));
+    assert!(select.contains("THEN usage_routing_snapshots.candidate_id"));
+    assert!(select.contains("ELSE \"usage\".candidate_id"));
+    assert!(
+        !select.contains("COALESCE(usage_routing_snapshots.candidate_id, \"usage\".candidate_id)")
+    );
+
+    let update = super::UPDATE_FAILED_PENDING_CANDIDATES_SQL;
+    assert!(update.contains("WHERE request_id = ?"));
+    assert!(update.contains("AND id = ?"));
+    assert!(update.contains("status IN ('pending', 'streaming')"));
+}
+
+#[test]
+fn sqlite_stale_cleanup_guards_effective_settlement_snapshots_and_terminal_usage() {
+    let stale_sql = super::SELECT_STALE_PENDING_USAGE_BATCH_SQL;
+    for field in [
+        "request_type",
+        "api_format",
+        "endpoint_kind",
+        "endpoint_api_format",
+        "provider_endpoint_kind",
+    ] {
+        let normalized = format!(
+            "LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(\"usage\".{field}, ''), ' ', ''), CHAR(9), ''), CHAR(10), ''), CHAR(11), ''), CHAR(12), ''), CHAR(13), ''))"
+        );
+        assert!(
+            stale_sql.contains(&format!("{normalized} = 'video'")),
+            "stale cleanup must exclude exact video contracts from {field}"
+        );
+        assert!(
+            stale_sql.contains(&format!("{normalized} LIKE '%:video'")),
+            "stale cleanup must exclude whitespace-normalized provider:video contracts from {field}"
+        );
+    }
+    assert!(stale_sql.contains(
+        "COALESCE(usage_settlement_snapshots.billing_status, \"usage\".billing_status) = 'pending'"
+    ));
+    assert!(stale_sql.contains(
+        "COALESCE(usage_settlement_snapshots.finalized_at, \"usage\".finalized_at) IS NULL"
+    ));
+    assert!(stale_sql.contains("\"usage\".billing_status = 'pending'"));
+    assert!(stale_sql.contains("\"usage\".finalized_at IS NULL"));
+    let sql = super::UPDATE_FAILED_VOID_STALE_USAGE_SQL;
+    assert!(sql.contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+    assert!(sql.contains("billing_status = 'pending'"));
+    assert!(sql.contains("finalized_at IS NULL"));
+    assert!(sql.contains("billing_status = 'void'"));
+    assert!(sql.contains("NOT EXISTS"));
+    assert!(sql.contains("settlement.billing_status <> 'pending'"));
+    assert!(sql.contains("settlement.finalized_at IS NOT NULL"));
+}
+
+#[tokio::test]
+async fn sqlite_stale_cleanup_excludes_video_suffix_with_runtime_whitespace() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    for (request_id, contract) in [
+        ("video-space", "openai: video"),
+        ("video-tab", "openai:\tvideo\r\n"),
+        ("ordinary-chat", "openai: chat"),
+    ] {
+        sqlx::query(
+            r#"
+INSERT INTO "usage" (
+  id, request_id, provider_name, model, request_type, status,
+  billing_status, finalized_at, created_at_unix_ms, updated_at_unix_secs
+)
+VALUES (?, ?, 'provider', 'model', ?, 'completed', 'pending', NULL, 1, 1)
+"#,
+        )
+        .bind(format!("usage-{request_id}"))
+        .bind(request_id)
+        .bind(contract)
+        .execute(&pool)
+        .await
+        .expect("usage fixture should insert");
+    }
+
+    let request_ids: Vec<String> = sqlx::query_scalar(super::SELECT_STALE_PENDING_USAGE_BATCH_SQL)
+        .bind(2_i64)
+        .bind(100_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("stale selector should execute");
+    assert_eq!(request_ids, vec!["ordinary-chat".to_string()]);
+}
+
 #[tokio::test]
 async fn sqlite_provider_performance_can_skip_timeline() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -920,6 +1031,18 @@ WHERE request_id = 'canonical-snapshots'
     assert!(after_late.candidate_id.is_none());
     assert_eq!(after_late.total_cost_usd, 0.0);
     assert_eq!(after_late.trace_id(), Some("terminal"));
+
+    // A conflicting terminal billing event from a late attempt must not replace
+    // the first settled outcome (or its finalized timestamp/snapshot).
+    let late_void = sample_usage("canonical-snapshots", "completed", "void", 1_004);
+    let after_late_void = writer
+        .upsert(late_void)
+        .await
+        .expect("late SQLite void usage should return terminal record");
+    assert_eq!(after_late_void.status, "completed");
+    assert_eq!(after_late_void.billing_status, "settled");
+    assert_eq!(after_late_void.total_cost_usd, 0.0);
+    assert_eq!(after_late_void.finalized_at_unix_secs, Some(2_000));
 }
 
 #[tokio::test]
@@ -948,6 +1071,15 @@ async fn sqlite_usage_cleanup_matches_policy_windows_and_targets() {
             .await
             .expect("usage should seed");
     }
+    repository
+        .upsert(sample_usage(
+            "cleanup-unresolved",
+            "completed",
+            "pending",
+            10,
+        ))
+        .await
+        .expect("unresolved usage should seed");
 
     sqlx::query(
         r#"
@@ -969,6 +1101,16 @@ WHERE request_id = 'cleanup-legacy';
 UPDATE "usage"
 SET request_headers = '{"new":true}', request_body = '{"new":true}'
 WHERE request_id = 'cleanup-new';
+UPDATE "usage"
+SET request_headers = '{"retain":true}',
+    response_headers = '{"retain":true}',
+    request_body = '{"retain":true}',
+    response_body = '{"retain":true}',
+    finalized_at = NULL
+WHERE request_id = 'cleanup-unresolved';
+UPDATE usage_settlement_snapshots
+SET billing_status = 'pending', finalized_at = NULL
+WHERE request_id = 'cleanup-unresolved';
 
 INSERT INTO usage_body_blobs (body_ref, request_id, body_field, payload_gzip)
 VALUES ('usage-body://cleanup-stale-body/request_body', 'cleanup-stale-body', 'request_body', X'1F8B');
@@ -1118,6 +1260,28 @@ VALUES (
     .expect("new usage should load");
     assert!(new_fields.0.is_some());
     assert!(new_fields.1.is_some());
+
+    let unresolved_fields: (
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        r#"
+SELECT COUNT(*), request_headers, response_headers, request_body, response_body
+FROM "usage"
+WHERE request_id = 'cleanup-unresolved'
+"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("unresolved usage evidence should load");
+    assert_eq!(unresolved_fields.0, 1);
+    assert!(unresolved_fields.1.is_some());
+    assert!(unresolved_fields.2.is_some());
+    assert!(unresolved_fields.3.is_some());
+    assert!(unresolved_fields.4.is_some());
 }
 
 #[tokio::test]
@@ -1405,8 +1569,10 @@ async fn sqlite_usage_write_repository_allows_authoritative_completed_recovery()
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool);
+    let mut failed = sample_usage("request-recovery", "failed", "void", 1_000);
+    failed.candidate_id = Some("recovered-candidate".to_string());
     repository
-        .upsert(sample_usage("request-recovery", "failed", "void", 1_000))
+        .upsert(failed)
         .await
         .expect("void failure should upsert");
 
@@ -1436,6 +1602,38 @@ async fn sqlite_usage_write_repository_allows_authoritative_completed_recovery()
         recovered.provider_service_tier().as_deref(),
         Some("priority")
     );
+}
+
+#[tokio::test]
+async fn sqlite_usage_write_repository_rejects_recovery_from_another_candidate() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    seed_stats_targets(&pool).await;
+
+    let repository = SqliteUsageWriteRepository::new(pool);
+    let mut cancelled = sample_usage("request-recovery-mismatch", "cancelled", "void", 1_000);
+    cancelled.candidate_id = Some("candidate-a".to_string());
+    repository
+        .upsert(cancelled)
+        .await
+        .expect("void cancellation should upsert");
+
+    let mut late_success = sample_usage("request-recovery-mismatch", "completed", "pending", 1_001);
+    late_success.candidate_id = Some("candidate-b".to_string());
+    let stored = repository
+        .upsert(late_success)
+        .await
+        .expect("conflicting candidate should return stored terminal");
+
+    assert_eq!(stored.status, "cancelled");
+    assert_eq!(stored.billing_status, "void");
+    assert_eq!(stored.routing_candidate_id(), Some("candidate-a"));
 }
 
 #[tokio::test]
@@ -1536,13 +1734,86 @@ async fn sqlite_usage_write_repository_cleans_stale_pending_requests() {
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
     repository
-        .upsert(sample_usage("request-recovered", "streaming", "pending", 1))
+        // A terminal-looking row with no finalized billing is still an accounting shell.  A
+        // successful candidate (and even a 2xx status) must not promote it back to completed.
+        .upsert(sample_usage("request-recovered", "completed", "pending", 1))
         .await
         .expect("streaming usage should upsert");
+    repository
+        .upsert(sample_usage(
+            "request-active-streaming",
+            "streaming",
+            "pending",
+            1,
+        ))
+        .await
+        .expect("active streaming usage should upsert");
+    repository
+        .upsert(sample_usage(
+            "request-incomplete-success",
+            "streaming",
+            "pending",
+            1,
+        ))
+        .await
+        .expect("incomplete success usage should upsert");
+    repository
+        .upsert(sample_usage(
+            "request-success-with-active",
+            "streaming",
+            "pending",
+            1,
+        ))
+        .await
+        .expect("mixed candidate usage should upsert");
     repository
         .upsert(sample_usage("request-failed", "pending", "pending", 1))
         .await
         .expect("pending usage should upsert");
+    repository
+        .upsert(sample_usage(
+            "request-finalized-terminal",
+            "streaming",
+            "pending",
+            1,
+        ))
+        .await
+        .expect("finalized terminal usage should upsert");
+
+    // The cleanup guard deliberately refuses to overwrite a finalized usage row.  Make these
+    // synthetic stale rows represent the real in-flight shape before exercising recovery/failure.
+    sqlx::query(
+        r#"
+UPDATE "usage"
+SET finalized_at = NULL
+WHERE request_id IN (
+  'request-recovered',
+  'request-active-streaming',
+  'request-incomplete-success',
+  'request-success-with-active',
+  'request-failed'
+);
+UPDATE "usage"
+SET input_tokens = 0,
+    output_tokens = 0,
+    total_tokens = 0,
+    total_cost_usd = 0.0,
+    actual_total_cost_usd = 0.0
+WHERE request_id = 'request-recovered';
+UPDATE usage_settlement_snapshots
+SET finalized_at = NULL
+WHERE request_id IN (
+  'request-recovered',
+  'request-active-streaming',
+  'request-incomplete-success',
+  'request-success-with-active',
+  'request-failed'
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("stale usage rows should be unfinalized");
 
     sqlx::query(
         r#"
@@ -1552,11 +1823,26 @@ INSERT INTO request_candidates (
   candidate_index,
   retry_index,
   status,
+  status_code,
+  extra_data,
   is_cached,
-  created_at
+  created_at,
+  started_at,
+  finished_at
 ) VALUES
-  ('candidate-recovered', 'request-recovered', 0, 0, 'streaming', 0, 1),
-  ('candidate-failed', 'request-failed', 0, 0, 'pending', 0, 1)
+  ('candidate-recovered', 'request-recovered', 0, 0, 'success', 200,
+   '{"stream_completed":true}', 0, 1, 2, 3),
+  ('candidate-active-streaming', 'request-active-streaming', 0, 0, 'streaming', 200,
+   NULL, 0, 1, 2, NULL),
+  ('candidate-incomplete-success', 'request-incomplete-success', 0, 0, 'success', 200,
+   '{"stream_completed":true}', 0, 1, 2, NULL),
+  ('candidate-success-with-active-terminal', 'request-success-with-active', 0, 0, 'success', 200,
+   '{"stream_completed":true}', 0, 1, 2, 3),
+  ('candidate-success-with-active-open', 'request-success-with-active', 1, 0, 'streaming', 200,
+   NULL, 0, 1, 2, NULL),
+  ('candidate-failed', 'request-failed', 0, 0, 'pending', NULL, NULL, 0, 1, NULL, NULL),
+  ('candidate-finalized-terminal', 'request-finalized-terminal', 0, 0, 'success', 200,
+   '{"stream_completed":true}', 0, 1, 2, 3)
 "#,
     )
     .execute(&pool)
@@ -1564,19 +1850,60 @@ INSERT INTO request_candidates (
     .expect("request candidates should seed");
 
     let summary = repository
-        .cleanup_stale_pending_requests(2, 10, 5, 1)
+        .cleanup_stale_pending_requests(2, 10, 5, 10)
         .await
         .expect("cleanup should run");
-    assert_eq!(summary.recovered, 1);
-    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.recovered, 0);
+    assert_eq!(summary.failed, 5);
 
     let recovered = repository
         .find_by_request_id("request-recovered")
         .await
         .expect("recovered usage should load")
         .expect("recovered usage should exist");
-    assert_eq!(recovered.status, "completed");
-    assert_eq!(recovered.status_code, Some(200));
+    assert_eq!(recovered.status, "failed");
+    assert_eq!(recovered.status_code, Some(504));
+    assert_eq!(recovered.billing_status, "void");
+    assert_eq!(recovered.total_tokens, 0);
+    assert_eq!(recovered.total_cost_usd, 0.0);
+    assert_eq!(recovered.finalized_at_unix_secs, Some(10));
+
+    let active_streaming = repository
+        .find_by_request_id("request-active-streaming")
+        .await
+        .expect("active streaming usage should load")
+        .expect("active streaming usage should exist");
+    assert_eq!(active_streaming.status, "failed");
+    assert_eq!(active_streaming.status_code, Some(504));
+    assert_eq!(active_streaming.billing_status, "void");
+
+    let incomplete_success = repository
+        .find_by_request_id("request-incomplete-success")
+        .await
+        .expect("incomplete success usage should load")
+        .expect("incomplete success usage should exist");
+    assert_eq!(incomplete_success.status, "failed");
+    assert_eq!(incomplete_success.status_code, Some(504));
+    assert_eq!(incomplete_success.billing_status, "void");
+
+    let mixed_candidates = repository
+        .find_by_request_id("request-success-with-active")
+        .await
+        .expect("mixed candidate usage should load")
+        .expect("mixed candidate usage should exist");
+    assert_eq!(mixed_candidates.status, "failed");
+    assert_eq!(mixed_candidates.status_code, Some(504));
+    assert_eq!(mixed_candidates.billing_status, "void");
+
+    let finalized_terminal = repository
+        .find_by_request_id("request-finalized-terminal")
+        .await
+        .expect("finalized terminal usage should load")
+        .expect("finalized terminal usage should exist");
+    assert_eq!(finalized_terminal.status, "streaming");
+    assert_eq!(finalized_terminal.status_code, Some(200));
+    assert_eq!(finalized_terminal.billing_status, "pending");
+    assert_eq!(finalized_terminal.finalized_at_unix_secs, Some(1));
 
     let failed = repository
         .find_by_request_id("request-failed")
@@ -1593,7 +1920,7 @@ INSERT INTO request_candidates (
         r#"
 SELECT request_id, status, finished_at
 FROM request_candidates
-ORDER BY request_id
+ORDER BY request_id, candidate_index
 "#,
     )
     .fetch_all(&pool)
@@ -1603,13 +1930,38 @@ ORDER BY request_id
         candidate_statuses,
         vec![
             (
+                "request-active-streaming".to_string(),
+                "failed".to_string(),
+                Some(10_000)
+            ),
+            (
                 "request-failed".to_string(),
                 "failed".to_string(),
                 Some(10_000)
             ),
             (
+                "request-finalized-terminal".to_string(),
+                "success".to_string(),
+                Some(3)
+            ),
+            (
+                "request-incomplete-success".to_string(),
+                "success".to_string(),
+                None
+            ),
+            (
                 "request-recovered".to_string(),
                 "success".to_string(),
+                Some(3)
+            ),
+            (
+                "request-success-with-active".to_string(),
+                "success".to_string(),
+                Some(3)
+            ),
+            (
+                "request-success-with-active".to_string(),
+                "failed".to_string(),
                 Some(10_000)
             ),
         ]
@@ -1622,6 +1974,397 @@ ORDER BY request_id
         .await
         .expect("void settlement snapshot should load");
     assert_eq!(snapshot, ("void".to_string(), Some(10)));
+}
+
+#[tokio::test]
+async fn sqlite_stale_cleanup_skips_settled_void_snapshots_and_late_terminal_usage() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    seed_stats_targets(&pool).await;
+
+    let repository = SqliteUsageWriteRepository::new(pool.clone());
+    for request_id in [
+        "request-snapshot-settled",
+        "request-snapshot-void",
+        "request-late-terminal",
+    ] {
+        repository
+            .upsert(sample_usage(request_id, "streaming", "pending", 1))
+            .await
+            .expect("stale usage should upsert");
+    }
+
+    // Keep the first two rows active in the base table while their settlement snapshots already
+    // carry a terminal state.  The third row simulates a terminal writer winning just before a
+    // cleanup UPDATE; its persisted token fields must remain untouched.
+    sqlx::query(
+        r#"
+UPDATE "usage"
+SET finalized_at = NULL
+WHERE request_id IN (
+  'request-snapshot-settled',
+  'request-snapshot-void',
+  'request-late-terminal'
+);
+
+UPDATE usage_settlement_snapshots
+SET billing_status = CASE request_id
+      WHEN 'request-snapshot-settled' THEN 'settled'
+      WHEN 'request-snapshot-void' THEN 'void'
+    END,
+    finalized_at = CASE request_id
+      WHEN 'request-snapshot-settled' THEN 9
+      WHEN 'request-snapshot-void' THEN 10
+    END,
+    updated_at = 1
+WHERE request_id IN ('request-snapshot-settled', 'request-snapshot-void');
+
+DELETE FROM usage_settlement_snapshots
+WHERE request_id = 'request-late-terminal';
+
+UPDATE "usage"
+SET status = 'completed',
+    status_code = 200,
+    billing_status = 'settled',
+    finalized_at = 11,
+    input_tokens = 100,
+    output_tokens = 50,
+    total_tokens = 150,
+    total_cost_usd = 7.5,
+    actual_total_cost_usd = 7.5
+WHERE request_id = 'request-late-terminal';
+
+INSERT INTO request_candidates (
+  id, request_id, candidate_index, retry_index, status, status_code,
+  is_cached, created_at, started_at, finished_at
+) VALUES
+  ('candidate-snapshot-settled', 'request-snapshot-settled', 0, 0, 'streaming', 200,
+   0, 1, 2, NULL),
+  ('candidate-snapshot-void', 'request-snapshot-void', 0, 0, 'pending', NULL,
+   0, 1, NULL, NULL),
+  ('candidate-late-terminal', 'request-late-terminal', 0, 0, 'pending', NULL,
+   0, 1, NULL, NULL);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("terminal snapshots and candidates should seed");
+
+    let summary = repository
+        .cleanup_stale_pending_requests(2, 20, 5, 10)
+        .await
+        .expect("cleanup should run");
+    assert_eq!(summary.recovered, 0);
+    assert_eq!(summary.failed, 0);
+
+    let settled = repository
+        .find_by_request_id("request-snapshot-settled")
+        .await
+        .expect("settled snapshot usage should load")
+        .expect("settled snapshot usage should exist");
+    assert_eq!(settled.status, "streaming");
+    assert_eq!(settled.billing_status, "settled");
+    assert_eq!(settled.finalized_at_unix_secs, Some(9));
+
+    let voided = repository
+        .find_by_request_id("request-snapshot-void")
+        .await
+        .expect("void snapshot usage should load")
+        .expect("void snapshot usage should exist");
+    assert_eq!(voided.status, "streaming");
+    assert_eq!(voided.billing_status, "void");
+    assert_eq!(voided.finalized_at_unix_secs, Some(10));
+
+    let late_terminal = repository
+        .find_by_request_id("request-late-terminal")
+        .await
+        .expect("late terminal usage should load")
+        .expect("late terminal usage should exist");
+    assert_eq!(late_terminal.status, "completed");
+    assert_eq!(late_terminal.billing_status, "settled");
+    assert_eq!(late_terminal.finalized_at_unix_secs, Some(11));
+    assert_eq!(late_terminal.input_tokens, 100);
+    assert_eq!(late_terminal.output_tokens, 50);
+    assert_eq!(late_terminal.total_tokens, 150);
+    assert_eq!(late_terminal.total_cost_usd, 7.5);
+
+    let candidate_statuses = sqlx::query_as::<_, (String, String)>(
+        r#"
+SELECT request_id, status
+FROM request_candidates
+WHERE request_id IN (
+  'request-snapshot-settled',
+  'request-snapshot-void',
+  'request-late-terminal'
+)
+ORDER BY request_id
+"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("candidate statuses should load");
+    assert_eq!(
+        candidate_statuses,
+        vec![
+            ("request-late-terminal".to_string(), "pending".to_string()),
+            (
+                "request-snapshot-settled".to_string(),
+                "streaming".to_string()
+            ),
+            ("request-snapshot-void".to_string(), "pending".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sqlite_stale_cleanup_does_not_touch_candidates_when_usage_update_loses_race() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    seed_stats_targets(&pool).await;
+
+    let repository = SqliteUsageWriteRepository::new(pool.clone());
+    repository
+        .upsert(sample_usage(
+            "request-failure-race",
+            "streaming",
+            "pending",
+            1,
+        ))
+        .await
+        .expect("stale usage should upsert");
+    sqlx::query(
+        r#"
+UPDATE "usage" SET finalized_at = NULL WHERE request_id = 'request-failure-race';
+UPDATE usage_settlement_snapshots
+SET billing_status = 'pending', finalized_at = NULL
+WHERE request_id = 'request-failure-race';
+INSERT INTO request_candidates (
+  id, request_id, candidate_index, retry_index, status, is_cached,
+  created_at, started_at, finished_at
+) VALUES (
+  'candidate-failure-race', 'request-failure-race', 0, 0, 'pending', 0, 1, NULL, NULL
+);
+
+-- The trigger models a terminal settlement winning between stale-row SELECT and
+-- the guarded failure UPDATE.  RAISE(IGNORE) makes rows_affected() zero, so the
+-- cleanup must not write a void snapshot or fail the candidate.
+CREATE TRIGGER stale_cleanup_failure_race
+BEFORE UPDATE OF status ON "usage"
+WHEN OLD.request_id = 'request-failure-race' AND NEW.status = 'failed'
+BEGIN
+  UPDATE usage_settlement_snapshots
+  SET billing_status = 'settled', finalized_at = 99
+  WHERE request_id = OLD.request_id;
+  SELECT RAISE(IGNORE);
+END;
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("race trigger and candidate should seed");
+
+    let summary = repository
+        .cleanup_stale_pending_requests(2, 20, 5, 10)
+        .await
+        .expect("cleanup should run");
+    assert_eq!(summary.recovered, 0);
+    assert_eq!(summary.failed, 0);
+
+    let usage = repository
+        .find_by_request_id("request-failure-race")
+        .await
+        .expect("raced usage should load")
+        .expect("raced usage should exist");
+    assert_eq!(usage.status, "streaming");
+    assert_eq!(usage.billing_status, "settled");
+    assert_eq!(usage.finalized_at_unix_secs, Some(99));
+
+    let candidate = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT status, finished_at FROM request_candidates WHERE request_id = 'request-failure-race'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("raced candidate should load");
+    assert_eq!(candidate, ("pending".to_string(), None));
+}
+
+#[tokio::test]
+async fn sqlite_stale_cleanup_only_fails_exact_active_routing_candidate() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    seed_stats_targets(&pool).await;
+
+    let repository = SqliteUsageWriteRepository::new(pool.clone());
+    let mut exact_usage = sample_usage("request-exact-candidate", "streaming", "pending", 1);
+    exact_usage.candidate_id = Some("candidate-exact".to_string());
+    exact_usage.candidate_index = Some(0);
+    repository
+        .upsert(exact_usage)
+        .await
+        .expect("exact-candidate usage should upsert");
+
+    let mut null_snapshot_usage = sample_usage("request-null-snapshot", "streaming", "pending", 1);
+    null_snapshot_usage.candidate_id = Some("candidate-legacy".to_string());
+    null_snapshot_usage.candidate_index = Some(0);
+    repository
+        .upsert(null_snapshot_usage)
+        .await
+        .expect("null-snapshot usage should upsert");
+
+    let mut conflicting_usage =
+        sample_usage("request-conflicting-identity", "streaming", "pending", 1);
+    conflicting_usage.candidate_id = Some("candidate-foreign".to_string());
+    conflicting_usage.candidate_index = Some(0);
+    repository
+        .upsert(conflicting_usage)
+        .await
+        .expect("conflicting-candidate usage should upsert");
+
+    sqlx::query(
+        r#"
+UPDATE "usage"
+SET finalized_at = NULL
+WHERE request_id IN (
+  'request-exact-candidate',
+  'request-null-snapshot',
+  'request-conflicting-identity'
+);
+UPDATE usage_settlement_snapshots
+SET billing_status = 'pending', finalized_at = NULL
+WHERE request_id IN (
+  'request-exact-candidate',
+  'request-null-snapshot',
+  'request-conflicting-identity'
+);
+
+-- The routing snapshot row is authoritative by its presence. A NULL candidate
+-- identity must not fall back to the legacy usage.candidate_id value.
+INSERT INTO usage_routing_snapshots (request_id, candidate_id, candidate_index)
+VALUES ('request-null-snapshot', NULL, NULL)
+ON CONFLICT(request_id) DO UPDATE SET
+  candidate_id = NULL,
+  candidate_index = NULL;
+UPDATE "usage"
+SET candidate_id = 'candidate-legacy', candidate_index = 0
+WHERE request_id = 'request-null-snapshot';
+
+-- Preserve a deliberately conflicting routing identity: the authoritative
+-- candidate exists, but belongs to a different request. The cleanup update's
+-- request_id + id predicate must reject it.
+INSERT INTO usage_routing_snapshots (request_id, candidate_id, candidate_index)
+VALUES ('request-conflicting-identity', 'candidate-foreign', 0)
+ON CONFLICT(request_id) DO UPDATE SET
+  candidate_id = 'candidate-foreign',
+  candidate_index = 0;
+UPDATE "usage"
+SET candidate_id = 'candidate-conflict-own', candidate_index = 0
+WHERE request_id = 'request-conflicting-identity';
+
+INSERT INTO request_candidates (
+  id, request_id, candidate_index, retry_index, status, is_cached,
+  created_at, started_at, finished_at
+) VALUES
+  ('candidate-exact', 'request-exact-candidate', 0, 0, 'pending', 0, 1, NULL, NULL),
+  ('candidate-sibling', 'request-exact-candidate', 1, 0, 'streaming', 0, 1, 2, NULL),
+  ('candidate-terminal', 'request-exact-candidate', 2, 0, 'success', 0, 1, 2, 3),
+  ('candidate-legacy', 'request-null-snapshot', 0, 0, 'pending', 0, 1, NULL, NULL),
+  ('candidate-conflict-own', 'request-conflicting-identity', 0, 0, 'pending', 0, 1, NULL, NULL),
+  ('candidate-foreign', 'request-foreign-owner', 0, 0, 'streaming', 0, 1, 2, NULL);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("stale usages and candidates should seed");
+
+    let summary = repository
+        .cleanup_stale_pending_requests(2, 20, 5, 10)
+        .await
+        .expect("cleanup should run");
+    assert_eq!(summary.recovered, 0);
+    assert_eq!(summary.failed, 3);
+
+    for request_id in [
+        "request-exact-candidate",
+        "request-null-snapshot",
+        "request-conflicting-identity",
+    ] {
+        let usage = repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("cleaned usage should load")
+            .expect("cleaned usage should exist");
+        assert_eq!(usage.status, "failed");
+        assert_eq!(usage.billing_status, "void");
+        assert_eq!(usage.finalized_at_unix_secs, Some(20));
+    }
+
+    let candidates = sqlx::query_as::<_, (String, String, Option<i64>)>(
+        r#"
+SELECT id, status, finished_at
+FROM request_candidates
+WHERE id IN (
+  'candidate-exact',
+  'candidate-sibling',
+  'candidate-terminal',
+  'candidate-legacy',
+  'candidate-conflict-own',
+  'candidate-foreign'
+)
+ORDER BY id
+"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("candidate statuses should load");
+    assert_eq!(
+        candidates,
+        vec![
+            (
+                "candidate-conflict-own".to_string(),
+                "pending".to_string(),
+                None,
+            ),
+            (
+                "candidate-exact".to_string(),
+                "failed".to_string(),
+                Some(20_000),
+            ),
+            (
+                "candidate-foreign".to_string(),
+                "streaming".to_string(),
+                None,
+            ),
+            ("candidate-legacy".to_string(), "pending".to_string(), None,),
+            (
+                "candidate-sibling".to_string(),
+                "streaming".to_string(),
+                None,
+            ),
+            (
+                "candidate-terminal".to_string(),
+                "success".to_string(),
+                Some(3),
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1650,6 +2393,20 @@ async fn sqlite_usage_write_repository_cleanup_uses_failed_candidate_status_when
         .upsert(sample_usage("request-stuck", "pending", "pending", 1))
         .await
         .expect("pending usage should upsert");
+
+    sqlx::query(
+        r#"
+UPDATE "usage"
+SET finalized_at = NULL
+WHERE request_id IN ('request-upstream-reset', 'request-stuck');
+UPDATE usage_settlement_snapshots
+SET finalized_at = NULL
+WHERE request_id IN ('request-upstream-reset', 'request-stuck');
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("stale usage rows should be unfinalized");
 
     // request-upstream-reset has a failed candidate carrying a concrete 502 status
     // and a connection-reset message — cleanup should use them instead of 504.

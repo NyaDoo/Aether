@@ -14,6 +14,36 @@ export interface DashboardStat {
   icon: string
 }
 
+/** Accounting semantics attached to the realtime throughput snapshot. */
+export interface DashboardRealtimeSemantics {
+  rpm: 'accepted_non_failed_requests' | string
+  tpm: 'observed_token_deltas_including_failed' | string
+  window: 'trailing_60_seconds' | string
+  failed_requests: 'excluded_from_rpm_only' | string
+}
+
+/**
+ * Site-wide realtime throughput metrics.
+ *
+ * Unlike the aggregate dashboard response, this contract is intentionally
+ * numeric and carries the measurement window, server snapshot timestamp, and
+ * accounting semantics so consumers can render the value without guessing.
+ */
+export interface DashboardRealtimeMetrics {
+  /** Requests admitted during the measurement window, normalized per minute. */
+  rpm: number
+  /** Reported tokens during the measurement window, normalized per minute. */
+  tpm: number
+  /** Length of the measurement window in seconds. */
+  window_seconds: number
+  /** Server-side snapshot timestamp (RFC 3339). */
+  as_of: string
+  /** Explicit accounting semantics supplied by the server. */
+  semantics: DashboardRealtimeSemantics
+  /** Scope of the backing realtime counter. */
+  storage_scope: 'shared' | 'process'
+}
+
 export interface RecentRequest {
   id: string // UUID
   user: string
@@ -431,6 +461,18 @@ export const dashboardApi = {
       },
       30 * 1000
     )
+  },
+
+  /**
+   * 获取全站实时吞吐指标。
+   *
+   * This endpoint is deliberately not wrapped in cachedRequest: the dashboard
+   * polls it every few seconds and the server owns any short-lived cache or
+   * coalescing policy for this lightweight response.
+   */
+  async getRealtimeMetrics(): Promise<DashboardRealtimeMetrics> {
+    const response = await apiClient.get<DashboardRealtimeMetrics>('/api/dashboard/realtime')
+    return response.data
   },
 
   // 获取最近的请求记录

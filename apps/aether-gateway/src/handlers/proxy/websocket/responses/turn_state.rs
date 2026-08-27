@@ -29,6 +29,11 @@ pub(super) struct LogicalTurn {
     /// this logical turn. Quota retries reuse it instead of falling back to the
     /// connection's Upgrade-time authorization snapshot.
     pub(super) turn_control: Option<ResponsesWebSocketTurnControl>,
+    /// Wall-clock instant at which this logical `response.create` entered the
+    /// gateway.  A quota retry is the same logical request, so it must retain
+    /// the original timestamp instead of falling back to the connection
+    /// handshake time (or the retry/planner time).
+    pub(super) realtime_admission_at_ms: Option<u64>,
 }
 
 impl LogicalTurn {
@@ -41,11 +46,17 @@ impl LogicalTurn {
             retry_attempted: false,
             retry_unsafe_reason: None,
             turn_control: None,
+            realtime_admission_at_ms: None,
         }
     }
 
     pub(super) fn with_turn_control(mut self, turn_control: ResponsesWebSocketTurnControl) -> Self {
         self.turn_control = Some(turn_control);
+        self
+    }
+
+    pub(super) fn with_realtime_admission_at_ms(mut self, at_ms: u64) -> Self {
+        self.realtime_admission_at_ms = Some(at_ms);
         self
     }
 

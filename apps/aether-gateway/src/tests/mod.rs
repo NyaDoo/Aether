@@ -15,6 +15,7 @@ mod async_task;
 mod audit;
 mod concurrency;
 mod control;
+mod dashboard_realtime;
 mod files;
 mod frontdoor;
 mod proxy;

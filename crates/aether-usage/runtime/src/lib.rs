@@ -15,6 +15,8 @@ pub mod usage_mapper;
 pub mod worker;
 pub mod write;
 
+pub use executor::spawn_on_usage_background_runtime;
+
 pub use body_capture::{
     apply_usage_body_capture_policy_to_event, apply_usage_body_capture_policy_to_record,
     UsageBodyCaptureEngine,
@@ -42,7 +44,8 @@ pub use report_context::{
 };
 pub use runtime::{
     UsageBillingEventEnricher, UsageBodyCapturePolicy, UsageQueueHealthSnapshot,
-    UsageRequestRecordLevel, UsageRuntime, UsageRuntimeAccess, UsageRuntimeMetricsSnapshot,
+    UsageRealtimeMetricsSink, UsageRealtimeTokenDelta, UsageRequestRecordLevel, UsageRuntime,
+    UsageRuntimeAccess, UsageRuntimeMetricsSnapshot,
     DEFAULT_USAGE_REQUEST_BODY_CAPTURE_LIMIT_BYTES,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };

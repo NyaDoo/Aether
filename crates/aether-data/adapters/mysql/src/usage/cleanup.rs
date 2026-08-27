@@ -130,6 +130,23 @@ OR (
 )
 "#;
 
+// Cleanup is an evidence-retention operation, not a settlement decision.  A
+// pending/unfinalized mirror or snapshot is therefore enough to retain the
+// row, even when the other copy already looks terminal.  This conservative
+// predicate intentionally waits for both copies to stop looking unresolved.
+const RESOLVED_USAGE_CLEANUP_PREDICATE: &str = r#"
+NOT (
+  (`usage`.billing_status = 'pending' AND `usage`.finalized_at IS NULL)
+  OR EXISTS (
+    SELECT 1
+    FROM usage_settlement_snapshots AS cleanup_settlement
+    WHERE cleanup_settlement.request_id = `usage`.request_id
+      AND cleanup_settlement.billing_status = 'pending'
+      AND cleanup_settlement.finalized_at IS NULL
+  )
+)
+"#;
+
 #[derive(Debug)]
 struct CleanupRow {
     id: String,
@@ -354,13 +371,7 @@ pub(crate) async fn preview_usage_cleanup(
         0
     };
     let log = if targets.records {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM `usage` WHERE created_at_unix_ms < ?")
-                .bind(window.log_cutoff.timestamp())
-                .fetch_one(pool)
-                .await
-                .map_sql_err()?;
-        u64::try_from(count).unwrap_or(0)
+        count_candidates(pool, "1 = 1", window.log_cutoff, None).await?
     } else {
         0
     };
@@ -405,6 +416,7 @@ SELECT COUNT(*)
 FROM `usage`
 WHERE created_at_unix_ms < ?
   AND (? IS NULL OR created_at_unix_ms >= ?)
+  AND ({RESOLVED_USAGE_CLEANUP_PREDICATE})
   AND ({predicate})
 "#
     );
@@ -435,6 +447,7 @@ SELECT id, request_id
 FROM `usage`
 WHERE created_at_unix_ms < ?
   AND (? IS NULL OR created_at_unix_ms >= ?)
+  AND ({RESOLVED_USAGE_CLEANUP_PREDICATE})
   AND ({predicate})
 ORDER BY created_at_unix_ms ASC, id ASC
 LIMIT ?
@@ -459,6 +472,28 @@ LIMIT ?
         .collect()
 }
 
+async fn lock_resolved_usage_for_cleanup(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    request_id: &str,
+) -> Result<bool, DataLayerError> {
+    let sql = format!(
+        r#"
+SELECT request_id
+FROM `usage`
+WHERE request_id = ?
+  AND ({RESOLVED_USAGE_CLEANUP_PREDICATE})
+LIMIT 1
+FOR UPDATE
+"#
+    );
+    let request_id: Option<String> = sqlx::query_scalar(&sql)
+        .bind(request_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_sql_err()?;
+    Ok(request_id.is_some())
+}
+
 async fn delete_old_usage_records(
     pool: &MysqlPool,
     cutoff: DateTime<Utc>,
@@ -474,6 +509,9 @@ async fn delete_old_usage_records(
         let mut tx = pool.begin().await.map_sql_err()?;
         let mut deleted = 0usize;
         for row in rows {
+            if !lock_resolved_usage_for_cleanup(&mut tx, &row.request_id).await? {
+                continue;
+            }
             deleted += usize::try_from(
                 sqlx::query("DELETE FROM `usage` WHERE id = ?")
                     .bind(row.id)
@@ -513,6 +551,9 @@ async fn cleanup_headers(
         let row_count = rows.len();
         let mut tx = pool.begin().await.map_sql_err()?;
         for row in rows {
+            if !lock_resolved_usage_for_cleanup(&mut tx, &row.request_id).await? {
+                continue;
+            }
             sqlx::query(
                 r#"
 UPDATE `usage`
@@ -574,6 +615,9 @@ async fn cleanup_body_fields(
         let row_count = rows.len();
         let mut tx = pool.begin().await.map_sql_err()?;
         for row in rows {
+            if !lock_resolved_usage_for_cleanup(&mut tx, &row.request_id).await? {
+                continue;
+            }
             let update = if kind == BodyCleanupKind::All {
                 r#"
 UPDATE `usage`
@@ -697,6 +741,9 @@ async fn migrate_legacy_body_refs(
         let mut tx = pool.begin().await.map_sql_err()?;
         let mut migrated = 0usize;
         for row in rows {
+            if !lock_resolved_usage_for_cleanup(&mut tx, &row.request_id).await? {
+                continue;
+            }
             let metadata: Option<String> =
                 sqlx::query_scalar("SELECT request_metadata FROM `usage` WHERE id = ? LIMIT 1")
                     .bind(&row.id)
@@ -816,6 +863,10 @@ async fn externalize_detail_bodies(
         for row in rows {
             let (blobs, refs) = build_detached_bodies(&row)?;
             let mut tx = pool.begin().await.map_sql_err()?;
+            if !lock_resolved_usage_for_cleanup(&mut tx, &row.request_id).await? {
+                tx.rollback().await.map_sql_err()?;
+                continue;
+            }
             for blob in blobs {
                 sqlx::query(
                     r#"
@@ -893,6 +944,7 @@ SELECT id,
 FROM `usage`
 WHERE created_at_unix_ms < ?
   AND (? IS NULL OR created_at_unix_ms >= ?)
+  AND ({RESOLVED_USAGE_CLEANUP_PREDICATE})
   AND ({INLINE_OR_COMPRESSED_BODY_PREDICATE})
 ORDER BY created_at_unix_ms ASC, id ASC
 LIMIT ?
@@ -1132,7 +1184,21 @@ mod tests {
     use flate2::read::GzDecoder;
     use serde_json::json;
 
-    use super::{compress_json, legacy_body_ref_plan};
+    use super::{compress_json, legacy_body_ref_plan, RESOLVED_USAGE_CLEANUP_PREDICATE};
+
+    #[test]
+    fn mysql_cleanup_rechecks_pending_unfinalized_evidence() {
+        assert!(RESOLVED_USAGE_CLEANUP_PREDICATE
+            .contains("`usage`.billing_status = 'pending' AND `usage`.finalized_at IS NULL"));
+        assert!(RESOLVED_USAGE_CLEANUP_PREDICATE
+            .contains("cleanup_settlement.billing_status = 'pending'"));
+        assert!(
+            RESOLVED_USAGE_CLEANUP_PREDICATE.contains("cleanup_settlement.finalized_at IS NULL")
+        );
+
+        let source = include_str!("cleanup.rs");
+        assert!(source.matches("lock_resolved_usage_for_cleanup").count() >= 6);
+    }
 
     #[test]
     fn mysql_cleanup_legacy_body_ref_plan_preserves_unrelated_metadata() {

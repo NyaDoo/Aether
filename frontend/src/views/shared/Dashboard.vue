@@ -60,13 +60,25 @@
                 <p
                   class="mt-2 sm:mt-4 text-xl sm:text-3xl font-semibold text-foreground"
                 >
-                  {{ stat.value }}
+                  {{ getDisplayedStatValue(stat) }}
                 </p>
                 <p
-                  v-if="stat.subValue"
+                  v-if="getDisplayedStatSubValue(stat)"
                   class="mt-0.5 sm:mt-1 text-[10px] sm:text-sm text-muted-foreground"
                 >
-                  {{ stat.subValue }}
+                  {{ getDisplayedStatSubValue(stat) }}
+                </p>
+                <p
+                  v-if="isRealtimeStat(stat) && realtimeMetrics?.semantics"
+                  class="mt-0.5 text-[9px] sm:text-[10px] text-muted-foreground/80"
+                >
+                  口径：{{ formatRealtimeSemantics(realtimeMetrics.semantics) }}
+                </p>
+                <p
+                  v-if="isRealtimeStat(stat) && realtimeMetrics?.storage_scope"
+                  class="mt-0.5 text-[9px] sm:text-[10px] text-muted-foreground/80"
+                >
+                  范围：{{ formatRealtimeStorageScope(realtimeMetrics.storage_scope) }}
                 </p>
                 <div
                   v-if="stat.change || stat.extraBadge"
@@ -919,6 +931,8 @@ import { useAuthStore } from "@/stores/auth";
 import {
   dashboardApi,
   type DashboardStat,
+  type DashboardRealtimeMetrics,
+  type DashboardRealtimeSemantics,
   type DailyStat,
   type ProviderSummary,
   type SystemHealth,
@@ -1108,6 +1122,9 @@ const getStatIconColor = (_index: number): string => {
 
 // 统计数据
 const stats = ref<DashboardStatCard[]>([]);
+const realtimeMetrics = ref<DashboardRealtimeMetrics | null>(null);
+const realtimeMetricsError = ref(false);
+const realtimeMetricsLoading = ref(false);
 const todayStats = ref<{
   requests: number;
   tokens: number;
@@ -1182,6 +1199,15 @@ let dailyStatsLoadPromise: Promise<void> | null = null;
 let hasPendingDailyStatsLoad = false;
 let dailyStatsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+// 全站实时指标仅对真正的管理员开放；审计管理员仍沿用原有仪表盘数据。
+const canViewRealtimeMetrics = computed(() => authStore.isAdmin);
+const isPageVisible = ref(
+  typeof document === "undefined" ? true : !document.hidden,
+);
+const REALTIME_REFRESH_INTERVAL_MS = 5_000;
+let realtimeRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let realtimeRefreshPromise: Promise<void> | null = null;
+
 // 公告
 const announcements = ref<Announcement[]>([]);
 const loadingAnnouncements = ref(false);
@@ -1218,6 +1244,99 @@ const emptyStatPlaceholders = computed(() => {
 });
 
 const statSkeletonCount = computed(() => emptyStatPlaceholders.value.length);
+
+const REALTIME_STAT_NAME_PATTERN = /全站\s*RPM/i;
+const REALTIME_SEMANTIC_LABELS: Record<string, string> = {
+  admitted_requests_and_reported_tokens: "已接纳请求 / 已上报 Token",
+  accepted_non_failed_requests: "已接纳且未失败请求",
+  token_deltas: "Token 增量",
+  observed_token_deltas_including_failed: "Token 增量（含失败请求已产生部分）",
+  trailing_60_seconds: "滚动 60 秒窗口",
+  excluded: "已排除失败请求",
+  excluded_from_rpm_only: "失败请求仅从 RPM 排除",
+};
+
+function isRealtimeStat(stat: DashboardStatCard): boolean {
+  return REALTIME_STAT_NAME_PATTERN.test(stat.name);
+}
+
+function formatRealtimeRate(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "--";
+  }
+  return Number(value).toLocaleString("zh-CN", {
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatRealtimeWindow(windowSeconds: number): string {
+  if (!Number.isFinite(windowSeconds) || windowSeconds <= 0) {
+    return "实时窗口";
+  }
+  // Keep seconds for the common 60-second rate window so the displayed unit
+  // matches the API contract (RPM/TPM are normalized from this window).
+  if (windowSeconds <= 60 || windowSeconds % 60 !== 0) {
+    return `最近 ${Math.round(windowSeconds)} 秒`;
+  }
+  if (windowSeconds % 60 === 0) return `最近 ${windowSeconds / 60} 分钟`;
+  return `最近 ${Math.round(windowSeconds)} 秒`;
+}
+
+function formatRealtimeAsOf(asOf: string): string {
+  const date = new Date(asOf);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  return `截至 ${date.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  })}`;
+}
+
+function formatRealtimeSemantics(semantics: DashboardRealtimeSemantics): string {
+  const label = (value: string | undefined): string => {
+    const normalized = value?.trim() || "未说明";
+    return REALTIME_SEMANTIC_LABELS[normalized] || normalized;
+  };
+  return `请求：${label(semantics.rpm)} · Token：${label(semantics.tpm)} · ${label(semantics.window)} · 失败：${label(semantics.failed_requests)}`;
+}
+
+function formatRealtimeStorageScope(scope: DashboardRealtimeMetrics["storage_scope"]): string {
+  return scope === "shared" ? "全站共享" : "单进程";
+}
+
+const realtimeDisplayValue = computed(() => {
+  const metrics = realtimeMetrics.value;
+  if (!metrics) return null;
+  return `${formatRealtimeRate(metrics.rpm)} / ${formatTokens(metrics.tpm)}`;
+});
+
+const realtimeDisplaySubValue = computed(() => {
+  const metrics = realtimeMetrics.value;
+  if (!metrics) return null;
+  const windowLabel = formatRealtimeWindow(metrics.window_seconds);
+  const asOfLabel = formatRealtimeAsOf(metrics.as_of);
+  return `${windowLabel} · ${asOfLabel}`;
+});
+
+function getDisplayedStatValue(stat: DashboardStatCard): string {
+  if (isRealtimeStat(stat) && realtimeDisplayValue.value) {
+    return realtimeDisplayValue.value;
+  }
+  return stat.value;
+}
+
+function getDisplayedStatSubValue(stat: DashboardStatCard): string | undefined {
+  if (isRealtimeStat(stat)) {
+    if (realtimeDisplaySubValue.value) {
+      return realtimeMetricsError.value
+        ? `${realtimeDisplaySubValue.value} · 更新失败`
+        : realtimeDisplaySubValue.value;
+    }
+    if (realtimeMetricsLoading.value) return "正在获取实时数据…";
+    if (realtimeMetricsError.value) return "实时数据暂不可用 · 保留上次统计";
+  }
+  return stat.subValue;
+}
 
 const totalStats = computed(() => {
   if (dailyStats.value.length === 0) {
@@ -1507,12 +1626,134 @@ const dailyUsageTrendChartOptions = computed<ChartOptions<"line">>(() => {
   };
 });
 
+function parseRealtimeMetrics(value: unknown): DashboardRealtimeMetrics | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const rpm = candidate.rpm;
+  const tpm = candidate.tpm;
+  const windowSeconds = candidate.window_seconds;
+  const asOf = candidate.as_of;
+  const semantics = candidate.semantics;
+  const storageScope = candidate.storage_scope;
+
+  if (
+    typeof rpm !== "number" ||
+    !Number.isFinite(rpm) ||
+    typeof tpm !== "number" ||
+    !Number.isFinite(tpm) ||
+    typeof windowSeconds !== "number" ||
+    !Number.isFinite(windowSeconds) ||
+    windowSeconds <= 0 ||
+    typeof asOf !== "string" ||
+    !asOf.trim() ||
+    !semantics ||
+    typeof semantics !== "object" ||
+    Array.isArray(semantics) ||
+    !["shared", "process"].includes(String(storageScope))
+  ) {
+    return null;
+  }
+
+  const semanticRecord = semantics as Record<string, unknown>;
+  const semanticKeys = ["rpm", "tpm", "window", "failed_requests"];
+  if (semanticKeys.some((key) => typeof semanticRecord[key] !== "string")) {
+    return null;
+  }
+
+  return {
+    rpm,
+    tpm,
+    window_seconds: windowSeconds,
+    as_of: asOf,
+    semantics: {
+      rpm: semanticRecord.rpm as string,
+      tpm: semanticRecord.tpm as string,
+      window: semanticRecord.window as string,
+      failed_requests: semanticRecord.failed_requests as string,
+    },
+    storage_scope: storageScope as "shared" | "process",
+  };
+}
+
+async function loadRealtimeMetrics(): Promise<void> {
+  if (!canViewRealtimeMetrics.value || !isPageVisible.value) return;
+
+  // Keep only one in-flight request. A slow response must not pile up behind
+  // the 5-second timer or overwrite a newer snapshot when it finally returns.
+  if (realtimeRefreshPromise) return realtimeRefreshPromise;
+
+  // Older test/demo adapters may not expose the optional endpoint yet. Keep
+  // the existing aggregate card in that case until the endpoint is available.
+  if (typeof dashboardApi.getRealtimeMetrics !== "function") return;
+
+  realtimeMetricsLoading.value = true;
+  const request = (async () => {
+    try {
+      const payload = await dashboardApi.getRealtimeMetrics();
+      const parsed = parseRealtimeMetrics(payload);
+      if (!parsed) throw new Error("Invalid realtime dashboard payload");
+      realtimeMetrics.value = parsed;
+      realtimeMetricsError.value = false;
+    } catch {
+      // Retain the last good snapshot and mark it in the subtitle. The legacy
+      // aggregate card remains visible as a graceful fallback on first load.
+      realtimeMetricsError.value = true;
+    } finally {
+      realtimeMetricsLoading.value = false;
+    }
+  })().finally(() => {
+    if (realtimeRefreshPromise === request) realtimeRefreshPromise = null;
+  });
+  realtimeRefreshPromise = request;
+  return request;
+}
+
+function startRealtimeRefresh() {
+  if (
+    !canViewRealtimeMetrics.value ||
+    !isPageVisible.value ||
+    realtimeRefreshTimer !== null
+  ) {
+    return;
+  }
+  realtimeRefreshTimer = setInterval(() => {
+    if (isPageVisible.value) void loadRealtimeMetrics();
+  }, REALTIME_REFRESH_INTERVAL_MS);
+}
+
+function stopRealtimeRefresh() {
+  if (realtimeRefreshTimer !== null) {
+    clearInterval(realtimeRefreshTimer);
+    realtimeRefreshTimer = null;
+  }
+}
+
+function handleDashboardVisibilityChange() {
+  if (typeof document === "undefined") return;
+  isPageVisible.value = !document.hidden;
+  if (!isPageVisible.value) {
+    stopRealtimeRefresh();
+    return;
+  }
+  if (canViewRealtimeMetrics.value) {
+    void loadRealtimeMetrics();
+    startRealtimeRefresh();
+  }
+}
+
 onMounted(async () => {
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", handleDashboardVisibilityChange);
+  }
   checkScreenSize();
   setupResizeObserver();
   if (typeof window !== "undefined") {
     window.addEventListener("resize", handleWindowResize);
   }
+  // Start the lightweight realtime overlay independently of the aggregate
+  // dashboard requests so a slow historical query cannot delay live rates.
+  if (canViewRealtimeMetrics.value) void loadRealtimeMetrics();
+  startRealtimeRefresh();
   await Promise.all([
     loadDashboardData(),
     loadDailyStats(),
@@ -1525,6 +1766,10 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  stopRealtimeRefresh();
+  if (typeof document !== "undefined") {
+    document.removeEventListener("visibilitychange", handleDashboardVisibilityChange);
+  }
   if (typeof window !== "undefined") {
     window.removeEventListener("resize", handleWindowResize);
   }

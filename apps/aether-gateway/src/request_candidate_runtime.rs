@@ -2,6 +2,7 @@ use aether_contracts::ExecutionPlan;
 use aether_data_contracts::repository::candidates::{
     RequestCandidateStatus, StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
+use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
 use aether_scheduler_core::{
     build_execution_request_candidate_seed, build_local_request_candidate_status_record,
     build_report_request_candidate_status_record,
@@ -14,19 +15,32 @@ use aether_scheduler_core::{
 use aether_usage_runtime::build_locally_actionable_report_context_from_request_candidate;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::clock::current_unix_ms;
 use crate::log_ids::short_request_id;
-use crate::GatewayError;
+use crate::{AppState, GatewayError};
 
 const REQUEST_CANDIDATE_PERSISTENCE_ENV: &str = "AETHER_GATEWAY_REQUEST_CANDIDATE_PERSISTENCE";
 const REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_ENV: &str =
     "AETHER_GATEWAY_REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_MS";
 const DEFAULT_REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_MS: u64 = 10;
+const TERMINAL_CANDIDATE_RECONCILIATION_MAX_IN_FLIGHT: usize = 256;
+const TERMINAL_CANDIDATE_RECONCILIATION_DELAYS: &[Duration] = &[
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+    Duration::from_secs(1800),
+    Duration::from_secs(3600),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestCandidatePersistenceMode {
@@ -61,6 +75,117 @@ fn request_candidate_status_is_terminal(status: RequestCandidateStatus) -> bool 
             | RequestCandidateStatus::Failed
             | RequestCandidateStatus::Cancelled
     )
+}
+
+/// A usage row is safe to drive a terminal request-candidate transition only
+/// after the accounting write has recorded its durable terminal timestamp.
+/// Status alone is insufficient: cleanup/reconciliation can briefly observe a
+/// skeleton row with a terminal-looking status while usage/finalization is
+/// still in flight.
+fn request_usage_is_durable_terminal(status: &str, finalized_at_unix_secs: Option<u64>) -> bool {
+    finalized_at_unix_secs.is_some()
+        && matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "cancelled"
+        )
+}
+
+/// Repository reads populate the typed candidate field with routing-snapshot
+/// presence semantics. A present snapshot whose candidate id is NULL is
+/// authoritative absence; report reconciliation must not fall back to stale
+/// request metadata in that case.
+fn authoritative_usage_candidate_id(usage: &StoredRequestUsageAudit) -> Option<&str> {
+    usage.candidate_id.as_deref()
+}
+
+/// Reconciliation must not apply a stale desired candidate status merely
+/// because some terminal usage row appeared for the request.  A later attempt
+/// (or a client cancellation) can legitimately win the usage race with a
+/// different terminal outcome; promoting the old candidate in that case would
+/// make the candidate ledger contradict the durable usage ledger.
+fn terminal_candidate_matches_usage(
+    candidate_status: RequestCandidateStatus,
+    usage_status: &str,
+) -> bool {
+    let usage_status = usage_status.trim();
+    match candidate_status {
+        RequestCandidateStatus::Success => usage_status.eq_ignore_ascii_case("completed"),
+        RequestCandidateStatus::Failed => usage_status.eq_ignore_ascii_case("failed"),
+        RequestCandidateStatus::Cancelled => usage_status.eq_ignore_ascii_case("cancelled"),
+        RequestCandidateStatus::Available
+        | RequestCandidateStatus::Unused
+        | RequestCandidateStatus::Pending
+        | RequestCandidateStatus::Streaming
+        | RequestCandidateStatus::Skipped => false,
+    }
+}
+
+/// A request can have several provider candidates under one request id.  A
+/// durable terminal usage row is therefore only allowed to settle the
+/// candidate that produced it.  Treat a missing id on either side as a
+/// mismatch when the other side has one; otherwise a late report from a
+/// previous candidate could silently promote the current candidate.
+fn terminal_usage_matches_candidate(
+    candidate_id: Option<&str>,
+    usage_candidate_id: Option<&str>,
+) -> bool {
+    let candidate_id = candidate_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let usage_candidate_id = usage_candidate_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (candidate_id, usage_candidate_id) {
+        (Some(candidate_id), Some(usage_candidate_id)) => candidate_id == usage_candidate_id,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Check whether an internal/report-driven terminal candidate write is backed
+/// by a durable usage terminal row.  Internal gateway routes may receive a
+/// report before the remote executioner's usage write becomes visible; a
+/// status-only check would recreate the old candidate-before-billing race.
+pub(crate) async fn report_candidate_terminal_usage_is_durable(
+    state: &AppState,
+    report_context: Option<&Value>,
+    candidate_status: RequestCandidateStatus,
+) -> bool {
+    let Some(request_id) = report_context
+        .and_then(|context| context.get("request_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let usage = match state
+        .usage_lifecycle_data_state()
+        .find_request_usage_by_request_id_shallow(request_id)
+        .await
+    {
+        Ok(usage) => usage,
+        Err(error) => {
+            warn!(
+                event_name = "request_candidate_report_usage_lookup_failed",
+                log_type = "ops",
+                request_id = %short_request_id(request_id),
+                error = ?error,
+                "gateway will suppress report-driven candidate terminal status"
+            );
+            return false;
+        }
+    };
+    usage.is_some_and(|usage| {
+        request_usage_is_durable_terminal(usage.status.as_str(), usage.finalized_at_unix_secs)
+            && terminal_candidate_matches_usage(candidate_status, usage.status.as_str())
+            && terminal_usage_matches_candidate(
+                report_context
+                    .and_then(|context| context.get("candidate_id"))
+                    .and_then(Value::as_str),
+                authoritative_usage_candidate_id(&usage),
+            )
+    })
 }
 
 fn should_persist_request_candidate_status(status: RequestCandidateStatus) -> bool {
@@ -141,6 +266,339 @@ pub(crate) trait RequestCandidateRuntimeCapabilityReader {
         user_id: &str,
         api_key_id: &str,
     ) -> Result<Option<Value>, GatewayError>;
+}
+
+fn terminal_candidate_reconciliation_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SEMAPHORE.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            TERMINAL_CANDIDATE_RECONCILIATION_MAX_IN_FLIGHT,
+        ))
+    })
+}
+
+/// Retry a candidate terminal transition after a usage handoff could not be
+/// confirmed in the request's critical path. The usage runtime retains the
+/// terminal event in its own retry/queue machinery; this companion task only
+/// waits for the durable row to become visible and then publishes the matching
+/// candidate state. It is bounded and globally gated so a database outage does
+/// not create an unbounded task leak.
+pub(crate) fn spawn_terminal_candidate_reconciliation(
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    mut terminal_update: SchedulerRequestCandidateStatusUpdate,
+) {
+    let Some(permit) = terminal_candidate_reconciliation_semaphore()
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        warn!(
+            event_name = "request_candidate_terminal_reconciliation_saturated",
+            log_type = "event",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            "gateway could not schedule terminal candidate reconciliation because the global bound is full"
+        );
+        return;
+    };
+
+    // Reconciliation is part of the terminal usage→candidate handoff.  Keep
+    // it on the process-lifetime usage runtime: the request/relay runtime can
+    // be torn down after a 499 while the durable usage writer is still
+    // retrying, and cancelling this waiter would leave the candidate stuck in
+    // `streaming` forever.
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        let _permit = permit;
+        for delay in TERMINAL_CANDIDATE_RECONCILIATION_DELAYS {
+            tokio::time::sleep(*delay).await;
+            let usage = match state
+                .usage_lifecycle_data_state()
+                .find_request_usage_by_request_id_shallow(plan.request_id.as_str())
+                .await
+            {
+                Ok(usage) => usage,
+                Err(error) => {
+                    warn!(
+                        event_name = "request_candidate_terminal_reconciliation_usage_lookup_failed",
+                        log_type = "event",
+                        request_id = %short_request_id(plan.request_id.as_str()),
+                        error = ?error,
+                        "gateway will retry terminal candidate reconciliation"
+                    );
+                    continue;
+                }
+            };
+            let Some(usage) = usage else {
+                continue;
+            };
+            if !request_usage_is_durable_terminal(
+                usage.status.as_str(),
+                usage.finalized_at_unix_secs,
+            ) || !terminal_candidate_matches_usage(terminal_update.status, usage.status.as_str())
+                || !terminal_usage_matches_candidate(
+                    plan.candidate_id.as_deref(),
+                    authoritative_usage_candidate_id(&usage),
+                )
+            {
+                continue;
+            }
+            terminal_update.finished_at_unix_ms = Some(
+                terminal_update
+                    .finished_at_unix_ms
+                    .unwrap_or_else(current_unix_ms),
+            );
+            let candidate_persisted = record_local_request_candidate_status(
+                &state,
+                &plan,
+                report_context.as_ref(),
+                terminal_update.clone(),
+            )
+            .await;
+            if candidate_persisted {
+                return;
+            }
+            debug!(
+                event_name = "request_candidate_terminal_reconciliation_write_pending",
+                log_type = "event",
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                "gateway will retry terminal candidate reconciliation because the candidate write was not accepted"
+            );
+        }
+        warn!(
+            event_name = "request_candidate_terminal_reconciliation_exhausted",
+            log_type = "event",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            fallback = "usage_cleanup",
+            "gateway could not observe a durable terminal usage row before reconciliation expired"
+        );
+    });
+}
+
+/// Retry the candidate half of a terminal handoff after the caller has already
+/// confirmed that the matching usage event was accepted durably.  Unlike
+/// [`spawn_terminal_candidate_reconciliation`], this path must not wait for a
+/// terminal usage row: successful async submissions (notably video create)
+/// intentionally keep usage pending until the remote task finishes.
+pub(crate) fn spawn_candidate_persistence_retry_after_usage_handoff(
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    terminal_update: SchedulerRequestCandidateStatusUpdate,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) {
+    let Some(permit) = terminal_candidate_reconciliation_semaphore()
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        warn!(
+            event_name = "request_candidate_terminal_persistence_retry_saturated",
+            log_type = "event",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            "gateway could not schedule terminal candidate persistence retry because the global bound is full"
+        );
+        return;
+    };
+
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        let _permit = permit;
+        for delay in TERMINAL_CANDIDATE_RECONCILIATION_DELAYS {
+            tokio::time::sleep(*delay).await;
+            if record_local_request_candidate_status(
+                &state,
+                &plan,
+                report_context.as_ref(),
+                terminal_update.clone(),
+            )
+            .await
+            {
+                if let Some(progress) = watchdog_progress {
+                    crate::execution_runtime::unregister_stream_candidate_watchdog_progress(
+                        plan.request_id.as_str(),
+                        plan.candidate_id.as_deref(),
+                        &progress,
+                    );
+                }
+                return;
+            }
+        }
+        warn!(
+            event_name = "request_candidate_terminal_persistence_retry_exhausted",
+            log_type = "ops",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            "gateway could not persist the terminal candidate after a durable usage handoff"
+        );
+    });
+}
+
+/// Report-context counterpart of
+/// [`spawn_candidate_persistence_retry_after_usage_handoff`].
+pub(crate) fn spawn_report_candidate_persistence_retry_after_usage_handoff(
+    state: AppState,
+    plan: ExecutionPlan,
+    report_context: Option<Value>,
+    terminal_update: SchedulerRequestCandidateStatusUpdate,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) {
+    let Some(permit) = terminal_candidate_reconciliation_semaphore()
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        warn!(
+            event_name = "request_candidate_report_terminal_persistence_retry_saturated",
+            log_type = "event",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            "gateway could not schedule report terminal candidate persistence retry because the global bound is full"
+        );
+        return;
+    };
+
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        let _permit = permit;
+        for delay in TERMINAL_CANDIDATE_RECONCILIATION_DELAYS {
+            tokio::time::sleep(*delay).await;
+            if record_report_request_candidate_status(
+                &state,
+                report_context.as_ref(),
+                terminal_update.clone(),
+            )
+            .await
+            {
+                if let Some(progress) = watchdog_progress {
+                    crate::execution_runtime::unregister_stream_candidate_watchdog_progress(
+                        plan.request_id.as_str(),
+                        plan.candidate_id.as_deref(),
+                        &progress,
+                    );
+                }
+                return;
+            }
+        }
+        warn!(
+            event_name = "request_candidate_report_terminal_persistence_retry_exhausted",
+            log_type = "ops",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            "gateway could not persist the report terminal candidate after a durable usage handoff"
+        );
+    });
+}
+
+/// Detached counterpart for internal/report handlers that do not own an
+/// [`ExecutionPlan`].  It waits for the matching durable usage terminal row and
+/// then replays the report candidate update.  Until that point the caller's
+/// report path must leave the candidate non-terminal.
+pub(crate) fn spawn_report_candidate_reconciliation(
+    state: AppState,
+    report_context: Value,
+    terminal_update: SchedulerRequestCandidateStatusUpdate,
+) {
+    let Some(permit) = terminal_candidate_reconciliation_semaphore()
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        warn!(
+            event_name = "request_candidate_report_reconciliation_saturated",
+            log_type = "event",
+            request_id = %short_request_id(report_request_id_from_context(Some(&report_context))),
+            "gateway could not schedule report candidate reconciliation because the global bound is full"
+        );
+        return;
+    };
+
+    // Internal/report reconciliation has the same lifetime requirement as the
+    // execution-plan variant above.  A report often arrives while the owning
+    // request task is already being cancelled, so do not bind its retries to
+    // that task's Tokio runtime.
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        let _permit = permit;
+        let request_id = report_request_id_from_context(Some(&report_context));
+        if request_id == "-" {
+            return;
+        }
+        for delay in TERMINAL_CANDIDATE_RECONCILIATION_DELAYS {
+            tokio::time::sleep(*delay).await;
+            let usage = match state
+                .usage_lifecycle_data_state()
+                .find_request_usage_by_request_id_shallow(request_id)
+                .await
+            {
+                Ok(usage) => usage,
+                Err(error) => {
+                    warn!(
+                        event_name = "request_candidate_report_reconciliation_usage_lookup_failed",
+                        log_type = "ops",
+                        request_id = %short_request_id(request_id),
+                        error = ?error,
+                        "gateway will retry report candidate reconciliation"
+                    );
+                    continue;
+                }
+            };
+            let Some(usage) = usage else {
+                continue;
+            };
+            let report_candidate_id = parse_request_candidate_report_context(Some(&report_context))
+                .and_then(|metadata| metadata.candidate_id);
+            if !request_usage_is_durable_terminal(
+                usage.status.as_str(),
+                usage.finalized_at_unix_secs,
+            ) || !terminal_candidate_matches_usage(terminal_update.status, usage.status.as_str())
+                || !terminal_usage_matches_candidate(
+                    report_candidate_id.as_deref(),
+                    authoritative_usage_candidate_id(&usage),
+                )
+            {
+                continue;
+            }
+
+            let resolved_context = resolve_locally_actionable_request_candidate_report_context(
+                &state,
+                &report_context,
+            )
+            .await;
+            let context = resolved_context.as_ref().unwrap_or(&report_context);
+            let mut update = terminal_update.clone();
+            update.finished_at_unix_ms =
+                Some(update.finished_at_unix_ms.unwrap_or_else(current_unix_ms));
+            let candidate_persisted =
+                record_report_request_candidate_status(&state, Some(context), update).await;
+            if candidate_persisted {
+                return;
+            }
+            debug!(
+                event_name = "request_candidate_report_reconciliation_write_pending",
+                log_type = "event",
+                request_id = %short_request_id(request_id),
+                candidate_id = ?report_candidate_id,
+                "gateway will retry report candidate reconciliation because the candidate write was not accepted"
+            );
+        }
+        warn!(
+            event_name = "request_candidate_report_reconciliation_exhausted",
+            log_type = "event",
+            request_id = %short_request_id(request_id),
+            "gateway could not observe a matching durable usage terminal for the internal report"
+        );
+    });
+}
+
+fn report_request_id_from_context(report_context: Option<&Value>) -> &str {
+    report_context
+        .and_then(|context| context.get("request_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
 }
 
 pub(crate) async fn resolve_request_candidate_required_capabilities(
@@ -295,14 +753,21 @@ pub(crate) fn snapshot_local_request_candidate_status(
 pub(crate) async fn persist_local_request_candidate_status_record(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     record: UpsertRequestCandidateRecord,
-) {
+) -> bool {
     let candidate_id = record.id.clone();
     let request_id = short_request_id(record.request_id.as_str());
     let candidate_index = record.candidate_index;
     let retry_index = record.retry_index;
     let status = record.status;
+    // RETRY_ABORT is reserved by the intermediate Failed transition.  Do not
+    // let an unrelated terminal Success/Cancelled update mark that handoff
+    // complete: those updates can race a dropped retry owner while its usage
+    // row is still pending.
+    let mark_retry_handoff_complete = matches!(status, RequestCandidateStatus::Failed);
+    let watchdog_request_id = record.request_id.clone();
 
-    if !should_persist_request_candidate_status(status) {
+    let should_persist = should_persist_request_candidate_status(status);
+    if !should_persist {
         debug!(
             event_name = "request_candidate_status_persistence_skipped",
             log_type = "event",
@@ -314,11 +779,18 @@ pub(crate) async fn persist_local_request_candidate_status_record(
             source = "local_status",
             "gateway skipped request candidate status update due to persistence mode"
         );
-        return;
+        // A disabled writer is an intentional policy choice, not proof that a
+        // durable candidate row exists. Keep the return value false *and* keep
+        // any retry owner armed: a cancellation can still arrive before the
+        // request-level usage handoff and must be allowed to claim its 499
+        // fallback. The owner is released only after an accepted status write.
+        return false;
     }
 
+    let mut status_persisted = false;
     match state.enqueue_request_candidate_status(record).await {
         Ok(Some(())) => {
+            status_persisted = true;
             debug!(
                 event_name = "request_candidate_status_persisted",
                 log_type = "event",
@@ -355,6 +827,13 @@ pub(crate) async fn persist_local_request_candidate_status_record(
             );
         }
     }
+    if mark_retry_handoff_complete && status_persisted {
+        crate::execution_runtime::mark_stream_candidate_watchdog_retry_handoff_complete_for_request(
+            watchdog_request_id.as_str(),
+            Some(candidate_id.as_str()),
+        );
+    }
+    status_persisted
 }
 
 pub(crate) async fn record_local_request_candidate_status(
@@ -362,7 +841,7 @@ pub(crate) async fn record_local_request_candidate_status(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
-) {
+) -> bool {
     let Some(record) =
         build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
             plan,
@@ -370,9 +849,9 @@ pub(crate) async fn record_local_request_candidate_status(
             status_update,
         })
     else {
-        return;
+        return false;
     };
-    persist_local_request_candidate_status_record(state, record).await;
+    persist_local_request_candidate_status_record(state, record).await
 }
 
 pub(crate) async fn record_local_request_candidate_extra_data(
@@ -383,9 +862,9 @@ pub(crate) async fn record_local_request_candidate_extra_data(
     status_code: Option<u16>,
     latency_ms: Option<u64>,
     extra_data: Value,
-) {
+) -> bool {
     let Some(snapshot) = snapshot_local_request_candidate_status(plan, report_context) else {
-        return;
+        return false;
     };
     let record = UpsertRequestCandidateRecord {
         id: snapshot.candidate_id.clone(),
@@ -413,7 +892,7 @@ pub(crate) async fn record_local_request_candidate_extra_data(
         started_at_unix_ms: None,
         finished_at_unix_ms: None,
     };
-    persist_local_request_candidate_status_record(state, record).await;
+    persist_local_request_candidate_status_record(state, record).await
 }
 
 fn build_local_request_candidate_status_snapshot_record(
@@ -473,24 +952,131 @@ pub(crate) async fn record_local_request_candidate_status_snapshot(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     snapshot: &LocalRequestCandidateStatusSnapshot,
     status_update: SchedulerRequestCandidateStatusUpdate,
-) {
+) -> bool {
     let record = build_local_request_candidate_status_snapshot_record(snapshot, status_update);
-    persist_local_request_candidate_status_record(state, record).await;
+    persist_local_request_candidate_status_record(state, record).await
+}
+
+/// Completes a report-driven terminal candidate transition after the usage
+/// runtime's terminal event becomes visible and finalized.  This is separate
+/// from the execution-plan reconciliation above because internal report and
+/// video-finalize routes may not carry a full `ExecutionPlan` anymore.
+fn spawn_report_terminal_candidate_reconciliation(
+    state: AppState,
+    record: UpsertRequestCandidateRecord,
+) {
+    let Some(permit) = terminal_candidate_reconciliation_semaphore()
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        warn!(
+            event_name = "request_candidate_report_terminal_reconciliation_saturated",
+            log_type = "event",
+            request_id = %short_request_id(record.request_id.as_str()),
+            candidate_id = %record.id,
+            "gateway could not schedule report terminal candidate reconciliation because the global bound is full"
+        );
+        return;
+    };
+
+    // This terminal reconciliation may be scheduled from a detached report
+    // path.  Use the process-lifetime executor so runtime shutdown cannot
+    // discard the final candidate update after usage has become durable.
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        let _permit = permit;
+        for delay in TERMINAL_CANDIDATE_RECONCILIATION_DELAYS {
+            tokio::time::sleep(*delay).await;
+            let usage = match state
+                .usage_lifecycle_data_state()
+                .find_request_usage_by_request_id_shallow(record.request_id.as_str())
+                .await
+            {
+                Ok(usage) => usage,
+                Err(error) => {
+                    warn!(
+                        event_name = "request_candidate_report_terminal_reconciliation_usage_lookup_failed",
+                        log_type = "event",
+                        request_id = %short_request_id(record.request_id.as_str()),
+                        candidate_id = %record.id,
+                        error = ?error,
+                        "gateway will retry report terminal candidate reconciliation"
+                    );
+                    continue;
+                }
+            };
+            let Some(usage) = usage else {
+                continue;
+            };
+            if !request_usage_is_durable_terminal(
+                usage.status.as_str(),
+                usage.finalized_at_unix_secs,
+            ) {
+                continue;
+            }
+            if !terminal_candidate_matches_usage(record.status, usage.status.as_str()) {
+                warn!(
+                    event_name = "request_candidate_report_terminal_reconciliation_outcome_mismatch",
+                    log_type = "ops",
+                    request_id = %short_request_id(record.request_id.as_str()),
+                    candidate_id = %record.id,
+                    candidate_status = request_candidate_status_label(record.status),
+                    usage_status = %usage.status,
+                    "gateway abandoned report terminal reconciliation because usage finalized with another outcome"
+                );
+                return;
+            }
+            if !terminal_usage_matches_candidate(
+                Some(record.id.as_str()),
+                authoritative_usage_candidate_id(&usage),
+            ) {
+                warn!(
+                    event_name = "request_candidate_report_terminal_reconciliation_candidate_mismatch",
+                    log_type = "ops",
+                    request_id = %short_request_id(record.request_id.as_str()),
+                    candidate_id = %record.id,
+                    usage_candidate_id = ?authoritative_usage_candidate_id(&usage),
+                    "gateway abandoned report terminal reconciliation because usage finalized for another candidate"
+                );
+                return;
+            }
+            let candidate_persisted =
+                persist_local_request_candidate_status_record(&state, record.clone()).await;
+            if candidate_persisted {
+                return;
+            }
+            debug!(
+                event_name = "request_candidate_report_terminal_reconciliation_write_pending",
+                log_type = "event",
+                request_id = %short_request_id(record.request_id.as_str()),
+                candidate_id = %record.id,
+                "gateway will retry report terminal candidate reconciliation because the candidate write was not accepted"
+            );
+        }
+        warn!(
+            event_name = "request_candidate_report_terminal_reconciliation_exhausted",
+            log_type = "ops",
+            request_id = %short_request_id(record.request_id.as_str()),
+            candidate_id = %record.id,
+            fallback = "usage_cleanup",
+            "gateway could not observe a durable terminal usage row before report reconciliation expired"
+        );
+    });
 }
 
 pub(crate) async fn record_report_request_candidate_status(
-    state: &(impl RequestCandidateRuntimeReader + RequestCandidateRuntimeWriter + ?Sized),
+    state: &AppState,
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
-) {
+) -> bool {
     if matches!(
         request_candidate_persistence_mode(),
         RequestCandidatePersistenceMode::None
     ) {
-        return;
+        return false;
     }
     let Some(slot) = resolve_report_request_candidate_slot(state, report_context).await else {
-        return;
+        return false;
     };
     let request_id = slot.request_id.clone();
     let request_id_for_log = short_request_id(request_id.as_str());
@@ -517,7 +1103,90 @@ pub(crate) async fn record_report_request_candidate_status(
             source = "report_status",
             "gateway skipped report-driven request candidate status update due to persistence mode"
         );
-        return;
+        return false;
+    }
+
+    // A report is an asynchronous side channel.  It may arrive after a
+    // transport disconnect (or after a retry has already won) while the
+    // accounting terminal event is still queued.  Never let such a report
+    // publish a terminal candidate state ahead of a durable, matching usage
+    // row.  A missing usage row is not proof that no usage event exists: the
+    // writer may be delayed, the read may be on a lagging replica, or the
+    // usage skeleton may have been dropped before its terminal handoff.  Keep
+    // the candidate non-terminal and let reconciliation/cleanup decide; this
+    // fail-closed rule applies to report-only/internal paths as well.
+    if request_candidate_status_is_terminal(status) {
+        match state
+            .usage_lifecycle_data_state()
+            .find_request_usage_by_request_id_shallow(record.request_id.as_str())
+            .await
+        {
+            Ok(Some(usage))
+                if request_usage_is_durable_terminal(
+                    usage.status.as_str(),
+                    usage.finalized_at_unix_secs,
+                ) && terminal_candidate_matches_usage(status, usage.status.as_str())
+                    && terminal_usage_matches_candidate(
+                        Some(record.id.as_str()),
+                        authoritative_usage_candidate_id(&usage),
+                    ) => {}
+            Ok(Some(usage))
+                if request_usage_is_durable_terminal(
+                    usage.status.as_str(),
+                    usage.finalized_at_unix_secs,
+                ) =>
+            {
+                warn!(
+                    event_name = "request_candidate_report_terminal_ignored_usage_mismatch",
+                    log_type = "ops",
+                    request_id = %request_id_for_log,
+                    candidate_id = %candidate_id,
+                    candidate_status = request_candidate_status_label(status),
+                    usage_status = %usage.status,
+                    usage_candidate_id = ?authoritative_usage_candidate_id(&usage),
+                    "gateway ignored a report terminal outcome because durable usage belongs to another candidate or finalized differently"
+                );
+                return false;
+            }
+            Ok(Some(usage)) => {
+                warn!(
+                    event_name = "request_candidate_report_terminal_deferred_usage_pending",
+                    log_type = "ops",
+                    request_id = %request_id_for_log,
+                    candidate_id = %candidate_id,
+                    candidate_status = request_candidate_status_label(status),
+                    usage_status = %usage.status,
+                    usage_finalized = usage.finalized_at_unix_secs.is_some(),
+                    "gateway deferred report terminal candidate status until usage terminal handoff is durable"
+                );
+                spawn_report_terminal_candidate_reconciliation(state.clone(), record.clone());
+                return false;
+            }
+            Ok(None) => {
+                warn!(
+                    event_name = "request_candidate_report_terminal_deferred_usage_missing",
+                    log_type = "ops",
+                    request_id = %request_id_for_log,
+                    candidate_id = %candidate_id,
+                    candidate_status = request_candidate_status_label(status),
+                    "gateway deferred report terminal candidate status because no usage row was visible"
+                );
+                spawn_report_terminal_candidate_reconciliation(state.clone(), record.clone());
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    event_name = "request_candidate_report_terminal_usage_lookup_failed",
+                    log_type = "ops",
+                    request_id = %request_id_for_log,
+                    candidate_id = %candidate_id,
+                    error = ?error,
+                    "gateway deferred report terminal candidate status because usage durability could not be checked"
+                );
+                spawn_report_terminal_candidate_reconciliation(state.clone(), record.clone());
+                return false;
+            }
+        }
     }
 
     match state.enqueue_request_candidate_status(record).await {
@@ -533,6 +1202,7 @@ pub(crate) async fn record_report_request_candidate_status(
                 source = "report_status",
                 "gateway persisted report-driven request candidate status update"
             );
+            true
         }
         Ok(None) => {
             warn!(
@@ -546,6 +1216,7 @@ pub(crate) async fn record_report_request_candidate_status(
                 source = "report_status",
                 "gateway skipped request candidate persistence because writer is unavailable"
             );
+            false
         }
         Err(err) => {
             warn!(
@@ -557,6 +1228,7 @@ pub(crate) async fn record_report_request_candidate_status(
                 error = ?err,
                 "gateway failed to persist report-driven request candidate status update"
             );
+            false
         }
     }
 }
@@ -985,13 +1657,16 @@ mod tests {
         RequestCandidateReadRepository, RequestCandidateStatus, StoredRequestCandidate,
         UpsertRequestCandidateRecord,
     };
+    use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
     use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
     use serde_json::json;
 
     use super::{
         ensure_execution_request_candidate_slot, persist_available_local_candidate,
-        record_report_request_candidate_status, resolve_request_candidate_required_capabilities,
+        record_report_request_candidate_status, report_candidate_terminal_usage_is_durable,
+        request_usage_is_durable_terminal, resolve_request_candidate_required_capabilities,
         select_requested_model_capabilities, snapshot_local_request_candidate_status,
+        terminal_candidate_matches_usage, terminal_usage_matches_candidate,
         try_enqueue_local_request_candidate_status_snapshot, RequestCandidateRuntimeWriter,
         SchedulerRequestCandidateStatusUpdate,
     };
@@ -1076,6 +1751,146 @@ mod tests {
             transport_profile: None,
             timeouts: None,
         }
+    }
+
+    #[test]
+    fn terminal_candidate_reconciliation_requires_finalized_usage() {
+        assert!(!request_usage_is_durable_terminal("completed", None));
+        assert!(!request_usage_is_durable_terminal(
+            "pending",
+            Some(1_700_000_000)
+        ));
+        assert!(request_usage_is_durable_terminal(
+            " COMPLETED ",
+            Some(1_700_000_000)
+        ));
+        assert!(request_usage_is_durable_terminal(
+            "failed",
+            Some(1_700_000_001)
+        ));
+        assert!(request_usage_is_durable_terminal(
+            "cancelled",
+            Some(1_700_000_002)
+        ));
+    }
+
+    #[test]
+    fn terminal_candidate_reconciliation_requires_matching_usage_outcome() {
+        assert!(terminal_candidate_matches_usage(
+            RequestCandidateStatus::Success,
+            " COMPLETED "
+        ));
+        assert!(terminal_candidate_matches_usage(
+            RequestCandidateStatus::Failed,
+            "failed"
+        ));
+        assert!(terminal_candidate_matches_usage(
+            RequestCandidateStatus::Cancelled,
+            "cancelled"
+        ));
+
+        assert!(!terminal_candidate_matches_usage(
+            RequestCandidateStatus::Failed,
+            "completed"
+        ));
+        assert!(!terminal_candidate_matches_usage(
+            RequestCandidateStatus::Success,
+            "cancelled"
+        ));
+        assert!(!terminal_candidate_matches_usage(
+            RequestCandidateStatus::Cancelled,
+            "failed"
+        ));
+        assert!(!terminal_candidate_matches_usage(
+            RequestCandidateStatus::Streaming,
+            "completed"
+        ));
+    }
+
+    #[test]
+    fn terminal_candidate_reconciliation_requires_matching_candidate_identity() {
+        assert!(terminal_usage_matches_candidate(
+            Some("candidate-a"),
+            Some(" candidate-a "),
+        ));
+        assert!(terminal_usage_matches_candidate(None, None));
+        assert!(!terminal_usage_matches_candidate(
+            Some("candidate-a"),
+            Some("candidate-b"),
+        ));
+        assert!(!terminal_usage_matches_candidate(Some("candidate-a"), None));
+        assert!(!terminal_usage_matches_candidate(None, Some("candidate-a")));
+    }
+
+    #[tokio::test]
+    async fn durable_report_gate_does_not_fallback_to_metadata_candidate_identity() {
+        let mut usage = StoredRequestUsageAudit::new(
+            "usage-report-typed-identity".to_string(),
+            "req-report-typed-identity".to_string(),
+            Some("user-1".to_string()),
+            Some("api-key-1".to_string()),
+            None,
+            None,
+            "provider-1".to_string(),
+            "model-1".to_string(),
+            None,
+            Some("provider-1".to_string()),
+            Some("endpoint-1".to_string()),
+            Some("key-1".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            false,
+            false,
+            1,
+            1,
+            2,
+            0.0,
+            0.0,
+            Some(200),
+            None,
+            None,
+            Some(10),
+            Some(2),
+            "completed".to_string(),
+            "settled".to_string(),
+            1_000,
+            1,
+            Some(1),
+        )
+        .expect("terminal usage should build");
+        usage.candidate_id = None;
+        usage.candidate_index = None;
+        usage.request_metadata = Some(json!({
+            "candidate_id": "candidate-metadata-only",
+            "candidate_index": 0,
+        }));
+
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::new(InMemoryRequestCandidateRepository::default()),
+                    Arc::new(InMemoryUsageReadRepository::seed([usage])),
+                ),
+            );
+        let report_context = json!({
+            "request_id": "req-report-typed-identity",
+            "candidate_id": "candidate-metadata-only",
+        });
+
+        assert!(
+            !report_candidate_terminal_usage_is_durable(
+                &state,
+                Some(&report_context),
+                RequestCandidateStatus::Success,
+            )
+            .await
+        );
     }
 
     #[test]
@@ -1247,7 +2062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_report_request_candidate_status_for_existing_slot() {
+    async fn defers_report_request_candidate_status_until_usage_is_visible() {
         let repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
             StoredRequestCandidate::new(
                 "cand-report-123".to_string(),
@@ -1309,11 +2124,11 @@ mod tests {
             .expect("request candidates should read");
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].id, "cand-report-123");
-        assert_eq!(stored[0].status, RequestCandidateStatus::Success);
-        assert_eq!(stored[0].status_code, Some(200));
-        assert_eq!(stored[0].latency_ms, Some(25));
-        assert_eq!(stored[0].started_at_unix_ms, Some(101));
-        assert_eq!(stored[0].finished_at_unix_ms, Some(102));
+        assert_eq!(stored[0].status, RequestCandidateStatus::Pending);
+        assert_eq!(stored[0].status_code, None);
+        assert_eq!(stored[0].latency_ms, None);
+        assert_eq!(stored[0].started_at_unix_ms, Some(100_000));
+        assert_eq!(stored[0].finished_at_unix_ms, None);
     }
 
     #[tokio::test]

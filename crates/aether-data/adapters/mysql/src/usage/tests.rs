@@ -105,6 +105,74 @@ fn mysql_usage_upsert_keeps_terminal_state_when_streaming_arrives_late() {
 }
 
 #[test]
+fn mysql_stale_cleanup_never_promotes_from_a_candidate_marker() {
+    let source = include_str!("../usage.rs");
+    assert!(!source.contains("SELECT_COMPLETED_REQUEST_CANDIDATES_SQL"));
+    assert!(!source.contains("UPDATE_RECOVERED_STALE_USAGE_SQL"));
+    assert!(!source.contains("SET status = 'completed',\n    status_code = 200"));
+    assert!(super::SELECT_STALE_PENDING_USAGE_BATCH_SQL
+        .contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+    assert!(super::UPDATE_FAILED_VOID_STALE_USAGE_SQL
+        .contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+}
+
+#[test]
+fn mysql_stale_cleanup_uses_snapshot_authoritative_exact_candidate_identity() {
+    let select = super::SELECT_STALE_PENDING_USAGE_BATCH_SQL;
+    assert!(select.contains("LEFT JOIN usage_routing_snapshots"));
+    assert!(select.contains("WHEN usage_routing_snapshots.request_id IS NOT NULL"));
+    assert!(select.contains("THEN usage_routing_snapshots.candidate_id"));
+    assert!(select.contains("ELSE `usage`.candidate_id"));
+    assert!(
+        !select.contains("COALESCE(usage_routing_snapshots.candidate_id, `usage`.candidate_id)")
+    );
+
+    let update = super::UPDATE_FAILED_PENDING_CANDIDATES_SQL;
+    assert!(update.contains("WHERE request_id = ?"));
+    assert!(update.contains("AND id = ?"));
+    assert!(update.contains("status IN ('pending', 'streaming')"));
+}
+
+#[test]
+fn mysql_stale_cleanup_guards_effective_settlement_snapshots_and_terminal_usage() {
+    let stale_sql = super::SELECT_STALE_PENDING_USAGE_BATCH_SQL;
+    for field in [
+        "request_type",
+        "api_format",
+        "endpoint_kind",
+        "endpoint_api_format",
+        "provider_endpoint_kind",
+    ] {
+        let normalized =
+            format!("LOWER(REGEXP_REPLACE(COALESCE(`usage`.{field}, ''), '[[:space:]]', ''))");
+        assert!(
+            stale_sql.contains(&format!("{normalized} = 'video'")),
+            "stale cleanup must exclude exact video contracts from {field}"
+        );
+        assert!(
+            stale_sql.contains(&format!("{normalized} LIKE '%:video'")),
+            "stale cleanup must exclude whitespace-normalized provider:video contracts from {field}"
+        );
+    }
+    assert!(stale_sql.contains(
+        "COALESCE(usage_settlement_snapshots.billing_status, `usage`.billing_status) = 'pending'"
+    ));
+    assert!(stale_sql.contains(
+        "COALESCE(usage_settlement_snapshots.finalized_at, `usage`.finalized_at) IS NULL"
+    ));
+    assert!(stale_sql.contains("`usage`.billing_status = 'pending'"));
+    assert!(stale_sql.contains("`usage`.finalized_at IS NULL"));
+    let sql = super::UPDATE_FAILED_VOID_STALE_USAGE_SQL;
+    assert!(sql.contains("status IN ('pending', 'streaming', 'completed', 'failed', 'cancelled')"));
+    assert!(sql.contains("billing_status = 'pending'"));
+    assert!(sql.contains("finalized_at IS NULL"));
+    assert!(sql.contains("billing_status = 'void'"));
+    assert!(sql.contains("NOT EXISTS"));
+    assert!(sql.contains("settlement.billing_status <> 'pending'"));
+    assert!(sql.contains("settlement.finalized_at IS NOT NULL"));
+}
+
+#[test]
 fn mysql_usage_upsert_guards_candidate_identity_metadata_and_routing_from_late_lifecycle() {
     for field in [
         "provider_name",
@@ -803,6 +871,26 @@ async fn mysql_usage_canonical_snapshots_round_trip_when_url_is_set() {
     assert_eq!(after_late.billing_status, "settled");
     assert!(after_late.candidate_id.is_none());
     assert_eq!(after_late.total_cost_usd, 0.0);
+
+    // A conflicting terminal billing event from a late attempt must not replace
+    // the first settled outcome (or its finalized timestamp/snapshot).
+    let late_void = sample_usage(
+        &request_id,
+        &user_id,
+        &api_key_id,
+        &provider_id,
+        &provider_key_id,
+        "completed",
+        "void",
+        1_004,
+    );
+    let after_late_void = writer
+        .upsert(late_void)
+        .await
+        .expect("late MySQL void usage should return terminal record");
+    assert_eq!(after_late_void.status, "completed");
+    assert_eq!(after_late_void.billing_status, "settled");
+    assert_eq!(after_late_void.total_cost_usd, 0.0);
 
     let snapshot_counts: (i64, i64) = sqlx::query_as(
         r#"

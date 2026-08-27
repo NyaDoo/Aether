@@ -53,6 +53,22 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn list_active_request_candidates_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        match &self.request_candidate_reader {
+            Some(repository) => {
+                repository
+                    .list_active_after(after_created_at_unix_ms, after_id, limit)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) async fn list_finalized_request_candidates_by_endpoint_ids_since(
         &self,
         endpoint_ids: &[String],
@@ -117,6 +133,26 @@ impl GatewayDataState {
                 match &self.request_candidate_writer {
                     Some(repository) => repository.upsert(candidate).await.map(Some),
                     None => Ok(None),
+                }
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn finalize_active_request_candidates_exact(
+        &self,
+        candidates: Vec<UpsertRequestCandidateRecord>,
+    ) -> Result<usize, DataLayerError> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        crate::request_diagnostics::observe_db_operation(
+            "request_candidate_finalize_active_exact_many",
+            self.database_pool_summary(),
+            async {
+                match &self.request_candidate_writer {
+                    Some(repository) => repository.finalize_active_exact_many(candidates).await,
+                    None => Ok(0),
                 }
             },
         )

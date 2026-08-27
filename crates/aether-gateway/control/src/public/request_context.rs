@@ -3,6 +3,11 @@ use http::{HeaderMap, Method, Uri};
 #[derive(Debug, Clone)]
 pub struct PublicRequestContext<Decision> {
     pub trace_id: String,
+    /// A gateway-generated per-request identity used by realtime admission
+    /// accounting.  It is intentionally separate from `trace_id`: callers
+    /// may reuse an incoming trace header for correlation, but two HTTP
+    /// requests must never share an RPM reservation.
+    pub realtime_admission_id: Option<String>,
     pub request_method: Method,
     pub request_path: String,
     pub request_query_string: Option<String>,
@@ -27,6 +32,7 @@ impl<Decision> PublicRequestContext<Decision> {
 
         Self {
             trace_id: trace_id.into(),
+            realtime_admission_id: None,
             request_method: method.clone(),
             request_path,
             request_query_string: uri.query().map(ToOwned::to_owned),

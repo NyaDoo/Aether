@@ -288,6 +288,9 @@ impl AppState {
 
     fn build(execution_runtime_override_base_url: Option<String>) -> Result<Self, reqwest::Error> {
         let runtime_state = Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default()));
+        let realtime_metrics_recorder = Arc::new(
+            crate::dashboard_realtime::RealtimeMetricsRecorder::new(runtime_state.clone()),
+        );
         let data = Arc::new(
             GatewayDataState::disabled()
                 .with_usage_worker_queue(Self::usage_worker_queue_for(&runtime_state)),
@@ -304,6 +307,8 @@ impl AppState {
             ..HttpClientConfig::default()
         })?;
         let frontdoor_runtime_guards = Arc::new(FrontdoorRuntimeGuardConfig::from_env());
+        let usage_runtime =
+            usage::UsageRuntime::disabled().with_realtime_metrics_sink(realtime_metrics_recorder);
         Ok(Self {
             #[cfg(test)]
             execution_runtime_override_base_url: execution_runtime_override_base_url
@@ -315,7 +320,7 @@ impl AppState {
             background_data: Arc::clone(&data),
             background_data_isolated: false,
             runtime_state: runtime_state.clone(),
-            usage_runtime: Arc::new(usage::UsageRuntime::disabled()),
+            usage_runtime: Arc::new(usage_runtime),
             video_tasks: Arc::new(VideoTaskService::new(
                 VideoTaskTruthSourceMode::RustAuthoritative,
             )),
@@ -520,7 +525,12 @@ impl AppState {
         mut self,
         config: usage::UsageRuntimeConfig,
     ) -> Result<Self, aether_data::DataLayerError> {
-        self.usage_runtime = Arc::new(usage::UsageRuntime::new(config)?);
+        let realtime_metrics_recorder = Arc::new(
+            crate::dashboard_realtime::RealtimeMetricsRecorder::new(self.runtime_state.clone()),
+        );
+        self.usage_runtime = Arc::new(
+            usage::UsageRuntime::new(config)?.with_realtime_metrics_sink(realtime_metrics_recorder),
+        );
         Ok(self)
     }
 
@@ -597,6 +607,11 @@ impl AppState {
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<RuntimeState>) -> Self {
         self.runtime_state = runtime_state;
+        let mut usage_runtime = (*self.usage_runtime).clone();
+        usage_runtime.set_realtime_metrics_sink(Arc::new(
+            crate::dashboard_realtime::RealtimeMetricsRecorder::new(self.runtime_state.clone()),
+        ));
+        self.usage_runtime = Arc::new(usage_runtime);
         self.admin_security_blacklist_cache.clear();
         self.admin_security_whitelist_cache.clear();
         self.data = Arc::new(

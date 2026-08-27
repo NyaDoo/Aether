@@ -6,14 +6,17 @@ import Dashboard from '../Dashboard.vue'
 const dashboardApiMocks = vi.hoisted(() => ({
   getStats: vi.fn(),
   getDailyStats: vi.fn(),
+  getRealtimeMetrics: vi.fn(),
+}))
+
+const authStoreState = vi.hoisted(() => ({
+  canAccessAdmin: false,
+  isAdmin: false,
+  isAuditAdmin: false,
 }))
 
 vi.mock('@/stores/auth', () => ({
-  useAuthStore: () => ({
-    canAccessAdmin: false,
-    isAdmin: false,
-    isAuditAdmin: false,
-  }),
+  useAuthStore: () => authStoreState,
 }))
 
 vi.mock('@/api/dashboard', () => ({
@@ -125,6 +128,10 @@ async function settle() {
 beforeEach(() => {
   dashboardApiMocks.getStats.mockReset()
   dashboardApiMocks.getDailyStats.mockReset()
+  dashboardApiMocks.getRealtimeMetrics.mockReset()
+  authStoreState.canAccessAdmin = false
+  authStoreState.isAdmin = false
+  authStoreState.isAuditAdmin = false
   dashboardApiMocks.getDailyStats.mockResolvedValue({
     daily_stats: [],
     model_summary: [],
@@ -169,7 +176,7 @@ describe('Dashboard ordinary user wallet card', () => {
 })
 
 describe('Dashboard refresh controls', () => {
-  it('does not render or run automatic refresh', async () => {
+  it('does not refresh the ordinary-user dashboard automatically', async () => {
     vi.useFakeTimers()
     dashboardApiMocks.getStats.mockResolvedValue({ stats: [] })
 
@@ -187,6 +194,101 @@ describe('Dashboard refresh controls', () => {
       expect(dashboardApiMocks.getStats).toHaveBeenCalledTimes(1)
       expect(dashboardApiMocks.getDailyStats).toHaveBeenCalledTimes(1)
     } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('Dashboard realtime metrics', () => {
+  const realtimeSnapshot = {
+    rpm: 12.5,
+    tpm: 3456,
+    window_seconds: 60,
+    as_of: '2026-08-27T12:34:56Z',
+    semantics: {
+      rpm: 'accepted_non_failed_requests',
+      tpm: 'observed_token_deltas_including_failed',
+      window: 'trailing_60_seconds',
+      failed_requests: 'excluded_from_rpm_only',
+    },
+    storage_scope: 'shared',
+  }
+
+  function enableAdmin() {
+    authStoreState.canAccessAdmin = true
+    authStoreState.isAdmin = true
+  }
+
+  it('renders structured RPM/TPM values, window, timestamp, and semantics', async () => {
+    enableAdmin()
+    dashboardApiMocks.getStats.mockResolvedValue({
+      stats: [
+        { name: '今日请求 / 今日费用', value: '0 / $0.00', icon: 'Activity' },
+        { name: '今日 Tokens', value: '0', icon: 'Hash' },
+        { name: '全站 RPM / TPM', value: '0 / 0', subValue: '最近 60 秒', icon: 'Activity' },
+        { name: '在线 / 启用用户', value: '0 / 0', icon: 'Users' },
+      ],
+    })
+    dashboardApiMocks.getRealtimeMetrics.mockResolvedValue(realtimeSnapshot)
+
+    const root = mountDashboard()
+    await settle()
+
+    expect(dashboardApiMocks.getRealtimeMetrics).toHaveBeenCalledTimes(1)
+    expect(root.textContent).toContain('12.5 / 3.46K')
+    expect(root.textContent).toContain('最近 60 秒')
+    expect(root.textContent).toMatch(/截至 \d{2}:\d{2}:\d{2}/)
+    expect(root.textContent).toContain('已接纳且未失败请求')
+    expect(root.textContent).toContain('Token 增量')
+    expect(root.textContent).toContain('全站共享')
+  })
+
+  it('loads realtime metrics without waiting for the aggregate dashboard', async () => {
+    enableAdmin()
+    let resolveStats!: (value: { stats: Array<{ name: string, value: string, icon: string }> }) => void
+    dashboardApiMocks.getStats.mockReturnValue(new Promise((resolve) => {
+      resolveStats = resolve
+    }))
+    dashboardApiMocks.getRealtimeMetrics.mockResolvedValue(realtimeSnapshot)
+
+    const root = mountDashboard()
+    await settle()
+
+    expect(dashboardApiMocks.getRealtimeMetrics).toHaveBeenCalledTimes(1)
+
+    resolveStats({ stats: [] })
+    await settle()
+    expect(root).toBeTruthy()
+  })
+
+  it('pauses polling while hidden and refreshes immediately when visible again', async () => {
+    vi.useFakeTimers()
+    enableAdmin()
+    dashboardApiMocks.getStats.mockResolvedValue({ stats: [] })
+    dashboardApiMocks.getRealtimeMetrics.mockResolvedValue(realtimeSnapshot)
+
+    try {
+      const root = mountDashboard()
+      await settle()
+      expect(root).toBeTruthy()
+      expect(dashboardApiMocks.getRealtimeMetrics).toHaveBeenCalledTimes(1)
+
+      Object.defineProperty(document, 'hidden', { configurable: true, value: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      await vi.advanceTimersByTimeAsync(15_000)
+      await settle()
+      expect(dashboardApiMocks.getRealtimeMetrics).toHaveBeenCalledTimes(1)
+
+      Object.defineProperty(document, 'hidden', { configurable: true, value: false })
+      document.dispatchEvent(new Event('visibilitychange'))
+      await settle()
+      expect(dashboardApiMocks.getRealtimeMetrics).toHaveBeenCalledTimes(2)
+
+      await vi.advanceTimersByTimeAsync(5_000)
+      await settle()
+      expect(dashboardApiMocks.getRealtimeMetrics).toHaveBeenCalledTimes(3)
+    } finally {
+      Object.defineProperty(document, 'hidden', { configurable: true, value: false })
       vi.useRealTimers()
     }
   })

@@ -51,46 +51,88 @@ impl AppState {
         let persisted_snapshot = snapshot.redacted_for_persistence();
         let record = persisted_snapshot.to_upsert_record();
 
-        // Cancellation is a state transition, not an unconditional upsert.
-        // A poll can complete the task after the DELETE was sent but before
-        // this write; using UPSERT here would resurrect the row as Cancelled,
-        // erase the completed asset, and misclassify billing.  Use the
-        // repository CAS whenever a row already exists, and restore the
-        // winning database snapshot when the CAS loses.
-        if record.status == VideoTaskStatus::Cancelled {
-            if let Some(current) = self.find_video_task_by_id(&record.id).await? {
-                if !current.status.is_active() {
-                    self.video_tasks.hydrate_from_stored_task(&current);
-                    return Ok(Some(current));
-                }
-                let task_id = record.id.clone();
-                let updated = self.update_active_video_task(record).await?;
-                if updated.is_none() {
-                    if let Some(latest) = self.find_video_task_by_id(&task_id).await? {
-                        if !latest.status.is_active() {
-                            self.video_tasks.hydrate_from_stored_task(&latest);
-                            return Ok(Some(latest));
-                        }
-                        // The writer may be unavailable, or another active
-                        // update may still be in flight. Do not report a
-                        // cancellation success for an unchanged active row.
-                        if let Some(runtime) = self.reconstruct_video_task_snapshot(&latest).await?
-                        {
-                            self.video_tasks.record_snapshot(runtime);
-                        } else {
-                            self.video_tasks.hydrate_from_stored_task(&latest);
-                        }
-                        return Ok(None);
-                    }
-                }
-                return Ok(updated);
+        // Every update of an existing task is a state transition, not a blind
+        // UPSERT. A delayed/replayed create response can arrive after the
+        // poller has already completed or failed the task; replacing that row
+        // would erase its asset/token/error metadata and resurrect billing as
+        // active. Only an explicit administrative Deleted tombstone may
+        // replace a non-deleted terminal, and the repositories preserve the
+        // terminal payload while applying that tombstone.
+        if let Some(current) = self.find_video_task_by_id(&record.id).await? {
+            if !current
+                .status
+                .allows_snapshot_replacement_with(record.status)
+            {
+                self.record_video_task_snapshot_with_stored_truth(&current, snapshot);
+                return Ok(Some(current));
             }
+
+            if current.status.is_active() {
+                let task_id = record.id.clone();
+                if let Some(updated) = self.update_active_video_task(record).await? {
+                    self.record_video_task_snapshot_with_stored_truth(&updated, snapshot);
+                    return Ok(Some(updated));
+                }
+
+                // A concurrent poll/cancel/delete won the active-row CAS.
+                // Restore its immutable database truth rather than publishing
+                // the stale input snapshot to the in-memory registry.
+                if let Some(latest) = self.find_video_task_by_id(&task_id).await? {
+                    self.record_video_task_snapshot_with_stored_truth(&latest, snapshot);
+                    return Ok((!latest.status.is_active()).then_some(latest));
+                }
+                self.video_tasks.record_snapshot(snapshot.clone());
+                return Ok(None);
+            }
+
+            // The only allowed non-active transition is an explicit delete.
+            // Adapter upserts apply only the tombstone status/timestamp and
+            // preserve the generation terminal's asset and billing metadata.
+            let stored = self
+                .data
+                .upsert_video_task(record)
+                .await
+                .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            if let Some(stored) = stored.as_ref() {
+                self.record_video_task_snapshot_with_stored_truth(stored, snapshot);
+            }
+            return Ok(stored);
         }
 
-        self.data
+        let stored = self
+            .data
             .upsert_video_task(record)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if let Some(stored) = stored.as_ref() {
+            // SQL adapters independently enforce the same monotonic rule, so
+            // this also restores a concurrent insert's terminal truth.
+            self.record_video_task_snapshot_with_stored_truth(stored, snapshot);
+        } else {
+            // Preserve the existing in-memory-only fallback when no task
+            // writer is configured.
+            self.video_tasks.record_snapshot(snapshot.clone());
+        }
+        Ok(stored)
+    }
+
+    fn record_video_task_snapshot_with_stored_truth(
+        &self,
+        stored: &StoredVideoTask,
+        runtime_source: &video_tasks::LocalVideoTaskSnapshot,
+    ) {
+        let transport = match runtime_source {
+            video_tasks::LocalVideoTaskSnapshot::OpenAi(seed) => seed.transport.clone(),
+            video_tasks::LocalVideoTaskSnapshot::Gemini(seed) => seed.transport.clone(),
+            video_tasks::LocalVideoTaskSnapshot::Doubao(seed) => seed.transport.clone(),
+        };
+        if let Some(snapshot) =
+            video_tasks::LocalVideoTaskSnapshot::from_stored_task_with_transport(stored, transport)
+        {
+            self.video_tasks.record_snapshot(snapshot);
+        } else {
+            self.video_tasks.hydrate_from_stored_task(stored);
+        }
     }
 
     pub(crate) async fn hydrate_video_task_for_route(

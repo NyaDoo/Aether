@@ -161,20 +161,22 @@ impl Drop for ActiveProviderAttempt {
         };
         let outcome = turn.abandonment_outcome();
         let state = self.state.clone();
-        // No runtime means the process is going down; the spawn could not
-        // complete anyway.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            warn!(
-                event_name = "responses_websocket_turn_abandoned",
-                log_type = "ops",
-                transport = WEBSOCKET_LOG_TRANSPORT,
-                websocket = true,
-                "gateway finalized a Responses WebSocket turn whose relay task went away"
-            );
-            handle.spawn(async move {
-                turn.finalize_detached(&state, outcome).await;
-            });
-        }
+        warn!(
+            event_name = "responses_websocket_turn_abandoned",
+            log_type = "ops",
+            transport = WEBSOCKET_LOG_TRANSPORT,
+            websocket = true,
+            "gateway finalized a Responses WebSocket turn whose relay task went away"
+        );
+        // The owner can be dropped while the request runtime is already
+        // shutting down.  Spawning on that runtime silently loses the
+        // terminal usage/candidate handoff in precisely the 499 path this
+        // guard is meant to cover.  The usage runtime is process-lifetime and
+        // remains available until the process exits, so use it unconditionally
+        // (the same executor used by the terminal usage guards).
+        aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+            turn.finalize_detached(&state, outcome).await;
+        });
     }
 }
 
@@ -296,7 +298,11 @@ fn spawn_guarded_turn_finalization(
 ) -> JoinHandle<()> {
     // Spawn synchronously while the armed guard is still owned here. Caller
     // cancellation cannot drop an unguarded attempt between cleanup awaits.
-    tokio::spawn(async move {
+    // Keep the finalizer on the process-lifetime runtime as well: this handle
+    // may outlive the WebSocket relay task (and even its Tokio runtime) after a
+    // client 499.  Callers can still await the returned handle to preserve the
+    // normal ordering before a transparent retry.
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
         let mut turn = turn;
         turn.release_admission().await;
         turn.disarm().finalize_detached(&state, outcome).await;

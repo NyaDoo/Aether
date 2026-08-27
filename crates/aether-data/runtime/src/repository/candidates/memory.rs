@@ -4,9 +4,9 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 
 use super::{
-    request_candidate_lifecycle_would_regress, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
-    StoredRequestCandidate, UpsertRequestCandidateRecord,
+    request_candidate_lifecycle_should_preserve_existing, PublicHealthStatusCount,
+    PublicHealthTimelineBucket, RequestCandidateReadRepository, RequestCandidateStatus,
+    RequestCandidateWriteRepository, StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
 use crate::DataLayerError;
 
@@ -86,6 +86,41 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
             .cloned()
             .collect::<Vec<_>>();
         rows.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_unix_ms));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn list_active_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .by_id
+            .read()
+            .expect("request candidate repository lock")
+            .values()
+            .filter(|candidate| {
+                matches!(
+                    candidate.status,
+                    RequestCandidateStatus::Pending | RequestCandidateStatus::Streaming
+                ) && after_created_at_unix_ms.is_none_or(|created_at| {
+                    candidate.created_at_unix_ms > created_at
+                        || (candidate.created_at_unix_ms == created_at
+                            && candidate.id.as_str() > after_id.unwrap_or_default())
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            left.created_at_unix_ms
+                .cmp(&right.created_at_unix_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         rows.truncate(limit);
         Ok(rows)
     }
@@ -330,7 +365,7 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
             .cloned();
 
         let preserve_existing_lifecycle = existing.as_ref().is_some_and(|row| {
-            request_candidate_lifecycle_would_regress(row.status, candidate.status)
+            request_candidate_lifecycle_should_preserve_existing(row.status, candidate.status)
         });
         let merged_status = if preserve_existing_lifecycle {
             existing
@@ -439,6 +474,51 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
 
         by_id.insert(stored.id.clone(), stored.clone());
         Ok(stored)
+    }
+
+    async fn finalize_active_exact(
+        &self,
+        candidate: UpsertRequestCandidateRecord,
+    ) -> Result<bool, DataLayerError> {
+        candidate.validate()?;
+        if !candidate.status.is_terminal() {
+            return Err(DataLayerError::InvalidInput(
+                "exact active request candidate finalization requires a terminal status"
+                    .to_string(),
+            ));
+        }
+
+        let mut by_id = self
+            .by_id
+            .write()
+            .expect("request candidate repository lock");
+        let Some(existing) = by_id.get_mut(&candidate.id) else {
+            return Ok(false);
+        };
+        if existing.request_id != candidate.request_id
+            || existing.candidate_index != candidate.candidate_index
+            || existing.retry_index != candidate.retry_index
+            || !matches!(
+                existing.status,
+                RequestCandidateStatus::Pending | RequestCandidateStatus::Streaming
+            )
+        {
+            return Ok(false);
+        }
+
+        existing.status = candidate.status;
+        existing.status_code = candidate.status_code.or(existing.status_code);
+        if let Some(error_type) = candidate.error_type {
+            existing.error_type = Some(error_type);
+        }
+        if let Some(error_message) = candidate.error_message {
+            existing.error_message = Some(error_message);
+        }
+        existing.latency_ms = candidate.latency_ms.or(existing.latency_ms);
+        existing.finished_at_unix_ms = candidate
+            .finished_at_unix_ms
+            .or(existing.finished_at_unix_ms);
+        Ok(true)
     }
 
     async fn delete_created_before(

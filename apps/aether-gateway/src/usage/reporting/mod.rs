@@ -8,7 +8,10 @@ use tracing::{debug, warn};
 use crate::clock::current_unix_ms;
 use crate::log_ids::short_request_id;
 use crate::orchestration::{apply_local_report_effect, LocalReportEffect};
-use crate::request_candidate_runtime::record_report_request_candidate_status;
+use crate::request_candidate_runtime::{
+    record_report_request_candidate_status, report_candidate_terminal_usage_is_durable,
+    spawn_report_candidate_reconciliation,
+};
 use crate::task_runtime::{spawn_fire_and_forget, TASK_KEY_USAGE_SYNC_REPORT};
 use crate::{AppState, GatewayError};
 
@@ -82,9 +85,56 @@ fn log_dropped_report(
     );
 }
 
-pub(crate) async fn submit_sync_report(
+#[cfg(test)]
+async fn submit_sync_report(
+    state: &AppState,
+    payload: GatewaySyncReportRequest,
+) -> Result<(), GatewayError> {
+    submit_sync_report_with_candidate_gate(state, payload, true).await
+}
+
+/// Submit a sync execution report after the execution path has attempted its
+/// terminal usage handoff.  A `false` handoff means the usage terminal row is
+/// not known to be durable yet; in that case the report may still apply its
+/// provider-side effects, but it must not turn the request candidate into a
+/// terminal Success/Failed row and race the usage retry/cleanup path.
+pub(crate) async fn submit_sync_report_after_terminal_usage(
+    state: &AppState,
+    payload: GatewaySyncReportRequest,
+    usage_handoff_persisted: bool,
+) -> Result<(), GatewayError> {
+    submit_sync_report_with_candidate_gate(state, payload, usage_handoff_persisted).await
+}
+
+/// Safe entry point for internal/cross-gateway reports.  These handlers do not
+/// own the execution runtime's usage handoff, so they must prove that the
+/// matching usage terminal row is already durable before allowing a report to
+/// terminalize the request candidate.  A detached retry replays the candidate
+/// update once that proof becomes visible.
+pub(crate) async fn submit_sync_report_after_durable_usage(
+    state: &AppState,
+    payload: GatewaySyncReportRequest,
+) -> Result<(), GatewayError> {
+    let original_context = payload.report_context.clone();
+    let resolved_context =
+        resolve_locally_actionable_report_context(state, original_context.as_ref()).await;
+    let gate_context = resolved_context.as_ref().or(original_context.as_ref());
+    let terminal_update = build_sync_report_candidate_status_update(&payload, current_unix_ms());
+    let usage_handoff_persisted =
+        report_candidate_terminal_usage_is_durable(state, gate_context, terminal_update.status)
+            .await;
+    if !usage_handoff_persisted {
+        if let Some(context) = gate_context.cloned() {
+            spawn_report_candidate_reconciliation(state.clone(), context, terminal_update);
+        }
+    }
+    submit_sync_report_with_candidate_gate(state, payload, usage_handoff_persisted).await
+}
+
+async fn submit_sync_report_with_candidate_gate(
     state: &AppState,
     mut payload: GatewaySyncReportRequest,
+    candidate_terminal_allowed: bool,
 ) -> Result<(), GatewayError> {
     let original_report_context = payload.report_context.take();
     if let Some(report_context) =
@@ -95,7 +145,7 @@ pub(crate) async fn submit_sync_report(
             payload.report_context.as_ref(),
             payload.report_kind.as_str(),
         ) {
-            handle_local_sync_report(state, &payload).await;
+            handle_local_sync_report(state, &payload, candidate_terminal_allowed).await;
             log_local_report_handled(
                 payload.trace_id.as_str(),
                 &payload.report_kind,
@@ -111,7 +161,7 @@ pub(crate) async fn submit_sync_report(
         payload.report_context.as_ref(),
         payload.report_kind.as_str(),
     ) {
-        handle_local_sync_report(state, &payload).await;
+        handle_local_sync_report(state, &payload, candidate_terminal_allowed).await;
         log_local_report_handled(
             payload.trace_id.as_str(),
             &payload.report_kind,
@@ -124,7 +174,7 @@ pub(crate) async fn submit_sync_report(
     if payload.report_context.is_some()
         && is_local_ai_sync_report_kind(payload.report_kind.as_str())
     {
-        handle_local_sync_report(state, &payload).await;
+        handle_local_sync_report(state, &payload, candidate_terminal_allowed).await;
         log_local_report_effect_only(
             payload.trace_id.as_str(),
             &payload.report_kind,
@@ -143,12 +193,50 @@ pub(crate) async fn submit_sync_report(
     Ok(())
 }
 
-pub(crate) fn spawn_sync_report(state: AppState, payload: GatewaySyncReportRequest) {
+/// Detached counterpart of [`submit_sync_report_after_terminal_usage`].
+pub(crate) fn spawn_sync_report_after_terminal_usage(
+    state: AppState,
+    payload: GatewaySyncReportRequest,
+    usage_handoff_persisted: bool,
+) {
+    spawn_sync_report_with_candidate_gate(state, payload, usage_handoff_persisted);
+}
+
+pub(crate) fn spawn_sync_report_after_durable_usage(
+    state: AppState,
+    payload: GatewaySyncReportRequest,
+) {
     let report_request_id_for_log =
         short_request_id(report_request_id(payload.report_context.as_ref()));
     spawn_fire_and_forget(TASK_KEY_USAGE_SYNC_REPORT, async move {
         let trace_id = payload.trace_id.clone();
-        if let Err(err) = submit_sync_report(&state, payload).await {
+        if let Err(err) = submit_sync_report_after_durable_usage(&state, payload).await {
+            warn!(
+                event_name = "execution_report_submit_failed",
+                log_type = "ops",
+                trace_id = %trace_id,
+                report_scope = "sync",
+                report_request_id = %report_request_id_for_log,
+                error = ?err,
+                "gateway failed to submit internally gated sync execution report"
+            );
+        }
+    });
+}
+
+fn spawn_sync_report_with_candidate_gate(
+    state: AppState,
+    payload: GatewaySyncReportRequest,
+    candidate_terminal_allowed: bool,
+) {
+    let report_request_id_for_log =
+        short_request_id(report_request_id(payload.report_context.as_ref()));
+    spawn_fire_and_forget(TASK_KEY_USAGE_SYNC_REPORT, async move {
+        let trace_id = payload.trace_id.clone();
+        if let Err(err) =
+            submit_sync_report_with_candidate_gate(&state, payload, candidate_terminal_allowed)
+                .await
+        {
             warn!(
                 event_name = "execution_report_submit_failed",
                 log_type = "ops",
@@ -162,9 +250,29 @@ pub(crate) fn spawn_sync_report(state: AppState, payload: GatewaySyncReportReque
     });
 }
 
-pub(crate) async fn submit_stream_report(
+#[cfg(test)]
+async fn submit_stream_report(
+    state: &AppState,
+    payload: GatewayStreamReportRequest,
+) -> Result<(), GatewayError> {
+    submit_stream_report_with_candidate_gate(state, payload, true).await
+}
+
+/// Stream-report variant used by execution paths that already performed the
+/// terminal usage handoff.  Suppress report-driven candidate terminalization
+/// until that handoff is confirmed durable.
+pub(crate) async fn submit_stream_report_after_terminal_usage(
+    state: &AppState,
+    payload: GatewayStreamReportRequest,
+    usage_handoff_persisted: bool,
+) -> Result<(), GatewayError> {
+    submit_stream_report_with_candidate_gate(state, payload, usage_handoff_persisted).await
+}
+
+async fn submit_stream_report_with_candidate_gate(
     state: &AppState,
     mut payload: GatewayStreamReportRequest,
+    candidate_terminal_allowed: bool,
 ) -> Result<(), GatewayError> {
     let original_report_context = payload.report_context.take();
     if let Some(report_context) =
@@ -175,7 +283,7 @@ pub(crate) async fn submit_stream_report(
             payload.report_context.as_ref(),
             payload.report_kind.as_str(),
         ) {
-            handle_local_stream_report(state, &payload).await;
+            handle_local_stream_report(state, &payload, candidate_terminal_allowed).await;
             log_local_report_handled(
                 payload.trace_id.as_str(),
                 &payload.report_kind,
@@ -191,7 +299,7 @@ pub(crate) async fn submit_stream_report(
         payload.report_context.as_ref(),
         payload.report_kind.as_str(),
     ) {
-        handle_local_stream_report(state, &payload).await;
+        handle_local_stream_report(state, &payload, candidate_terminal_allowed).await;
         log_local_report_handled(
             payload.trace_id.as_str(),
             &payload.report_kind,
@@ -204,7 +312,7 @@ pub(crate) async fn submit_stream_report(
     if payload.report_context.is_some()
         && is_local_ai_stream_report_kind(payload.report_kind.as_str())
     {
-        handle_local_stream_report(state, &payload).await;
+        handle_local_stream_report(state, &payload, candidate_terminal_allowed).await;
         log_local_report_effect_only(
             payload.trace_id.as_str(),
             &payload.report_kind,
@@ -223,8 +331,76 @@ pub(crate) async fn submit_stream_report(
     Ok(())
 }
 
-async fn handle_local_sync_report(state: &AppState, payload: &GatewaySyncReportRequest) {
-    let terminal_unix_ms = current_unix_ms();
+async fn handle_local_sync_report(
+    state: &AppState,
+    payload: &GatewaySyncReportRequest,
+    candidate_terminal_allowed: bool,
+) {
+    let status_update = build_sync_report_candidate_status_update(payload, current_unix_ms());
+    let status = status_update.status;
+    if candidate_terminal_allowed {
+        let candidate_persisted = record_report_request_candidate_status(
+            state,
+            payload.report_context.as_ref(),
+            status_update.clone(),
+        )
+        .await;
+        if !candidate_persisted {
+            if let Some(context) = payload.report_context.clone() {
+                spawn_report_candidate_reconciliation(state.clone(), context, status_update);
+            }
+        }
+    } else {
+        warn!(
+            event_name = "execution_report_candidate_terminal_suppressed",
+            log_type = "ops",
+            trace_id = %payload.trace_id,
+            report_scope = "sync",
+            report_kind = %payload.report_kind,
+            status = ?status,
+            "suppressed report-driven candidate terminal status until usage handoff is durable"
+        );
+    }
+    apply_local_report_effect(state, LocalReportEffect::Sync { payload }).await;
+}
+
+async fn handle_local_stream_report(
+    state: &AppState,
+    payload: &GatewayStreamReportRequest,
+    candidate_terminal_allowed: bool,
+) {
+    let status_update = build_stream_report_candidate_status_update(payload, current_unix_ms());
+    let status = status_update.status;
+    if candidate_terminal_allowed {
+        let candidate_persisted = record_report_request_candidate_status(
+            state,
+            payload.report_context.as_ref(),
+            status_update.clone(),
+        )
+        .await;
+        if !candidate_persisted {
+            if let Some(context) = payload.report_context.clone() {
+                spawn_report_candidate_reconciliation(state.clone(), context, status_update);
+            }
+        }
+    } else {
+        warn!(
+            event_name = "execution_report_candidate_terminal_suppressed",
+            log_type = "ops",
+            trace_id = %payload.trace_id,
+            report_scope = "stream",
+            report_kind = %payload.report_kind,
+            status = ?status,
+            "suppressed report-driven candidate terminal status until usage handoff is durable"
+        );
+    }
+    apply_local_report_effect(state, LocalReportEffect::Stream { payload }).await;
+}
+
+fn build_sync_report_candidate_status_update(
+    payload: &GatewaySyncReportRequest,
+    terminal_unix_ms: u64,
+) -> SchedulerRequestCandidateStatusUpdate {
     let (error_type, error_message) =
         execution_error_details(None::<&ExecutionError>, payload.body_json.as_ref());
     let status = if sync_report_represents_failure(payload, error_type.as_deref()) {
@@ -232,74 +408,82 @@ async fn handle_local_sync_report(state: &AppState, payload: &GatewaySyncReportR
     } else {
         RequestCandidateStatus::Success
     };
-    let latency_ms = payload
-        .telemetry
-        .as_ref()
-        .and_then(|telemetry| telemetry.elapsed_ms);
-    record_report_request_candidate_status(
-        state,
-        payload.report_context.as_ref(),
-        SchedulerRequestCandidateStatusUpdate {
-            status,
-            status_code: Some(payload.status_code),
-            error_type,
-            error_message,
-            latency_ms,
-            started_at_unix_ms: None,
-            finished_at_unix_ms: Some(terminal_unix_ms),
-        },
-    )
-    .await;
-    apply_local_report_effect(state, LocalReportEffect::Sync { payload }).await;
+    SchedulerRequestCandidateStatusUpdate {
+        status,
+        status_code: Some(payload.status_code),
+        error_type,
+        error_message,
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms),
+        started_at_unix_ms: None,
+        finished_at_unix_ms: Some(terminal_unix_ms),
+    }
 }
 
-async fn handle_local_stream_report(state: &AppState, payload: &GatewayStreamReportRequest) {
-    let terminal_unix_ms = current_unix_ms();
-    let latency_ms = payload
-        .telemetry
-        .as_ref()
-        .and_then(|telemetry| telemetry.elapsed_ms);
+fn build_stream_report_candidate_status_update(
+    payload: &GatewayStreamReportRequest,
+    terminal_unix_ms: u64,
+) -> SchedulerRequestCandidateStatusUpdate {
     let failed = stream_report_represents_failure(payload);
     let missing_terminal_event = stream_report_missing_terminal_event(payload);
-    record_report_request_candidate_status(
-        state,
-        payload.report_context.as_ref(),
-        SchedulerRequestCandidateStatusUpdate {
-            status: if failed {
-                RequestCandidateStatus::Failed
-            } else {
-                RequestCandidateStatus::Success
-            },
-            status_code: Some(payload.status_code),
-            error_type: failed.then(|| {
-                if payload.status_code >= 400 {
-                    "stream_http_error".to_string()
-                } else if missing_terminal_event {
-                    STREAM_MISSING_TERMINAL_EVENT_CATEGORY.to_string()
-                } else {
-                    STREAM_TERMINAL_ERROR_CATEGORY.to_string()
-                }
-            }),
-            error_message: failed.then(|| {
-                payload
-                    .terminal_summary
-                    .as_ref()
-                    .and_then(|summary| summary.parser_error.clone())
-                    .unwrap_or_else(|| {
-                        if missing_terminal_event {
-                            STREAM_MISSING_TERMINAL_EVENT_MESSAGE.to_string()
-                        } else {
-                            STREAM_TERMINAL_ERROR_MESSAGE.to_string()
-                        }
-                    })
-            }),
-            latency_ms,
-            started_at_unix_ms: None,
-            finished_at_unix_ms: Some(terminal_unix_ms),
+    SchedulerRequestCandidateStatusUpdate {
+        status: if failed {
+            RequestCandidateStatus::Failed
+        } else {
+            RequestCandidateStatus::Success
         },
-    )
-    .await;
-    apply_local_report_effect(state, LocalReportEffect::Stream { payload }).await;
+        status_code: Some(payload.status_code),
+        error_type: failed.then(|| {
+            if payload.status_code >= 400 {
+                "stream_http_error".to_string()
+            } else if missing_terminal_event {
+                STREAM_MISSING_TERMINAL_EVENT_CATEGORY.to_string()
+            } else {
+                STREAM_TERMINAL_ERROR_CATEGORY.to_string()
+            }
+        }),
+        error_message: failed.then(|| {
+            payload
+                .terminal_summary
+                .as_ref()
+                .and_then(|summary| summary.parser_error.clone())
+                .unwrap_or_else(|| {
+                    if missing_terminal_event {
+                        STREAM_MISSING_TERMINAL_EVENT_MESSAGE.to_string()
+                    } else {
+                        STREAM_TERMINAL_ERROR_MESSAGE.to_string()
+                    }
+                })
+        }),
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms),
+        started_at_unix_ms: None,
+        finished_at_unix_ms: Some(terminal_unix_ms),
+    }
+}
+
+pub(crate) async fn submit_stream_report_after_durable_usage(
+    state: &AppState,
+    payload: GatewayStreamReportRequest,
+) -> Result<(), GatewayError> {
+    let original_context = payload.report_context.clone();
+    let resolved_context =
+        resolve_locally_actionable_report_context(state, original_context.as_ref()).await;
+    let gate_context = resolved_context.as_ref().or(original_context.as_ref());
+    let terminal_update = build_stream_report_candidate_status_update(&payload, current_unix_ms());
+    let usage_handoff_persisted =
+        report_candidate_terminal_usage_is_durable(state, gate_context, terminal_update.status)
+            .await;
+    if !usage_handoff_persisted {
+        if let Some(context) = gate_context.cloned() {
+            spawn_report_candidate_reconciliation(state.clone(), context, terminal_update);
+        }
+    }
+    submit_stream_report_with_candidate_gate(state, payload, usage_handoff_persisted).await
 }
 
 #[cfg(test)]
@@ -328,11 +512,26 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        resolve_locally_actionable_report_context, submit_stream_report, submit_sync_report,
-        GatewayStreamReportRequest, GatewaySyncReportRequest,
+        resolve_locally_actionable_report_context, submit_stream_report,
+        submit_stream_report_after_terminal_usage, submit_sync_report,
+        submit_sync_report_after_terminal_usage, GatewayStreamReportRequest,
+        GatewaySyncReportRequest,
     };
     use crate::data::GatewayDataState;
     use crate::AppState;
+
+    #[test]
+    fn ungated_report_entry_points_are_not_available_to_production_callers() {
+        let reporting_source = include_str!("mod.rs");
+        assert!(reporting_source.contains("#[cfg(test)]\nasync fn submit_sync_report("));
+        assert!(reporting_source.contains("#[cfg(test)]\nasync fn submit_stream_report("));
+        assert!(!reporting_source.contains("pub(crate) fn spawn_sync_report("));
+
+        let usage_exports = include_str!("../mod.rs");
+        assert!(!usage_exports.contains("submit_sync_report,"));
+        assert!(!usage_exports.contains("submit_stream_report,"));
+        assert!(!usage_exports.contains("spawn_sync_report,"));
+    }
 
     fn sample_request_candidate(id: &str, request_id: &str) -> StoredRequestCandidate {
         StoredRequestCandidate::new(
@@ -767,6 +966,85 @@ mod tests {
             stored[0].endpoint_id.as_deref(),
             Some("endpoint-reporting-tests-123")
         );
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_sync_usage_handoff_does_not_terminalize_candidate_from_report() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+            sample_request_candidate("cand-reporting-sync-gated-1", "req-reporting-sync-gated-1"),
+        ]));
+        let state = build_test_state(Arc::clone(&repository));
+
+        submit_sync_report_after_terminal_usage(
+            &state,
+            GatewaySyncReportRequest {
+                trace_id: "trace-reporting-sync-gated-1".to_string(),
+                report_kind: "openai_chat_sync_success".to_string(),
+                report_context: Some(json!({
+                    "request_id": "req-reporting-sync-gated-1",
+                    "client_api_format": "openai:chat"
+                })),
+                status_code: 200,
+                headers: BTreeMap::new(),
+                body_json: None,
+                client_body_json: None,
+                body_base64: None,
+                telemetry: None,
+            },
+            false,
+        )
+        .await
+        .expect("gated sync report should still apply locally");
+
+        let stored = repository
+            .list_by_request_id("req-reporting-sync-gated-1")
+            .await
+            .expect("request candidates should list");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].status, RequestCandidateStatus::Pending);
+        assert!(stored[0].finished_at_unix_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_stream_usage_handoff_does_not_terminalize_candidate_from_report() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+            sample_request_candidate(
+                "cand-reporting-stream-gated-1",
+                "req-reporting-stream-gated-1",
+            ),
+        ]));
+        let state = build_test_state(Arc::clone(&repository));
+
+        submit_stream_report_after_terminal_usage(
+            &state,
+            GatewayStreamReportRequest {
+                trace_id: "trace-reporting-stream-gated-1".to_string(),
+                report_kind: "openai_chat_stream_success".to_string(),
+                report_context: Some(json!({
+                    "request_id": "req-reporting-stream-gated-1",
+                    "client_api_format": "openai:chat"
+                })),
+                status_code: 200,
+                headers: BTreeMap::new(),
+                provider_body_base64: None,
+                provider_body_state: None,
+                client_body_base64: None,
+                client_body_state: None,
+                terminal_summary: None,
+                telemetry: None,
+            },
+            false,
+        )
+        .await
+        .expect("gated stream report should still apply locally");
+
+        let stored = repository
+            .list_by_request_id("req-reporting-stream-gated-1")
+            .await
+            .expect("request candidates should list");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].status, RequestCandidateStatus::Pending);
+        assert!(stored[0].finished_at_unix_ms.is_none());
     }
 
     #[tokio::test]

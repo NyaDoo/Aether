@@ -373,42 +373,50 @@ INSERT INTO video_tasks (
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-  short_id = excluded.short_id,
-  request_id = excluded.request_id,
-  user_id = excluded.user_id,
-  api_key_id = excluded.api_key_id,
-  username = excluded.username,
-  api_key_name = excluded.api_key_name,
-  external_task_id = excluded.external_task_id,
-  provider_id = excluded.provider_id,
-  endpoint_id = excluded.endpoint_id,
-  key_id = excluded.key_id,
-  client_api_format = excluded.client_api_format,
-  provider_api_format = excluded.provider_api_format,
-  format_converted = excluded.format_converted,
-  model = excluded.model,
-  prompt = excluded.prompt,
-  original_request_body = excluded.original_request_body,
-  duration_seconds = excluded.duration_seconds,
-  resolution = excluded.resolution,
-  aspect_ratio = excluded.aspect_ratio,
-  size = excluded.size,
-  status = excluded.status,
-  progress_percent = excluded.progress_percent,
-  progress_message = excluded.progress_message,
-  retry_count = excluded.retry_count,
-  poll_interval_seconds = excluded.poll_interval_seconds,
-  next_poll_at = excluded.next_poll_at,
-  poll_count = excluded.poll_count,
-  max_poll_count = excluded.max_poll_count,
-  video_url = excluded.video_url,
-  error_code = excluded.error_code,
-  error_message = excluded.error_message,
-  request_metadata = excluded.request_metadata,
-  created_at = excluded.created_at,
-  submitted_at = excluded.submitted_at,
-  completed_at = excluded.completed_at,
-  updated_at = excluded.updated_at
+  short_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.short_id ELSE excluded.short_id END,
+  request_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.request_id ELSE excluded.request_id END,
+  user_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.user_id ELSE excluded.user_id END,
+  api_key_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.api_key_id ELSE excluded.api_key_id END,
+  username = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.username ELSE excluded.username END,
+  api_key_name = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.api_key_name ELSE excluded.api_key_name END,
+  external_task_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.external_task_id ELSE excluded.external_task_id END,
+  provider_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.provider_id ELSE excluded.provider_id END,
+  endpoint_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.endpoint_id ELSE excluded.endpoint_id END,
+  key_id = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.key_id ELSE excluded.key_id END,
+  client_api_format = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.client_api_format ELSE excluded.client_api_format END,
+  provider_api_format = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.provider_api_format ELSE excluded.provider_api_format END,
+  format_converted = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.format_converted ELSE excluded.format_converted END,
+  model = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.model ELSE excluded.model END,
+  prompt = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.prompt ELSE excluded.prompt END,
+  original_request_body = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.original_request_body ELSE excluded.original_request_body END,
+  duration_seconds = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.duration_seconds ELSE excluded.duration_seconds END,
+  resolution = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.resolution ELSE excluded.resolution END,
+  aspect_ratio = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.aspect_ratio ELSE excluded.aspect_ratio END,
+  size = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.size ELSE excluded.size END,
+  progress_percent = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.progress_percent ELSE excluded.progress_percent END,
+  progress_message = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.progress_message ELSE excluded.progress_message END,
+  retry_count = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.retry_count ELSE excluded.retry_count END,
+  poll_interval_seconds = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.poll_interval_seconds ELSE excluded.poll_interval_seconds END,
+  next_poll_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.next_poll_at ELSE excluded.next_poll_at END,
+  poll_count = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.poll_count ELSE excluded.poll_count END,
+  max_poll_count = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.max_poll_count ELSE excluded.max_poll_count END,
+  video_url = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.video_url ELSE excluded.video_url END,
+  error_code = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.error_code ELSE excluded.error_code END,
+  error_message = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.error_message ELSE excluded.error_message END,
+  request_metadata = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.request_metadata ELSE excluded.request_metadata END,
+  created_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.created_at ELSE excluded.created_at END,
+  submitted_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.submitted_at ELSE excluded.submitted_at END,
+  completed_at = CASE WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.completed_at ELSE excluded.completed_at END,
+  updated_at = CASE
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired') AND excluded.status = 'deleted' THEN excluded.updated_at
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.updated_at
+    ELSE excluded.updated_at
+  END,
+  status = CASE
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired') AND excluded.status = 'deleted' THEN 'deleted'
+    WHEN video_tasks.status IN ('completed', 'failed', 'cancelled', 'expired', 'deleted') THEN video_tasks.status
+    ELSE excluded.status
+  END
 "#;
 
 const UPDATE_IF_ACTIVE_SQL: &str = r#"
@@ -811,6 +819,103 @@ mod tests {
             .expect("active task should update")
             .expect("active task should exist");
         assert_eq!(updated.progress_percent, 50);
+    }
+
+    #[tokio::test]
+    async fn sqlite_upsert_keeps_terminal_truth_and_tombstones_without_erasing_payload() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteVideoTaskRepository::new(pool);
+
+        for (index, terminal_status) in [
+            VideoTaskStatus::Completed,
+            VideoTaskStatus::Failed,
+            VideoTaskStatus::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task_id = format!("terminal-{index}");
+            let terminal = UpsertVideoTask {
+                completed_at_unix_secs: Some(100),
+                video_url: Some("https://assets.example/final.mp4".to_string()),
+                error_code: Some("terminal-code".to_string()),
+                error_message: Some("terminal-message".to_string()),
+                request_metadata: Some(serde_json::json!({
+                    "completion_tokens": 41,
+                    "total_tokens": 42,
+                })),
+                ..sample_task(&task_id, terminal_status, 100)
+            };
+            repository
+                .upsert(terminal.clone())
+                .await
+                .expect("terminal sqlite task should insert");
+
+            let blocked = repository
+                .upsert(UpsertVideoTask {
+                    video_url: None,
+                    error_code: None,
+                    error_message: None,
+                    request_metadata: None,
+                    ..sample_task(&task_id, VideoTaskStatus::Processing, 200)
+                })
+                .await
+                .expect("stale active sqlite upsert should return stored truth");
+            assert_eq!(blocked.status, terminal_status);
+            assert_eq!(blocked.video_url, terminal.video_url);
+            assert_eq!(blocked.error_code, terminal.error_code);
+            assert_eq!(blocked.error_message, terminal.error_message);
+            assert_eq!(blocked.request_metadata, terminal.request_metadata);
+            assert_eq!(blocked.completed_at_unix_secs, Some(100));
+
+            let conflicting_terminal_status = if terminal_status == VideoTaskStatus::Failed {
+                VideoTaskStatus::Completed
+            } else {
+                VideoTaskStatus::Failed
+            };
+            let conflicting_terminal = repository
+                .upsert(UpsertVideoTask {
+                    video_url: None,
+                    error_code: None,
+                    error_message: None,
+                    request_metadata: None,
+                    ..sample_task(&task_id, conflicting_terminal_status, 250)
+                })
+                .await
+                .expect("conflicting terminal sqlite upsert should return stored truth");
+            assert_eq!(conflicting_terminal, blocked);
+
+            let deleted = repository
+                .upsert(UpsertVideoTask {
+                    video_url: None,
+                    error_code: None,
+                    error_message: None,
+                    request_metadata: None,
+                    ..sample_task(&task_id, VideoTaskStatus::Deleted, 300)
+                })
+                .await
+                .expect("explicit sqlite delete should tombstone terminal task");
+            assert_eq!(deleted.status, VideoTaskStatus::Deleted);
+            assert_eq!(deleted.updated_at_unix_secs, 300);
+            assert_eq!(deleted.video_url, terminal.video_url);
+            assert_eq!(deleted.error_code, terminal.error_code);
+            assert_eq!(deleted.error_message, terminal.error_message);
+            assert_eq!(deleted.request_metadata, terminal.request_metadata);
+            assert_eq!(deleted.completed_at_unix_secs, Some(100));
+
+            let still_deleted = repository
+                .upsert(sample_task(&task_id, VideoTaskStatus::Completed, 400))
+                .await
+                .expect("deleted sqlite task should remain immutable");
+            assert_eq!(still_deleted, deleted);
+        }
     }
 
     #[tokio::test]

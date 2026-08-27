@@ -34,7 +34,8 @@ use crate::constants::{
     EXECUTION_PATH_LOCAL_ROUTE_NOT_FOUND, EXECUTION_PATH_PUBLIC_PROXY_PASSTHROUGH,
     EXECUTION_RUNTIME_LOOP_GUARD_HEADER, FORWARDED_FOR_HEADER, FORWARDED_HOST_HEADER,
     FORWARDED_PROTO_HEADER, GATEWAY_HEADER, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
-    TRACE_ID_HEADER, TRUSTED_AUTH_ACCESS_ALLOWED_HEADER, TRUSTED_AUTH_API_KEY_ID_HEADER,
+    REALTIME_ADMISSION_AT_MS_HEADER, REALTIME_ADMISSION_ID_HEADER, TRACE_ID_HEADER,
+    TRUSTED_AUTH_ACCESS_ALLOWED_HEADER, TRUSTED_AUTH_API_KEY_ID_HEADER,
     TRUSTED_AUTH_BALANCE_HEADER, TRUSTED_AUTH_USER_ID_HEADER, TUNNEL_AFFINITY_FORWARDED_BY_HEADER,
     TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
 };
@@ -514,7 +515,11 @@ async fn maybe_forward_public_request_to_tunnel_owner(
         upstream_request = upstream_request.timeout(timeout);
     }
     for (name, value) in &parts.headers {
-        if should_skip_request_header(name.as_str()) || name == http::header::HOST {
+        if (should_skip_request_header(name.as_str())
+            && name.as_str() != REALTIME_ADMISSION_ID_HEADER
+            && name.as_str() != REALTIME_ADMISSION_AT_MS_HEADER)
+            || name == http::header::HOST
+        {
             continue;
         }
         // Never relay caller-controlled identity or proof material. The sending
@@ -561,6 +566,32 @@ async fn maybe_forward_public_request_to_tunnel_owner(
         TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
         owner.gateway_instance_id.as_str(),
     )?;
+    if let Some(value) = parts
+        .headers
+        .get(REALTIME_ADMISSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        insert_internal_forward_header(
+            &mut internal_forward_headers,
+            REALTIME_ADMISSION_ID_HEADER,
+            value,
+        )?;
+    }
+    if let Some(value) = parts
+        .headers
+        .get(REALTIME_ADMISSION_AT_MS_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        insert_internal_forward_header(
+            &mut internal_forward_headers,
+            REALTIME_ADMISSION_AT_MS_HEADER,
+            value,
+        )?;
+    }
     insert_internal_forward_header(
         &mut internal_forward_headers,
         TRUSTED_AUTH_USER_ID_HEADER,
@@ -989,12 +1020,108 @@ pub(crate) async fn proxy_request(
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     request: Request,
 ) -> Result<Response<Body>, GatewayError> {
-    crate::request_diagnostics::scope_request_diagnostics(proxy_request_inner(
-        state,
-        remote_addr,
-        request,
-    ))
-    .await
+    // Resolve the trace ID once at the outer boundary and put it back on the
+    // request. `proxy_request_inner` also reads this header when it builds the
+    // execution plan; without the injection, header-less requests generated
+    // two different UUIDs and an error escaping the inner handler could not
+    // roll back the admission marker created under the other UUID.
+    let mut request = request;
+    let trace_id = extract_or_generate_trace_id(request.headers());
+    if let Ok(trace_header) = HeaderValue::from_str(&trace_id) {
+        request.headers_mut().insert(TRACE_ID_HEADER, trace_header);
+    }
+    // Do not use the caller's trace ID as the RPM idempotency key. A client is
+    // allowed to reuse a trace value for retries or a batch of requests, while
+    // each accepted HTTP request must have its own admission marker. An
+    // affinity-owner hop is the one exception: its HMAC proof authenticates
+    // the private identity/timestamp created by the originating gateway, so
+    // the owner must settle the same shared event rather than create a second
+    // request count.
+    let trusted_owner_forward = crate::control::verify_trusted_auth_forward_headers(
+        request.headers(),
+        request.method(),
+        request.uri(),
+    );
+    let realtime_admission_id = trusted_owner_forward
+        .then(|| {
+            request
+                .headers()
+                .get(REALTIME_ADMISSION_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .flatten()
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    if let Ok(admission_header) = HeaderValue::from_str(&realtime_admission_id) {
+        request
+            .headers_mut()
+            .insert(REALTIME_ADMISSION_ID_HEADER, admission_header);
+    }
+    let realtime_admission_at_ms = if trusted_owner_forward {
+        request
+            .headers()
+            .get(REALTIME_ADMISSION_AT_MS_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or_else(crate::clock::current_unix_ms)
+    } else {
+        request
+            .extensions()
+            .get::<crate::middleware::GatewayRequestAcceptedWallClockMs>()
+            .map(|value| value.0)
+            .unwrap_or_else(crate::clock::current_unix_ms)
+    };
+    if let Ok(admission_at_header) = HeaderValue::from_str(&realtime_admission_at_ms.to_string()) {
+        request
+            .headers_mut()
+            .insert(REALTIME_ADMISSION_AT_MS_HEADER, admission_at_header);
+    }
+    let realtime_runtime = state.runtime_state().clone();
+    let realtime_admission_id_for_error = realtime_admission_id.clone();
+    let terminal_state = state.clone();
+    let terminal_request_id = trace_id.clone();
+    let result = crate::request_diagnostics::scope_request_diagnostics(async move {
+        let mut terminal_guard = crate::executor::RequestTerminalOwnershipGuard::new(
+            terminal_state,
+            terminal_request_id,
+        );
+        let result = terminal_guard
+            .scope(proxy_request_inner(state, remote_addr, request))
+            .await;
+        match result {
+            Ok(response) => terminal_guard.settle_response(response).await,
+            Err(error) => {
+                terminal_guard.settle_error(&error).await;
+                Err(error)
+            }
+        }
+    })
+    .await;
+    if result.is_err() {
+        // Errors that escape the response finalizer (for example a planning
+        // panic/error) still need to remove an earlier realtime admission.
+        // The marker GETDEL makes this safe when a terminal usage event or a
+        // response finalizer already won the race.
+        aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+            if let Err(err) = crate::dashboard_realtime::rollback_admission(
+                &realtime_runtime,
+                &realtime_admission_id_for_error,
+            )
+            .await
+            {
+                tracing::warn!(
+                    event_name = "dashboard_realtime_request_error_rollback_failed",
+                    log_type = "ops",
+                    request_id = %realtime_admission_id_for_error,
+                    error = %err,
+                    "failed to compensate realtime admission after request error"
+                );
+            }
+        });
+    }
+    result
 }
 
 async fn proxy_request_inner(
@@ -1050,6 +1177,7 @@ async fn proxy_request_inner(
                 EXECUTION_PATH_LOCAL_OVERLOADED,
                 &started_at,
                 None,
+                None,
             ));
         }
         Err(RequestAdmissionError::Local(aether_runtime::ConcurrencyError::Closed { gate })) => {
@@ -1085,6 +1213,7 @@ async fn proxy_request_inner(
                 None,
                 EXECUTION_PATH_DISTRIBUTED_OVERLOADED,
                 &started_at,
+                None,
                 None,
             ));
         }
@@ -1126,6 +1255,7 @@ async fn proxy_request_inner(
                 EXECUTION_PATH_LOCAL_AUTH_DENIED,
                 &started_at,
                 request_permit.take(),
+                None,
             ));
         }
         Ok(false) => {}
@@ -1185,6 +1315,7 @@ async fn proxy_request_inner(
             EXECUTION_PATH_LOCAL_EXECUTION_LOOP_DETECTED,
             &started_at,
             request_permit.take(),
+            None,
         ));
     }
     let request_context_started_at = Instant::now();
@@ -1734,6 +1865,65 @@ async fn proxy_request_inner(
             &started_at,
             request_permit.take(),
         ));
+    }
+
+    // Count only requests that are actually handed to an execution path.  A
+    // number of `ai_public` routes (task listings, local validation, asset
+    // helpers, and operation reads) can be answered entirely in-process; they
+    // are not model executions and must not inflate the site-wide RPM card.
+    // This reservation is deliberately after the local-response branch but
+    // still follows authentication, owner forwarding, and frontdoor rate
+    // limiting.  Terminal failure paths consume the marker and compensate the
+    // original second bucket.
+    if control_decision.is_some_and(|decision| {
+        decision.route_class.as_deref() == Some("ai_public")
+            && decision.auth_context.is_some()
+            && decision.is_execution_runtime_candidate()
+    }) {
+        let realtime_admission_id = request_context
+            .realtime_admission_id
+            .as_deref()
+            .or_else(|| {
+                parts
+                    .headers
+                    .get(REALTIME_ADMISSION_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+            })
+            .unwrap_or(trace_id.as_str());
+        let realtime_admission_at_ms = parts
+            .headers
+            .get(REALTIME_ADMISSION_AT_MS_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<crate::middleware::GatewayRequestAcceptedWallClockMs>()
+                    .map(|value| value.0)
+            })
+            .unwrap_or_else(crate::clock::current_unix_ms);
+        match crate::dashboard_realtime::reserve_admission_at(
+            state.runtime_state(),
+            realtime_admission_id,
+            realtime_admission_at_ms,
+        )
+        .await
+        {
+            Ok(Some(guard)) => guard.handoff(),
+            Ok(None) => {}
+            Err(err) => {
+                // Realtime accounting is fail-open: a Redis outage must not
+                // turn a valid AI request into a 5xx.  The endpoint exposes
+                // the process/shared scope so operators can see degradation.
+                tracing::warn!(
+                    event_name = "dashboard_realtime_admission_record_failed",
+                    log_type = "ops",
+                    request_id = %realtime_admission_id,
+                    error = %err,
+                    "failed to record realtime AI admission"
+                );
+            }
+        }
     }
 
     if control_decision.is_none() {

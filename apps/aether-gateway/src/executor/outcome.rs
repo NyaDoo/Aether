@@ -26,8 +26,13 @@ use crate::constants::{
     EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
 };
 use crate::control::GatewayControlDecision;
+use crate::request_candidate_runtime::{
+    record_local_request_candidate_status, spawn_candidate_persistence_retry_after_usage_handoff,
+    spawn_terminal_candidate_reconciliation,
+};
 use crate::state::LocalExecutionRuntimeMissDiagnostic;
 use crate::AppState;
+use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 
 #[derive(Debug)]
 pub(crate) enum LocalExecutionRequestOutcome {
@@ -48,6 +53,8 @@ pub(crate) struct LocalExecutionExhaustion {
     upstream_status_code: Option<u16>,
     upstream_error_type: Option<String>,
     upstream_error_message: Option<String>,
+    reconciliation_plan: Option<ExecutionPlan>,
+    reconciliation_context: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -261,6 +268,8 @@ pub(crate) async fn build_local_execution_exhaustion(
         .and_then(|candidate| candidate.error_message.clone())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    exhaustion.reconciliation_plan = Some(plan.clone());
+    exhaustion.reconciliation_context = report_context.cloned();
     exhaustion
 }
 
@@ -281,6 +290,8 @@ pub(crate) fn build_fast_local_execution_exhaustion(
         upstream_status_code: None,
         upstream_error_type: None,
         upstream_error_message: None,
+        reconciliation_plan: Some(plan.clone()),
+        reconciliation_context: report_context.cloned(),
     }
 }
 
@@ -337,6 +348,8 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
         upstream_status_code,
         upstream_error_type,
         upstream_error_message,
+        reconciliation_plan,
+        reconciliation_context,
     } = exhaustion;
 
     let status_code = http::StatusCode::SERVICE_UNAVAILABLE.as_u16();
@@ -402,13 +415,73 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
     );
     data.request_metadata = Some(Value::Object(request_metadata));
 
-    state
+    let response_time_ms = data.response_time_ms;
+    let terminal_error_message = data.error_message.clone();
+    let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+        status: RequestCandidateStatus::Failed,
+        status_code: Some(candidate_status_code),
+        error_type: upstream_error_type,
+        error_message: terminal_error_message,
+        latency_ms: response_time_ms,
+        started_at_unix_ms: None,
+        finished_at_unix_ms: Some(crate::clock::current_unix_ms()),
+    };
+    let persisted = state
         .usage_runtime
-        .record_terminal_event_direct(
+        .record_terminal_event_direct_with_handoff(
             state.usage_lifecycle_data_state().as_ref(),
-            UsageEvent::new(UsageEventType::Failed, request_id, data),
+            UsageEvent::new(UsageEventType::Failed, request_id.clone(), data),
         )
         .await;
+    if let Some(plan) = reconciliation_plan {
+        let candidate_identity_matches = candidate_id
+            .as_deref()
+            .is_some_and(|candidate_id| plan.candidate_id.as_deref() == Some(candidate_id));
+        if candidate_identity_matches {
+            if persisted {
+                let candidate_persisted = record_local_request_candidate_status(
+                    state,
+                    &plan,
+                    reconciliation_context.as_ref(),
+                    terminal_candidate_update.clone(),
+                )
+                .await;
+                if !candidate_persisted {
+                    spawn_candidate_persistence_retry_after_usage_handoff(
+                        state.clone(),
+                        plan,
+                        reconciliation_context,
+                        terminal_candidate_update,
+                        None,
+                    );
+                }
+            } else {
+                spawn_terminal_candidate_reconciliation(
+                    state.clone(),
+                    plan,
+                    reconciliation_context,
+                    terminal_candidate_update,
+                );
+            }
+        } else if candidate_id.is_some() || plan.candidate_id.is_some() {
+            warn!(
+                event_name = "usage_runtime_miss_candidate_reconciliation_identity_mismatch",
+                log_type = "ops",
+                request_id = %request_id,
+                usage_candidate_id = ?candidate_id,
+                plan_candidate_id = ?plan.candidate_id,
+                "gateway refused to reconcile exhausted usage against a different request candidate"
+            );
+        }
+    }
+    if !persisted {
+        warn!(
+            event_name = "usage_runtime_miss_terminal_handoff_unconfirmed",
+            log_type = "ops",
+            request_id = %request_id,
+            "gateway could not confirm durable terminal usage for exhausted local execution"
+        );
+    }
 }
 
 pub(crate) async fn record_failed_usage_for_runtime_miss_request(
@@ -541,13 +614,21 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
     data.request_metadata =
         (!request_metadata.is_empty()).then_some(Value::Object(request_metadata));
 
-    state
+    let persisted = state
         .usage_runtime
-        .record_terminal_event_direct(
+        .record_terminal_event_direct_with_handoff(
             state.usage_lifecycle_data_state().as_ref(),
-            UsageEvent::new(UsageEventType::Failed, request_id, data),
+            UsageEvent::new(UsageEventType::Failed, request_id.to_string(), data),
         )
         .await;
+    if !persisted {
+        warn!(
+            event_name = "usage_runtime_miss_terminal_handoff_unconfirmed",
+            log_type = "ops",
+            request_id = %request_id,
+            "gateway could not confirm durable terminal usage for local execution runtime miss"
+        );
+    }
 }
 
 pub(crate) fn beautify_local_execution_client_error_message(message: &str) -> String {

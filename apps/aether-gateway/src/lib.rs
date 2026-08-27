@@ -39,6 +39,7 @@ mod client_session_affinity;
 mod clock;
 mod constants;
 mod control;
+pub(crate) mod dashboard_realtime;
 mod data;
 mod dispatch;
 mod email_delivery;

@@ -31,8 +31,9 @@ use serde_json::Value;
 
 use super::{
     api_key_usage_contribution, provider_api_key_usage_contribution,
-    strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
-    usage_request_metadata_client_family, ApiKeyUsageContribution, ApiKeyUsageDelta,
+    strip_deprecated_usage_display_fields, usage_billing_status_conflict_preserves_existing,
+    usage_can_recover_terminal_failure_for_candidate, usage_request_metadata_client_family,
+    usage_terminal_status_conflict_preserves_existing, ApiKeyUsageContribution, ApiKeyUsageDelta,
     ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta, ProviderApiKeyWindowUsageRequest,
     StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
     StoredProviderUsageSummary, StoredProviderUsageWindow, StoredRequestUsageAudit,
@@ -168,6 +169,35 @@ fn merge_usage_timing(existing: Option<u64>, incoming: Option<u64>) -> Option<u6
         Some(0) | None => existing.or(incoming),
         Some(value) => Some(value),
     }
+}
+
+/// Merge a counter from a retry/terminal payload without allowing a sparse or stale payload to
+/// erase facts already observed for the same request.  Terminal retries are monotonic: a larger
+/// observation wins, while an omitted/zero value is treated as missing.  Non-terminal writes
+/// retain the previous value only when the incoming field is omitted; their explicit values stay
+/// authoritative so progress events can still update counters normally.
+fn merge_usage_counter(existing: Option<u64>, incoming: Option<u64>, same_terminal: bool) -> u64 {
+    match incoming {
+        Some(value) if same_terminal => existing.unwrap_or_default().max(value),
+        Some(value) => value,
+        None => existing.unwrap_or_default(),
+    }
+}
+
+fn merge_usage_cost(existing: Option<f64>, incoming: Option<f64>, same_terminal: bool) -> f64 {
+    match incoming {
+        Some(value) if same_terminal => existing.unwrap_or_default().max(value),
+        Some(value) => value,
+        None => existing.unwrap_or_default(),
+    }
+}
+
+fn preserve_same_terminal<T: Clone>(
+    incoming: Option<T>,
+    existing: Option<&T>,
+    same_terminal: bool,
+) -> Option<T> {
+    incoming.or_else(|| same_terminal.then(|| existing.cloned()).flatten())
 }
 
 fn accumulate_provider_api_key_usage_contribution(
@@ -2881,6 +2911,24 @@ fn retain_previous_request_audit_metadata(
     Value::Object(retained)
 }
 
+fn merge_same_terminal_request_metadata(
+    existing: Option<&Value>,
+    incoming: Option<Value>,
+) -> Option<Value> {
+    match incoming {
+        None => existing.cloned(),
+        Some(Value::Object(incoming_object)) => {
+            let mut merged = existing
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            merged.extend(incoming_object);
+            Some(Value::Object(merged))
+        }
+        Some(incoming) => Some(incoming),
+    }
+}
+
 fn merge_usage_status_code(
     existing: Option<&StoredRequestUsageAudit>,
     incoming_status: &str,
@@ -2889,6 +2937,13 @@ fn merge_usage_status_code(
     if existing.is_some_and(|existing| {
         existing.status == "streaming"
             && incoming_status == "streaming"
+            && incoming_status_code.is_none()
+    }) {
+        return existing.and_then(|existing| existing.status_code);
+    }
+    if existing.is_some_and(|existing| {
+        usage_status_is_finalized(&existing.status)
+            && existing.status == incoming_status
             && incoming_status_code.is_none()
     }) {
         return existing.and_then(|existing| existing.status_code);
@@ -2913,6 +2968,11 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
         let usage = strip_deprecated_usage_display_fields(usage);
         let mut by_request_id = self.by_request_id.write().expect("usage repository lock");
         let existing = by_request_id.get(&usage.request_id).cloned();
+        let same_terminal_status = existing.as_ref().is_some_and(|existing| {
+            usage_status_is_finalized(&existing.status)
+                && existing.status == usage.status
+                && usage_status_is_finalized(&usage.status)
+        });
 
         let created_at_unix_ms = by_request_id
             .get(&usage.request_id)
@@ -2920,17 +2980,43 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
             .or(usage.created_at_unix_ms)
             .unwrap_or(usage.updated_at_unix_secs);
 
-        let total_tokens = usage
-            .total_tokens
-            .or_else(|| {
-                Some(
-                    usage.input_tokens.unwrap_or_default()
-                        + usage.output_tokens.unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
+        let input_tokens = merge_usage_counter(
+            existing.as_ref().map(|existing| existing.input_tokens),
+            usage.input_tokens,
+            same_terminal_status,
+        );
+        let output_tokens = merge_usage_counter(
+            existing.as_ref().map(|existing| existing.output_tokens),
+            usage.output_tokens,
+            same_terminal_status,
+        );
+        let total_tokens = match usage.total_tokens {
+            Some(value) if same_terminal_status => existing
+                .as_ref()
+                .map(|existing| existing.total_tokens.max(value))
+                .unwrap_or(value),
+            Some(value) => value,
+            None => existing
+                .as_ref()
+                .map(|existing| existing.total_tokens)
+                .unwrap_or_else(|| input_tokens.saturating_add(output_tokens)),
+        };
         if existing.as_ref().is_some_and(|existing| {
-            let can_recover = usage_can_recover_terminal_failure(
+            let can_recover = usage_can_recover_terminal_failure_for_candidate(
+                existing.status.as_str(),
+                existing.billing_status.as_str(),
+                existing.routing_candidate_id(),
+                usage.status.as_str(),
+                usage.billing_status.as_str(),
+                usage.routing_candidate_id(),
+            );
+            let terminal_status_conflict = usage_terminal_status_conflict_preserves_existing(
+                existing.status.as_str(),
+                existing.billing_status.as_str(),
+                usage.status.as_str(),
+                usage.billing_status.as_str(),
+            );
+            let billing_status_conflict = usage_billing_status_conflict_preserves_existing(
                 existing.status.as_str(),
                 existing.billing_status.as_str(),
                 usage.status.as_str(),
@@ -2941,7 +3027,11 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
             let completed_terminal_failure_recovery = existing.billing_status == "void"
                 && matches!(existing.status.as_str(), "failed" | "cancelled")
                 && usage.status == "completed";
-            (finalized_lifecycle_regression || completed_terminal_failure_recovery) && !can_recover
+            (billing_status_conflict
+                || terminal_status_conflict
+                || finalized_lifecycle_regression
+                || completed_terminal_failure_recovery)
+                && !can_recover
         }) {
             return Ok(existing.expect("existing usage should be present").clone());
         }
@@ -2967,7 +3057,10 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
         let clear_response_body = usage.response_body_state == Some(UsageBodyCaptureState::None);
         let clear_client_response_body =
             usage.client_response_body_state == Some(UsageBodyCaptureState::None);
-        let replace_routing_snapshot = usage_status_is_finalized(&usage.status);
+        // A repeated terminal write is an enrichment.  Preserve routing facts omitted by the
+        // sparse payload; only a lifecycle -> terminal transition replaces the prior snapshot.
+        let replace_routing_snapshot =
+            usage_status_is_finalized(&usage.status) && !same_terminal_status;
         let mut incoming_request_metadata = usage.request_metadata.clone();
         if incoming_request_metadata.is_some()
             && (clear_request_body || clear_provider_request_body)
@@ -2977,6 +3070,23 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 clear_request_body,
                 clear_provider_request_body,
             ));
+        }
+        if same_terminal_status {
+            incoming_request_metadata = merge_same_terminal_request_metadata(
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.request_metadata.as_ref()),
+                incoming_request_metadata,
+            );
+            // The merge above intentionally retains unrelated metadata, but an explicit body
+            // tombstone must still remove the corresponding derived facts from the result.
+            if clear_request_body || clear_provider_request_body {
+                incoming_request_metadata = Some(clear_request_body_facts(
+                    incoming_request_metadata.as_ref(),
+                    clear_request_body,
+                    clear_provider_request_body,
+                ));
+            }
         }
         let request_metadata = incoming_request_metadata.or_else(|| {
             if replace_routing_snapshot {
@@ -3061,8 +3171,20 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 .map(|existing| existing.id.clone())
                 .unwrap_or_else(|| format!("usage-{}", usage.request_id)),
             request_id: usage.request_id.clone(),
-            user_id: usage.user_id,
-            api_key_id: usage.api_key_id,
+            user_id: preserve_same_terminal(
+                usage.user_id,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.user_id.as_ref()),
+                same_terminal_status,
+            ),
+            api_key_id: preserve_same_terminal(
+                usage.api_key_id,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.api_key_id.as_ref()),
+                same_terminal_status,
+            ),
             username: existing
                 .as_ref()
                 .and_then(|existing| existing.username.clone()),
@@ -3071,84 +3193,184 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 .and_then(|existing| existing.api_key_name.clone()),
             provider_name: usage.provider_name,
             model: usage.model,
-            target_model: usage.target_model,
-            provider_id: usage.provider_id,
-            provider_endpoint_id: usage.provider_endpoint_id,
-            provider_api_key_id: usage.provider_api_key_id,
-            request_type: usage.request_type,
-            api_format: usage.api_format,
-            api_family: usage.api_family,
-            endpoint_kind: usage.endpoint_kind,
-            endpoint_api_format: usage.endpoint_api_format,
-            provider_api_family: usage.provider_api_family,
-            provider_endpoint_kind: usage.provider_endpoint_kind,
-            has_format_conversion: usage.has_format_conversion.unwrap_or(false),
-            is_stream: usage.is_stream.unwrap_or(false),
-            input_tokens: usage.input_tokens.unwrap_or_default(),
-            output_tokens: usage.output_tokens.unwrap_or_default(),
+            target_model: preserve_same_terminal(
+                usage.target_model,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.target_model.as_ref()),
+                same_terminal_status,
+            ),
+            provider_id: preserve_same_terminal(
+                usage.provider_id,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.provider_id.as_ref()),
+                same_terminal_status,
+            ),
+            provider_endpoint_id: preserve_same_terminal(
+                usage.provider_endpoint_id,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.provider_endpoint_id.as_ref()),
+                same_terminal_status,
+            ),
+            provider_api_key_id: preserve_same_terminal(
+                usage.provider_api_key_id,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.provider_api_key_id.as_ref()),
+                same_terminal_status,
+            ),
+            request_type: preserve_same_terminal(
+                usage.request_type,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.request_type.as_ref()),
+                same_terminal_status,
+            ),
+            api_format: preserve_same_terminal(
+                usage.api_format,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.api_format.as_ref()),
+                same_terminal_status,
+            ),
+            api_family: preserve_same_terminal(
+                usage.api_family,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.api_family.as_ref()),
+                same_terminal_status,
+            ),
+            endpoint_kind: preserve_same_terminal(
+                usage.endpoint_kind,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.endpoint_kind.as_ref()),
+                same_terminal_status,
+            ),
+            endpoint_api_format: preserve_same_terminal(
+                usage.endpoint_api_format,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.endpoint_api_format.as_ref()),
+                same_terminal_status,
+            ),
+            provider_api_family: preserve_same_terminal(
+                usage.provider_api_family,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.provider_api_family.as_ref()),
+                same_terminal_status,
+            ),
+            provider_endpoint_kind: preserve_same_terminal(
+                usage.provider_endpoint_kind,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.provider_endpoint_kind.as_ref()),
+                same_terminal_status,
+            ),
+            has_format_conversion: usage
+                .has_format_conversion
+                .or_else(|| {
+                    same_terminal_status
+                        .then(|| existing.as_ref().map(|e| e.has_format_conversion))
+                        .flatten()
+                })
+                .unwrap_or(false),
+            is_stream: usage
+                .is_stream
+                .or_else(|| {
+                    same_terminal_status
+                        .then(|| existing.as_ref().map(|e| e.is_stream))
+                        .flatten()
+                })
+                .unwrap_or(false),
+            input_tokens,
+            output_tokens,
             total_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or_else(|| {
+            cache_creation_input_tokens: merge_usage_counter(
                 existing
                     .as_ref()
-                    .map(|existing| existing.cache_creation_input_tokens)
-                    .unwrap_or_default()
-            }),
-            cache_creation_ephemeral_5m_input_tokens: usage
-                .cache_creation_ephemeral_5m_input_tokens
-                .unwrap_or_else(|| {
-                    existing
-                        .as_ref()
-                        .map(|existing| existing.cache_creation_ephemeral_5m_input_tokens)
-                        .unwrap_or_default()
-                }),
-            cache_creation_ephemeral_1h_input_tokens: usage
-                .cache_creation_ephemeral_1h_input_tokens
-                .unwrap_or_else(|| {
-                    existing
-                        .as_ref()
-                        .map(|existing| existing.cache_creation_ephemeral_1h_input_tokens)
-                        .unwrap_or_default()
-                }),
-            cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or_else(|| {
+                    .map(|existing| existing.cache_creation_input_tokens),
+                usage.cache_creation_input_tokens,
+                same_terminal_status,
+            ),
+            cache_creation_ephemeral_5m_input_tokens: merge_usage_counter(
                 existing
                     .as_ref()
-                    .map(|existing| existing.cache_read_input_tokens)
-                    .unwrap_or_default()
-            }),
-            cache_creation_cost_usd: usage.cache_creation_cost_usd.unwrap_or_else(|| {
+                    .map(|existing| existing.cache_creation_ephemeral_5m_input_tokens),
+                usage.cache_creation_ephemeral_5m_input_tokens,
+                same_terminal_status,
+            ),
+            cache_creation_ephemeral_1h_input_tokens: merge_usage_counter(
                 existing
                     .as_ref()
-                    .map(|existing| existing.cache_creation_cost_usd)
-                    .unwrap_or_default()
-            }),
-            cache_read_cost_usd: usage.cache_read_cost_usd.unwrap_or_else(|| {
+                    .map(|existing| existing.cache_creation_ephemeral_1h_input_tokens),
+                usage.cache_creation_ephemeral_1h_input_tokens,
+                same_terminal_status,
+            ),
+            cache_read_input_tokens: merge_usage_counter(
                 existing
                     .as_ref()
-                    .map(|existing| existing.cache_read_cost_usd)
-                    .unwrap_or_default()
-            }),
-            output_price_per_1m: existing
-                .as_ref()
-                .and_then(|existing| existing.output_price_per_1m),
-            total_cost_usd: usage.total_cost_usd.unwrap_or_else(|| {
+                    .map(|existing| existing.cache_read_input_tokens),
+                usage.cache_read_input_tokens,
+                same_terminal_status,
+            ),
+            cache_creation_cost_usd: merge_usage_cost(
                 existing
                     .as_ref()
-                    .map(|existing| existing.total_cost_usd)
-                    .unwrap_or_default()
-            }),
-            actual_total_cost_usd: usage.actual_total_cost_usd.unwrap_or_else(|| {
+                    .map(|existing| existing.cache_creation_cost_usd),
+                usage.cache_creation_cost_usd,
+                same_terminal_status,
+            ),
+            cache_read_cost_usd: merge_usage_cost(
                 existing
                     .as_ref()
-                    .map(|existing| existing.actual_total_cost_usd)
-                    .unwrap_or_default()
+                    .map(|existing| existing.cache_read_cost_usd),
+                usage.cache_read_cost_usd,
+                same_terminal_status,
+            ),
+            output_price_per_1m: usage.output_price_per_1m.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.output_price_per_1m)
             }),
+            total_cost_usd: merge_usage_cost(
+                existing.as_ref().map(|existing| existing.total_cost_usd),
+                usage.total_cost_usd,
+                same_terminal_status,
+            ),
+            actual_total_cost_usd: merge_usage_cost(
+                existing
+                    .as_ref()
+                    .map(|existing| existing.actual_total_cost_usd),
+                usage.actual_total_cost_usd,
+                same_terminal_status,
+            ),
             status_code: merge_usage_status_code(
                 existing.as_ref(),
                 usage.status.as_str(),
                 usage.status_code,
             ),
-            error_message: usage.error_message,
-            error_category: usage.error_category,
+            error_message: usage.error_message.or_else(|| {
+                same_terminal_status
+                    .then(|| {
+                        existing
+                            .as_ref()
+                            .and_then(|existing| existing.error_message.clone())
+                    })
+                    .flatten()
+            }),
+            error_category: usage.error_category.or_else(|| {
+                same_terminal_status
+                    .then(|| {
+                        existing
+                            .as_ref()
+                            .and_then(|existing| existing.error_category.clone())
+                    })
+                    .flatten()
+            }),
             response_time_ms: merge_usage_timing(
                 existing
                     .as_ref()
@@ -3326,8 +3548,21 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 }),
             request_metadata,
             created_at_unix_ms,
-            updated_at_unix_secs: usage.updated_at_unix_secs,
-            finalized_at_unix_secs: usage.finalized_at_unix_secs,
+            updated_at_unix_secs: existing
+                .as_ref()
+                .map(|existing| {
+                    existing
+                        .updated_at_unix_secs
+                        .max(usage.updated_at_unix_secs)
+                })
+                .unwrap_or(usage.updated_at_unix_secs),
+            finalized_at_unix_secs: preserve_same_terminal(
+                usage.finalized_at_unix_secs,
+                existing
+                    .as_ref()
+                    .and_then(|existing| existing.finalized_at_unix_secs.as_ref()),
+                same_terminal_status,
+            ),
         };
 
         by_request_id.insert(stored.request_id.clone(), stored.clone());

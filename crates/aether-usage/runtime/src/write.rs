@@ -975,7 +975,14 @@ pub fn build_stream_terminal_usage_payload_seed(
     let context = payload.report_context.as_ref().and_then(Value::as_object);
     let provider_response_headers = context_usage_value(context, "provider_response_headers")
         .or_else(|| headers_to_json(&payload.headers));
-    let client_response_headers = headers_to_json(&payload.headers);
+    // A stream report carries upstream headers in `payload.headers`, while
+    // the client-facing headers can differ after gateway translation (for
+    // example an upstream 4xx mapped to a local 502/499 response).  Preserve
+    // the explicit client capture from the report context whenever the
+    // execution path supplied it; only fall back to the upstream headers for
+    // legacy callers that have no transformed response metadata.
+    let client_response_headers = context_usage_value(context, "client_response_headers")
+        .or_else(|| headers_to_json(&payload.headers));
     let observed_stream_finish = payload
         .terminal_summary
         .as_ref()
@@ -2141,6 +2148,12 @@ fn build_runtime_request_metadata_seed_from_parts(
     let mut metadata = Map::new();
     if let Some(trace_id) = context_string(context, "trace_id") {
         metadata.insert("trace_id".to_string(), Value::String(trace_id));
+    }
+    if let Some(realtime_admission_id) = context_string(context, "realtime_admission_id") {
+        metadata.insert(
+            "realtime_admission_id".to_string(),
+            Value::String(realtime_admission_id),
+        );
     }
     if let Some(client_ip) = context_string(context, "client_ip") {
         metadata.insert("client_ip".to_string(), Value::String(client_ip));

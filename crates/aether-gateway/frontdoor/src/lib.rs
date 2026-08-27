@@ -9,7 +9,7 @@ pub use body::{
 
 pub use middleware::access_log::{
     access_log_middleware, sanitize_access_log_path, should_downgrade_access_log,
-    GatewayRequestAcceptedAt, RequestLogEmitted,
+    GatewayRequestAcceptedAt, GatewayRequestAcceptedWallClockMs, RequestLogEmitted,
 };
 pub use middleware::cf_headers::{
     apply_cf_header_stripping, strip_cf_headers_middleware, CfConnectingIp,

@@ -6,6 +6,10 @@ use crate::data::GatewayDataState;
 
 use super::{UsageCleanupSettings, UsageCleanupWindow};
 
+/// Keep stale-request cleanup well outside the normal long-lived stream window.  The value is
+/// expressed in minutes for backwards-compatible system-config keys; 120 minutes is 7,200s.
+pub(super) const DEFAULT_PENDING_CLEANUP_TIMEOUT_MINUTES: u64 = 120;
+
 pub(super) async fn system_config_bool(
     data: &GatewayDataState,
     key: &str,
@@ -80,7 +84,18 @@ pub(super) async fn system_config_string(
 pub(super) async fn pending_cleanup_timeout_minutes(
     data: &GatewayDataState,
 ) -> Result<u64, DataLayerError> {
-    system_config_u64(data, "pending_request_timeout_minutes", 10).await
+    let configured = system_config_u64(
+        data,
+        "pending_request_timeout_minutes",
+        DEFAULT_PENDING_CLEANUP_TIMEOUT_MINUTES,
+    )
+    .await?;
+    // Older installations may already have a persisted ten-minute value.  A
+    // new binary must not silently keep that unsafe window just because the
+    // setting predates the two-hour default: terminal usage handoff and
+    // provider drains are allowed to run for at least 7,200 seconds.  Operators
+    // can still choose a longer value explicitly.
+    Ok(configured.max(DEFAULT_PENDING_CLEANUP_TIMEOUT_MINUTES))
 }
 
 pub(super) async fn pending_cleanup_batch_size(

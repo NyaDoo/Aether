@@ -146,6 +146,11 @@ pub struct UsageEventData {
     pub request_metadata: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing_treat_as_completed: Option<bool>,
+    /// Records a successful, auditable operation that is explicitly outside
+    /// billing (for example an internal material-library control action).
+    /// Only trusted lifecycle builders should mint this typed proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_treat_as_void: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

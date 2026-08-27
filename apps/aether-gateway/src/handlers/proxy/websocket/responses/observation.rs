@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 
-use crate::ai_serving::api::StreamingStandardTerminalObserver;
+use crate::ai_serving::api::{StreamingCanonicalUsage, StreamingStandardTerminalObserver};
 use aether_contracts::ExecutionStreamTerminalSummary;
 
 /// 包一层 [`StreamingStandardTerminalObserver`]，只暴露结构化入口。
@@ -51,6 +51,13 @@ impl ResponsesStructuredTerminalObserver {
 
     pub(super) fn disable_with_error(&mut self, parser_error: impl Into<String>) {
         self.inner.disable_with_error(parser_error);
+    }
+
+    /// Drain usage increments observed since the previous structured frame.
+    /// Keeping this method on the wrapper makes the WebSocket relay consume
+    /// exactly the same high-water queue as the SSE/direct stream pump.
+    pub(super) fn take_token_deltas(&mut self) -> Vec<StreamingCanonicalUsage> {
+        self.inner.take_token_deltas()
     }
 
     pub(super) fn finish(&mut self, report_context: &Value) -> ExecutionStreamTerminalSummary {

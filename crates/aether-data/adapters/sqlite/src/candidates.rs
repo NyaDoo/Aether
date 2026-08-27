@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, SqliteConnection};
 
 use aether_data_contracts::repository::candidates::{
-    request_candidate_lifecycle_would_regress, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
-    StoredRequestCandidate, UpsertRequestCandidateRecord,
+    request_candidate_lifecycle_should_preserve_existing, PublicHealthStatusCount,
+    PublicHealthTimelineBucket, RequestCandidateReadRepository, RequestCandidateStatus,
+    RequestCandidateWriteRepository, StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::DataLayerError;
 use aether_data_query::{push_in, WhereClause};
@@ -41,6 +41,21 @@ SELECT
   started_at AS started_at_unix_ms,
   finished_at AS finished_at_unix_ms
 FROM request_candidates
+"#;
+
+const FINALIZE_ACTIVE_EXACT_SQL: &str = r#"
+UPDATE request_candidates
+SET status = ?,
+    status_code = COALESCE(?, status_code),
+    error_type = COALESCE(?, error_type),
+    error_message = COALESCE(?, error_message),
+    latency_ms = COALESCE(?, latency_ms),
+    finished_at = COALESCE(?, finished_at)
+WHERE id = ?
+  AND request_id = ?
+  AND candidate_index = ?
+  AND retry_index = ?
+  AND status IN ('pending', 'streaming')
 "#;
 
 #[derive(Debug, Clone)]
@@ -101,6 +116,47 @@ impl RequestCandidateReadRepository for SqliteRequestCandidateRepository {
         .fetch_all(&self.pool)
         .await
         .map_sql_err()?;
+        rows.iter().map(map_candidate_row).collect()
+    }
+
+    async fn list_active_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = if let Some(after_created_at_unix_ms) = after_created_at_unix_ms {
+            let after_created_at_unix_ms =
+                i64::try_from(after_created_at_unix_ms).map_err(|_| {
+                    DataLayerError::UnexpectedValue(format!(
+                        "invalid active request candidate cursor: {after_created_at_unix_ms}"
+                    ))
+                })?;
+            sqlx::query(&format!(
+                "{CANDIDATE_COLUMNS} WHERE status IN ('pending', 'streaming') \
+                 AND (created_at > ? OR (created_at = ? AND id > ?)) \
+                 ORDER BY created_at ASC, id ASC LIMIT ?"
+            ))
+            .bind(after_created_at_unix_ms)
+            .bind(after_created_at_unix_ms)
+            .bind(after_id.unwrap_or_default())
+            .bind(limit_i64(limit, "active request candidate limit")?)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        } else {
+            sqlx::query(&format!(
+                "{CANDIDATE_COLUMNS} WHERE status IN ('pending', 'streaming') \
+                 ORDER BY created_at ASC, id ASC LIMIT ?"
+            ))
+            .bind(limit_i64(limit, "active request candidate limit")?)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        };
         rows.iter().map(map_candidate_row).collect()
     }
 
@@ -306,6 +362,39 @@ impl RequestCandidateWriteRepository for SqliteRequestCandidateRepository {
         }
     }
 
+    async fn finalize_active_exact(
+        &self,
+        candidate: UpsertRequestCandidateRecord,
+    ) -> Result<bool, DataLayerError> {
+        candidate.validate()?;
+        if !candidate.status.is_terminal() {
+            return Err(DataLayerError::InvalidInput(
+                "exact active request candidate finalization requires a terminal status"
+                    .to_string(),
+            ));
+        }
+        let result = sqlx::query(FINALIZE_ACTIVE_EXACT_SQL)
+            .bind(status_to_database(candidate.status))
+            .bind(candidate.status_code.map(i32::from))
+            .bind(&candidate.error_type)
+            .bind(&candidate.error_message)
+            .bind(candidate.latency_ms.map(to_i32_u64).transpose()?)
+            .bind(
+                candidate
+                    .finished_at_unix_ms
+                    .map(|value| u64_to_i64(value, "request candidate finished_at"))
+                    .transpose()?,
+            )
+            .bind(&candidate.id)
+            .bind(&candidate.request_id)
+            .bind(to_i32(candidate.candidate_index)?)
+            .bind(to_i32(candidate.retry_index)?)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn delete_created_before(
         &self,
         created_before_unix_secs: u64,
@@ -381,7 +470,7 @@ async fn insert_candidate_if_absent(
 INSERT INTO request_candidates (
   id, request_id, candidate_index, retry_index, status, created_at
 )
-VALUES (?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, 'available', ?)
 ON CONFLICT(request_id, candidate_index, retry_index) DO NOTHING
 "#,
     )
@@ -389,7 +478,6 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO NOTHING
     .bind(&candidate.request_id)
     .bind(to_i32(candidate.candidate_index)?)
     .bind(to_i32(candidate.retry_index)?)
-    .bind(status_to_database(candidate.status))
     .bind(u64_to_i64(
         candidate.created_at_unix_ms,
         "request candidate created_at",
@@ -441,6 +529,10 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
   key_id = excluded.key_id,
   status = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND excluded.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> excluded.status
+      THEN request_candidates.status
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status
     WHEN request_candidates.status = 'pending'
@@ -455,6 +547,10 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
   is_cached = excluded.is_cached,
   status_code = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND excluded.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> excluded.status
+      THEN request_candidates.status_code
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status_code
     WHEN request_candidates.status = 'pending'
@@ -466,6 +562,10 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
     ELSE COALESCE(excluded.status_code, request_candidates.status_code)
   END,
   error_type = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND excluded.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> excluded.status
+      THEN request_candidates.error_type
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_type
@@ -479,6 +579,10 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
   END,
   error_message = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND excluded.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> excluded.status
+      THEN request_candidates.error_message
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_message
     WHEN request_candidates.status = 'pending'
@@ -490,6 +594,10 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
     ELSE COALESCE(excluded.error_message, request_candidates.error_message)
   END,
   latency_ms = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND excluded.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> excluded.status
+      THEN request_candidates.latency_ms
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.latency_ms
@@ -507,6 +615,10 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
   created_at = excluded.created_at,
   started_at = excluded.started_at,
   finished_at = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND excluded.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> excluded.status
+      THEN request_candidates.finished_at
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.finished_at
@@ -564,7 +676,7 @@ fn merge_candidate(
     existing: Option<StoredRequestCandidate>,
 ) -> Result<StoredRequestCandidate, DataLayerError> {
     let preserve_existing_lifecycle = existing.as_ref().is_some_and(|value| {
-        request_candidate_lifecycle_would_regress(value.status, candidate.status)
+        request_candidate_lifecycle_should_preserve_existing(value.status, candidate.status)
     });
     let merged_status = if preserve_existing_lifecycle {
         existing
@@ -926,6 +1038,90 @@ mod tests {
     };
     use serde_json::json;
 
+    #[test]
+    fn exact_active_finalization_sql_is_identity_cas_and_terminal_safe() {
+        let sql = super::FINALIZE_ACTIVE_EXACT_SQL;
+        assert!(sql.contains("WHERE id = ?"));
+        assert!(sql.contains("AND request_id = ?"));
+        assert!(sql.contains("AND candidate_index = ?"));
+        assert!(sql.contains("AND retry_index = ?"));
+        assert!(sql.contains("status IN ('pending', 'streaming')"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_exact_active_finalization_rejects_slot_alias_and_terminal_rewrite() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteRequestCandidateRepository::new(pool);
+        repository
+            .upsert(sample_upsert(
+                "candidate-exact",
+                RequestCandidateStatus::Pending,
+                None,
+                1_000,
+            ))
+            .await
+            .expect("active candidate should seed");
+
+        let mut slot_alias = sample_upsert(
+            "candidate-different-id",
+            RequestCandidateStatus::Failed,
+            None,
+            1_000,
+        );
+        slot_alias.status_code = Some(502);
+        assert!(!repository
+            .finalize_active_exact(slot_alias)
+            .await
+            .expect("slot alias compare/update should run"));
+        assert_eq!(
+            repository
+                .list_by_request_id("request-1")
+                .await
+                .expect("candidate should read")[0]
+                .status,
+            RequestCandidateStatus::Pending
+        );
+
+        let mut exact = sample_upsert(
+            "candidate-exact",
+            RequestCandidateStatus::Failed,
+            None,
+            1_000,
+        );
+        exact.status_code = Some(502);
+        exact.error_message = Some("upstream failed".to_string());
+        exact.finished_at_unix_ms = Some(2_000);
+        assert!(repository
+            .finalize_active_exact(exact)
+            .await
+            .expect("exact compare/update should run"));
+
+        let rewrite = sample_upsert(
+            "candidate-exact",
+            RequestCandidateStatus::Success,
+            None,
+            1_000,
+        );
+        assert!(!repository
+            .finalize_active_exact(rewrite)
+            .await
+            .expect("terminal rewrite compare/update should run"));
+        let stored = repository
+            .list_by_request_id("request-1")
+            .await
+            .expect("candidate should read");
+        assert_eq!(stored[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(stored[0].status_code, Some(502));
+        assert_eq!(stored[0].finished_at_unix_ms, Some(2_000));
+    }
+
     #[tokio::test]
     async fn sqlite_repository_writes_and_reads_request_candidates() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1064,6 +1260,66 @@ mod tests {
         assert_eq!(populated.sla_eligible_count, 0);
         assert_eq!(populated.failed_count, 0);
         assert_eq!(populated.user_error_count, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_terminal_conflict_keeps_first_terminal_metadata() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteRequestCandidateRepository::new(pool);
+        let request_id = "request-terminal-conflict";
+
+        let mut first = sample_upsert(
+            "first-terminal",
+            RequestCandidateStatus::Success,
+            Some(json!({"first": true})),
+            2_000_000,
+        );
+        first.request_id = request_id.to_string();
+        first.status_code = Some(200);
+        first.latency_ms = Some(123);
+        first.finished_at_unix_ms = Some(2_000_123);
+        repository
+            .upsert(first)
+            .await
+            .expect("first terminal candidate should persist");
+
+        let mut late = sample_upsert(
+            "late-terminal",
+            RequestCandidateStatus::Failed,
+            Some(json!({"late": true})),
+            2_000_100,
+        );
+        late.request_id = request_id.to_string();
+        late.status_code = Some(502);
+        late.error_type = Some("late_failure".to_string());
+        late.error_message = Some("late terminal report".to_string());
+        late.latency_ms = Some(9_999);
+        late.finished_at_unix_ms = Some(9_999_999);
+        repository
+            .upsert(late)
+            .await
+            .expect("late terminal candidate should be accepted");
+
+        let rows = repository
+            .list_by_request_id(request_id)
+            .await
+            .expect("terminal conflict candidate should load");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.status, RequestCandidateStatus::Success);
+        assert_eq!(row.status_code, Some(200));
+        assert_eq!(row.error_type, None);
+        assert_eq!(row.error_message, None);
+        assert_eq!(row.latency_ms, Some(123));
+        assert_eq!(row.finished_at_unix_ms, Some(2_000_123));
+        assert_eq!(row.extra_data, Some(json!({"first": true, "late": true})));
     }
 
     #[tokio::test]

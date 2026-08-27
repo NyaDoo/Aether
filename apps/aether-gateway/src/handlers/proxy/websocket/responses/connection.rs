@@ -287,6 +287,13 @@ pub(super) async fn relay_bound_connection(
                     }
                     _ => None,
                 };
+                if let Some(turn) = bound.turn_state.attempt_mut() {
+                    // Publish cumulative usage increments before forwarding or
+                    // settling the frame.  This keeps TPM live for long-lived
+                    // Responses WebSocket turns and includes tokens observed
+                    // before a terminal event arrives.
+                    turn.drain_realtime_token_deltas(state);
+                }
                 if matches!(
                     observation,
                     Some(ResponsesWebSocketTurnObservation::Started)
@@ -364,6 +371,12 @@ pub(super) async fn relay_bound_connection(
                     //    或者干脆判成无可用供应商。
                     let settled = match retry_turn {
                         Some(mut turn) => {
+                            // The old provider attempt is an intermediate
+                            // failure: keep the logical request's RPM
+                            // admission alive until the replacement attempt
+                            // settles.  The quota retry owner carries a
+                            // compensating guard for the all-failure path.
+                            turn.defer_realtime_admission_failure_rollback();
                             turn.release_admission().await;
                             settle_turn_finalization(
                                 bound,

@@ -4,7 +4,7 @@ use std::io::Error as IoError;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    Arc,
+    Arc, LazyLock,
 };
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -36,7 +36,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::MissedTickBehavior;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, info, warn};
@@ -80,7 +80,7 @@ use crate::execution_runtime::kiro_cache::{
     compute_kiro_prompt_cache_usage, estimate_kiro_prompt_input_tokens,
     kiro_simulated_cache_enabled_from_provider_config,
     kiro_simulated_cache_enabled_from_report_context, KiroPromptCacheUsage,
-    KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD,
+    KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD, TERMINAL_KIRO_CACHE_LOOKUP_TIMEOUT,
 };
 use crate::execution_runtime::kiro_web_search::maybe_execute_kiro_web_search_stream;
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
@@ -89,6 +89,7 @@ use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_executio
 use crate::execution_runtime::submission::{
     resolve_core_error_background_report_kind, resolve_local_sync_error_status_code,
     strip_utf8_bom_and_ws, submit_local_core_error_or_sync_finalize,
+    submit_local_core_error_or_sync_finalize_after_terminal_usage,
 };
 use crate::execution_runtime::transport::{
     execute_stream_plan_via_local_tunnel, format_hyper_error_chain, format_upstream_request_error,
@@ -99,26 +100,27 @@ use crate::execution_runtime::transport::{
 };
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_stream;
 use crate::execution_runtime::{
-    ai_attempt_retry_scope_from_failure_disposition, apply_endpoint_response_header_rules,
-    attach_provider_response_headers_to_report_context, local_failover_response_text,
+    ai_attempt_retry_scope_from_failure_disposition,
+    apply_endpoint_response_header_rules_best_effort,
+    attach_provider_response_headers_to_report_context,
+    build_direct_execution_frame_stream_with_realtime, local_failover_response_text,
     resolve_core_stream_direct_finalize_report_kind,
     resolve_core_stream_error_finalize_report_kind,
     resolve_local_candidate_failover_analysis_stream, should_fallback_to_control_stream,
-    should_retry_next_local_candidate_stream, LocalFailoverDecision,
+    should_retry_next_local_candidate_stream, LocalFailoverDecision, RealtimeStreamContext,
 };
 use crate::execution_runtime::{
     MAX_ERROR_BODY_BYTES, MAX_STREAM_PREFETCH_BYTES, MAX_STREAM_PREFETCH_FRAMES,
 };
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
-    apply_local_execution_effect, build_local_error_flow_metadata, classify_failure_disposition,
-    cyber_continue_failover_enabled, spawn_local_oauth_success_effect,
-    trace_upstream_response_body, with_error_flow_report_context,
+    apply_local_execution_effect, apply_local_stream_failure_effects_with_analysis,
+    build_local_error_flow_metadata, classify_failure_disposition, cyber_continue_failover_enabled,
+    spawn_local_oauth_success_effect, trace_upstream_response_body, with_error_flow_report_context,
     with_upstream_response_report_context, FailureDisposition, FailureTokenAction,
-    LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
-    LocalExecutionEffect, LocalExecutionEffectContext, LocalFailoverAnalysis,
-    LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
-    LocalOAuthSuccessEffect, LocalPoolErrorEffect,
+    LocalAdaptiveSuccessEffect, LocalExecutionEffect, LocalExecutionEffectContext,
+    LocalFailoverAnalysis, LocalHealthSuccessEffect, LocalOAuthSuccessEffect,
+    LocalStreamFailureEffect,
 };
 use crate::provider_pool_demand::{
     acquire_provider_pool_in_flight_guard, ProviderPoolInFlightGuard,
@@ -126,7 +128,8 @@ use crate::provider_pool_demand::{
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, persist_local_request_candidate_status_record,
     record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
-    snapshot_local_request_candidate_status, try_enqueue_local_request_candidate_status_snapshot,
+    snapshot_local_request_candidate_status, spawn_candidate_persistence_retry_after_usage_handoff,
+    spawn_terminal_candidate_reconciliation, try_enqueue_local_request_candidate_status_snapshot,
     LocalRequestCandidateStatusSnapshot,
 };
 use crate::request_diagnostics::{
@@ -138,7 +141,7 @@ use crate::stage_metrics::{
     attach_stage_trace_to_report_context, observe_gateway_stage_ms, observe_gateway_stage_trace_ms,
     record_stream_pre_first_byte_spawn, RequestStageTrace,
 };
-use crate::usage::submit_stream_report;
+use crate::usage::submit_stream_report_after_terminal_usage;
 use crate::usage::{GatewayStreamReportRequest, GatewaySyncReportRequest};
 use crate::{
     AppState, GatewayError, GEMINI_FILES_DOWNLOAD_PLAN_KIND, OPENAI_VIDEO_CONTENT_PLAN_KIND,
@@ -163,6 +166,18 @@ const POST_STOP_FRAME_READ_BUDGET_INACTIVE: usize = usize::MAX;
 const POST_STOP_MAX_EMPTY_CHUNKS_PER_POLL: usize = 32;
 const DEFAULT_DIRECT_PASSTHROUGH_CHANNEL_CAPACITY: usize = 16;
 const MAX_DIRECT_PASSTHROUGH_CHANNEL_CAPACITY: usize = 1024;
+// A dropped client must not be able to create an unbounded number of detached
+// upstream drain tasks.  The normal upstream admission gates still protect
+// active requests; this separate gate limits the extra work performed after a
+// downstream disconnect.
+const STREAM_DRAIN_CONCURRENCY: usize = 256;
+static STREAM_DRAIN_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(STREAM_DRAIN_CONCURRENCY)));
+const STREAM_TERMINAL_HANDOFF_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
 const DIRECT_PASSTHROUGH_CHANNEL_CAPACITY_ENV: &str =
     "AETHER_GATEWAY_DIRECT_PASSTHROUGH_CHANNEL_CAPACITY";
 const DIRECT_PASSTHROUGH_MODE_ENV: &str = "AETHER_GATEWAY_DIRECT_PASSTHROUGH_MODE";
@@ -329,6 +344,10 @@ fn direct_passthrough_channel_capacity() -> usize {
         .clamp(1, MAX_DIRECT_PASSTHROUGH_CHANNEL_CAPACITY)
 }
 
+fn try_acquire_stream_drain_permit() -> Option<OwnedSemaphorePermit> {
+    STREAM_DRAIN_SEMAPHORE.clone().try_acquire_owned().ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectPassthroughMode {
     Inline,
@@ -401,7 +420,7 @@ async fn record_sync_terminal_usage_with_handoff(
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
-) {
+) -> bool {
     record_sync_terminal_usage_with_handoff_after_spawn(
         state,
         plan,
@@ -409,7 +428,7 @@ async fn record_sync_terminal_usage_with_handoff(
         payload,
         std::future::ready(()),
     )
-    .await;
+    .await
 }
 
 async fn record_sync_terminal_usage_with_handoff_after_spawn<F>(
@@ -418,34 +437,102 @@ async fn record_sync_terminal_usage_with_handoff_after_spawn<F>(
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
     before_dispatch: F,
-) where
+) -> bool
+where
     F: Future<Output = ()> + Send + 'static,
 {
-    crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
+    let watchdog_progress =
+        crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        );
+    record_sync_terminal_usage_with_handoff_with_progress_after_spawn(
+        state,
+        plan,
+        report_context,
+        payload,
+        watchdog_progress,
+        before_dispatch,
+    )
+    .await
+    .0
+}
+
+async fn record_sync_terminal_usage_with_handoff_with_progress(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    payload: &GatewaySyncReportRequest,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) -> (
+    bool,
+    Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) {
+    record_sync_terminal_usage_with_handoff_with_progress_after_spawn(
+        state,
+        plan,
+        report_context,
+        payload,
+        watchdog_progress,
+        std::future::ready(()),
+    )
+    .await
+}
+
+async fn record_sync_terminal_usage_with_handoff_with_progress_after_spawn<F>(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    payload: &GatewaySyncReportRequest,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+    before_dispatch: F,
+) -> (
+    bool,
+    Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if !crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started_with_progress(
+        watchdog_progress.as_ref(),
+    ) {
+        warn!(
+            event_name = "sync_terminal_usage_owner_lost",
+            log_type = "ops",
+            request_id = %plan.request_id,
+            "gateway skipped a competing sync terminal handoff because another watchdog owner won"
+        );
+        return (false, None);
+    }
     // Capture request task-local diagnostics before handing the work to a spawned task. Tokio
     // task-local values do not propagate across spawn boundaries.
     let (context_seed, payload_seed) =
         build_sync_terminal_usage_seeds(plan, report_context, payload);
     let state = state.clone();
-    let task = tokio::spawn(async move {
+    let task = aether_usage_runtime::spawn_on_usage_background_runtime(async move {
         before_dispatch.await;
         state
             .usage_runtime
-            .record_sync_terminal(
+            .record_sync_terminal_with_handoff(
                 state.usage_lifecycle_data_state().as_ref(),
                 context_seed,
                 payload_seed,
             )
-            .await;
+            .await
     });
-    if let Err(err) = task.await {
-        warn!(
-            event_name = "sync_terminal_usage_handoff_failed",
-            log_type = "ops",
-            error = %err,
-            "gateway sync terminal usage handoff task failed"
-        );
-    }
+    let persisted = match task.await {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            warn!(
+                event_name = "sync_terminal_usage_handoff_failed",
+                log_type = "ops",
+                error = %err,
+                "gateway sync terminal usage handoff task failed"
+            );
+            false
+        }
+    };
+    (persisted, watchdog_progress)
 }
 
 fn build_stream_sync_payload(
@@ -523,19 +610,638 @@ async fn record_stream_terminal_usage(
     report_context: Option<&serde_json::Value>,
     payload: &GatewayStreamReportRequest,
     cancelled: bool,
+) -> bool {
+    let watchdog_progress =
+        crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        );
+    record_stream_terminal_usage_with_progress(
+        state,
+        plan,
+        report_context,
+        payload,
+        cancelled,
+        watchdog_progress,
+    )
+    .await
+    .0
+}
+
+/// Claim and persist a stream terminal event using one exact watchdog owner.
+/// The returned `Arc` is present only when this call won terminal ownership;
+/// callers must keep it registered until their candidate write has returned.
+async fn record_stream_terminal_usage_with_progress(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    payload: &GatewayStreamReportRequest,
+    cancelled: bool,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) -> (
+    bool,
+    Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
 ) {
-    crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
+    if !crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started_with_progress(
+        watchdog_progress.as_ref(),
+    ) {
+        warn!(
+            event_name = "stream_terminal_usage_owner_lost",
+            log_type = "ops",
+            request_id = %plan.request_id,
+            candidate_id = ?plan.candidate_id.as_deref(),
+            cancelled,
+            "gateway skipped a competing stream terminal handoff because another watchdog owner won"
+        );
+        return (false, None);
+    }
+    let persisted = persist_stream_terminal_usage_for_claimed_owner(
+        state,
+        plan,
+        report_context,
+        payload,
+        cancelled,
+    )
+    .await;
+    (persisted, watchdog_progress)
+}
+
+async fn retry_stream_terminal_usage_for_claimed_owner(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    payload: &GatewayStreamReportRequest,
+    cancelled: bool,
+    claimed_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+    require_claimed_owner: bool,
+) -> bool {
+    let watchdog_progress = claimed_progress.or_else(|| {
+        crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        )
+    });
+    if require_claimed_owner && watchdog_progress.is_none() {
+        // A continuation that lost its owner must never manufacture a new
+        // request-level terminal event. Another candidate (or a cancellation
+        // guard) may already own the usage row; the durable reconciliation
+        // path will resolve that outcome.
+        return false;
+    }
+    if watchdog_progress
+        .as_ref()
+        .is_some_and(|progress| !progress.terminal_started() && !progress.cancel_fallback())
+    {
+        return false;
+    }
+    persist_stream_terminal_usage_for_claimed_owner(state, plan, report_context, payload, cancelled)
+        .await
+}
+
+async fn persist_stream_terminal_usage_for_claimed_owner(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    payload: &GatewayStreamReportRequest,
+    cancelled: bool,
+) -> bool {
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
     let payload_seed = build_stream_terminal_usage_payload_seed(payload);
-    state
+    let persisted = state
         .usage_runtime
-        .record_stream_terminal(
+        .record_stream_terminal_with_handoff(
             state.usage_lifecycle_data_state().as_ref(),
             context_seed,
             payload_seed,
             cancelled,
         )
         .await;
+    if !persisted {
+        warn!(
+            event_name = "stream_terminal_usage_handoff_failed",
+            log_type = "ops",
+            request_id = %plan.request_id,
+            candidate_id = ?plan.candidate_id.as_deref(),
+            cancelled,
+            "gateway could not confirm stream terminal usage persistence before candidate finalization"
+        );
+    }
+    persisted
+}
+
+/// Release a terminal watchdog registration only after the corresponding
+/// candidate-status handoff has returned.  Usage and candidate rows form one
+/// ordered lifecycle; unregistering between those two writes allows another
+/// scope to install a new owner and race the still-in-flight candidate write.
+fn release_stream_terminal_watchdog_progress(
+    plan: &ExecutionPlan,
+    progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) {
+    if let Some(progress) = progress {
+        crate::execution_runtime::unregister_stream_candidate_watchdog_progress(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+            &progress,
+        );
+    }
+}
+
+/// Own the request-level terminal fallback while a framed stream is being
+/// prepared.  The normal body task has its own finalizer, but there is a
+/// short (and important) window after the pending usage skeleton is created
+/// and before that task is spawned.  If the request future is cancelled in
+/// that window (watchdog timeout, server shutdown, or a dropped caller),
+/// dropping the frame reader alone used to strand the usage row at `pending`
+/// with no billing terminal event.  Keep this guard deliberately small and
+/// idempotent: normal responses/retries disarm it, while `Drop` emits a void
+/// 499 terminal handoff on the process-lifetime usage executor.
+struct StreamAttemptTerminalGuard {
+    state: AppState,
+    plan: ExecutionPlan,
+    trace_id: String,
+    report_kind: String,
+    report_context: Option<Value>,
+    candidate_started_unix_ms: u64,
+    candidate_started_at: Instant,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+    armed: bool,
+}
+
+impl StreamAttemptTerminalGuard {
+    fn new(
+        state: &AppState,
+        plan: &ExecutionPlan,
+        trace_id: &str,
+        report_kind: Option<&str>,
+        report_context: Option<&Value>,
+        candidate_started_unix_ms: u64,
+        candidate_started_at: Instant,
+    ) -> Self {
+        let report_context_with_diagnostics =
+            attach_current_request_diagnostics_to_report_context(report_context)
+                .or_else(|| report_context.cloned());
+        Self {
+            state: state.clone(),
+            plan: plan.clone(),
+            trace_id: trace_id.to_string(),
+            report_kind: report_kind
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("stream_terminal_error")
+                .to_string(),
+            report_context: report_context_with_diagnostics,
+            candidate_started_unix_ms,
+            candidate_started_at,
+            watchdog_progress:
+                crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                    plan.request_id.as_str(),
+                    plan.candidate_id.as_deref(),
+                ),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Keep ownership alive when an intermediate retry reservation was made
+    /// but its candidate-status handoff returned without being accepted.  A
+    /// dropped outer stream task then reaches `Drop`, which promotes the
+    /// reservation to the detached void-499 terminal handoff instead of
+    /// silently leaving the request usage row pending.
+    fn retry_handoff_incomplete(&self) -> bool {
+        self.watchdog_progress.as_ref().is_some_and(|progress| {
+            progress.retry_abort()
+                && !progress.retry_owner_external()
+                && !progress.retry_handoff_complete()
+        })
+    }
+
+    fn arm_for(
+        &mut self,
+        plan: &ExecutionPlan,
+        trace_id: &str,
+        report_kind: Option<&str>,
+        report_context: Option<&Value>,
+        candidate_started_unix_ms: u64,
+        candidate_started_at: Instant,
+    ) {
+        self.plan = plan.clone();
+        self.trace_id = trace_id.to_string();
+        self.report_kind = report_kind
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("stream_terminal_error")
+            .to_string();
+        self.report_context = attach_current_request_diagnostics_to_report_context(report_context)
+            .or_else(|| report_context.cloned());
+        self.candidate_started_unix_ms = candidate_started_unix_ms;
+        self.candidate_started_at = candidate_started_at;
+        // Candidate-slot creation can replace a plan that initially had no
+        // candidate id. Resolve the candidate key first, then fall back to the
+        // request-level alias left by the outer watchdog. The fallback is
+        // rekeyed atomically so a detached body/terminal task never observes a
+        // gap between the two registry entries.
+        self.watchdog_progress =
+            crate::execution_runtime::stream_candidate_watchdog_progress_for_request(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+            )
+            .or_else(|| {
+                if plan.candidate_id.is_some() {
+                    crate::execution_runtime::stream_candidate_watchdog_progress_for_request(
+                        plan.request_id.as_str(),
+                        None,
+                    )
+                } else {
+                    None
+                }
+            });
+        if plan.candidate_id.is_some() {
+            if let Some(progress) = self.watchdog_progress.take() {
+                let progress = crate::execution_runtime::rekey_stream_candidate_watchdog_progress(
+                    plan.request_id.as_str(),
+                    None,
+                    plan.candidate_id.as_deref(),
+                    progress,
+                );
+                self.watchdog_progress = Some(progress);
+            }
+        }
+        self.armed = true;
+    }
+}
+
+pub(crate) fn spawn_stream_attempt_cancelled_terminal_handoff(
+    state: AppState,
+    plan: ExecutionPlan,
+    trace_id: String,
+    report_kind: String,
+    report_context: Option<Value>,
+    candidate_started_unix_ms: u64,
+    candidate_started_at: Instant,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) {
+    let usage_payload = GatewayStreamReportRequest {
+        trace_id,
+        report_kind,
+        report_context,
+        status_code: 499,
+        headers: BTreeMap::new(),
+        provider_body_base64: None,
+        provider_body_state: Some(UsageBodyCaptureState::None),
+        client_body_base64: None,
+        client_body_state: Some(UsageBodyCaptureState::None),
+        terminal_summary: Some(ExecutionStreamTerminalSummary {
+            parser_error: Some(
+                "stream execution attempt was cancelled before terminal finalization".to_string(),
+            ),
+            ..ExecutionStreamTerminalSummary::default()
+        }),
+        telemetry: Some(ExecutionTelemetry {
+            elapsed_ms: Some(
+                candidate_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            ttfb_ms: None,
+            upstream_bytes: None,
+        }),
+    };
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        let usage_handoff_succeeded = retry_stream_terminal_usage_for_claimed_owner(
+            &state,
+            &plan,
+            usage_payload.report_context.as_ref(),
+            &usage_payload,
+            true,
+            watchdog_progress.clone(),
+            false,
+        )
+        .await;
+        let candidate_status = stream_candidate_status_after_usage_handoff(
+            RequestCandidateStatus::Cancelled,
+            usage_handoff_succeeded,
+        );
+        let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+            status: candidate_status,
+            status_code: Some(499),
+            error_type: Some(if usage_handoff_succeeded {
+                "stream_execution_cancelled".to_string()
+            } else {
+                "usage_terminal_handoff_unconfirmed".to_string()
+            }),
+            error_message: Some(if usage_handoff_succeeded {
+                "stream execution attempt was cancelled before terminal finalization".to_string()
+            } else {
+                "terminal usage persistence was not confirmed before candidate finalization"
+                    .to_string()
+            }),
+            latency_ms: usage_payload
+                .telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.elapsed_ms),
+            started_at_unix_ms: Some(candidate_started_unix_ms),
+            finished_at_unix_ms: usage_handoff_succeeded
+                .then_some(current_request_candidate_unix_ms()),
+        };
+        let candidate_persisted = record_local_request_candidate_status(
+            &state,
+            &plan,
+            usage_payload.report_context.as_ref(),
+            terminal_candidate_update.clone(),
+        )
+        .await;
+        if usage_handoff_succeeded && candidate_persisted {
+            release_stream_terminal_watchdog_progress(&plan, watchdog_progress);
+        } else if usage_handoff_succeeded {
+            // Usage is already durable. Retrying the whole 499 handoff would
+            // replay the accounting event on every candidate-write failure;
+            // retry only the missing side and retain the exact owner until it
+            // is accepted.
+            spawn_candidate_persistence_retry_after_usage_handoff(
+                state,
+                plan,
+                usage_payload.report_context.clone(),
+                terminal_candidate_update,
+                watchdog_progress,
+            );
+        } else if watchdog_progress.is_some() {
+            // Keep the exact owner reservation until both terminal rows have
+            // been accepted.  The detached continuation retries either side
+            // that was not confirmed and prevents a second 499 owner from
+            // being created during the handoff window.
+            spawn_stream_499_terminal_handoff_continuation(
+                state,
+                plan,
+                usage_payload,
+                candidate_started_unix_ms,
+                watchdog_progress,
+            );
+        } else {
+            spawn_terminal_candidate_reconciliation(
+                state,
+                plan,
+                usage_payload.report_context.clone(),
+                terminal_candidate_update,
+            );
+        }
+    });
+}
+
+impl Drop for StreamAttemptTerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        // A stop-on-transport watchdog timeout is a failed/504 terminal, not
+        // a client-disconnect 499.  If the outer candidate loop is cancelled
+        // while it is about to build that response, convert the reservation
+        // into a detached transport handoff here so the pending usage row is
+        // still settled without changing its billing classification.
+        if let Some(progress) = self.watchdog_progress.as_ref() {
+            if progress.stop_requested() {
+                if progress.try_claim_stop_fallback() {
+                    self.armed = false;
+                    let elapsed_ms = self
+                        .candidate_started_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    crate::execution_runtime::spawn_transport_error_terminal_handoff(
+                        self.state.clone(),
+                        self.plan.clone(),
+                        self.report_context.clone(),
+                        http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        "local_stream_candidate_watchdog_timeout".to_string(),
+                        "Stream first byte timeout".to_string(),
+                        elapsed_ms,
+                        Some(Arc::clone(progress)),
+                    );
+                }
+                return;
+            }
+        }
+
+        // Claim the cancellation fallback with the same atomic owner used by
+        // the watchdog and transport finalizer.  A retry abort normally has a
+        // candidate owner that will publish its Failed transition; yield to
+        // that owner after its write has completed (or when the watchdog moved
+        // the owner outside this task).  If the stream task itself owns the
+        // retry write and is dropped while that write is pending, promote the
+        // reservation to a process-lifetime 499 handoff instead of silently
+        // leaving the usage row pending.
+        let owns_cancel_fallback = self
+            .watchdog_progress
+            .as_ref()
+            .map(|progress| {
+                if progress.terminal_started() {
+                    false
+                } else if progress.retry_abort() {
+                    if progress.retry_owner_external() || progress.retry_handoff_complete() {
+                        false
+                    } else {
+                        progress.try_claim_retry_cancel_fallback()
+                    }
+                } else {
+                    progress.try_claim_cancel_fallback()
+                }
+            })
+            .unwrap_or_else(|| {
+                let watchdog_owns_terminal =
+                    crate::execution_runtime::stream_candidate_watchdog_terminal_started()
+                        || crate::execution_runtime::stream_candidate_watchdog_retry_aborted();
+                !watchdog_owns_terminal
+            });
+        if !owns_cancel_fallback {
+            return;
+        }
+        self.armed = false;
+        spawn_stream_attempt_cancelled_terminal_handoff(
+            self.state.clone(),
+            self.plan.clone(),
+            self.trace_id.clone(),
+            self.report_kind.clone(),
+            self.report_context.clone(),
+            self.candidate_started_unix_ms,
+            self.candidate_started_at,
+            self.watchdog_progress.clone(),
+        );
+    }
+}
+
+/// A 499 finalizer may outlive the request task, and the usage runtime can
+/// legitimately return `false` while its terminal retry queue is unavailable.
+/// Keep the candidate non-terminal in that case, but give the same idempotent
+/// terminal event a short, bounded chance to become durable.  The candidate is
+/// promoted to Cancelled only after a retry confirms persistence; if all tries
+/// fail, cleanup/watchdog code can make the conservative decision later.
+fn spawn_stream_499_terminal_handoff_continuation(
+    state: AppState,
+    plan: ExecutionPlan,
+    usage_payload: GatewayStreamReportRequest,
+    candidate_started_unix_ms: u64,
+    watchdog_progress: Option<Arc<crate::execution_runtime::StreamCandidateWatchdogProgress>>,
+) {
+    // This continuation is a billing/candidate handoff, not request work.
+    // Keep it on the process-lifetime usage runtime so a client disconnect or
+    // HTTP runtime shutdown cannot cancel the retry loop before the 499 row is
+    // made durable.
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        for (attempt, delay) in STREAM_TERMINAL_HANDOFF_RETRY_DELAYS.iter().enumerate() {
+            tokio::time::sleep(*delay).await;
+            if retry_stream_terminal_usage_for_claimed_owner(
+                &state,
+                &plan,
+                usage_payload.report_context.as_ref(),
+                &usage_payload,
+                true,
+                watchdog_progress.clone(),
+                true,
+            )
+            .await
+            {
+                let terminal_update = SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Cancelled,
+                    status_code: Some(499),
+                    error_type: Some("downstream_disconnect".to_string()),
+                    error_message: Some("client disconnected before stream completion".to_string()),
+                    latency_ms: usage_payload
+                        .telemetry
+                        .as_ref()
+                        .and_then(|value| value.elapsed_ms),
+                    started_at_unix_ms: Some(candidate_started_unix_ms),
+                    finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                };
+                if record_local_request_candidate_status(
+                    &state,
+                    &plan,
+                    usage_payload.report_context.as_ref(),
+                    terminal_update.clone(),
+                )
+                .await
+                {
+                    if let Some(progress) = watchdog_progress.clone() {
+                        release_stream_terminal_watchdog_progress(&plan, Some(progress));
+                    }
+                    return;
+                }
+                debug!(
+                    event_name = "stream_499_candidate_handoff_retry_pending",
+                    log_type = "debug",
+                    trace_id = %usage_payload.trace_id,
+                    request_id = %plan.request_id,
+                    candidate_id = ?plan.candidate_id,
+                    retry_attempt = attempt + 1,
+                    "stream 499 usage is durable but candidate persistence is still pending"
+                );
+                spawn_candidate_persistence_retry_after_usage_handoff(
+                    state,
+                    plan,
+                    usage_payload.report_context.clone(),
+                    terminal_update,
+                    watchdog_progress,
+                );
+                return;
+            }
+            debug!(
+                event_name = "stream_499_terminal_handoff_retry_pending",
+                log_type = "debug",
+                trace_id = %usage_payload.trace_id,
+                request_id = %plan.request_id,
+                candidate_id = ?plan.candidate_id,
+                retry_attempt = attempt + 1,
+                "stream 499 terminal usage handoff is still not durable"
+            );
+        }
+        warn!(
+            event_name = "stream_499_terminal_handoff_continuation_exhausted",
+            log_type = "ops",
+            trace_id = %usage_payload.trace_id,
+            request_id = %plan.request_id,
+            candidate_id = ?plan.candidate_id,
+            fallback = "remain_streaming",
+            "bounded retries could not confirm 499 terminal usage persistence"
+        );
+        let terminal_update = SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Cancelled,
+            status_code: Some(499),
+            error_type: Some("downstream_disconnect".to_string()),
+            error_message: Some("client disconnected before stream completion".to_string()),
+            latency_ms: usage_payload
+                .telemetry
+                .as_ref()
+                .and_then(|value| value.elapsed_ms),
+            started_at_unix_ms: Some(candidate_started_unix_ms),
+            finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+        };
+        spawn_terminal_candidate_reconciliation(
+            state,
+            plan,
+            usage_payload.report_context.clone(),
+            terminal_update,
+        );
+    });
+}
+
+fn stream_candidate_status_after_usage_handoff(
+    desired: RequestCandidateStatus,
+    usage_persisted: bool,
+) -> RequestCandidateStatus {
+    if !usage_persisted {
+        // Do not publish any terminal candidate until its terminal usage row is durable.  This
+        // includes 499/failed paths: terminal candidate metadata must never be used as evidence
+        // that an otherwise skeletal usage row is safe to finalize.
+        RequestCandidateStatus::Streaming
+    } else {
+        desired
+    }
+}
+
+/// Apply provider health/pool effects only after the terminal usage handoff has
+/// been attempted.  Effects are secondary bookkeeping; running them first can
+/// block or fail while the response path goes on to publish a terminal
+/// candidate, recreating the usage/candidate race this lifecycle is meant to
+/// prevent.
+async fn apply_stream_success_effects(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    payload: &GatewayStreamReportRequest,
+) {
+    apply_local_execution_effect(
+        state,
+        LocalExecutionEffectContext {
+            plan,
+            report_context: payload.report_context.as_ref(),
+        },
+        LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
+    )
+    .await;
+    apply_local_execution_effect(
+        state,
+        LocalExecutionEffectContext {
+            plan,
+            report_context: payload.report_context.as_ref(),
+        },
+        LocalExecutionEffect::AdaptiveSuccess(LocalAdaptiveSuccessEffect),
+    )
+    .await;
+    apply_local_execution_effect(
+        state,
+        LocalExecutionEffectContext {
+            plan,
+            report_context: payload.report_context.as_ref(),
+        },
+        LocalExecutionEffect::PoolSuccessStream { payload },
+    )
+    .await;
 }
 
 async fn record_stream_admission_timeout_candidate_failure(
@@ -822,12 +1528,29 @@ async fn seed_kiro_report_context_prompt_cache_usage(
         return;
     };
 
-    let cache_usage = compute_kiro_prompt_cache_usage(
-        state.runtime_state(),
-        kiro_stream_cache_credential_id(plan),
-        &profile,
+    let cache_usage = match tokio::time::timeout(
+        TERMINAL_KIRO_CACHE_LOOKUP_TIMEOUT,
+        compute_kiro_prompt_cache_usage(
+            state.runtime_state(),
+            kiro_stream_cache_credential_id(plan),
+            &profile,
+        ),
     )
-    .await;
+    .await
+    {
+        Ok(cache_usage) => cache_usage,
+        Err(_) => {
+            warn!(
+                event_name = "kiro_prompt_cache_usage_lookup_timeout",
+                log_type = "ops",
+                request_id = %plan.request_id,
+                provider_id = %plan.provider_id,
+                timeout_ms = TERMINAL_KIRO_CACHE_LOOKUP_TIMEOUT.as_millis() as u64,
+                "gateway skipped Kiro prompt-cache enrichment before terminal usage handoff"
+            );
+            KiroPromptCacheUsage::default()
+        }
+    };
     if cache_usage.cache_creation_input_tokens == 0 && cache_usage.cache_read_input_tokens == 0 {
         return;
     }
@@ -949,12 +1672,29 @@ async fn maybe_apply_kiro_prompt_cache_usage_to_stream_summary(
         return;
     };
 
-    let cache_usage = compute_kiro_prompt_cache_usage(
-        state.runtime_state(),
-        kiro_stream_cache_credential_id(plan),
-        &profile,
+    let cache_usage = match tokio::time::timeout(
+        TERMINAL_KIRO_CACHE_LOOKUP_TIMEOUT,
+        compute_kiro_prompt_cache_usage(
+            state.runtime_state(),
+            kiro_stream_cache_credential_id(plan),
+            &profile,
+        ),
     )
-    .await;
+    .await
+    {
+        Ok(cache_usage) => cache_usage,
+        Err(_) => {
+            warn!(
+                event_name = "kiro_prompt_cache_usage_lookup_timeout",
+                log_type = "ops",
+                request_id = %plan.request_id,
+                provider_id = %plan.provider_id,
+                timeout_ms = TERMINAL_KIRO_CACHE_LOOKUP_TIMEOUT.as_millis() as u64,
+                "gateway skipped Kiro prompt-cache enrichment before terminal usage handoff"
+            );
+            KiroPromptCacheUsage::default()
+        }
+    };
     if cache_usage.cache_creation_input_tokens == 0 && cache_usage.cache_read_input_tokens == 0 {
         return;
     }
@@ -1183,6 +1923,24 @@ fn stream_terminal_summary_represents_failure_with_requirement(
                 requires_observed_terminal_event,
             )
     })
+}
+
+/// The frame/legacy trackers can observe a protocol failure marker even when
+/// the format-specific usage observer has no summary to return (for example a
+/// bridge or an unknown SSE envelope).  Preserve that fact in the terminal
+/// summary so the final report cannot fall through to a successful candidate.
+fn mark_stream_terminal_summary_failure_from_tracker(
+    summary: &mut Option<ExecutionStreamTerminalSummary>,
+    tracker: &ClientVisibleStreamCompletionTracker,
+) {
+    if !tracker.terminal_is_failure() {
+        return;
+    }
+    let summary = summary.get_or_insert_with(ExecutionStreamTerminalSummary::default);
+    if summary.parser_error.is_none() {
+        summary.parser_error =
+            Some("execution runtime stream emitted a failed terminal event".to_string());
+    }
 }
 
 async fn execute_in_process_stream(
@@ -1584,6 +2342,61 @@ async fn prefetch_direct_stream_error_body(
     Some(String::from_utf8_lossy(&inspected).into_owned())
 }
 
+fn realtime_stream_context(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    attempt_id: Option<&str>,
+) -> RealtimeStreamContext {
+    let admission_id = report_context
+        .and_then(|context| context.get("realtime_admission_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    RealtimeStreamContext {
+        usage_runtime: state.usage_runtime.clone(),
+        request_id: plan.request_id.clone(),
+        admission_id,
+        candidate_id: plan.candidate_id.clone(),
+        attempt_id: attempt_id.map(str::to_owned),
+    }
+}
+
+fn drain_realtime_token_deltas_for_runtime(
+    observer: &mut Option<StreamingStandardTerminalObserver>,
+    state: &AppState,
+    request_id: &str,
+    candidate_id: Option<&String>,
+    admission_id: Option<&str>,
+    attempt_id: Option<&str>,
+    sequence: &mut u64,
+) {
+    let Some(observer) = observer.as_mut() else {
+        return;
+    };
+    let deltas = observer.take_token_deltas();
+    for delta in deltas {
+        let token_delta = delta.inclusive_token_total();
+        if token_delta == 0 {
+            continue;
+        }
+        let current_sequence = *sequence;
+        *sequence = (*sequence).saturating_add(1);
+        state
+            .usage_runtime
+            .record_realtime_token_delta_with_attempt(
+                request_id.to_owned(),
+                admission_id.map(ToOwned::to_owned),
+                candidate_id.cloned(),
+                attempt_id.map(ToOwned::to_owned),
+                current_request_candidate_unix_ms(),
+                token_delta,
+                Some(current_sequence),
+            );
+    }
+}
+
 fn should_use_direct_sse_passthrough(
     plan: &ExecutionPlan,
     plan_kind: &str,
@@ -1717,12 +2530,6 @@ async fn forward_direct_passthrough_client_chunk(
     if chunk.is_empty() {
         return false;
     }
-    append_stream_capture_bytes(
-        buffered_body,
-        chunk.as_ref(),
-        max_stream_body_buffer_bytes,
-        client_body_truncated,
-    );
     if *downstream_dropped {
         return false;
     }
@@ -1740,6 +2547,17 @@ async fn forward_direct_passthrough_client_chunk(
         *downstream_dropped = true;
         return false;
     }
+    // Only bytes accepted by the downstream channel belong to the client
+    // response capture.  Appending before `send` made a disconnecting client
+    // appear to have received the entire provider tail that we drained for
+    // billing, which polluted `client_response_body` on 499 rows and could
+    // make a later audit look like a successful delivery.
+    append_stream_capture_bytes(
+        buffered_body,
+        chunk.as_ref(),
+        max_stream_body_buffer_bytes,
+        client_body_truncated,
+    );
     let send_wait_ms = send_started_at.elapsed().as_millis() as u64;
     observe_gateway_stage_ms("direct_passthrough_body_send_wait", send_wait_ms);
     if first_client_chunk {
@@ -1762,6 +2580,15 @@ struct DirectPassthroughFinalizer {
     core: Option<DirectPassthroughFinalizerCore>,
 }
 
+fn spawn_direct_passthrough_finalizer_core(core: DirectPassthroughFinalizerCore) {
+    // Terminal usage/candidate reconciliation must survive cancellation of the
+    // request runtime itself.  The process-lifetime usage runtime is shared by
+    // all terminal guards and remains alive while the gateway is draining.
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        core.finalize(true).await;
+    });
+}
+
 struct DirectPassthroughFinalizerCore {
     state: AppState,
     plan: ExecutionPlan,
@@ -1782,6 +2609,8 @@ struct DirectPassthroughFinalizerCore {
     headers: BTreeMap<String, String>,
     stream_usage_report_context: Option<Value>,
     stream_usage_observer: Option<StreamingStandardTerminalObserver>,
+    realtime_token_sequence: u64,
+    realtime_attempt_id: Option<String>,
     stream_usage_observer_buffered: Vec<u8>,
     provider_error_inspection: ProviderStreamErrorInspection,
     max_stream_body_buffer_bytes: usize,
@@ -1821,6 +2650,46 @@ impl DirectPassthroughFinalizer {
             .expect("direct passthrough finalizer core should exist")
     }
 
+    fn take_core(&mut self) -> Option<DirectPassthroughFinalizerCore> {
+        self.core.take()
+    }
+
+    fn has_core(&self) -> bool {
+        self.core.is_some()
+    }
+
+    fn client_visible_stream_completed(&self) -> bool {
+        self.core().client_visible_stream_completed
+    }
+
+    fn client_visible_stream_terminal(&self) -> bool {
+        self.core()
+            .client_stream_completion_tracker
+            .terminal_is_success()
+            || self
+                .core()
+                .client_stream_completion_tracker
+                .terminal_is_failure()
+    }
+
+    fn client_visible_stream_completed_successfully(&self) -> bool {
+        let core = self.core();
+        core.client_visible_stream_completed
+            && core.client_stream_completion_tracker.terminal_is_success()
+    }
+
+    fn observed_terminal_is_billable(&self) -> bool {
+        self.core()
+            .client_stream_completion_tracker
+            .terminal_is_success()
+    }
+
+    fn observed_terminal_is_failure(&self) -> bool {
+        self.core()
+            .client_stream_completion_tracker
+            .terminal_is_failure()
+    }
+
     fn stream_started_at(&self) -> Instant {
         self.core().stream_started_at
     }
@@ -1839,6 +2708,33 @@ impl DirectPassthroughFinalizer {
 
     fn set_terminal_failure(&mut self, failure: StreamFailureReport) {
         self.core_mut().terminal_failure = Some(failure);
+    }
+
+    /// Observe an upstream chunk while the downstream client is gone.  The
+    /// chunk still contributes to captures and usage parsing, but it must not
+    /// mark the client-visible stream as completed: a drained 499 remains
+    /// cancelled while billing follows the completed pricing path.
+    fn observe_drained_upstream_chunk(&mut self, chunk: &Bytes) -> bool {
+        if chunk.is_empty() || !self.has_core() {
+            return false;
+        }
+        let observed_at = Instant::now();
+        self.observe_upstream_chunk(chunk, observed_at);
+        let core = self.core_mut();
+        if core.requires_anthropic_message_stop {
+            core.client_stream_completion_tracker
+                .observe_anthropic_message_stop(chunk)
+        } else {
+            core.client_stream_completion_tracker.observe_chunk(chunk)
+        }
+    }
+
+    fn mark_billing_treat_as_completed(&mut self) {
+        let Some(core) = self.core.as_mut() else {
+            return;
+        };
+        core.report_context =
+            merge_billing_treat_as_completed_into_context(core.report_context.take(), true);
     }
 
     fn prepare_upstream_chunk(&mut self, mut chunk: Bytes) -> Option<Bytes> {
@@ -1874,7 +2770,8 @@ impl DirectPassthroughFinalizer {
     fn completed_native_anthropic_stream(&self) -> bool {
         let core = self.core();
         core.requires_anthropic_message_stop
-            && core.client_visible_stream_completed
+            && (core.client_visible_stream_completed
+                || core.client_stream_completion_tracker.terminal_is_success())
             && core.terminal_failure.is_none()
     }
 
@@ -1949,6 +2846,7 @@ impl DirectPassthroughFinalizer {
                 chunk.as_ref(),
             );
         }
+        core.drain_realtime_token_deltas();
         if let Some(error_body_json) = core
             .provider_error_inspection
             .observe(core.stream_usage_report_context.as_ref(), chunk.as_ref())
@@ -1977,9 +2875,11 @@ impl DirectPassthroughFinalizer {
             &mut core.client_body_truncated,
         );
         if !core.requires_anthropic_message_stop {
-            core.client_visible_stream_completed |= core
+            let observed_terminal = core
                 .client_stream_completion_tracker
                 .observe_chunk(chunk.as_ref());
+            core.client_visible_stream_completed |=
+                observed_terminal && core.client_stream_completion_tracker.terminal_is_success();
         }
         core.client_stream_bytes = core
             .client_stream_bytes
@@ -2038,7 +2938,7 @@ impl DirectPassthroughFinalizer {
         // client disconnect or an execution timeout may cancel this body
         // future while terminal admission is backpressured; the handoff must
         // continue independently so the usage row cannot remain streaming.
-        let task = tokio::spawn(async move {
+        let task = aether_usage_runtime::spawn_on_usage_background_runtime(async move {
             core.finalize(downstream_dropped).await;
         });
         if let Err(err) = task.await {
@@ -2058,11 +2958,7 @@ impl Drop for DirectPassthroughFinalizer {
             return;
         };
         observe_gateway_stage_ms("stream_finalizer_enqueue", 0);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                core.finalize(true).await;
-            });
-        }
+        spawn_direct_passthrough_finalizer_core(core);
     }
 }
 
@@ -2091,6 +2987,45 @@ fn enqueue_stream_candidate_status_update(
 }
 
 impl DirectPassthroughFinalizerCore {
+    fn drain_realtime_token_deltas(&mut self) {
+        let Some(observer) = self.stream_usage_observer.as_mut() else {
+            return;
+        };
+        let deltas = observer.take_token_deltas();
+        if deltas.is_empty() {
+            return;
+        }
+        let request_id = self.plan.request_id.clone();
+        let admission_id = self
+            .report_context
+            .as_ref()
+            .and_then(|context| context.get("realtime_admission_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let candidate_id = self.plan.candidate_id.clone();
+        for delta in deltas {
+            let token_delta = delta.inclusive_token_total();
+            if token_delta == 0 {
+                continue;
+            }
+            let sequence = self.realtime_token_sequence;
+            self.realtime_token_sequence = self.realtime_token_sequence.saturating_add(1);
+            self.state
+                .usage_runtime
+                .record_realtime_token_delta_with_attempt(
+                    request_id.clone(),
+                    admission_id.clone(),
+                    candidate_id.clone(),
+                    self.realtime_attempt_id.clone(),
+                    current_request_candidate_unix_ms(),
+                    token_delta,
+                    Some(sequence),
+                );
+        }
+    }
+
     fn record_client_visible_stream_started_if_needed(&mut self) {
         if self.stream_started_recorded || self.client_stream_bytes == 0 {
             return;
@@ -2128,15 +3063,35 @@ impl DirectPassthroughFinalizerCore {
 
     async fn finalize(mut self, mut downstream_dropped: bool) {
         self.record_client_visible_stream_started_if_needed();
+        // A clean transport EOF while the client is still connected is not a
+        // valid Anthropic completion unless `message_stop` was observed.  The
+        // body wrapper normally records this before calling finalize, but the
+        // detached/drop and pre-first-yield paths can enter here directly.
+        // Preserve 499 semantics for a disconnected client: its bounded drain
+        // is intentionally allowed to finish without a provider stop marker.
+        if !downstream_dropped
+            && self.requires_anthropic_message_stop
+            && !self.client_stream_completion_tracker.terminal_is_success()
+            && !self.client_stream_completion_tracker.terminal_is_failure()
+            && self.terminal_failure.is_none()
+        {
+            self.terminal_failure = Some(build_anthropic_premature_eof_failure(
+                "upstream Anthropic stream ended before message_stop",
+            ));
+        }
         observe_gateway_stage_ms(
             "stream_total",
             stream_elapsed_ms_since(self.stream_started_at),
         );
-        let stream_terminal_summary = finalize_stream_usage_observer(
+        let mut stream_terminal_summary = finalize_stream_usage_observer(
             &mut self.stream_usage_observer,
             self.stream_usage_report_context.as_ref(),
             &mut self.stream_usage_observer_buffered,
         );
+        // `finish` may observe a final cumulative usage snapshot that was
+        // buffered without another upstream chunk. Publish it before moving
+        // the core into the terminal handoff below.
+        self.drain_realtime_token_deltas();
 
         let DirectPassthroughFinalizerCore {
             state,
@@ -2158,6 +3113,8 @@ impl DirectPassthroughFinalizerCore {
             headers,
             stream_usage_report_context,
             stream_usage_observer: _,
+            realtime_token_sequence: _,
+            realtime_attempt_id: _,
             stream_usage_observer_buffered: _,
             provider_error_inspection: _,
             max_stream_body_buffer_bytes: _,
@@ -2165,7 +3122,7 @@ impl DirectPassthroughFinalizerCore {
             buffered_body,
             provider_body_truncated,
             client_body_truncated,
-            client_stream_completion_tracker: _,
+            client_stream_completion_tracker,
             requires_anthropic_message_stop: _,
             client_visible_stream_completed,
             usage_stream_telemetry,
@@ -2180,6 +3137,11 @@ impl DirectPassthroughFinalizerCore {
             _upstream_target_permit,
         } = self;
 
+        mark_stream_terminal_summary_failure_from_tracker(
+            &mut stream_terminal_summary,
+            &client_stream_completion_tracker,
+        );
+
         // Queue backpressure must not keep scarce upstream/provider permits
         // occupied after the client-visible stream has already ended.
         drop(_provider_pool_in_flight_guard);
@@ -2188,7 +3150,11 @@ impl DirectPassthroughFinalizerCore {
             persist_local_request_candidate_status_record(&state, record).await;
         }
 
-        if downstream_dropped && client_visible_stream_completed && terminal_failure.is_none() {
+        if downstream_dropped
+            && client_visible_stream_completed
+            && client_stream_completion_tracker.terminal_is_success()
+            && terminal_failure.is_none()
+        {
             debug!(
                 event_name = "direct_passthrough_downstream_closed_after_done",
                 log_type = "debug",
@@ -2201,7 +3167,6 @@ impl DirectPassthroughFinalizerCore {
         }
 
         if let Some(failure) = terminal_failure {
-            record_manual_proxy_stream_error(&state, &plan).await;
             let terminal_telemetry = Some(build_terminal_stream_telemetry(
                 stream_started_at,
                 telemetry.as_ref(),
@@ -2225,6 +3190,7 @@ impl DirectPassthroughFinalizerCore {
                 &trace_id,
                 &plan,
                 direct_stream_finalize_kind.as_deref(),
+                report_kind.as_deref(),
                 report_context_for_payload,
                 headers,
                 terminal_telemetry,
@@ -2233,10 +3199,17 @@ impl DirectPassthroughFinalizerCore {
                 failure,
             )
             .await;
+            // Proxy-node traffic is secondary bookkeeping.  Keep it behind the
+            // terminal usage handoff so a slow proxy mutation cannot precede
+            // (or obscure) the billing source of truth.
+            record_manual_proxy_stream_error(&state, &plan).await;
             return;
         }
 
-        if downstream_dropped {
+        if downstream_dropped
+            && terminal_failure.is_none()
+            && !client_stream_completion_tracker.terminal_is_failure()
+        {
             let terminal_telemetry = Some(build_terminal_stream_telemetry(
                 stream_started_at,
                 telemetry.as_ref(),
@@ -2268,32 +3241,71 @@ impl DirectPassthroughFinalizerCore {
                 stream_terminal_summary,
                 terminal_telemetry,
             );
-            record_stream_terminal_usage(
+            let watchdog_progress =
+                crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                    plan.request_id.as_str(),
+                    plan.candidate_id.as_deref(),
+                );
+            let (usage_handoff_succeeded, terminal_owner_progress) =
+                record_stream_terminal_usage_with_progress(
+                    &state,
+                    &plan,
+                    usage_payload.report_context.as_ref(),
+                    &usage_payload,
+                    true,
+                    watchdog_progress,
+                )
+                .await;
+            let candidate_status = stream_candidate_status_after_usage_handoff(
+                RequestCandidateStatus::Cancelled,
+                usage_handoff_succeeded,
+            );
+            let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+                status: candidate_status,
+                status_code: Some(499),
+                error_type: Some("downstream_disconnect".to_string()),
+                error_message: Some("client disconnected before stream completion".to_string()),
+                latency_ms: usage_payload
+                    .telemetry
+                    .as_ref()
+                    .and_then(|value| value.elapsed_ms),
+                started_at_unix_ms: Some(candidate_started_unix_secs),
+                finished_at_unix_ms: (candidate_status != RequestCandidateStatus::Streaming)
+                    .then_some(current_request_candidate_unix_ms()),
+            };
+            let candidate_persisted = record_local_request_candidate_status(
                 &state,
                 &plan,
                 usage_payload.report_context.as_ref(),
-                &usage_payload,
-                true,
+                terminal_candidate_update.clone(),
             )
             .await;
-            record_local_request_candidate_status(
-                &state,
-                &plan,
-                usage_payload.report_context.as_ref(),
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Cancelled,
-                    status_code: Some(499),
-                    error_type: Some("downstream_disconnect".to_string()),
-                    error_message: Some("client disconnected before stream completion".to_string()),
-                    latency_ms: usage_payload
-                        .telemetry
-                        .as_ref()
-                        .and_then(|value| value.elapsed_ms),
-                    started_at_unix_ms: Some(candidate_started_unix_secs),
-                    finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
-                },
-            )
-            .await;
+            if usage_handoff_succeeded && candidate_persisted {
+                release_stream_terminal_watchdog_progress(&plan, terminal_owner_progress);
+            } else if usage_handoff_succeeded {
+                spawn_candidate_persistence_retry_after_usage_handoff(
+                    state.clone(),
+                    plan.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update,
+                    terminal_owner_progress,
+                );
+            } else if terminal_owner_progress.is_some() {
+                spawn_stream_499_terminal_handoff_continuation(
+                    state.clone(),
+                    plan.clone(),
+                    usage_payload,
+                    candidate_started_unix_secs,
+                    terminal_owner_progress,
+                );
+            } else {
+                spawn_terminal_candidate_reconciliation(
+                    state.clone(),
+                    plan.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update,
+                );
+            }
             return;
         }
 
@@ -2373,80 +3385,100 @@ impl DirectPassthroughFinalizerCore {
                 error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
                 "gateway direct passthrough stream ended with a failed terminal state"
             );
-        } else {
-            apply_local_execution_effect(
-                &state,
-                LocalExecutionEffectContext {
-                    plan: &plan,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
-            )
-            .await;
-            apply_local_execution_effect(
-                &state,
-                LocalExecutionEffectContext {
-                    plan: &plan,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::AdaptiveSuccess(LocalAdaptiveSuccessEffect),
-            )
-            .await;
-            apply_local_execution_effect(
-                &state,
-                LocalExecutionEffectContext {
-                    plan: &plan,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::PoolSuccessStream {
-                    payload: &usage_payload,
-                },
-            )
-            .await;
         }
-        record_stream_terminal_usage(
-            &state,
-            &plan,
-            usage_payload.report_context.as_ref(),
-            &usage_payload,
-            false,
-        )
-        .await;
-        record_local_request_candidate_status(
+        let watchdog_progress =
+            crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+            );
+        let (usage_handoff_succeeded, terminal_owner_progress) =
+            record_stream_terminal_usage_with_progress(
+                &state,
+                &plan,
+                usage_payload.report_context.as_ref(),
+                &usage_payload,
+                false,
+                watchdog_progress,
+            )
+            .await;
+        let desired_candidate_status = if stream_failed {
+            RequestCandidateStatus::Failed
+        } else {
+            RequestCandidateStatus::Success
+        };
+        let candidate_status = stream_candidate_status_after_usage_handoff(
+            desired_candidate_status,
+            usage_handoff_succeeded,
+        );
+        let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+            status: desired_candidate_status,
+            status_code: Some(status_code),
+            error_type: if stream_failed {
+                if missing_observed_finish {
+                    Some("stream_missing_terminal_event".to_string())
+                } else {
+                    Some("stream_terminal_error".to_string())
+                }
+            } else {
+                None
+            },
+            error_message: stream_failed
+                .then_some(stream_terminal_error_message.clone())
+                .flatten(),
+            latency_ms: usage_payload
+                .telemetry
+                .as_ref()
+                .and_then(|value| value.elapsed_ms),
+            started_at_unix_ms: Some(candidate_started_unix_secs),
+            finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+        };
+        if !usage_handoff_succeeded {
+            spawn_terminal_candidate_reconciliation(
+                state.clone(),
+                plan.clone(),
+                usage_payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+            );
+        }
+        let candidate_persisted = record_local_request_candidate_status(
             &state,
             &plan,
             usage_payload.report_context.as_ref(),
             SchedulerRequestCandidateStatusUpdate {
-                status: if stream_failed {
-                    RequestCandidateStatus::Failed
-                } else {
-                    RequestCandidateStatus::Success
-                },
-                status_code: Some(status_code),
-                error_type: if stream_failed {
-                    if missing_observed_finish {
-                        Some("stream_missing_terminal_event".to_string())
-                    } else {
-                        Some("stream_terminal_error".to_string())
-                    }
-                } else {
-                    None
-                },
-                error_message: stream_failed
-                    .then_some(stream_terminal_error_message)
-                    .flatten(),
-                latency_ms: usage_payload
-                    .telemetry
-                    .as_ref()
-                    .and_then(|value| value.elapsed_ms),
-                started_at_unix_ms: Some(candidate_started_unix_secs),
-                finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                status: candidate_status,
+                finished_at_unix_ms: (candidate_status != RequestCandidateStatus::Streaming)
+                    .then_some(current_request_candidate_unix_ms()),
+                ..terminal_candidate_update.clone()
             },
         )
         .await;
+        if usage_handoff_succeeded && candidate_persisted {
+            release_stream_terminal_watchdog_progress(&plan, terminal_owner_progress);
+        } else if usage_handoff_succeeded {
+            // Usage is terminal but the candidate writer did not accept the
+            // update. Keep the owner registered while the reconciliation task
+            // retries; releasing here would let a late body/drop task create a
+            // second terminal owner.
+            spawn_candidate_persistence_retry_after_usage_handoff(
+                state.clone(),
+                plan.clone(),
+                usage_payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+                terminal_owner_progress,
+            );
+        }
+        if !stream_failed {
+            apply_stream_success_effects(&state, &plan, &usage_payload).await;
+        }
 
         if should_submit_report {
-            if let Err(err) = submit_stream_report(&state, usage_payload).await {
+            if let Err(err) = submit_stream_report_after_terminal_usage(
+                &state,
+                usage_payload,
+                usage_handoff_succeeded,
+            )
+            .await
+            {
                 warn!(
                     event_name = "execution_report_submit_failed",
                     log_type = "ops",
@@ -2477,6 +3509,94 @@ fn build_direct_passthrough_inline_body_stream(
         stream_first_byte_timeout,
     );
     futures_stream::unfold(state, |state| async move { state.next_item().await })
+}
+
+/// Continue consuming a direct upstream response after the downstream body is
+/// dropped.  This task is deliberately detached from the response future so a
+/// client cancellation cannot cancel terminal usage admission.  Every poll is
+/// bounded by the configured drain timeout; a provider that keeps sending
+/// frames may be drained for as long as it remains productive, while a silent
+/// provider is released promptly.
+async fn drain_direct_passthrough_after_disconnect(
+    mut upstream: DirectUpstreamByteStream,
+    mut finalizer: DirectPassthroughFinalizer,
+    drain_timeout: Duration,
+    permit: OwnedSemaphorePermit,
+) {
+    let mut upstream_drained = false;
+    loop {
+        let item = match tokio::time::timeout(drain_timeout, upstream.next()).await {
+            Ok(Some(item)) => item,
+            Ok(None) => {
+                upstream_drained = true;
+                break;
+            }
+            Err(_) => {
+                if finalizer.has_core() {
+                    let core = finalizer.core();
+                    warn!(
+                        event_name = "direct_passthrough_drop_drain_timeout",
+                        log_type = "ops",
+                        trace_id = %core.trace_id,
+                        request_id = %core.request_id_for_log,
+                        candidate_id = ?core.candidate_id.as_deref(),
+                        timeout_ms = drain_timeout.as_millis() as u64,
+                        upstream_bytes = core.provider_stream_bytes,
+                        "gateway direct passthrough drop-drain timed out"
+                    );
+                }
+                break;
+            }
+        };
+
+        match item {
+            Ok(chunk) => {
+                if finalizer.observe_drained_upstream_chunk(&chunk) {
+                    // A semantic terminal event is sufficient to close the
+                    // client-visible request. Do not wait for a provider that
+                    // leaves the HTTP connection open after [DONE]. A failure
+                    // marker also ends the drain, but is deliberately not
+                    // treated as billable completion.
+                    upstream_drained = finalizer.observed_terminal_is_billable();
+                    break;
+                }
+                if !finalizer.has_core() || finalizer.terminal_failure().is_some() {
+                    break;
+                }
+            }
+            Err(message) => {
+                if finalizer.has_core() {
+                    let core = finalizer.core();
+                    warn!(
+                        event_name = "direct_passthrough_drop_drain_read_error",
+                        log_type = "ops",
+                        trace_id = %core.trace_id,
+                        request_id = %core.request_id_for_log,
+                        candidate_id = ?core.candidate_id.as_deref(),
+                        upstream_bytes = core.provider_stream_bytes,
+                        error = %message,
+                        "gateway direct passthrough drop-drain upstream body read failed"
+                    );
+                    finalizer.set_terminal_failure(build_stream_failure_report(
+                        "execution_runtime_stream_read_error",
+                        message,
+                        502,
+                    ));
+                }
+                break;
+            }
+        }
+    }
+    drop(upstream);
+    drop(permit);
+    // Transport EOF alone is not proof that the provider completed inference.  A
+    // provider can close a stream after a partial response (or a read error can
+    // be normalized as EOF); only an observed *successful semantic terminal*
+    // marker is safe to route through the billable 499 path.
+    if upstream_drained && finalizer.observed_terminal_is_billable() {
+        finalizer.mark_billing_treat_as_completed();
+    }
+    finalizer.finalize(true).await;
 }
 
 struct DirectPassthroughInlineBodyState {
@@ -2523,14 +3643,13 @@ impl DirectPassthroughInlineBodyState {
         if self.finalized {
             return None;
         }
-        if self
-            .finalizer
-            .as_ref()
-            .is_some_and(DirectPassthroughFinalizer::completed_native_anthropic_stream)
-        {
-            self.upstream.take();
-            self.finalized = true;
-            drop(self.finalizer.take());
+        if self.finalizer.as_ref().is_some_and(|finalizer| {
+            finalizer.client_visible_stream_terminal() && finalizer.terminal_failure().is_none()
+        }) {
+            // A provider SSE terminal marker is the protocol EOF.  Some
+            // upstreams keep the HTTP connection open after [DONE]; waiting
+            // for transport EOF leaves usage stuck in streaming forever.
+            self.finalize(false).await;
             return None;
         }
         if !self.observed_first_body_poll {
@@ -2586,11 +3705,10 @@ impl DirectPassthroughInlineBodyState {
             {
                 self.prepare_client_chunk_yield(&client_chunk);
                 self.terminal_error_sent |= provider_error_detected;
-                if self
-                    .finalizer
-                    .as_ref()
-                    .is_some_and(DirectPassthroughFinalizer::completed_native_anthropic_stream)
-                {
+                if self.finalizer.as_ref().is_some_and(|finalizer| {
+                    finalizer.client_visible_stream_terminal()
+                        && finalizer.terminal_failure().is_none()
+                }) {
                     self.upstream.take();
                     self.upstream_done = true;
                 }
@@ -2735,19 +3853,58 @@ impl Drop for DirectPassthroughInlineBodyState {
         // `finalized` only prevents another poll from entering finalization;
         // the finalizer may still be waiting for its handoff task to finish.
         // Keep the fallback armed while the finalizer is present.
-        if self.finalizer.is_none() {
+        let Some(finalizer) = self.finalizer.as_ref() else {
+            return;
+        };
+
+        let should_drain = !self.finalized
+            && !self.upstream_done
+            && finalizer.has_core()
+            && finalizer.terminal_failure().is_none()
+            && !finalizer.client_visible_stream_completed();
+        if !should_drain {
+            self.upstream.take();
+            if let Some(mut finalizer) = self.finalizer.take() {
+                observe_gateway_stage_ms("stream_finalizer_enqueue", 0);
+                if let Some(core) = finalizer.take_core() {
+                    spawn_direct_passthrough_finalizer_core(core);
+                }
+            }
             return;
         }
-        self.upstream.take();
-        if let Some(finalizer) = self.finalizer.take() {
-            observe_gateway_stage_ms("stream_finalizer_enqueue", 0);
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let mut finalizer = finalizer;
-                    finalizer.finalize(true).await;
-                });
-            }
+
+        let Some(permit) = try_acquire_stream_drain_permit() else {
+            observe_gateway_stage_ms("direct_passthrough_drop_drain_shed", 0);
+            // Leave both fields in place. Their normal destructors invoke the
+            // 499 fallback finalizer, so shedding drain cannot lose the row.
+            return;
+        };
+        let Some(upstream) = self.upstream.take() else {
+            drop(permit);
+            return;
+        };
+        if let Some(finalizer) = self.finalizer.as_mut() {
+            // A client can disconnect before the first body yield.  Release
+            // the target admission permit before doing detached drain work so
+            // the request cannot pin scarce upstream capacity.
+            finalizer.release_upstream_target_permit_after_first_yield();
         }
+        let Some(finalizer) = self.finalizer.take() else {
+            drop(permit);
+            return;
+        };
+        let drain_timeout = finalizer
+            .core()
+            .state
+            .frontdoor_runtime_guards
+            .stream_drain_timeout;
+        observe_gateway_stage_ms("direct_passthrough_drop_drain_enqueue", 0);
+        // The body future may be dropped while the request runtime is
+        // shutting down.  Drain on the process-lifetime runtime so provider
+        // bytes and the terminal 499 handoff are not lost with that runtime.
+        aether_usage_runtime::spawn_on_usage_background_runtime(
+            drain_direct_passthrough_after_disconnect(upstream, finalizer, drain_timeout, permit),
+        );
     }
 }
 
@@ -2844,6 +4001,7 @@ async fn execute_stream_from_direct_passthrough(
         stream_first_byte_timeout,
         upstream_target_permit,
     } = execution;
+    let realtime_attempt_id = Some(response_observation.request_order_id.clone());
 
     let requires_anthropic_message_stop = status_code == 200
         && response_headers_indicate_sse(&headers)
@@ -2913,7 +4071,7 @@ async fn execute_stream_from_direct_passthrough(
     }
 
     let response_header_rules_started_at = Instant::now();
-    apply_endpoint_response_header_rules(state, &plan, &mut headers, None).await?;
+    apply_endpoint_response_header_rules_best_effort(state, &plan, &mut headers, None).await;
     observe_gateway_stage_ms(
         "stream_response_header_rules",
         response_header_rules_started_at.elapsed().as_millis() as u64,
@@ -2977,6 +4135,8 @@ async fn execute_stream_from_direct_passthrough(
             headers: headers_for_report,
             stream_usage_report_context,
             stream_usage_observer,
+            realtime_token_sequence: 0,
+            realtime_attempt_id: realtime_attempt_id.clone(),
             stream_usage_observer_buffered: Vec::new(),
             provider_error_inspection: ProviderStreamErrorInspection::default(),
             max_stream_body_buffer_bytes,
@@ -3019,6 +4179,7 @@ async fn execute_stream_from_direct_passthrough(
     let plan_for_report = plan;
     let trace_id_owned = trace_id.to_string();
     let report_kind_owned = report_kind;
+    let report_kind_for_failure = report_kind_owned.clone();
     let report_context_owned = report_context;
     let lifecycle_seed_for_report = lifecycle_seed;
     let direct_stream_finalize_kind_owned =
@@ -3043,8 +4204,23 @@ async fn execute_stream_from_direct_passthrough(
     let candidate_id_for_report = candidate_id.clone();
     let provider_pool_in_flight_guard_for_report = in_flight_guard;
     let stream_drain_timeout = state.frontdoor_runtime_guards.stream_drain_timeout;
+    let realtime_attempt_id = response_observation.request_order_id.clone();
     record_stream_pre_first_byte_spawn();
     tokio::spawn(async move {
+        // Legacy/mpsc passthrough has a detached producer of its own.  Keep a
+        // terminal owner inside that task as well; otherwise cancellation of
+        // the request runtime after the response has been returned can drop
+        // the producer before it reaches the usage finalizer, leaving a
+        // pending/streaming row with no 499 terminal event.
+        let mut body_terminal_guard = StreamAttemptTerminalGuard::new(
+            &state_for_report,
+            &plan_for_report,
+            trace_id_owned.as_str(),
+            report_kind_owned.as_deref(),
+            report_context_owned.as_ref(),
+            candidate_started_unix_secs,
+            stream_started_at_for_report,
+        );
         let mut stage_trace_for_report = stage_trace_for_report;
         let _stream_total_guard =
             StageElapsedGuard::from_started_at("stream_total", stream_started_at_for_report);
@@ -3060,6 +4236,7 @@ async fn execute_stream_from_direct_passthrough(
         let mut stream_usage_observer = stream_usage_report_context
             .as_ref()
             .map(|_| StreamingStandardTerminalObserver::default());
+        let mut realtime_token_sequence = 0_u64;
         let mut stream_usage_observer_buffered = Vec::new();
         let mut provider_error_inspection = ProviderStreamErrorInspection::default();
         let mut provider_buffered_body = Vec::new();
@@ -3077,6 +4254,10 @@ async fn execute_stream_from_direct_passthrough(
         let mut last_client_chunk_elapsed_ms = 0u64;
         let mut downstream_dropped = false;
         let mut upstream_drained = false;
+        // A disconnected client may leave this detached producer draining for
+        // a long time.  Keep the extra post-disconnect work bounded across
+        // concurrent requests instead of allowing one permit per stream.
+        let mut stream_drain_permit: Option<OwnedSemaphorePermit> = None;
         let mut terminal_failure: Option<StreamFailureReport> = None;
         let mut provider_error_forwarded_to_client = false;
         let mut upstream = direct_upstream_response_byte_stream(prefetched_body, response);
@@ -3084,6 +4265,20 @@ async fn execute_stream_from_direct_passthrough(
         let mut observed_first_client_send = false;
 
         loop {
+            if downstream_dropped && stream_drain_permit.is_none() {
+                let Some(permit) = try_acquire_stream_drain_permit() else {
+                    warn!(
+                        event_name = "direct_passthrough_drop_drain_shed",
+                        log_type = "ops",
+                        trace_id = %trace_id_owned,
+                        request_id = %request_id_for_report_log,
+                        candidate_id = ?candidate_id_for_report.as_deref(),
+                        "gateway shed direct passthrough drop-drain after reaching its concurrency limit"
+                    );
+                    break;
+                };
+                stream_drain_permit = Some(permit);
+            }
             let item = if downstream_dropped {
                 // 客户端断开后继续消费上游流式响应，以便按真实 token 计费（499 取消也计费）。
                 // 超时为单帧静默上限：每收到一帧即重置，不限制 drain 总时长，
@@ -3142,7 +4337,10 @@ async fn execute_stream_from_direct_passthrough(
             let chunk = match item {
                 Ok(chunk) => chunk,
                 Err(message) => {
-                    if requires_anthropic_message_stop && client_visible_stream_completed {
+                    if requires_anthropic_message_stop
+                        && (client_visible_stream_completed
+                            || client_stream_completion_tracker.terminal_is_success())
+                    {
                         debug!(
                             event_name = "direct_passthrough_read_error_ignored_after_anthropic_stop",
                             log_type = "debug",
@@ -3279,6 +4477,18 @@ async fn execute_stream_from_direct_passthrough(
                     provider_chunk.as_ref(),
                 );
             }
+            drain_realtime_token_deltas_for_runtime(
+                &mut stream_usage_observer,
+                &state_for_report,
+                request_id_for_report.as_str(),
+                candidate_id_for_report.as_ref(),
+                report_context_owned
+                    .as_ref()
+                    .and_then(|context| context.get("realtime_admission_id"))
+                    .and_then(Value::as_str),
+                Some(realtime_attempt_id.as_str()),
+                &mut realtime_token_sequence,
+            );
             let provider_private_error_body_json = provider_error_inspection.observe(
                 stream_usage_report_context.as_ref(),
                 provider_chunk.as_ref(),
@@ -3299,7 +4509,35 @@ async fn execute_stream_from_direct_passthrough(
             if requires_anthropic_message_stop && client_visible_stream_completed {
                 break;
             }
+
+            if !downstream_dropped
+                && !requires_anthropic_message_stop
+                && client_visible_stream_completed
+                && client_stream_completion_tracker.terminal_is_success()
+            {
+                // Generic SSE protocols use `[DONE]`/`response.completed` as
+                // the semantic EOF.  Stop the detached producer even when the
+                // runtime transport never emits a trailing EOF frame.
+                break;
+            }
+
+            // Once the downstream is gone, the provider's semantic terminal
+            // event is enough to close the request.  Some providers leave the
+            // HTTP response open after `[DONE]`; waiting for transport EOF in
+            // that case would keep usage in `streaming` until the drain
+            // timeout expires.  Observe the raw upstream bytes only while
+            // draining so a cancelled (499) request does not become
+            // client-visible `completed`.
+            if downstream_dropped && !requires_anthropic_message_stop {
+                if client_stream_completion_tracker.observe_chunk(provider_chunk.as_ref())
+                    && client_stream_completion_tracker.terminal_is_success()
+                {
+                    upstream_drained = true;
+                    break;
+                }
+            }
         }
+        drop(stream_drain_permit);
         drop(upstream);
         drop(_provider_pool_in_flight_guard);
         drop(_upstream_target_permit);
@@ -3386,8 +4624,28 @@ async fn execute_stream_from_direct_passthrough(
             stream_usage_report_context.as_ref(),
             &mut stream_usage_observer_buffered,
         );
+        drain_realtime_token_deltas_for_runtime(
+            &mut stream_usage_observer,
+            &state_for_report,
+            request_id_for_report.as_str(),
+            candidate_id_for_report.as_ref(),
+            report_context_owned
+                .as_ref()
+                .and_then(|context| context.get("realtime_admission_id"))
+                .and_then(Value::as_str),
+            Some(realtime_attempt_id.as_str()),
+            &mut realtime_token_sequence,
+        );
+        mark_stream_terminal_summary_failure_from_tracker(
+            &mut stream_terminal_summary,
+            &client_stream_completion_tracker,
+        );
 
-        if downstream_dropped && client_visible_stream_completed && terminal_failure.is_none() {
+        if downstream_dropped
+            && client_visible_stream_completed
+            && client_stream_completion_tracker.terminal_is_success()
+            && terminal_failure.is_none()
+        {
             debug!(
                 event_name = "direct_passthrough_downstream_closed_after_done",
                 log_type = "debug",
@@ -3399,7 +4657,10 @@ async fn execute_stream_from_direct_passthrough(
             downstream_dropped = false;
         }
 
-        if downstream_dropped {
+        if downstream_dropped
+            && terminal_failure.is_none()
+            && !client_stream_completion_tracker.terminal_is_failure()
+        {
             let terminal_telemetry = Some(build_terminal_stream_telemetry(
                 stream_started_at_for_report,
                 telemetry.as_ref(),
@@ -3431,43 +4692,88 @@ async fn execute_stream_from_direct_passthrough(
                 stream_terminal_summary,
                 terminal_telemetry,
             );
-            if upstream_drained {
+            // A drained socket without a protocol terminal event is still an
+            // incomplete/cancelled attempt.  Do not infer usage or billing
+            // eligibility from transport EOF alone.
+            if upstream_drained && client_stream_completion_tracker.terminal_is_success() {
                 usage_payload.report_context = merge_billing_treat_as_completed_into_context(
                     usage_payload.report_context.take(),
                     true,
                 );
             }
-            record_stream_terminal_usage(
+            let watchdog_progress =
+                crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                    plan_for_report.request_id.as_str(),
+                    plan_for_report.candidate_id.as_deref(),
+                );
+            let (usage_handoff_succeeded, terminal_owner_progress) =
+                record_stream_terminal_usage_with_progress(
+                    &state_for_report,
+                    &plan_for_report,
+                    usage_payload.report_context.as_ref(),
+                    &usage_payload,
+                    true,
+                    watchdog_progress,
+                )
+                .await;
+            let candidate_status = stream_candidate_status_after_usage_handoff(
+                RequestCandidateStatus::Cancelled,
+                usage_handoff_succeeded,
+            );
+            let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+                status: candidate_status,
+                status_code: Some(499),
+                error_type: Some("downstream_disconnect".to_string()),
+                error_message: Some("client disconnected before stream completion".to_string()),
+                latency_ms: usage_payload
+                    .telemetry
+                    .as_ref()
+                    .and_then(|value| value.elapsed_ms),
+                started_at_unix_ms: Some(candidate_started_unix_secs),
+                finished_at_unix_ms: (candidate_status != RequestCandidateStatus::Streaming)
+                    .then_some(current_request_candidate_unix_ms()),
+            };
+            let candidate_persisted = record_local_request_candidate_status(
                 &state_for_report,
                 &plan_for_report,
                 usage_payload.report_context.as_ref(),
-                &usage_payload,
-                true,
+                terminal_candidate_update.clone(),
             )
             .await;
-            record_local_request_candidate_status(
-                &state_for_report,
-                &plan_for_report,
-                usage_payload.report_context.as_ref(),
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Cancelled,
-                    status_code: Some(499),
-                    error_type: Some("downstream_disconnect".to_string()),
-                    error_message: Some("client disconnected before stream completion".to_string()),
-                    latency_ms: usage_payload
-                        .telemetry
-                        .as_ref()
-                        .and_then(|value| value.elapsed_ms),
-                    started_at_unix_ms: Some(candidate_started_unix_secs),
-                    finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
-                },
-            )
-            .await;
+            if usage_handoff_succeeded && candidate_persisted {
+                release_stream_terminal_watchdog_progress(
+                    &plan_for_report,
+                    terminal_owner_progress,
+                );
+            } else if usage_handoff_succeeded {
+                spawn_candidate_persistence_retry_after_usage_handoff(
+                    state_for_report.clone(),
+                    plan_for_report.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update,
+                    terminal_owner_progress,
+                );
+            } else if terminal_owner_progress.is_some() {
+                spawn_stream_499_terminal_handoff_continuation(
+                    state_for_report.clone(),
+                    plan_for_report.clone(),
+                    usage_payload,
+                    candidate_started_unix_secs,
+                    terminal_owner_progress,
+                );
+            } else {
+                spawn_terminal_candidate_reconciliation(
+                    state_for_report.clone(),
+                    plan_for_report.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update,
+                );
+            }
+            body_terminal_guard.disarm();
             return;
         }
 
         if let Some(failure) = terminal_failure {
-            record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
             let terminal_telemetry = Some(build_terminal_stream_telemetry(
                 stream_started_at_for_report,
                 telemetry.as_ref(),
@@ -3491,6 +4797,7 @@ async fn execute_stream_from_direct_passthrough(
                 &trace_id_owned,
                 &plan_for_report,
                 direct_stream_finalize_kind_owned.as_deref(),
+                report_kind_for_failure.as_deref(),
                 report_context_for_payload,
                 headers_for_report,
                 terminal_telemetry,
@@ -3499,6 +4806,8 @@ async fn execute_stream_from_direct_passthrough(
                 failure,
             )
             .await;
+            record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
+            body_terminal_guard.disarm();
             return;
         }
 
@@ -3577,80 +4886,96 @@ async fn execute_stream_from_direct_passthrough(
                 error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
                 "gateway direct passthrough stream ended with a failed terminal state"
             );
-        } else {
-            apply_local_execution_effect(
-                &state_for_report,
-                LocalExecutionEffectContext {
-                    plan: &plan_for_report,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
-            )
-            .await;
-            apply_local_execution_effect(
-                &state_for_report,
-                LocalExecutionEffectContext {
-                    plan: &plan_for_report,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::AdaptiveSuccess(LocalAdaptiveSuccessEffect),
-            )
-            .await;
-            apply_local_execution_effect(
-                &state_for_report,
-                LocalExecutionEffectContext {
-                    plan: &plan_for_report,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::PoolSuccessStream {
-                    payload: &usage_payload,
-                },
-            )
-            .await;
         }
-        record_stream_terminal_usage(
-            &state_for_report,
-            &plan_for_report,
-            usage_payload.report_context.as_ref(),
-            &usage_payload,
-            false,
-        )
-        .await;
-        record_local_request_candidate_status(
+        let watchdog_progress =
+            crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                plan_for_report.request_id.as_str(),
+                plan_for_report.candidate_id.as_deref(),
+            );
+        let (usage_handoff_succeeded, terminal_owner_progress) =
+            record_stream_terminal_usage_with_progress(
+                &state_for_report,
+                &plan_for_report,
+                usage_payload.report_context.as_ref(),
+                &usage_payload,
+                false,
+                watchdog_progress,
+            )
+            .await;
+        let desired_candidate_status = if stream_failed {
+            RequestCandidateStatus::Failed
+        } else {
+            RequestCandidateStatus::Success
+        };
+        let candidate_status = stream_candidate_status_after_usage_handoff(
+            desired_candidate_status,
+            usage_handoff_succeeded,
+        );
+        let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+            status: desired_candidate_status,
+            status_code: Some(status_code),
+            error_type: if stream_failed {
+                if missing_observed_finish {
+                    Some("stream_missing_terminal_event".to_string())
+                } else {
+                    Some("stream_terminal_error".to_string())
+                }
+            } else {
+                None
+            },
+            error_message: stream_failed
+                .then_some(stream_terminal_error_message.clone())
+                .flatten(),
+            latency_ms: usage_payload
+                .telemetry
+                .as_ref()
+                .and_then(|value| value.elapsed_ms),
+            started_at_unix_ms: Some(candidate_started_unix_secs),
+            finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+        };
+        if !usage_handoff_succeeded {
+            spawn_terminal_candidate_reconciliation(
+                state_for_report.clone(),
+                plan_for_report.clone(),
+                usage_payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+            );
+        }
+        let candidate_persisted = record_local_request_candidate_status(
             &state_for_report,
             &plan_for_report,
             usage_payload.report_context.as_ref(),
             SchedulerRequestCandidateStatusUpdate {
-                status: if stream_failed {
-                    RequestCandidateStatus::Failed
-                } else {
-                    RequestCandidateStatus::Success
-                },
-                status_code: Some(status_code),
-                error_type: if stream_failed {
-                    if missing_observed_finish {
-                        Some("stream_missing_terminal_event".to_string())
-                    } else {
-                        Some("stream_terminal_error".to_string())
-                    }
-                } else {
-                    None
-                },
-                error_message: stream_failed
-                    .then_some(stream_terminal_error_message)
-                    .flatten(),
-                latency_ms: usage_payload
-                    .telemetry
-                    .as_ref()
-                    .and_then(|value| value.elapsed_ms),
-                started_at_unix_ms: Some(candidate_started_unix_secs),
-                finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                status: candidate_status,
+                finished_at_unix_ms: (candidate_status != RequestCandidateStatus::Streaming)
+                    .then_some(current_request_candidate_unix_ms()),
+                ..terminal_candidate_update.clone()
             },
         )
         .await;
+        if usage_handoff_succeeded && candidate_persisted {
+            release_stream_terminal_watchdog_progress(&plan_for_report, terminal_owner_progress);
+        } else if usage_handoff_succeeded {
+            spawn_candidate_persistence_retry_after_usage_handoff(
+                state_for_report.clone(),
+                plan_for_report.clone(),
+                usage_payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+                terminal_owner_progress,
+            );
+        }
+        if !stream_failed {
+            apply_stream_success_effects(&state_for_report, &plan_for_report, &usage_payload).await;
+        }
 
         if should_submit_report {
-            if let Err(err) = submit_stream_report(&state_for_report, usage_payload).await {
+            if let Err(err) = submit_stream_report_after_terminal_usage(
+                &state_for_report,
+                usage_payload,
+                usage_handoff_succeeded,
+            )
+            .await
+            {
                 warn!(
                     event_name = "execution_report_submit_failed",
                     log_type = "ops",
@@ -3663,6 +4988,7 @@ async fn execute_stream_from_direct_passthrough(
                 );
             }
         }
+        body_terminal_guard.disarm();
     });
 
     let body_stream = build_sse_body_stream(
@@ -3692,17 +5018,45 @@ pub(crate) fn execute_execution_runtime_stream<'a>(
     report_kind: Option<String>,
     report_context: Option<serde_json::Value>,
 ) -> Pin<Box<dyn Future<Output = Result<Option<Response<Body>>, GatewayError>> + Send + 'a>> {
-    Box::pin(execute_execution_runtime_stream_inner(
-        state,
-        plan,
-        trace_id,
-        decision,
-        plan_kind,
-        report_kind,
-        report_context,
-        None,
-        None,
-    ))
+    Box::pin(async move {
+        let stream_started_at = Instant::now();
+        let plan_for_error = plan.clone();
+        let report_context_for_error = report_context.clone();
+        match execute_execution_runtime_stream_inner(
+            state,
+            plan,
+            trace_id,
+            decision,
+            plan_kind,
+            report_kind,
+            report_context,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                // The internal gateway route has no candidate loop/exhaustion
+                // owner.  Convert an execution-runtime failure into a
+                // terminal transport response so its pending usage row cannot
+                // be left with only first-byte timing.
+                handle_stream_frame_execution_error(
+                    state,
+                    &plan_for_error,
+                    trace_id,
+                    decision,
+                    plan_kind,
+                    report_context_for_error.as_ref(),
+                    crate::clock::current_unix_ms(),
+                    stream_started_at,
+                    None,
+                    error,
+                )
+                .await
+            }
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3737,7 +5091,9 @@ pub(crate) fn execute_execution_runtime_stream_with_retry_scope<'a>(
         )
         .await?;
         Ok(match response {
-            Some(response) => AiAttemptExecutionOutcome::Responded(response),
+            Some(response) => AiAttemptExecutionOutcome::Responded(
+                crate::executor::mark_stream_response_usage_terminal_owner(response),
+            ),
             None => AiAttemptExecutionOutcome::Retry {
                 scope: retry_scope,
                 fallback_response,
@@ -3781,7 +5137,239 @@ async fn maybe_build_stream_transport_error_stop_response(
     .map(Some)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamWatchdogIntermediateOwnership {
+    /// The watchdog reserved an intermediate retry and will publish the
+    /// candidate transition itself. The stream task must not write a second
+    /// Failed row or ask the outer loop to retry again.
+    Retry,
+    /// A terminal owner (499 cancellation or 504 transport timeout) already
+    /// won. The stream task may only return a client payload; usage and
+    /// candidate settlement belong to that owner.
+    Terminal,
+}
+
+fn stream_watchdog_intermediate_ownership(
+    plan: &ExecutionPlan,
+) -> Option<StreamWatchdogIntermediateOwnership> {
+    let progress =
+        crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        )?;
+    if progress.retry_abort() {
+        Some(StreamWatchdogIntermediateOwnership::Retry)
+    } else if progress.terminal_owner_active() || progress.stop_requested() {
+        Some(StreamWatchdogIntermediateOwnership::Terminal)
+    } else {
+        None
+    }
+}
+
+fn build_stream_watchdog_owned_client_response(
+    plan: &ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+) -> Result<Response<Body>, GatewayError> {
+    crate::execution_runtime::build_transport_error_client_response(
+        plan,
+        trace_id,
+        decision,
+        http::StatusCode::BAD_GATEWAY.as_u16(),
+    )
+}
+
+/// Finish a stream-runtime transport failure when there is no framed response
+/// to hand to the normal stream finalizer.  A candidate-loop invocation may
+/// return `None` as an intermediate retry signal, but the direct/internal
+/// invocation has no exhaustion owner: returning `None` there used to leave a
+/// pending usage row with only its first-byte timing and no terminal billing
+/// event.  Keep the distinction in one helper so every native/remote adapter
+/// follows the same rule.
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_runtime_transport_error(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    report_context: Option<&Value>,
+    candidate_started_unix_ms: u64,
+    stream_started_at: Instant,
+    mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
+    error_type: &str,
+    error_message: &str,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    let elapsed_ms = stream_elapsed_ms_since(stream_started_at);
+    if let Some(response) = maybe_build_stream_transport_error_stop_response(
+        state,
+        plan,
+        report_context,
+        trace_id,
+        decision,
+        error_type,
+        error_message,
+        elapsed_ms,
+    )
+    .await?
+    {
+        return Ok(Some(response));
+    }
+
+    match stream_watchdog_intermediate_ownership(plan) {
+        Some(StreamWatchdogIntermediateOwnership::Retry) => return Ok(None),
+        Some(StreamWatchdogIntermediateOwnership::Terminal) => {
+            return Ok(Some(build_stream_watchdog_owned_client_response(
+                plan, trace_id, decision,
+            )?));
+        }
+        None => {}
+    }
+
+    // With an outer candidate loop this is deliberately an intermediate
+    // failure; the next candidate owns the request-level usage terminal.
+    if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+        // Reserve the intermediate lane before publishing Failed.  A frame
+        // error can race a watchdog/other observer that is about to claim a
+        // retry or terminal fallback; only the CAS winner may write this
+        // candidate transition.
+        if !crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        ) {
+            return match stream_watchdog_intermediate_ownership(plan) {
+                Some(StreamWatchdogIntermediateOwnership::Retry) => Ok(None),
+                Some(StreamWatchdogIntermediateOwnership::Terminal) => Ok(Some(
+                    build_stream_watchdog_owned_client_response(plan, trace_id, decision)?,
+                )),
+                None => Ok(None),
+            };
+        }
+        *retry_scope = AiAttemptRetryScope::Candidate;
+        let finished_at_unix_ms = current_request_candidate_unix_ms();
+        record_local_request_candidate_status(
+            state,
+            plan,
+            report_context,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Failed,
+                status_code: Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                error_type: Some(error_type.to_string()),
+                error_message: Some(error_message.to_string()),
+                latency_ms: Some(elapsed_ms),
+                started_at_unix_ms: Some(
+                    finished_at_unix_ms
+                        .saturating_sub(elapsed_ms)
+                        .max(candidate_started_unix_ms),
+                ),
+                finished_at_unix_ms: Some(finished_at_unix_ms),
+            },
+        )
+        .await;
+        return Ok(None);
+    }
+
+    // No candidate loop means this request must receive a terminal response;
+    // this helper performs the usage-first handoff and reconciliation itself.
+    let response = crate::execution_runtime::build_transport_error_stop_response(
+        state,
+        plan,
+        report_context,
+        trace_id,
+        decision,
+        http::StatusCode::BAD_GATEWAY.as_u16(),
+        error_type,
+        error_message,
+        elapsed_ms,
+    )
+    .await?;
+    Ok(Some(response))
+}
+
 async fn execute_execution_runtime_stream_inner(
+    state: &AppState,
+    plan: ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    report_kind: Option<String>,
+    report_context: Option<serde_json::Value>,
+    mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
+    mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    // The request can be cancelled before the framed-stream body task takes
+    // ownership (provider adapters, admission, first-frame prefetch, and
+    // response-header policy all await in this function).  Keep one
+    // request-level fallback owner around that entire preparation window; the
+    // framed-stream helper has no second owner, so a dropped future cannot
+    // strand the pending usage skeleton.
+    let mut terminal_guard = StreamAttemptTerminalGuard::new(
+        state,
+        &plan,
+        trace_id,
+        report_kind.as_deref(),
+        report_context.as_ref(),
+        current_request_candidate_unix_ms(),
+        Instant::now(),
+    );
+    terminal_guard.disarm();
+    let result = execute_execution_runtime_stream_inner_impl(
+        state,
+        plan,
+        trace_id,
+        decision,
+        plan_kind,
+        report_kind,
+        report_context,
+        &mut terminal_guard,
+        retry_scope_out.as_deref_mut(),
+        retry_fallback_out.as_deref_mut(),
+    )
+    .await;
+
+    match result {
+        Ok(response) => {
+            // Every normal return has transferred ownership to either the
+            // body-task finalizer, an explicit terminal handoff, or the
+            // candidate loop (including its intentional `None` retry result).
+            // Do not let the guard fire after ownership has been transferred.
+            if !(response.is_none() && terminal_guard.retry_handoff_incomplete()) {
+                terminal_guard.disarm();
+            }
+            Ok(response)
+        }
+        Err(error) => {
+            // Once the usage skeleton has been armed, every escaped framed
+            // execution error must go through the shared usage-first handler.
+            // Candidate-loop callers receive `Ok(None)` for an intermediate
+            // retry; direct callers receive a terminal transport response.
+            // Only errors raised before the guard was armed (for example,
+            // candidate-slot admission) may propagate to their outer owner.
+            if !terminal_guard.is_armed() {
+                terminal_guard.disarm();
+                return Err(error);
+            }
+            let handled = handle_stream_frame_execution_error(
+                state,
+                &terminal_guard.plan,
+                trace_id,
+                decision,
+                plan_kind,
+                terminal_guard.report_context.as_ref(),
+                current_request_candidate_unix_ms(),
+                terminal_guard.candidate_started_at,
+                retry_scope_out.as_deref_mut(),
+                error,
+            )
+            .await;
+            if handled.is_ok() {
+                terminal_guard.disarm();
+            }
+            handled
+        }
+    }
+}
+
+async fn execute_execution_runtime_stream_inner_impl(
     state: &AppState,
     mut plan: ExecutionPlan,
     trace_id: &str,
@@ -3789,6 +5377,7 @@ async fn execute_execution_runtime_stream_inner(
     plan_kind: &str,
     report_kind: Option<String>,
     mut report_context: Option<serde_json::Value>,
+    terminal_guard: &mut StreamAttemptTerminalGuard,
     mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
     mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
@@ -3809,6 +5398,23 @@ async fn execute_execution_runtime_stream_inner(
         plan_kind,
         report_context.as_ref(),
     );
+    let candidate_started_unix_secs = current_request_candidate_unix_ms();
+    // Candidate-slot creation has completed, so the guard now has the
+    // canonical candidate id/report context. Arm it before the first pending
+    // usage write; cancellation during that write must still get a terminal
+    // fallback.
+    terminal_guard.arm_for(
+        &plan,
+        trace_id,
+        report_kind.as_deref(),
+        report_context.as_ref(),
+        candidate_started_unix_secs,
+        stream_started_at,
+    );
+    // The exact stream-attempt guard now owns cancellation through pending
+    // persistence and body-owner handoff. Do not let the request-gap owner
+    // compete using a prior candidate snapshot.
+    crate::executor::pause_current_request_terminal_gap_for_attempt();
     // Inline passthrough records its lifecycle seed after upstream headers are
     // available. Avoid constructing a throwaway seed on the common path.
     let mut lifecycle_seed = (!defer_stream_pending_for_direct_inline)
@@ -3818,7 +5424,6 @@ async fn execute_execution_runtime_stream_inner(
         record_stream_pending_lifecycle(state, seed, &mut stage_trace).await;
         lifecycle_pending_recorded = true;
     }
-    let candidate_started_unix_secs = current_request_candidate_unix_ms();
     if let Some(snapshot) = request_candidate_status_snapshot.clone() {
         record_local_request_candidate_status_snapshot(
             state,
@@ -3901,37 +5506,19 @@ async fn execute_execution_runtime_stream_inner(
                 error = %err,
                 "gateway Grok stream execution unavailable"
             );
-            let terminal_unix_secs = current_request_candidate_unix_ms();
-            record_local_request_candidate_status(
+            return handle_stream_runtime_transport_error(
                 state,
                 &plan,
-                report_context.as_ref(),
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Failed,
-                    status_code: None,
-                    error_type: Some("grok_execution_unavailable".to_string()),
-                    error_message: Some(transport_error_message.clone()),
-                    latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
-                    started_at_unix_ms: Some(candidate_started_unix_secs),
-                    finished_at_unix_ms: Some(terminal_unix_secs),
-                },
-            )
-            .await;
-            if let Some(response) = maybe_build_stream_transport_error_stop_response(
-                state,
-                &plan,
-                report_context.as_ref(),
                 trace_id,
                 decision,
+                report_context.as_ref(),
+                candidate_started_unix_secs,
+                stream_started_at,
+                retry_scope_out.as_deref_mut(),
                 "grok_execution_unavailable",
                 transport_error_message.as_str(),
-                stream_elapsed_ms_since(stream_started_at),
             )
-            .await?
-            {
-                return Ok(Some(response));
-            }
-            return Ok(None);
+            .await;
         }
     }
     match maybe_execute_windsurf_stream(state, &plan, report_context.as_ref()).await {
@@ -3974,37 +5561,19 @@ async fn execute_execution_runtime_stream_inner(
                 error = %err,
                 "gateway native Windsurf stream execution unavailable"
             );
-            let terminal_unix_secs = current_request_candidate_unix_ms();
-            record_local_request_candidate_status(
+            return handle_stream_runtime_transport_error(
                 state,
                 &plan,
-                report_context.as_ref(),
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Failed,
-                    status_code: None,
-                    error_type: Some("windsurf_native_execution_unavailable".to_string()),
-                    error_message: Some(transport_error_message.clone()),
-                    latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
-                    started_at_unix_ms: Some(candidate_started_unix_secs),
-                    finished_at_unix_ms: Some(terminal_unix_secs),
-                },
-            )
-            .await;
-            if let Some(response) = maybe_build_stream_transport_error_stop_response(
-                state,
-                &plan,
-                report_context.as_ref(),
                 trace_id,
                 decision,
+                report_context.as_ref(),
+                candidate_started_unix_secs,
+                stream_started_at,
+                retry_scope_out.as_deref_mut(),
                 "windsurf_native_execution_unavailable",
                 transport_error_message.as_str(),
-                stream_elapsed_ms_since(stream_started_at),
             )
-            .await?
-            {
-                return Ok(Some(response));
-            }
-            return Ok(None);
+            .await;
         }
     }
     match maybe_execute_kiro_web_search_stream(state, &plan, report_context.as_ref()).await {
@@ -4047,37 +5616,19 @@ async fn execute_execution_runtime_stream_inner(
                 error = %err,
                 "gateway Kiro web_search MCP execution unavailable"
             );
-            let terminal_unix_secs = current_request_candidate_unix_ms();
-            record_local_request_candidate_status(
+            return handle_stream_runtime_transport_error(
                 state,
                 &plan,
-                report_context.as_ref(),
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Failed,
-                    status_code: None,
-                    error_type: Some("kiro_web_search_mcp_unavailable".to_string()),
-                    error_message: Some(transport_error_message.clone()),
-                    latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
-                    started_at_unix_ms: Some(candidate_started_unix_secs),
-                    finished_at_unix_ms: Some(terminal_unix_secs),
-                },
-            )
-            .await;
-            if let Some(response) = maybe_build_stream_transport_error_stop_response(
-                state,
-                &plan,
-                report_context.as_ref(),
                 trace_id,
                 decision,
+                report_context.as_ref(),
+                candidate_started_unix_secs,
+                stream_started_at,
+                retry_scope_out.as_deref_mut(),
                 "kiro_web_search_mcp_unavailable",
                 transport_error_message.as_str(),
-                stream_elapsed_ms_since(stream_started_at),
             )
-            .await?
-            {
-                return Ok(Some(response));
-            }
-            return Ok(None);
+            .await;
         }
     }
     match maybe_execute_chatgpt_web_image_stream(state, &plan, report_context.as_ref()).await {
@@ -4120,37 +5671,19 @@ async fn execute_execution_runtime_stream_inner(
                 error = %err,
                 "gateway ChatGPT-Web image stream execution unavailable"
             );
-            let terminal_unix_secs = current_request_candidate_unix_ms();
-            record_local_request_candidate_status(
+            return handle_stream_runtime_transport_error(
                 state,
                 &plan,
-                report_context.as_ref(),
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Failed,
-                    status_code: None,
-                    error_type: Some("chatgpt_web_image_execution_unavailable".to_string()),
-                    error_message: Some(transport_error_message.clone()),
-                    latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
-                    started_at_unix_ms: Some(candidate_started_unix_secs),
-                    finished_at_unix_ms: Some(terminal_unix_secs),
-                },
-            )
-            .await;
-            if let Some(response) = maybe_build_stream_transport_error_stop_response(
-                state,
-                &plan,
-                report_context.as_ref(),
                 trace_id,
                 decision,
+                report_context.as_ref(),
+                candidate_started_unix_secs,
+                stream_started_at,
+                retry_scope_out.as_deref_mut(),
                 "chatgpt_web_image_execution_unavailable",
                 transport_error_message.as_str(),
-                stream_elapsed_ms_since(stream_started_at),
             )
-            .await?
-            {
-                return Ok(Some(response));
-            }
-            return Ok(None);
+            .await;
         }
     }
     #[cfg(not(test))]
@@ -4167,12 +5700,35 @@ async fn execute_execution_runtime_stream_inner(
             Ok(execution) => execution,
             Err(InProcessStreamExecutionError::Gateway(err)) => {
                 if matches!(err, GatewayError::AdmissionTimeout { .. }) {
-                    record_stream_admission_timeout_candidate_failure(
+                    // The candidate-loop variant owns an intermediate
+                    // admission failure marker.  A direct/internal call has
+                    // no retry owner; let the outer frame-error handler
+                    // perform the usage-first terminal handoff instead of
+                    // publishing Failed ahead of it.
+                    if retry_scope_out.is_some() {
+                        record_stream_admission_timeout_candidate_failure(
+                            state,
+                            &plan,
+                            report_context.as_ref(),
+                            candidate_started_unix_secs,
+                            &err,
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+                if lifecycle_pending_recorded {
+                    return handle_stream_frame_execution_error(
                         state,
                         &plan,
+                        trace_id,
+                        decision,
+                        plan_kind,
                         report_context.as_ref(),
                         candidate_started_unix_secs,
-                        &err,
+                        stream_started_at,
+                        retry_scope_out.as_deref_mut(),
+                        err,
                     )
                     .await;
                 }
@@ -4194,37 +5750,19 @@ async fn execute_execution_runtime_stream_inner(
                     error = %err,
                     "gateway in-process stream execution unavailable"
                 );
-                let terminal_unix_secs = current_request_candidate_unix_ms();
-                record_local_request_candidate_status(
+                return handle_stream_runtime_transport_error(
                     state,
                     &plan,
-                    report_context.as_ref(),
-                    SchedulerRequestCandidateStatusUpdate {
-                        status: RequestCandidateStatus::Failed,
-                        status_code: None,
-                        error_type: Some("execution_runtime_unavailable".to_string()),
-                        error_message: Some(transport_error_message.clone()),
-                        latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
-                        started_at_unix_ms: Some(candidate_started_unix_secs),
-                        finished_at_unix_ms: Some(terminal_unix_secs),
-                    },
-                )
-                .await;
-                if let Some(response) = maybe_build_stream_transport_error_stop_response(
-                    state,
-                    &plan,
-                    report_context.as_ref(),
                     trace_id,
                     decision,
+                    report_context.as_ref(),
+                    candidate_started_unix_secs,
+                    stream_started_at,
+                    retry_scope_out.as_deref_mut(),
                     "execution_runtime_unavailable",
                     transport_error_message.as_str(),
-                    stream_elapsed_ms_since(stream_started_at),
                 )
-                .await?
-                {
-                    return Ok(Some(response));
-                }
-                return Ok(None);
+                .await;
             }
         };
         observe_gateway_stage_trace_ms(
@@ -4267,7 +5805,15 @@ async fn execute_execution_runtime_stream_inner(
             &execution.response_observation.request_order_id,
         );
         let stream_precommit_committed = execution.stream_precommit_committed;
-        let frame_stream = build_direct_execution_frame_stream(execution).boxed();
+        let realtime_context = realtime_stream_context(
+            state,
+            &plan,
+            report_context.as_ref(),
+            Some(execution.response_observation.request_order_id.as_str()),
+        );
+        let frame_stream =
+            build_direct_execution_frame_stream_with_realtime(execution, Some(realtime_context))
+                .boxed();
         return execute_stream_from_frame_stream_with_retry_scope(
             state,
             plan,
@@ -4307,12 +5853,30 @@ async fn execute_execution_runtime_stream_inner(
                 Ok(execution) => execution,
                 Err(InProcessStreamExecutionError::Gateway(err)) => {
                     if matches!(err, GatewayError::AdmissionTimeout { .. }) {
-                        record_stream_admission_timeout_candidate_failure(
+                        if retry_scope_out.is_some() {
+                            record_stream_admission_timeout_candidate_failure(
+                                state,
+                                &plan,
+                                report_context.as_ref(),
+                                candidate_started_unix_secs,
+                                &err,
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
+                    if lifecycle_pending_recorded {
+                        return handle_stream_frame_execution_error(
                             state,
                             &plan,
+                            trace_id,
+                            decision,
+                            plan_kind,
                             report_context.as_ref(),
                             candidate_started_unix_secs,
-                            &err,
+                            stream_started_at,
+                            retry_scope_out.as_deref_mut(),
+                            err,
                         )
                         .await;
                     }
@@ -4334,37 +5898,19 @@ async fn execute_execution_runtime_stream_inner(
                         error = %err,
                         "gateway in-process stream execution unavailable"
                     );
-                    let terminal_unix_secs = current_request_candidate_unix_ms();
-                    record_local_request_candidate_status(
+                    return handle_stream_runtime_transport_error(
                         state,
                         &plan,
-                        report_context.as_ref(),
-                        SchedulerRequestCandidateStatusUpdate {
-                            status: RequestCandidateStatus::Failed,
-                            status_code: None,
-                            error_type: Some("execution_runtime_unavailable".to_string()),
-                            error_message: Some(transport_error_message.clone()),
-                            latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
-                            started_at_unix_ms: Some(candidate_started_unix_secs),
-                            finished_at_unix_ms: Some(terminal_unix_secs),
-                        },
-                    )
-                    .await;
-                    if let Some(response) = maybe_build_stream_transport_error_stop_response(
-                        state,
-                        &plan,
-                        report_context.as_ref(),
                         trace_id,
                         decision,
+                        report_context.as_ref(),
+                        candidate_started_unix_secs,
+                        stream_started_at,
+                        retry_scope_out.as_deref_mut(),
                         "execution_runtime_unavailable",
                         transport_error_message.as_str(),
-                        stream_elapsed_ms_since(stream_started_at),
                     )
-                    .await?
-                    {
-                        return Ok(Some(response));
-                    }
-                    return Ok(None);
+                    .await;
                 }
             };
             observe_gateway_stage_trace_ms(
@@ -4412,7 +5958,17 @@ async fn execute_execution_runtime_stream_inner(
                 &execution.response_observation.request_order_id,
             );
             let stream_precommit_committed = execution.stream_precommit_committed;
-            let frame_stream = build_direct_execution_frame_stream(execution).boxed();
+            let realtime_context = realtime_stream_context(
+                state,
+                &plan,
+                report_context.as_ref(),
+                Some(execution.response_observation.request_order_id.as_str()),
+            );
+            let frame_stream = build_direct_execution_frame_stream_with_realtime(
+                execution,
+                Some(realtime_context),
+            )
+            .boxed();
             return execute_stream_from_frame_stream_with_retry_scope(
                 state,
                 plan,
@@ -4457,60 +6013,130 @@ async fn execute_execution_runtime_stream_inner(
                     error = ?err,
                     "gateway remote execution runtime stream unavailable"
                 );
-                let terminal_unix_secs = current_request_candidate_unix_ms();
-                record_local_request_candidate_status(
+                return handle_stream_runtime_transport_error(
                     state,
                     &plan,
-                    report_context.as_ref(),
-                    SchedulerRequestCandidateStatusUpdate {
-                        status: RequestCandidateStatus::Failed,
-                        status_code: None,
-                        error_type: Some("execution_runtime_unavailable".to_string()),
-                        error_message: Some(transport_error_message.clone()),
-                        latency_ms: Some(stream_elapsed_ms_since(stream_started_at)),
-                        started_at_unix_ms: Some(candidate_started_unix_secs),
-                        finished_at_unix_ms: Some(terminal_unix_secs),
-                    },
-                )
-                .await;
-                if let Some(response) = maybe_build_stream_transport_error_stop_response(
-                    state,
-                    &plan,
-                    report_context.as_ref(),
                     trace_id,
                     decision,
+                    report_context.as_ref(),
+                    candidate_started_unix_secs,
+                    stream_started_at,
+                    retry_scope_out.as_deref_mut(),
                     "execution_runtime_unavailable",
                     transport_error_message.as_str(),
-                    stream_elapsed_ms_since(stream_started_at),
                 )
-                .await?
-                {
-                    return Ok(Some(response));
-                }
-                return Ok(None);
+                .await;
             }
         };
 
         if response.status() != http::StatusCode::OK {
+            let status_code = response.status().as_u16();
+            let response_headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let error_message = format!("execution runtime returned HTTP {status_code}");
+            // The remote compatibility path still owns the request-level
+            // lifecycle seed.  Close it through the same terminal handoff
+            // barrier as local stream errors before publishing a candidate
+            // terminal status; otherwise a non-OK runtime response leaves a
+            // pending usage row with a prematurely Failed candidate.
+            let usage_payload = build_stream_sync_payload(
+                trace_id,
+                report_kind.clone().unwrap_or_default(),
+                report_context.clone(),
+                status_code,
+                response_headers,
+                Some(json!({
+                    "error": {
+                        "type": "execution_runtime_http_error",
+                        "message": error_message.clone(),
+                        "code": status_code,
+                    }
+                })),
+                None,
+                Some(ExecutionTelemetry {
+                    elapsed_ms: Some(stream_elapsed_ms_since(stream_started_at)),
+                    ttfb_ms: None,
+                    upstream_bytes: None,
+                }),
+            );
+            let (usage_handoff_persisted, terminal_owner_progress) =
+                record_sync_terminal_usage_with_handoff_with_progress(
+                    state,
+                    &plan,
+                    usage_payload.report_context.as_ref(),
+                    &usage_payload,
+                    terminal_guard.watchdog_progress.clone(),
+                )
+                .await;
             let terminal_unix_secs = current_request_candidate_unix_ms();
-            record_local_request_candidate_status(
+            let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Failed,
+                status_code: Some(status_code),
+                error_type: Some("execution_runtime_http_error".to_string()),
+                error_message: Some(error_message),
+                latency_ms: usage_payload
+                    .telemetry
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.elapsed_ms),
+                started_at_unix_ms: Some(candidate_started_unix_secs),
+                finished_at_unix_ms: Some(terminal_unix_secs),
+            };
+            if !usage_handoff_persisted {
+                spawn_terminal_candidate_reconciliation(
+                    state.clone(),
+                    plan.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update.clone(),
+                );
+            }
+            let candidate_persisted = record_local_request_candidate_status(
                 state,
                 &plan,
-                report_context.as_ref(),
+                usage_payload.report_context.as_ref(),
                 SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Failed,
-                    status_code: Some(response.status().as_u16()),
-                    error_type: Some("execution_runtime_http_error".to_string()),
-                    error_message: Some(format!(
-                        "execution runtime returned HTTP {}",
-                        response.status()
-                    )),
-                    latency_ms: None,
-                    started_at_unix_ms: Some(candidate_started_unix_secs),
-                    finished_at_unix_ms: Some(terminal_unix_secs),
+                    status: usage_handoff_persisted
+                        .then_some(RequestCandidateStatus::Failed)
+                        .unwrap_or(RequestCandidateStatus::Streaming),
+                    error_type: usage_handoff_persisted
+                        .then(|| "execution_runtime_http_error".to_string())
+                        .or_else(|| Some("usage_terminal_handoff_unconfirmed".to_string())),
+                    error_message: usage_handoff_persisted
+                        .then(|| {
+                            terminal_candidate_update
+                                .error_message
+                                .clone()
+                                .unwrap_or_default()
+                        })
+                        .or_else(|| {
+                            Some(
+                                "terminal usage persistence was not confirmed before candidate finalization"
+                                    .to_string(),
+                            )
+                        }),
+                    finished_at_unix_ms: usage_handoff_persisted.then_some(terminal_unix_secs),
+                    ..terminal_candidate_update.clone()
                 },
             )
             .await;
+            if usage_handoff_persisted && candidate_persisted {
+                release_stream_terminal_watchdog_progress(&plan, terminal_owner_progress);
+            } else if usage_handoff_persisted {
+                spawn_candidate_persistence_retry_after_usage_handoff(
+                    state.clone(),
+                    plan.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update.clone(),
+                    terminal_owner_progress,
+                );
+            }
             return Ok(Some(attach_control_metadata_headers(
                 build_client_response(response, trace_id, Some(decision))?,
                 Some(plan.request_id.as_str()),
@@ -4727,23 +6353,79 @@ fn build_sse_body_stream(
     anthropic_message_stop_terminates_body: bool,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = Result<Bytes, IoError>> + Send + 'static {
+    build_sse_body_stream_with_delivery_probe(
+        prefetched_chunks_for_body,
+        rx,
+        filter_control_blocks,
+        emit_keepalive,
+        anthropic_message_stop_terminates_body,
+        keepalive_interval,
+        None,
+    )
+}
+
+/// Variant used by the frame runtime, whose prefetched chunks are produced
+/// before the response body is handed back to hyper.  The producer must not
+/// finalize a request as successful until the body stream has actually been
+/// polled through those chunks; otherwise a client that disconnects before its
+/// first body poll leaves a false-success candidate and a skeletal usage row.
+fn build_sse_body_stream_with_delivery_probe(
+    prefetched_chunks_for_body: Vec<Bytes>,
+    mut rx: mpsc::Receiver<Result<Bytes, IoError>>,
+    filter_control_blocks: bool,
+    emit_keepalive: bool,
+    anthropic_message_stop_terminates_body: bool,
+    keepalive_interval: Duration,
+    prefetched_delivery: Option<tokio::sync::oneshot::Sender<()>>,
+) -> impl futures_util::Stream<Item = Result<Bytes, IoError>> + Send + 'static {
     stream! {
         let mut upstream_control_filter = filter_control_blocks.then(SseControlBlockFilter::default);
         let mut anthropic_completion_tracker =
             anthropic_message_stop_terminates_body.then(ClientVisibleStreamCompletionTracker::default);
+        let mut prefetched_delivery = prefetched_delivery;
         let mut sent_prefetched_chunk = false;
-        for chunk in prefetched_chunks_for_body {
+        let mut prefetched_chunks = prefetched_chunks_for_body.into_iter().peekable();
+        while let Some(chunk) = prefetched_chunks.next() {
+            let is_last_prefetched_input = prefetched_chunks.peek().is_none();
             if let Some(mut chunk) = filter_upstream_sse_control_chunk(&mut upstream_control_filter, chunk) {
                 let completed = truncate_at_anthropic_message_stop(
                     anthropic_completion_tracker.as_mut(),
                     &mut chunk,
                 );
                 sent_prefetched_chunk = true;
+                // `async_stream::stream!` resumes after a `yield` only when
+                // the consumer polls again.  Notify before yielding a
+                // terminal Anthropic chunk so a client that consumes the
+                // marker and then closes still gets a delivery confirmation.
+                if completed {
+                    if let Some(delivery) = prefetched_delivery.take() {
+                        let _ = delivery.send(());
+                    }
+                }
+                // For non-Anthropic terminal markers (for example OpenAI
+                // `[DONE]`) there is no tracker-local completion flag here.
+                // Notify immediately before yielding the final prefetched
+                // input chunk so a single-chunk response can be confirmed
+                // without requiring an extra EOF poll.  If the final input
+                // block was filtered as a control-only block, the notification
+                // remains deferred until after the filtering pass below.
+                if is_last_prefetched_input && !completed {
+                    if let Some(delivery) = prefetched_delivery.take() {
+                        let _ = delivery.send(());
+                    }
+                }
                 yield Ok(chunk);
                 if completed {
                     return;
                 }
             }
+        }
+        // Reaching this point means every prefetched chunk was yielded (or was
+        // intentionally filtered as a control-only block).  If the stream is
+        // dropped before it resumes after a `yield`, the sender is dropped and
+        // the producer treats that as a downstream disconnect instead.
+        if let Some(delivery) = prefetched_delivery.take() {
+            let _ = delivery.send(());
         }
 
         if emit_keepalive {
@@ -4968,6 +6650,7 @@ struct ClientVisibleStreamCompletionTracker {
     discarded_line_nonempty: bool,
     skip_next_lf: bool,
     completed: bool,
+    terminal_failed: bool,
 }
 
 impl ClientVisibleStreamCompletionTracker {
@@ -4983,6 +6666,14 @@ impl ClientVisibleStreamCompletionTracker {
     fn observe_anthropic_message_stop(&mut self, chunk: &[u8]) -> bool {
         self.observe_anthropic_message_stop_terminal_end(chunk);
         self.completed
+    }
+
+    fn terminal_is_success(&self) -> bool {
+        self.completed && !self.terminal_failed
+    }
+
+    fn terminal_is_failure(&self) -> bool {
+        self.completed && self.terminal_failed
     }
 
     fn observe_anthropic_message_stop_terminal_end(&mut self, chunk: &[u8]) -> Option<usize> {
@@ -5063,6 +6754,7 @@ impl ClientVisibleStreamCompletionTracker {
 
         if line.is_empty() {
             self.completed = self.current_event_is_terminal(policy);
+            self.terminal_failed = self.completed && self.current_event_is_failure();
             self.reset_current_event();
             self.record_bytes = 0;
             return;
@@ -5120,6 +6812,32 @@ impl ClientVisibleStreamCompletionTracker {
                         .is_none_or(|event_type| event_type == "message_stop")
             }
         }
+    }
+
+    fn current_event_is_failure(&self) -> bool {
+        if self.event_type.as_deref().is_some_and(|event_type| {
+            matches!(
+                event_type,
+                "response.failed" | "response.incomplete" | "error"
+            )
+        }) {
+            return true;
+        }
+        self.has_data_payload
+            && serde_json::from_str::<serde_json::Value>(&self.data_payload)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|event_type| {
+                            matches!(
+                                event_type,
+                                "response.failed" | "response.incomplete" | "error"
+                            )
+                        })
+                })
+                .unwrap_or(false)
     }
 
     fn reset_current_event(&mut self) {
@@ -5591,6 +7309,159 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     report_context: Option<serde_json::Value>,
     candidate_started_unix_secs: u64,
     stream_started_at: Instant,
+    stage_trace: RequestStageTrace,
+    lifecycle_pending_recorded: bool,
+    frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
+    stream_precommit_committed: bool,
+    in_flight_guard: Option<ProviderPoolInFlightGuard>,
+    mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
+    mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
+    fallback_response_observation: Option<ExecutionResponseObservation>,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    execute_stream_from_frame_stream_with_retry_scope_inner(
+        state,
+        plan,
+        trace_id,
+        decision,
+        plan_kind,
+        report_kind,
+        report_context,
+        candidate_started_unix_secs,
+        stream_started_at,
+        stage_trace,
+        lifecycle_pending_recorded,
+        frame_stream,
+        stream_precommit_committed,
+        in_flight_guard,
+        retry_scope_out.as_deref_mut(),
+        retry_fallback_out,
+        fallback_response_observation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_frame_execution_error(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    report_context: Option<&serde_json::Value>,
+    candidate_started_unix_secs: u64,
+    stream_started_at: Instant,
+    mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
+    error: GatewayError,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    let error_message = error.into_message();
+    let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
+    // A frame error after the pending lifecycle has been recorded is a
+    // transport/decoder failure, even when it is represented by the generic
+    // GatewayError::Internal variant.  Honor the local failover policy first;
+    // Stop settles usage and candidate state, while Retry leaves request-level
+    // usage pending for the next candidate.
+    if let Some(response) = maybe_build_stream_transport_error_stop_response(
+        state,
+        plan,
+        report_context,
+        trace_id,
+        decision,
+        "stream_frame_execution_error",
+        error_message.as_str(),
+        elapsed_ms,
+    )
+    .await?
+    {
+        return Ok(Some(response));
+    }
+
+    match stream_watchdog_intermediate_ownership(plan) {
+        Some(StreamWatchdogIntermediateOwnership::Retry) => return Ok(None),
+        Some(StreamWatchdogIntermediateOwnership::Terminal) => {
+            return Ok(Some(build_stream_watchdog_owned_client_response(
+                plan, trace_id, decision,
+            )?));
+        }
+        None => {}
+    }
+
+    if let Some(retry_scope) = retry_scope_out {
+        // This is another generic framed-error fallback.  Claim the shared
+        // intermediate owner before writing Failed so a concurrent timeout or
+        // error observer cannot publish a duplicate transition.
+        if !crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        ) {
+            return match stream_watchdog_intermediate_ownership(plan) {
+                Some(StreamWatchdogIntermediateOwnership::Retry) => Ok(None),
+                Some(StreamWatchdogIntermediateOwnership::Terminal) => Ok(Some(
+                    build_stream_watchdog_owned_client_response(plan, trace_id, decision)?,
+                )),
+                None => Ok(None),
+            };
+        }
+        *retry_scope = AiAttemptRetryScope::Candidate;
+        let finished_at_unix_ms = current_request_candidate_unix_ms();
+        record_local_request_candidate_status(
+            state,
+            plan,
+            report_context,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Failed,
+                status_code: Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                error_type: Some("stream_frame_execution_error".to_string()),
+                error_message: Some(error_message),
+                latency_ms: Some(elapsed_ms),
+                started_at_unix_ms: Some(
+                    finished_at_unix_ms
+                        .saturating_sub(elapsed_ms)
+                        .max(candidate_started_unix_secs),
+                ),
+                finished_at_unix_ms: Some(finished_at_unix_ms),
+            },
+        )
+        .await;
+        warn!(
+            event_name = "local_stream_candidate_frame_error_retry",
+            log_type = "ops",
+            trace_id = %trace_id,
+            plan_kind,
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            "gateway retrying stream candidate after framed execution error"
+        );
+        return Ok(None);
+    }
+
+    // Direct/internal execution has no outer candidate loop to perform
+    // exhaustion settlement, so always create a terminal transport response.
+    let response = crate::execution_runtime::build_transport_error_stop_response(
+        state,
+        plan,
+        report_context,
+        trace_id,
+        decision,
+        http::StatusCode::BAD_GATEWAY.as_u16(),
+        "stream_frame_execution_error",
+        error_message.as_str(),
+        elapsed_ms,
+    )
+    .await?;
+    Ok(Some(response))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_stream_from_frame_stream_with_retry_scope_inner(
+    state: &AppState,
+    plan: ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    report_kind: Option<String>,
+    report_context: Option<serde_json::Value>,
+    candidate_started_unix_secs: u64,
+    stream_started_at: Instant,
     mut stage_trace: RequestStageTrace,
     lifecycle_pending_recorded: bool,
     frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
@@ -5652,6 +7523,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         response_observation.response_headers_observed_at_unix_ms,
         &response_observation.request_order_id,
     );
+    let realtime_admission_id = report_context
+        .as_ref()
+        .and_then(|context| context.get("realtime_admission_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let realtime_attempt_id = response_observation.request_order_id.clone();
     spawn_local_oauth_success_effect(
         state.clone(),
         &plan,
@@ -5674,16 +7553,29 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     if status_code == 200 && should_probe_success_failover_before_stream(&headers) {
         let success_probe_text =
             probe_local_stream_success_failover_text(&mut buffered_frames, &mut lines).await?;
-        if should_retry_next_local_candidate_stream(
-            state,
-            &plan,
-            plan_kind,
-            report_context.as_ref(),
-            status_code,
-            success_probe_text.as_deref(),
-        )
-        .await
-        {
+        let should_retry_success_probe = retry_scope_out.is_some()
+            && should_retry_next_local_candidate_stream(
+                state,
+                &plan,
+                plan_kind,
+                report_context.as_ref(),
+                status_code,
+                success_probe_text.as_deref(),
+            )
+            .await;
+        if should_retry_success_probe {
+            if !crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+            ) {
+                return match stream_watchdog_intermediate_ownership(&plan) {
+                    Some(StreamWatchdogIntermediateOwnership::Retry) => Ok(None),
+                    Some(StreamWatchdogIntermediateOwnership::Terminal) => Ok(Some(
+                        build_stream_watchdog_owned_client_response(&plan, trace_id, decision)?,
+                    )),
+                    None => Ok(None),
+                };
+            }
             let terminal_unix_secs = current_request_candidate_unix_ms();
             record_local_request_candidate_status(
                 state,
@@ -5776,70 +7668,15 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             error_response_text.as_deref(),
         )
         .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::AttemptFailure(LocalAttemptFailureEffect {
-                status_code,
-                classification: failover_analysis.classification,
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
-                status_code,
-                classification: failover_analysis.classification,
-                headers: Some(&headers),
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
-                status_code,
-                classification: failover_analysis.classification,
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
-                status_code,
-                response_text: error_response_text.as_deref(),
-            }),
-        )
-        .await;
-        apply_local_execution_effect(
-            state,
-            LocalExecutionEffectContext {
-                plan: &plan,
-                report_context: report_context.as_ref(),
-            },
-            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
-                status_code,
-                classification: failover_analysis.classification,
-                headers: &headers,
-                error_body: error_response_text.as_deref(),
-            }),
-        )
-        .await;
         let failover_decision = failover_analysis.decision;
+        if let Some(ownership) = stream_watchdog_intermediate_ownership(&plan) {
+            return match ownership {
+                StreamWatchdogIntermediateOwnership::Retry => Ok(None),
+                StreamWatchdogIntermediateOwnership::Terminal => Ok(Some(
+                    build_stream_watchdog_owned_client_response(&plan, trace_id, decision)?,
+                )),
+            };
+        }
         debug!(
             event_name = "execution_runtime_stream_failover_decided",
             log_type = "debug",
@@ -5856,7 +7693,40 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             failover_decision = failover_decision.as_str(),
             "gateway resolved execution runtime stream failover decision"
         );
-        if matches!(failover_decision, LocalFailoverDecision::RetryNextCandidate) {
+        if retry_scope_out.is_some()
+            && matches!(failover_decision, LocalFailoverDecision::RetryNextCandidate)
+        {
+            if !crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+            ) {
+                // The ownership snapshot above may have raced a terminal or
+                // retry owner.  Never fall through to terminal finalization
+                // after a failed intermediate CAS: the retry owner must keep
+                // the candidate-loop signal, while a terminal owner gets only
+                // a client payload and retains its usage handoff.
+                return match stream_watchdog_intermediate_ownership(&plan) {
+                    Some(StreamWatchdogIntermediateOwnership::Retry) => Ok(None),
+                    Some(StreamWatchdogIntermediateOwnership::Terminal) => Ok(Some(
+                        build_stream_watchdog_owned_client_response(&plan, trace_id, decision)?,
+                    )),
+                    None => Ok(None),
+                };
+            }
+            apply_local_stream_failure_effects_with_analysis(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalStreamFailureEffect::new(
+                    status_code,
+                    &headers,
+                    error_response_text.as_deref(),
+                ),
+                failover_analysis,
+            )
+            .await;
             let failure_disposition = classify_failure_disposition(
                 &plan.provider_api_format,
                 failover_analysis.classification,
@@ -5868,13 +7738,13 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             if failure_disposition.preserve_upstream_error {
                 if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
                     let mut fallback_headers = headers.clone();
-                    apply_endpoint_response_header_rules(
+                    apply_endpoint_response_header_rules_best_effort(
                         state,
                         &plan,
                         &mut fallback_headers,
                         provider_body_json.as_ref(),
                     )
-                    .await?;
+                    .await;
                     *retry_fallback = Some(attach_control_metadata_headers(
                         build_client_response_from_parts(
                             status_code,
@@ -5933,13 +7803,44 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             return Ok(None);
         }
 
-        if !matches!(failover_decision, LocalFailoverDecision::StopLocalFailover)
+        if retry_scope_out.is_some()
+            && !matches!(failover_decision, LocalFailoverDecision::StopLocalFailover)
             && should_fallback_to_control_stream(
                 plan_kind,
                 status_code,
                 stream_error_finalize_kind.is_some(),
             )
         {
+            if !crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+            ) {
+                // As above, a failed CAS means another owner won the
+                // lifecycle.  Returning the normal retry signal here would
+                // allow the outer loop to start another attempt and race the
+                // terminal usage/cancellation handoff.
+                return match stream_watchdog_intermediate_ownership(&plan) {
+                    Some(StreamWatchdogIntermediateOwnership::Retry) => Ok(None),
+                    Some(StreamWatchdogIntermediateOwnership::Terminal) => Ok(Some(
+                        build_stream_watchdog_owned_client_response(&plan, trace_id, decision)?,
+                    )),
+                    None => Ok(None),
+                };
+            }
+            apply_local_stream_failure_effects_with_analysis(
+                state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: report_context.as_ref(),
+                },
+                LocalStreamFailureEffect::new(
+                    status_code,
+                    &headers,
+                    error_response_text.as_deref(),
+                ),
+                failover_analysis,
+            )
+            .await;
             let terminal_unix_secs = current_request_candidate_unix_ms();
             let error_trace_report_context = with_stream_error_trace_context(
                 report_context.as_ref(),
@@ -5987,13 +7888,13 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             client_headers.remove("content-length");
             client_headers.insert("content-type".to_string(), "application/json".to_string());
         }
-        apply_endpoint_response_header_rules(
+        apply_endpoint_response_header_rules_best_effort(
             state,
             &plan,
             &mut client_headers,
             client_body_json.as_ref(),
         )
-        .await?;
+        .await;
 
         let client_response_headers = client_headers.clone();
         let error_trace_report_context = with_stream_error_trace_context(
@@ -6021,35 +7922,96 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             payload_client_body_json,
             None,
         );
-        record_sync_terminal_usage_with_handoff(
-            state,
-            &plan,
-            payload.report_context.as_ref(),
-            &payload,
-        )
-        .await;
+        let (usage_handoff_persisted, terminal_owner_progress) =
+            record_sync_terminal_usage_with_handoff_with_progress(
+                state,
+                &plan,
+                payload.report_context.as_ref(),
+                &payload,
+                crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                    plan.request_id.as_str(),
+                    plan.candidate_id.as_deref(),
+                ),
+            )
+            .await;
         let terminal_unix_secs = current_request_candidate_unix_ms();
-        record_local_request_candidate_status(
+        let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Failed,
+            status_code: Some(status_code),
+            error_type: Some("execution_runtime_stream_non_success_status".to_string()),
+            error_message: Some(format!(
+                "execution runtime stream returned non-success status {status_code}"
+            )),
+            latency_ms: None,
+            started_at_unix_ms: Some(candidate_started_unix_secs),
+            finished_at_unix_ms: Some(terminal_unix_secs),
+        };
+        if !usage_handoff_persisted {
+            spawn_terminal_candidate_reconciliation(
+                state.clone(),
+                plan.clone(),
+                payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+            );
+        }
+        let candidate_persisted = record_local_request_candidate_status(
             state,
             &plan,
             payload.report_context.as_ref(),
             SchedulerRequestCandidateStatusUpdate {
-                status: RequestCandidateStatus::Failed,
-                status_code: Some(status_code),
-                error_type: Some("execution_runtime_stream_non_success_status".to_string()),
-                error_message: Some(format!(
-                    "execution runtime stream returned non-success status {status_code}"
-                )),
-                latency_ms: None,
-                started_at_unix_ms: Some(candidate_started_unix_secs),
-                finished_at_unix_ms: Some(terminal_unix_secs),
+                status: usage_handoff_persisted
+                    .then_some(RequestCandidateStatus::Failed)
+                    .unwrap_or(RequestCandidateStatus::Streaming),
+                error_type: usage_handoff_persisted
+                    .then(|| "execution_runtime_stream_non_success_status".to_string())
+                    .or_else(|| Some("usage_terminal_handoff_unconfirmed".to_string())),
+                error_message: usage_handoff_persisted
+                    .then(|| {
+                        format!(
+                            "execution runtime stream returned non-success status {status_code}"
+                        )
+                    })
+                    .or_else(|| {
+                        Some(
+                            "terminal usage persistence was not confirmed before candidate finalization"
+                                .to_string(),
+                        )
+                    }),
+                finished_at_unix_ms: usage_handoff_persisted.then_some(terminal_unix_secs),
+                ..terminal_candidate_update.clone()
             },
         )
         .await;
+        if usage_handoff_persisted && candidate_persisted {
+            release_stream_terminal_watchdog_progress(&plan, terminal_owner_progress);
+        } else if usage_handoff_persisted {
+            spawn_candidate_persistence_retry_after_usage_handoff(
+                state.clone(),
+                plan.clone(),
+                payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+                terminal_owner_progress,
+            );
+        }
+        apply_local_stream_failure_effects_with_analysis(
+            state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: payload.report_context.as_ref(),
+            },
+            LocalStreamFailureEffect::new(status_code, &headers, error_response_text.as_deref()),
+            failover_analysis,
+        )
+        .await;
         if stream_error_finalize_kind.is_some() {
-            let response =
-                submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload)
-                    .await?;
+            let response = submit_local_core_error_or_sync_finalize_after_terminal_usage(
+                state,
+                trace_id,
+                decision,
+                payload,
+                usage_handoff_persisted,
+            )
+            .await?;
             return Ok(Some(attach_control_metadata_headers(
                 response,
                 Some(request_id),
@@ -6451,17 +8413,105 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 None,
                                 prefetched_usage_telemetry.clone(),
                             );
-                            record_sync_terminal_usage_with_handoff(
+                            let (usage_handoff_persisted, terminal_owner_progress) =
+                                record_sync_terminal_usage_with_handoff_with_progress(
+                                    state,
+                                    &plan,
+                                    payload.report_context.as_ref(),
+                                    &payload,
+                                    crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                                        plan.request_id.as_str(),
+                                        plan.candidate_id.as_deref(),
+                                    ),
+                                )
+                                .await;
+                            let terminal_unix_ms = current_request_candidate_unix_ms();
+                            let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+                                status: RequestCandidateStatus::Failed,
+                                status_code: Some(status_code),
+                                error_type: Some(
+                                    "execution_runtime_stream_prefetch_embedded_error".to_string(),
+                                ),
+                                error_message: Some(
+                                    "execution runtime stream contained an embedded provider error"
+                                        .to_string(),
+                                ),
+                                latency_ms: prefetched_usage_telemetry
+                                    .as_ref()
+                                    .and_then(|telemetry| telemetry.elapsed_ms),
+                                started_at_unix_ms: Some(candidate_started_unix_secs),
+                                finished_at_unix_ms: Some(terminal_unix_ms),
+                            };
+                            if !usage_handoff_persisted {
+                                spawn_terminal_candidate_reconciliation(
+                                    state.clone(),
+                                    plan.clone(),
+                                    payload.report_context.clone(),
+                                    terminal_candidate_update.clone(),
+                                );
+                            }
+                            // Keep candidate publication explicit on this
+                            // terminal prefetch path.  The report mapper also
+                            // records a terminal status when the handoff is
+                            // confirmed, but writing the gated state here
+                            // closes the gap when report dispatch is disabled
+                            // or the report is not locally actionable.
+                            let candidate_persisted = record_local_request_candidate_status(
                                 state,
                                 &plan,
                                 payload.report_context.as_ref(),
-                                &payload,
+                                SchedulerRequestCandidateStatusUpdate {
+                                    status: usage_handoff_persisted
+                                        .then_some(RequestCandidateStatus::Failed)
+                                        .unwrap_or(RequestCandidateStatus::Streaming),
+                                    error_type: usage_handoff_persisted
+                                        .then(|| {
+                                            "execution_runtime_stream_prefetch_embedded_error"
+                                                .to_string()
+                                        })
+                                        .or_else(|| {
+                                            Some("usage_terminal_handoff_unconfirmed".to_string())
+                                        }),
+                                    error_message: usage_handoff_persisted
+                                        .then(|| {
+                                            "execution runtime stream contained an embedded provider error"
+                                                .to_string()
+                                        })
+                                        .or_else(|| {
+                                            Some(
+                                                "terminal usage persistence was not confirmed before candidate finalization"
+                                                    .to_string(),
+                                            )
+                                        }),
+                                    finished_at_unix_ms: usage_handoff_persisted
+                                        .then_some(terminal_unix_ms),
+                                    ..terminal_candidate_update.clone()
+                                },
                             )
                             .await;
-                            let response = submit_local_core_error_or_sync_finalize(
-                                state, trace_id, decision, payload,
-                            )
-                            .await?;
+                            if usage_handoff_persisted && candidate_persisted {
+                                release_stream_terminal_watchdog_progress(
+                                    &plan,
+                                    terminal_owner_progress,
+                                );
+                            } else if usage_handoff_persisted {
+                                spawn_candidate_persistence_retry_after_usage_handoff(
+                                    state.clone(),
+                                    plan.clone(),
+                                    payload.report_context.clone(),
+                                    terminal_candidate_update.clone(),
+                                    terminal_owner_progress,
+                                );
+                            }
+                            let response =
+                                submit_local_core_error_or_sync_finalize_after_terminal_usage(
+                                    state,
+                                    trace_id,
+                                    decision,
+                                    payload,
+                                    usage_handoff_persisted,
+                                )
+                                .await?;
                             return Ok(Some(attach_control_metadata_headers(
                                 response,
                                 Some(request_id),
@@ -6739,7 +8789,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         .await;
     }
 
-    apply_endpoint_response_header_rules(state, &plan, &mut headers, None).await?;
+    apply_endpoint_response_header_rules_best_effort(state, &plan, &mut headers, None).await;
 
     let request_id = request_id.to_string();
     let candidate_id = candidate_id.map(ToOwned::to_owned);
@@ -6748,12 +8798,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     let trace_id_owned = trace_id.to_string();
     let headers_for_report = headers.clone();
     let report_kind_owned = report_kind;
+    let report_kind_for_failure = report_kind_owned.clone();
     let report_context_owned = report_context;
     let normalized_stream_report_context_owned = normalized_stream_report_context;
     let lifecycle_seed_for_report = lifecycle_seed;
     let provider_prefetched_body_for_report = provider_prefetched_body;
     let prefetched_body_for_report = prefetched_body;
     let prefetched_chunks_for_body = prefetched_chunks;
+    let (prefetched_delivery_tx, prefetched_delivery_rx) = tokio::sync::oneshot::channel::<()>();
     let sync_json_stream_bridge_active_for_report = sync_json_stream_bridge_active;
     let initial_telemetry = prefetched_telemetry;
     let initial_reached_eof = reached_eof;
@@ -6783,7 +8835,24 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     let stage_trace_for_report = stage_trace;
     let request_diagnostics_for_report = current_request_diagnostics();
     let provider_pool_in_flight_guard_for_report = in_flight_guard;
+    let stream_drain_timeout = state.frontdoor_runtime_guards.stream_drain_timeout;
     tokio::spawn(async move {
+        // The response-body producer is normally detached from the request
+        // future.  Keep an armed terminal owner inside that producer as well:
+        // if the Tokio request runtime is stopped while it is draining an
+        // upstream stream, dropping this task must still enqueue the 499
+        // usage handoff on the process-lifetime runtime.  The outer guard is
+        // intentionally disarmed once this task is spawned, so this is the
+        // final ownership boundary for the framed-stream path.
+        let mut body_terminal_guard = StreamAttemptTerminalGuard::new(
+            &state_for_report,
+            &plan_for_report,
+            trace_id_owned.as_str(),
+            report_kind_owned.as_deref(),
+            report_context_owned.as_ref(),
+            candidate_started_unix_secs_for_report,
+            stream_started_at_for_report,
+        );
         let mut stage_trace_for_report = stage_trace_for_report;
         let _stream_total_guard =
             StageElapsedGuard::from_started_at("stream_total", stream_started_at_for_report);
@@ -6814,6 +8883,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             .filter(|_| !sync_json_stream_bridge_active_for_report)
             .map(|_| StreamingStandardTerminalObserver::default());
         let mut stream_usage_observer_buffered = Vec::new();
+        let mut realtime_token_sequence = 0_u64;
         let mut provider_error_inspection = ProviderStreamErrorInspection::default();
         append_stream_capture_bytes(
             &mut provider_buffered_body,
@@ -6821,19 +8891,18 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             max_stream_body_buffer_bytes,
             &mut provider_body_truncated,
         );
-        append_stream_capture_bytes(
-            &mut buffered_body,
-            &prefetched_body_for_report,
-            max_stream_body_buffer_bytes,
-            &mut client_body_truncated,
-        );
         let mut client_stream_completion_tracker = ClientVisibleStreamCompletionTracker::default();
-        let mut client_visible_stream_completed = if native_anthropic_stream_for_report {
+        if native_anthropic_stream_for_report {
             client_stream_completion_tracker
-                .observe_anthropic_message_stop(&prefetched_body_for_report)
+                .observe_anthropic_message_stop(&prefetched_body_for_report);
         } else {
-            client_stream_completion_tracker.observe_chunk(&prefetched_body_for_report)
-        };
+            client_stream_completion_tracker.observe_chunk(&prefetched_body_for_report);
+        }
+        // Prefetched bytes are not client-visible until the response body
+        // stream has actually yielded them.  Keep the tracker observing them
+        // for provider-side billing, but delay client delivery/capture and
+        // semantic-EOF success until the delivery probe confirms consumption.
+        let mut client_visible_stream_completed = false;
         let mut anthropic_post_stop_drain_started_at = (native_anthropic_stream_for_report
             && client_visible_stream_completed)
             .then(|| prefetched_anthropic_message_stop_observed_at.unwrap_or_else(Instant::now));
@@ -6849,8 +8918,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         let mut anthropic_post_stop_drain_bytes = 0usize;
         let mut usage_stream_telemetry: Option<ExecutionTelemetry> = initial_usage_telemetry;
         let mut telemetry: Option<ExecutionTelemetry> = initial_telemetry;
-        let reached_eof = initial_reached_eof;
+        // A semantic terminal marker is the protocol EOF even when the
+        // execution-runtime producer keeps its transport open.  This also
+        // handles a marker that was prefetched before the response body was
+        // handed to the client.
+        let mut reached_eof = false;
         let mut downstream_dropped = false;
+        let mut upstream_drained = false;
+        let mut stream_drain_permit: Option<OwnedSemaphorePermit> = None;
         let mut terminal_failure: Option<StreamFailureReport> = None;
         let mut provider_error_forwarded_to_client = false;
         let initial_elapsed_ms = stream_started_at_for_report
@@ -6858,18 +8933,11 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
         let last_upstream_frame_elapsed_ms = Arc::new(AtomicU64::new(initial_elapsed_ms));
-        let last_client_chunk_elapsed_ms =
-            Arc::new(AtomicU64::new(if prefetched_body_for_report.is_empty() {
-                0
-            } else {
-                initial_elapsed_ms
-            }));
+        let last_client_chunk_elapsed_ms = Arc::new(AtomicU64::new(0));
         let provider_stream_bytes = Arc::new(AtomicU64::new(
             u64::try_from(provider_prefetched_body_for_report.len()).unwrap_or(u64::MAX),
         ));
-        let client_stream_bytes = Arc::new(AtomicU64::new(
-            u64::try_from(prefetched_body_for_report.len()).unwrap_or(u64::MAX),
-        ));
+        let client_stream_bytes = Arc::new(AtomicU64::new(0));
         let idle_monitor_done = Arc::new(AtomicBool::new(false));
         let idle_monitor_handle = {
             let done = Arc::clone(&idle_monitor_done);
@@ -7019,6 +9087,15 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     replay_chunk,
                 );
             }
+            drain_realtime_token_deltas_for_runtime(
+                &mut stream_usage_observer,
+                &state_for_report,
+                request_id_for_report.as_str(),
+                candidate_id_for_report.as_ref(),
+                realtime_admission_id.as_deref(),
+                Some(realtime_attempt_id.as_str()),
+                &mut realtime_token_sequence,
+            );
             if terminal_failure.is_none() {
                 if let Some(rewriter) = local_stream_rewriter.as_mut() {
                     if let Err(err) = rewriter.push_chunk(replay_chunk) {
@@ -7048,12 +9125,94 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             }
         }
 
+        // Do not classify a prefetched semantic terminal as a successful client
+        // response until the body stream has yielded the prefetched chunks.
+        // This closes the pre-first-yield race where the producer could observe
+        // `initial_reached_eof` and finalize before hyper ever polled the body.
+        if terminal_failure.is_none() {
+            let prefetched_delivery_confirmed = tokio::select! {
+                biased;
+                _ = tx.closed() => false,
+                delivery = prefetched_delivery_rx => delivery.is_ok(),
+                _ = tokio::time::sleep(stream_drain_timeout) => {
+                    warn!(
+                        event_name = "stream_execution_prefetched_body_delivery_timeout",
+                        log_type = "ops",
+                        trace_id = %trace_id_owned,
+                        request_id = %request_id_for_report_log,
+                        candidate_id = ?candidate_id_for_report.as_deref(),
+                        timeout_ms = stream_drain_timeout.as_millis() as u64,
+                        "gateway did not observe prefetched stream bytes reaching the downstream body"
+                    );
+                    false
+                }
+            };
+            if prefetched_delivery_confirmed {
+                append_stream_capture_bytes(
+                    &mut buffered_body,
+                    &prefetched_body_for_report,
+                    max_stream_body_buffer_bytes,
+                    &mut client_body_truncated,
+                );
+                client_stream_bytes.store(
+                    u64::try_from(prefetched_body_for_report.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                last_client_chunk_elapsed_ms.store(initial_elapsed_ms, Ordering::Relaxed);
+                client_visible_stream_completed =
+                    client_stream_completion_tracker.terminal_is_success();
+                reached_eof = initial_reached_eof
+                    || (!native_anthropic_stream_for_report
+                        && client_stream_completion_tracker.terminal_is_success());
+            } else {
+                downstream_dropped = true;
+            }
+        }
+
         if terminal_failure.is_none() && !reached_eof {
             loop {
+                if downstream_dropped && stream_drain_permit.is_none() {
+                    let Some(permit) = try_acquire_stream_drain_permit() else {
+                        warn!(
+                            event_name = "stream_execution_drop_drain_shed",
+                            log_type = "ops",
+                            trace_id = %trace_id_owned,
+                            request_id = %request_id_for_report_log,
+                            candidate_id = ?candidate_id_for_report.as_deref(),
+                            "gateway shed execution-runtime stream drop-drain after reaching its concurrency limit"
+                        );
+                        break;
+                    };
+                    stream_drain_permit = Some(permit);
+                }
                 let draining_after_anthropic_stop = anthropic_post_stop_drain_started_at.is_some();
-                let next_frame_result = if let Some(drain_started_at) =
-                    anthropic_post_stop_drain_started_at
-                {
+                let next_frame_result = if downstream_dropped && !draining_after_anthropic_stop {
+                    // A disconnected client must not cancel the execution
+                    // runtime reader.  Bound each silent upstream poll; the
+                    // timeout resets whenever a frame arrives so long but
+                    // productive generations can still be fully accounted.
+                    match tokio::time::timeout(
+                        stream_drain_timeout,
+                        next_stream_frame(&mut buffered_frames, &mut lines),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(
+                                event_name = "stream_execution_drop_drain_timeout",
+                                log_type = "ops",
+                                trace_id = %trace_id_owned,
+                                request_id = %request_id_for_report_log,
+                                candidate_id = ?candidate_id_for_report.as_deref(),
+                                timeout_ms = stream_drain_timeout.as_millis() as u64,
+                                provider_bytes = provider_stream_bytes.load(Ordering::Relaxed),
+                                "gateway execution-runtime stream drop-drain timed out"
+                            );
+                            break;
+                        }
+                    }
+                } else if let Some(drain_started_at) = anthropic_post_stop_drain_started_at {
                     if anthropic_post_stop_drain_frames >= ANTHROPIC_POST_STOP_DRAIN_MAX_FRAMES
                         || anthropic_post_stop_drain_bytes >= ANTHROPIC_POST_STOP_DRAIN_MAX_BYTES
                         || anthropic_post_stop_buffer_over_limit
@@ -7065,21 +9224,26 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     if remaining.is_zero() {
                         break;
                     }
-                    match tokio::time::timeout(
-                        remaining,
-                        next_stream_frame(&mut buffered_frames, &mut lines),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => break,
+                    tokio::select! {
+                        biased;
+                        _ = tx.closed(), if !downstream_dropped => {
+                            downstream_dropped = true;
+                            continue;
+                        }
+                        result = tokio::time::timeout(
+                            remaining,
+                            next_stream_frame(&mut buffered_frames, &mut lines),
+                        ) => match result {
+                            Ok(result) => result,
+                            Err(_) => break,
+                        },
                     }
                 } else {
                     tokio::select! {
                         biased;
                         _ = tx.closed(), if !downstream_dropped => {
                             downstream_dropped = true;
-                            break;
+                            continue;
                         }
                         result = next_stream_frame(&mut buffered_frames, &mut lines) => result,
                     }
@@ -7087,7 +9251,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 let next_frame = match next_frame_result {
                     Ok(frame) => frame,
                     Err(err) => {
-                        if native_anthropic_stream_for_report && client_visible_stream_completed {
+                        if native_anthropic_stream_for_report
+                            && (client_visible_stream_completed
+                                || client_stream_completion_tracker.terminal_is_success())
+                        {
                             debug!(
                                 event_name = "stream_execution_frame_decode_ignored_after_anthropic_stop",
                                 log_type = "debug",
@@ -7119,11 +9286,21 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 let Some(observed_frame) = next_frame else {
                     if tx.is_closed() {
                         downstream_dropped = true;
-                    } else if native_anthropic_stream_for_report && !client_visible_stream_completed
+                    }
+                    if native_anthropic_stream_for_report
+                        && !downstream_dropped
+                        && !client_stream_completion_tracker.terminal_is_success()
                     {
                         terminal_failure = Some(build_anthropic_premature_eof_failure(
                             "upstream Anthropic stream ended before message_stop",
                         ));
+                    } else if downstream_dropped
+                        && !client_stream_completion_tracker.terminal_is_failure()
+                    {
+                        // A successful semantic terminal marker makes a
+                        // drained 499 billable; a plain transport EOF without
+                        // one remains a conservative incomplete attempt.
+                        upstream_drained = true;
                     }
                     break;
                 };
@@ -7146,7 +9323,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 last_upstream_frame_elapsed_ms.store(frame_elapsed_ms, Ordering::Relaxed);
                 match observed_frame.frame.payload {
                     StreamFramePayload::Data { chunk_b64, text } => {
-                        if native_anthropic_stream_for_report && client_visible_stream_completed {
+                        if native_anthropic_stream_for_report
+                            && (client_visible_stream_completed
+                                || client_stream_completion_tracker.terminal_is_success())
+                        {
                             continue;
                         }
                         let first_data_before = usage_stream_telemetry
@@ -7210,18 +9390,38 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                         if chunk.is_empty() {
                             continue;
                         }
+                        let mut semantic_terminal_observed = false;
                         if native_anthropic_stream_for_report {
                             if let Some(terminal_end) = client_stream_completion_tracker
                                 .observe_anthropic_message_stop_terminal_end(&chunk)
                             {
                                 chunk.truncate(terminal_end);
-                                client_visible_stream_completed = true;
-                                if anthropic_post_stop_drain_started_at.is_none() {
-                                    anthropic_post_stop_drain_started_at = Some(Instant::now());
-                                    anthropic_post_stop_buffer_over_limit |=
-                                        activate_post_stop_frame_read_budget(&mut lines);
+                                semantic_terminal_observed = true;
+                                if downstream_dropped {
+                                    // The marker arrived while draining after
+                                    // a client disconnect.  Keep the request
+                                    // cancelled, but remember that all usage
+                                    // bytes have now been observed.
+                                    if client_stream_completion_tracker.terminal_is_success() {
+                                        upstream_drained = true;
+                                    }
+                                } else {
+                                    client_visible_stream_completed = true;
+                                    if anthropic_post_stop_drain_started_at.is_none() {
+                                        anthropic_post_stop_drain_started_at = Some(Instant::now());
+                                        anthropic_post_stop_buffer_over_limit |=
+                                            activate_post_stop_frame_read_budget(&mut lines);
+                                    }
                                 }
                             }
+                        } else if downstream_dropped {
+                            // During a 499 drain there is no successful send
+                            // through which to update the completion tracker.
+                            // Observe provider bytes directly so split `[DONE]`
+                            // and Responses terminal events still close the
+                            // producer without waiting for transport EOF.
+                            semantic_terminal_observed =
+                                client_stream_completion_tracker.observe_chunk(&chunk);
                         }
 
                         provider_stream_bytes.fetch_add(
@@ -7273,6 +9473,15 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 &normalized_chunk,
                             );
                         }
+                        drain_realtime_token_deltas_for_runtime(
+                            &mut stream_usage_observer,
+                            &state_for_report,
+                            request_id_for_report.as_str(),
+                            candidate_id_for_report.as_ref(),
+                            realtime_admission_id.as_deref(),
+                            Some(realtime_attempt_id.as_str()),
+                            &mut realtime_token_sequence,
+                        );
                         let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
                         {
                             match rewriter.push_chunk(&normalized_chunk) {
@@ -7326,18 +9535,41 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                     ));
                                 break;
                             }
+                            if semantic_terminal_observed
+                                && (!native_anthropic_stream_for_report || downstream_dropped)
+                            {
+                                // A failure terminal marker is still a semantic end.  Stop
+                                // consuming the producer, but only classify a successful marker
+                                // as a completed/billable drain; the tracker summary below keeps
+                                // failed markers on the failure path.
+                                if client_stream_completion_tracker.terminal_is_success() {
+                                    if downstream_dropped {
+                                        upstream_drained = true;
+                                    }
+                                    reached_eof = !downstream_dropped;
+                                }
+                                break;
+                            }
                             continue;
                         }
 
-                        append_stream_capture_bytes(
-                            &mut buffered_body,
-                            &rewritten_chunk,
-                            max_stream_body_buffer_bytes,
-                            &mut client_body_truncated,
-                        );
                         let rewritten_chunk_len =
                             u64::try_from(rewritten_chunk.len()).unwrap_or(u64::MAX);
                         if downstream_dropped {
+                            // Drain bytes are provider-side evidence only.  The
+                            // client response capture must contain bytes that
+                            // were accepted by `tx`, not the unconsumed tail
+                            // read after a 499 disconnect.
+                            if !semantic_terminal_observed && !native_anthropic_stream_for_report {
+                                semantic_terminal_observed = client_stream_completion_tracker
+                                    .observe_chunk(rewritten_chunk.as_ref());
+                            }
+                            if semantic_terminal_observed {
+                                if client_stream_completion_tracker.terminal_is_success() {
+                                    upstream_drained = true;
+                                }
+                                break;
+                            }
                             continue;
                         }
                         let rewritten_chunk = Bytes::from(rewritten_chunk);
@@ -7351,11 +9583,41 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 "gateway stream downstream dropped; cancelling execution runtime stream"
                             );
                             downstream_dropped = true;
-                            break;
+                            if native_anthropic_stream_for_report && semantic_terminal_observed {
+                                // The message_stop bytes were not accepted by
+                                // the client, so they are not client-visible.
+                                // Preserve 499 semantics and let the drain
+                                // handoff carry the billing flag instead.
+                                client_visible_stream_completed = false;
+                            }
+                            if semantic_terminal_observed
+                                && client_stream_completion_tracker.terminal_is_success()
+                            {
+                                upstream_drained = true;
+                                break;
+                            }
+                            if semantic_terminal_observed
+                                && client_stream_completion_tracker.terminal_is_failure()
+                            {
+                                break;
+                            }
+                            continue;
                         } else {
+                            // Capture and client-visible accounting happen only
+                            // after the channel accepts the chunk.  This keeps
+                            // unsent chunks out of `client_response_body` on a
+                            // disconnect race.
+                            append_stream_capture_bytes(
+                                &mut buffered_body,
+                                rewritten_chunk.as_ref(),
+                                max_stream_body_buffer_bytes,
+                                &mut client_body_truncated,
+                            );
                             if !native_anthropic_stream_for_report {
-                                client_visible_stream_completed |= client_stream_completion_tracker
+                                let observed_terminal = client_stream_completion_tracker
                                     .observe_chunk(rewritten_chunk.as_ref());
+                                client_visible_stream_completed |= observed_terminal
+                                    && client_stream_completion_tracker.terminal_is_success();
                             }
                             client_stream_bytes.fetch_add(rewritten_chunk_len, Ordering::Relaxed);
                             last_client_chunk_elapsed_ms.store(
@@ -7381,6 +9643,17 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                             ));
                             break;
                         }
+                        if !native_anthropic_stream_for_report
+                            && (client_stream_completion_tracker.terminal_is_success()
+                                || client_stream_completion_tracker.terminal_is_failure())
+                            && terminal_failure.is_none()
+                        {
+                            // `[DONE]`/`response.completed` is a semantic EOF;
+                            // do not wait for a runtime frame producer that
+                            // leaves its transport open after the marker.
+                            reached_eof = client_stream_completion_tracker.terminal_is_success();
+                            break;
+                        }
                     }
                     StreamFramePayload::Telemetry {
                         telemetry: frame_telemetry,
@@ -7404,15 +9677,28 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     StreamFramePayload::Eof { summary } => {
                         stream_terminal_summary =
                             merge_stream_terminal_summary(stream_terminal_summary.take(), summary);
-                        if native_anthropic_stream_for_report && !client_visible_stream_completed {
+                        if native_anthropic_stream_for_report
+                            && !downstream_dropped
+                            && !client_stream_completion_tracker.terminal_is_success()
+                        {
                             terminal_failure = Some(build_anthropic_premature_eof_failure(
                                 "upstream Anthropic stream ended before message_stop",
                             ));
+                        } else if downstream_dropped
+                            && !client_stream_completion_tracker.terminal_is_failure()
+                        {
+                            // An explicit runtime EOF is a complete drain for
+                            // non-Anthropic formats (and for Anthropic streams
+                            // that already exposed message_stop).
+                            upstream_drained = true;
                         }
                         break;
                     }
                     StreamFramePayload::Error { error } => {
-                        if native_anthropic_stream_for_report && client_visible_stream_completed {
+                        if native_anthropic_stream_for_report
+                            && (client_visible_stream_completed
+                                || client_stream_completion_tracker.terminal_is_success())
+                        {
                             debug!(
                                 event_name = "stream_execution_error_frame_ignored_after_anthropic_stop",
                                 log_type = "debug",
@@ -7440,6 +9726,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 }
             }
         }
+        drop(stream_drain_permit);
         drop(lines);
         drop(buffered_frames);
         drop(_provider_pool_in_flight_guard);
@@ -7476,6 +9763,15 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                             &normalized_chunk,
                         );
                     }
+                    drain_realtime_token_deltas_for_runtime(
+                        &mut stream_usage_observer,
+                        &state_for_report,
+                        request_id_for_report.as_str(),
+                        candidate_id_for_report.as_ref(),
+                        realtime_admission_id.as_deref(),
+                        Some(realtime_attempt_id.as_str()),
+                        &mut realtime_token_sequence,
+                    );
                     if !downstream_dropped {
                         let rewritten_chunk = if let Some(rewriter) = local_stream_rewriter.as_mut()
                         {
@@ -7516,12 +9812,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                             }
                         }
                         if !rewritten_chunk.is_empty() {
-                            append_stream_capture_bytes(
-                                &mut buffered_body,
-                                &rewritten_chunk,
-                                max_stream_body_buffer_bytes,
-                                &mut client_body_truncated,
-                            );
                             let rewritten_chunk_len =
                                 u64::try_from(rewritten_chunk.len()).unwrap_or(u64::MAX);
                             let rewritten_chunk = Bytes::from(rewritten_chunk);
@@ -7536,8 +9826,16 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 );
                                 downstream_dropped = true;
                             } else {
-                                client_visible_stream_completed |= client_stream_completion_tracker
+                                append_stream_capture_bytes(
+                                    &mut buffered_body,
+                                    rewritten_chunk.as_ref(),
+                                    max_stream_body_buffer_bytes,
+                                    &mut client_body_truncated,
+                                );
+                                let observed_terminal = client_stream_completion_tracker
                                     .observe_chunk(rewritten_chunk.as_ref());
+                                client_visible_stream_completed |= observed_terminal
+                                    && client_stream_completion_tracker.terminal_is_success();
                                 client_stream_bytes
                                     .fetch_add(rewritten_chunk_len, Ordering::Relaxed);
                                 last_client_chunk_elapsed_ms.store(
@@ -7598,12 +9896,6 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 }
                 match finish_result {
                     Ok(flushed_chunk) if !flushed_chunk.is_empty() => {
-                        append_stream_capture_bytes(
-                            &mut buffered_body,
-                            &flushed_chunk,
-                            max_stream_body_buffer_bytes,
-                            &mut client_body_truncated,
-                        );
                         let flushed_chunk_len =
                             u64::try_from(flushed_chunk.len()).unwrap_or(u64::MAX);
                         let flushed_chunk = Bytes::from(flushed_chunk);
@@ -7618,8 +9910,16 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                             );
                             downstream_dropped = true;
                         } else {
-                            client_visible_stream_completed |= client_stream_completion_tracker
+                            append_stream_capture_bytes(
+                                &mut buffered_body,
+                                flushed_chunk.as_ref(),
+                                max_stream_body_buffer_bytes,
+                                &mut client_body_truncated,
+                            );
+                            let observed_terminal = client_stream_completion_tracker
                                 .observe_chunk(flushed_chunk.as_ref());
+                            client_visible_stream_completed |= observed_terminal
+                                && client_stream_completion_tracker.terminal_is_success();
                             client_stream_bytes.fetch_add(flushed_chunk_len, Ordering::Relaxed);
                             last_client_chunk_elapsed_ms.store(
                                 stream_started_at_for_report
@@ -7688,13 +9988,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                         Ok(error_event) => {
                             let error_event_len =
                                 u64::try_from(error_event.len()).unwrap_or(u64::MAX);
-                            append_stream_capture_bytes(
-                                &mut buffered_body,
-                                error_event.as_ref(),
-                                max_stream_body_buffer_bytes,
-                                &mut client_body_truncated,
-                            );
-                            if tx.send(Ok(error_event)).await.is_err() {
+                            if tx.send(Ok(error_event.clone())).await.is_err() {
                                 warn!(
                                 event_name = "stream_execution_downstream_terminal_error_disconnected",
                                 log_type = "ops",
@@ -7705,6 +9999,15 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 );
                                 downstream_dropped = true;
                             } else {
+                                // The terminal error event is client-visible only when
+                                // the downstream channel accepted it.  Do not include an
+                                // unsent event in the captured response body on a 499 race.
+                                append_stream_capture_bytes(
+                                    &mut buffered_body,
+                                    error_event.as_ref(),
+                                    max_stream_body_buffer_bytes,
+                                    &mut client_body_truncated,
+                                );
                                 client_stream_bytes.fetch_add(error_event_len, Ordering::Relaxed);
                                 last_client_chunk_elapsed_ms.store(
                                     stream_started_at_for_report
@@ -7744,8 +10047,25 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 &mut stream_usage_observer_buffered,
             ),
         );
+        drain_realtime_token_deltas_for_runtime(
+            &mut stream_usage_observer,
+            &state_for_report,
+            request_id_for_report.as_str(),
+            candidate_id_for_report.as_ref(),
+            realtime_admission_id.as_deref(),
+            Some(realtime_attempt_id.as_str()),
+            &mut realtime_token_sequence,
+        );
+        mark_stream_terminal_summary_failure_from_tracker(
+            &mut stream_terminal_summary,
+            &client_stream_completion_tracker,
+        );
 
-        if downstream_dropped && client_visible_stream_completed && terminal_failure.is_none() {
+        if downstream_dropped
+            && client_visible_stream_completed
+            && client_stream_completion_tracker.terminal_is_success()
+            && terminal_failure.is_none()
+        {
             debug!(
                 event_name = "execution_runtime_stream_downstream_closed_after_done",
                 log_type = "debug",
@@ -7757,7 +10077,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             downstream_dropped = false;
         }
 
-        if downstream_dropped {
+        if downstream_dropped
+            && terminal_failure.is_none()
+            && !client_stream_completion_tracker.terminal_is_failure()
+        {
             debug!(
                 event_name = "execution_runtime_stream_report_skipped",
                 log_type = "debug",
@@ -7785,7 +10108,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 stream_started_at_for_report,
                 terminal_telemetry.as_ref(),
             );
-            let usage_payload = build_stream_usage_payload(
+            let mut usage_payload = build_stream_usage_payload(
                 trace_id_owned,
                 report_kind_owned.unwrap_or_default(),
                 report_context_for_payload,
@@ -7798,37 +10121,88 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 stream_terminal_summary,
                 terminal_telemetry,
             );
-            record_stream_terminal_usage(
+            // Require a successful semantic terminal marker.  `upstream_drained`
+            // may also mean a clean transport EOF after a partial response, which
+            // must remain void rather than becoming an estimated charge.
+            if upstream_drained && client_stream_completion_tracker.terminal_is_success() {
+                usage_payload.report_context = merge_billing_treat_as_completed_into_context(
+                    usage_payload.report_context.take(),
+                    true,
+                );
+            }
+            let watchdog_progress =
+                crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                    plan_for_report.request_id.as_str(),
+                    plan_for_report.candidate_id.as_deref(),
+                );
+            let (usage_handoff_succeeded, terminal_owner_progress) =
+                record_stream_terminal_usage_with_progress(
+                    &state_for_report,
+                    &plan_for_report,
+                    usage_payload.report_context.as_ref(),
+                    &usage_payload,
+                    true,
+                    watchdog_progress,
+                )
+                .await;
+            let candidate_status = stream_candidate_status_after_usage_handoff(
+                RequestCandidateStatus::Cancelled,
+                usage_handoff_succeeded,
+            );
+            let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+                status: candidate_status,
+                status_code: Some(499),
+                error_type: Some("downstream_disconnect".to_string()),
+                error_message: Some("client disconnected before stream completion".to_string()),
+                latency_ms: usage_payload
+                    .telemetry
+                    .as_ref()
+                    .and_then(|value| value.elapsed_ms),
+                started_at_unix_ms: Some(candidate_started_unix_secs_for_report),
+                finished_at_unix_ms: (candidate_status != RequestCandidateStatus::Streaming)
+                    .then_some(current_request_candidate_unix_ms()),
+            };
+            let candidate_persisted = record_local_request_candidate_status(
                 &state_for_report,
                 &plan_for_report,
                 usage_payload.report_context.as_ref(),
-                &usage_payload,
-                true,
+                terminal_candidate_update.clone(),
             )
             .await;
-            record_local_request_candidate_status(
-                &state_for_report,
-                &plan_for_report,
-                usage_payload.report_context.as_ref(),
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Cancelled,
-                    status_code: Some(499),
-                    error_type: Some("downstream_disconnect".to_string()),
-                    error_message: Some("client disconnected before stream completion".to_string()),
-                    latency_ms: usage_payload
-                        .telemetry
-                        .as_ref()
-                        .and_then(|value| value.elapsed_ms),
-                    started_at_unix_ms: Some(candidate_started_unix_secs_for_report),
-                    finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
-                },
-            )
-            .await;
+            if usage_handoff_succeeded && candidate_persisted {
+                release_stream_terminal_watchdog_progress(
+                    &plan_for_report,
+                    terminal_owner_progress,
+                );
+            } else if usage_handoff_succeeded {
+                spawn_candidate_persistence_retry_after_usage_handoff(
+                    state_for_report.clone(),
+                    plan_for_report.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update,
+                    terminal_owner_progress,
+                );
+            } else if terminal_owner_progress.is_some() {
+                spawn_stream_499_terminal_handoff_continuation(
+                    state_for_report.clone(),
+                    plan_for_report.clone(),
+                    usage_payload,
+                    candidate_started_unix_secs_for_report,
+                    terminal_owner_progress,
+                );
+            } else {
+                spawn_terminal_candidate_reconciliation(
+                    state_for_report.clone(),
+                    plan_for_report.clone(),
+                    usage_payload.report_context.clone(),
+                    terminal_candidate_update,
+                );
+            }
+            body_terminal_guard.disarm();
             return;
         }
 
         if let Some(failure) = terminal_failure {
-            record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
             let terminal_telemetry = Some(build_terminal_stream_telemetry(
                 stream_started_at_for_report,
                 telemetry.as_ref(),
@@ -7852,6 +10226,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 &trace_id_owned,
                 &plan_for_report,
                 direct_stream_finalize_kind_owned.as_deref(),
+                report_kind_for_failure.as_deref(),
                 report_context_for_payload,
                 headers_for_report,
                 terminal_telemetry,
@@ -7860,6 +10235,8 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 failure,
             )
             .await;
+            record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
+            body_terminal_guard.disarm();
             return;
         }
 
@@ -7939,80 +10316,96 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
                 "gateway stream ended with a failed terminal state"
             );
-        } else {
-            apply_local_execution_effect(
-                &state_for_report,
-                LocalExecutionEffectContext {
-                    plan: &plan_for_report,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
-            )
-            .await;
-            apply_local_execution_effect(
-                &state_for_report,
-                LocalExecutionEffectContext {
-                    plan: &plan_for_report,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::AdaptiveSuccess(LocalAdaptiveSuccessEffect),
-            )
-            .await;
-            apply_local_execution_effect(
-                &state_for_report,
-                LocalExecutionEffectContext {
-                    plan: &plan_for_report,
-                    report_context: usage_payload.report_context.as_ref(),
-                },
-                LocalExecutionEffect::PoolSuccessStream {
-                    payload: &usage_payload,
-                },
-            )
-            .await;
         }
-        record_stream_terminal_usage(
-            &state_for_report,
-            &plan_for_report,
-            usage_payload.report_context.as_ref(),
-            &usage_payload,
-            false,
-        )
-        .await;
-        record_local_request_candidate_status(
+        let watchdog_progress =
+            crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                plan_for_report.request_id.as_str(),
+                plan_for_report.candidate_id.as_deref(),
+            );
+        let (usage_handoff_succeeded, terminal_owner_progress) =
+            record_stream_terminal_usage_with_progress(
+                &state_for_report,
+                &plan_for_report,
+                usage_payload.report_context.as_ref(),
+                &usage_payload,
+                false,
+                watchdog_progress,
+            )
+            .await;
+        if !stream_failed {
+            apply_stream_success_effects(&state_for_report, &plan_for_report, &usage_payload).await;
+        }
+        let desired_candidate_status = if stream_failed {
+            RequestCandidateStatus::Failed
+        } else {
+            RequestCandidateStatus::Success
+        };
+        let candidate_status = stream_candidate_status_after_usage_handoff(
+            desired_candidate_status,
+            usage_handoff_succeeded,
+        );
+        let terminal_candidate_update = SchedulerRequestCandidateStatusUpdate {
+            status: desired_candidate_status,
+            status_code: Some(status_code),
+            error_type: if stream_failed {
+                if missing_observed_finish {
+                    Some("stream_missing_terminal_event".to_string())
+                } else {
+                    Some("stream_terminal_error".to_string())
+                }
+            } else {
+                None
+            },
+            error_message: stream_failed
+                .then_some(stream_terminal_error_message.clone())
+                .flatten(),
+            latency_ms: usage_payload
+                .telemetry
+                .as_ref()
+                .and_then(|value| value.elapsed_ms),
+            started_at_unix_ms: Some(candidate_started_unix_secs_for_report),
+            finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+        };
+        if !usage_handoff_succeeded {
+            spawn_terminal_candidate_reconciliation(
+                state_for_report.clone(),
+                plan_for_report.clone(),
+                usage_payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+            );
+        }
+        let candidate_persisted = record_local_request_candidate_status(
             &state_for_report,
             &plan_for_report,
             usage_payload.report_context.as_ref(),
             SchedulerRequestCandidateStatusUpdate {
-                status: if stream_failed {
-                    RequestCandidateStatus::Failed
-                } else {
-                    RequestCandidateStatus::Success
-                },
-                status_code: Some(status_code),
-                error_type: if stream_failed {
-                    if missing_observed_finish {
-                        Some("stream_missing_terminal_event".to_string())
-                    } else {
-                        Some("stream_terminal_error".to_string())
-                    }
-                } else {
-                    None
-                },
-                error_message: stream_failed
-                    .then_some(stream_terminal_error_message)
-                    .flatten(),
-                latency_ms: usage_payload
-                    .telemetry
-                    .as_ref()
-                    .and_then(|value| value.elapsed_ms),
-                started_at_unix_ms: Some(candidate_started_unix_secs_for_report),
-                finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                status: candidate_status,
+                finished_at_unix_ms: (candidate_status != RequestCandidateStatus::Streaming)
+                    .then_some(current_request_candidate_unix_ms()),
+                ..terminal_candidate_update.clone()
             },
         )
         .await;
+        if usage_handoff_succeeded && candidate_persisted {
+            release_stream_terminal_watchdog_progress(&plan_for_report, terminal_owner_progress);
+        } else if usage_handoff_succeeded {
+            spawn_candidate_persistence_retry_after_usage_handoff(
+                state_for_report.clone(),
+                plan_for_report.clone(),
+                usage_payload.report_context.clone(),
+                terminal_candidate_update.clone(),
+                terminal_owner_progress,
+            );
+        }
 
         if should_submit_report {
-            if let Err(err) = submit_stream_report(&state_for_report, usage_payload).await {
+            if let Err(err) = submit_stream_report_after_terminal_usage(
+                &state_for_report,
+                usage_payload,
+                usage_handoff_succeeded,
+            )
+            .await
+            {
                 warn!(
                     event_name = "execution_report_submit_failed",
                     log_type = "ops",
@@ -8025,6 +10418,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 );
             }
         }
+        body_terminal_guard.disarm();
     });
 
     headers.insert(CONTROL_REQUEST_ID_HEADER.to_string(), request_id.clone());
@@ -8043,13 +10437,14 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
     if response_headers_are_sse {
         headers.remove("content-length");
     }
-    let body_stream = build_sse_body_stream(
+    let body_stream = build_sse_body_stream_with_delivery_probe(
         prefetched_chunks_for_body,
         rx,
         response_headers_are_sse,
         emit_proxy_generated_sse_control_blocks,
         native_anthropic_stream_for_report,
         SSE_KEEPALIVE_INTERVAL,
+        Some(prefetched_delivery_tx),
     );
 
     Ok(Some(build_client_response_from_parts(
@@ -8105,6 +10500,7 @@ mod tests {
         StoredRequestUsageAudit, UpsertUsageRecord, UsageBodyCaptureState,
     };
     use aether_data_contracts::DataLayerError;
+    use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
     use aether_usage_runtime::{
         apply_usage_body_capture_policy_to_event, UsageBillingEventEnricher,
         UsageBodyCapturePolicy, UsageEvent, UsageEventData, UsageEventType, UsageRecordWriter,
@@ -8122,11 +10518,12 @@ mod tests {
     use base64::Engine as _;
     use futures_util::StreamExt as _;
     use serde_json::{json, Value};
-    use tokio::sync::{mpsc, watch, Notify};
+    use tokio::sync::{mpsc, oneshot, watch, Notify};
 
     use super::{
         activate_post_stop_frame_read_budget, build_direct_execution_frame_stream,
-        build_sse_body_stream, build_stream_failure_report, build_stream_sync_payload,
+        build_sse_body_stream, build_sse_body_stream_with_delivery_probe,
+        build_stream_failure_report, build_stream_sync_payload,
         client_format_allows_proxy_generated_sse_control_blocks,
         direct_upstream_response_byte_stream, encode_terminal_sse_error_event_for_plan,
         ensure_stream_terminal_summary_for_missing_observed_finish,
@@ -8139,16 +10536,22 @@ mod tests {
         record_sync_terminal_usage_with_handoff_after_spawn,
         resolve_provider_stream_error_status_code, select_direct_anthropic_prefetch_wait,
         should_limit_direct_finalize_prefetch, should_probe_success_failover_before_stream,
-        should_skip_direct_finalize_prefetch, stream_chunk_contains_sse_done,
-        stream_requires_observed_terminal_event, stream_terminal_summary_missing_observed_finish,
+        should_skip_direct_finalize_prefetch, stream_candidate_status_after_usage_handoff,
+        stream_chunk_contains_sse_done, stream_requires_observed_terminal_event,
+        stream_terminal_summary_missing_observed_finish,
         stream_terminal_summary_missing_observed_finish_with_requirement,
         stream_terminal_summary_represents_failure_with_requirement,
-        ClientVisibleStreamCompletionTracker, DirectPassthroughFinalizer,
-        DirectPassthroughFinalizerCore, DirectPassthroughInlineBodyState, DirectPassthroughMode,
-        PostStopFrameReadBudget, PostStopLimitedStreamReader, ProviderStreamErrorInspection,
-        ANTHROPIC_POST_STOP_DRAIN_MAX_BYTES, POST_STOP_MAX_EMPTY_CHUNKS_PER_POLL,
+        stream_watchdog_intermediate_ownership, ClientVisibleStreamCompletionTracker,
+        DirectPassthroughFinalizer, DirectPassthroughFinalizerCore,
+        DirectPassthroughInlineBodyState, DirectPassthroughMode, PostStopFrameReadBudget,
+        PostStopLimitedStreamReader, ProviderStreamErrorInspection, StreamAttemptTerminalGuard,
+        StreamWatchdogIntermediateOwnership, ANTHROPIC_POST_STOP_DRAIN_MAX_BYTES,
+        POST_STOP_MAX_EMPTY_CHUNKS_PER_POLL,
     };
     use crate::control::GatewayControlDecision;
+    use crate::request_candidate_runtime::{
+        ensure_execution_request_candidate_slot, record_local_request_candidate_status,
+    };
     use crate::stage_metrics::RequestStageTrace;
     use crate::tunnel::{tunnel_protocol, TunnelProxyConn};
     use crate::AppState;
@@ -8450,7 +10853,9 @@ mod tests {
         }
         .boxed();
 
-        execute_stream_from_frame_stream(
+        let mut retry_scope = continue_failover.then_some(AiAttemptRetryScope::Candidate);
+
+        execute_stream_from_frame_stream_with_retry_scope(
             &state,
             plan,
             &format!("trace-{request_id}"),
@@ -8470,6 +10875,10 @@ mod tests {
             RequestStageTrace::from_env(),
             true,
             frame_stream,
+            false,
+            None,
+            retry_scope.as_mut(),
+            None,
             None,
         )
         .await
@@ -8564,6 +10973,100 @@ mod tests {
                 fallback_response: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn empty_frame_stream_after_pending_retries_instead_of_bubbling_gateway_error() {
+        let request_id = "req-frame-pre-header-error-retry";
+        let plan = native_anthropic_stream_plan(request_id);
+        let provider_catalog = provider_catalog_for_plan(&plan, None);
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_transport_reader_for_tests(
+                    Arc::new(provider_catalog),
+                    "development-key",
+                ),
+            );
+        let frame_stream = futures_util::stream::empty::<Result<Bytes, std::io::Error>>().boxed();
+        let mut retry_scope = AiAttemptRetryScope::Provider;
+        let response = execute_stream_from_frame_stream_with_retry_scope(
+            &state,
+            plan,
+            "trace-frame-pre-header-error-retry",
+            &test_decision(),
+            "claude_chat_stream",
+            Some("claude_chat_stream_success".to_string()),
+            Some(json!({
+                "request_id": request_id,
+                "candidate_id": format!("candidate-{request_id}"),
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "claude:messages",
+                "client_api_format": "claude:messages"
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            RequestStageTrace::from_env(),
+            true,
+            frame_stream,
+            false,
+            None,
+            Some(&mut retry_scope),
+            None,
+            None,
+        )
+        .await
+        .expect("pre-header frame failure should be converted to a retry outcome");
+
+        assert!(
+            response.is_none(),
+            "default policy should retry this candidate"
+        );
+        assert_eq!(retry_scope, AiAttemptRetryScope::Candidate);
+    }
+
+    #[tokio::test]
+    async fn empty_frame_stream_without_candidate_loop_returns_terminal_transport_response() {
+        let request_id = "req-frame-pre-header-error-direct";
+        let plan = native_anthropic_stream_plan(request_id);
+        let provider_catalog = provider_catalog_for_plan(&plan, None);
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_provider_transport_reader_for_tests(
+                    Arc::new(provider_catalog),
+                    "development-key",
+                ),
+            );
+        let frame_stream = futures_util::stream::empty::<Result<Bytes, std::io::Error>>().boxed();
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-frame-pre-header-error-direct",
+            &test_decision(),
+            "claude_chat_stream",
+            Some("claude_chat_stream_success".to_string()),
+            Some(json!({
+                "request_id": request_id,
+                "candidate_id": format!("candidate-{request_id}"),
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "claude:messages",
+                "client_api_format": "claude:messages"
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            RequestStageTrace::from_env(),
+            true,
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("direct frame failure should become a terminal response")
+        .expect("terminal transport response should be present");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     async fn execute_prefetched_http_status_failure(
@@ -8725,6 +11228,8 @@ mod tests {
             )]),
             stream_usage_report_context: None,
             stream_usage_observer: None,
+            realtime_token_sequence: 0,
+            realtime_attempt_id: None,
             stream_usage_observer_buffered: Vec::new(),
             provider_error_inspection: ProviderStreamErrorInspection::default(),
             max_stream_body_buffer_bytes: super::DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
@@ -8772,6 +11277,61 @@ mod tests {
             terminal_error_sent: false,
             finalized: false,
         }
+    }
+
+    fn direct_openai_inline_state(
+        request_id: &str,
+        items: Vec<Result<Bytes, String>>,
+    ) -> DirectPassthroughInlineBodyState {
+        let mut finalizer = direct_anthropic_test_finalizer(request_id);
+        let core = finalizer.core.as_mut().expect("test finalizer core");
+        core.plan = codex_cyber_policy_plan(request_id);
+        core.lifecycle_seed = aether_usage_runtime::build_lifecycle_usage_seed(&core.plan, None);
+        core.request_id_for_log = request_id.to_string();
+        core.candidate_id = core.plan.candidate_id.clone();
+        core.requires_anthropic_message_stop = false;
+        DirectPassthroughInlineBodyState {
+            finalizer: Some(finalizer),
+            upstream: Some(futures_util::stream::iter(items).boxed()),
+            upstream_control_filter: Some(super::SseControlBlockFilter::default()),
+            upstream_started_at: Instant::now(),
+            stream_first_byte_timeout: None,
+            observed_first_body_poll: false,
+            observed_first_client_yield: false,
+            upstream_done: false,
+            control_filter_flushed: false,
+            terminal_error_sent: false,
+            finalized: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_openai_done_is_semantic_eof_without_transport_eof() {
+        let items = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: {\"id\":\"first\"}\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ])
+        .chain(futures_util::stream::pending::<Result<Bytes, String>>())
+        .boxed();
+        let mut state = direct_openai_inline_state("req-inline-openai-done", Vec::new());
+        state.upstream = Some(items);
+
+        let first = tokio::time::timeout(Duration::from_secs(1), state.next_item())
+            .await
+            .expect("first chunk should arrive")
+            .expect("first item should exist");
+        assert!(first.0.is_ok());
+        state = first.1;
+        let second = tokio::time::timeout(Duration::from_secs(1), state.next_item())
+            .await
+            .expect("done chunk should arrive")
+            .expect("done item should exist");
+        assert!(second.0.is_ok());
+        state = second.1;
+        let eof = tokio::time::timeout(Duration::from_secs(1), state.next_item())
+            .await
+            .expect("semantic EOF should not wait for transport EOF");
+        assert!(eof.is_none());
     }
 
     async fn execute_native_anthropic_prefetch_stream(
@@ -9844,6 +12404,8 @@ mod tests {
             headers: BTreeMap::new(),
             stream_usage_report_context: None,
             stream_usage_observer: None,
+            realtime_token_sequence: 0,
+            realtime_attempt_id: None,
             stream_usage_observer_buffered: Vec::new(),
             provider_error_inspection: ProviderStreamErrorInspection::default(),
             max_stream_body_buffer_bytes: super::DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
@@ -10030,6 +12592,391 @@ mod tests {
 
         execution.abort();
         let _ = execution.await;
+    }
+
+    #[tokio::test]
+    async fn frame_stream_terminal_guard_closes_usage_when_cancelled_before_headers() {
+        let request_id = "req-frame-stream-cancelled-before-headers";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let mut plan = codex_cyber_policy_plan(request_id);
+        let mut report_context = Some(json!({
+            "request_id": request_id,
+            "candidate_id": plan.candidate_id.clone(),
+            "candidate_index": 0,
+            "retry_index": 0,
+            "provider_api_format": plan.provider_api_format.clone(),
+            "client_api_format": plan.client_api_format.clone(),
+        }));
+        ensure_execution_request_candidate_slot(&state, &mut plan, &mut report_context).await;
+        let candidate_started_at = Instant::now();
+        let candidate_started_unix_ms = crate::clock::current_unix_ms();
+        state.usage_runtime.record_pending(
+            state.usage_lifecycle_data_state().as_ref(),
+            aether_usage_runtime::build_lifecycle_usage_seed(&plan, report_context.as_ref()),
+        );
+        record_local_request_candidate_status(
+            &state,
+            &plan,
+            report_context.as_ref(),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Pending,
+                status_code: None,
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(candidate_started_unix_ms),
+                finished_at_unix_ms: None,
+            },
+        )
+        .await;
+
+        // Dropping the guard models cancellation of the frame execution future
+        // after the pending skeleton exists but before the response body task
+        // (and its normal finalizer) has been created.
+        {
+            let _guard = StreamAttemptTerminalGuard::new(
+                &state,
+                &plan,
+                "trace-frame-stream-cancelled-before-headers",
+                Some("openai_responses_stream"),
+                report_context.as_ref(),
+                candidate_started_unix_ms,
+                candidate_started_at,
+            );
+        }
+
+        let cancelled_usage = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage should read")
+                {
+                    if usage.status == "cancelled" {
+                        break usage;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled usage should be recorded");
+        assert_eq!(cancelled_usage.status_code, Some(499));
+        assert_eq!(cancelled_usage.billing_status, "void");
+        let cancelled_candidate = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id(request_id)
+                    .await
+                    .expect("candidate read should succeed");
+                if let Some(candidate) = candidates.into_iter().next() {
+                    if candidate.status == RequestCandidateStatus::Cancelled {
+                        break candidate;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("candidate cancellation should follow the durable usage handoff");
+        assert_eq!(cancelled_candidate.status_code, Some(499));
+    }
+
+    #[tokio::test]
+    async fn stream_attempt_guard_closes_usage_when_cancelled_before_provider_runtime() {
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local address should resolve");
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1/execute/stream",
+                any(|| async {
+                    // Keep the remote runtime await pending long enough for
+                    // the caller future to be cancelled before response
+                    // headers (and the framed-stream finalizer) exist.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    (StatusCode::OK, "")
+                }),
+            );
+            axum::serve(listener, app)
+                .await
+                .expect("server should start");
+        });
+
+        let request_id = "req-stream-attempt-cancelled-before-provider-runtime";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
+        let plan = codex_cyber_policy_plan(request_id);
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("cli".to_string()),
+            Some("openai:responses".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let state_for_task = state.clone();
+        let task = tokio::spawn(async move {
+            execute_execution_runtime_stream(
+                &state_for_task,
+                plan,
+                "trace-stream-attempt-cancelled-before-provider-runtime",
+                &decision,
+                "openai_responses_stream",
+                None,
+                Some(json!({
+                    "request_id": request_id,
+                    "provider_api_format": "openai:responses",
+                    "client_api_format": "openai:responses",
+                })),
+            )
+            .await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage should read")
+                {
+                    if usage.status == "pending" {
+                        break usage;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending usage should be recorded before remote runtime await");
+        assert_eq!(pending.billing_status, "pending");
+
+        task.abort();
+        let _ = task.await;
+
+        let cancelled_usage = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage should read")
+                {
+                    if usage.status == "cancelled" {
+                        break usage;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled usage should be persisted after request future drop");
+        assert_eq!(cancelled_usage.status_code, Some(499));
+        assert_eq!(cancelled_usage.billing_status, "void");
+
+        let cancelled_candidate = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(candidate) = request_candidate_repository
+                    .list_by_request_id(request_id)
+                    .await
+                    .expect("candidate read should succeed")
+                    .into_iter()
+                    .next()
+                {
+                    if candidate.status == RequestCandidateStatus::Cancelled {
+                        break candidate;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("candidate should follow cancelled usage");
+        assert_eq!(cancelled_candidate.status_code, Some(499));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_attempt_guard_yields_to_watchdog_terminal_owner() {
+        let request_id = "req-stream-attempt-watchdog-terminal-owner";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_usage_repository_for_tests(Arc::clone(
+                    &usage_repository,
+                )),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = codex_cyber_policy_plan(request_id);
+        let progress = crate::execution_runtime::StreamCandidateWatchdogProgress::shared();
+        progress
+            .clone()
+            .scope(async {
+                let mut guard = StreamAttemptTerminalGuard::new(
+                    &state,
+                    &plan,
+                    "trace-stream-attempt-watchdog-terminal-owner",
+                    Some("openai_responses_stream"),
+                    None,
+                    crate::clock::current_unix_ms(),
+                    Instant::now(),
+                );
+                crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
+                // The watchdog is about to publish its own timeout response;
+                // dropping this guard must not enqueue a competing 499.
+                guard.armed = true;
+                drop(guard);
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(usage_repository
+            .find_by_request_id(request_id)
+            .await
+            .expect("usage read should succeed")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_attempt_guard_closes_usage_when_retry_owner_is_cancelled() {
+        let request_id = "req-stream-attempt-retry-owner-cancelled";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_usage_repository_for_tests(Arc::clone(
+                    &usage_repository,
+                )),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = codex_cyber_policy_plan(request_id);
+        state.usage_runtime.record_pending(
+            state.usage_lifecycle_data_state().as_ref(),
+            aether_usage_runtime::build_lifecycle_usage_seed(&plan, None),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage read should succeed")
+                    .is_some_and(|usage| usage.status == "pending")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending usage should be visible before cancellation");
+
+        let progress = crate::execution_runtime::StreamCandidateWatchdogProgress::shared();
+        assert!(progress.try_mark_retry_abort());
+        crate::execution_runtime::register_stream_candidate_watchdog_progress(
+            request_id,
+            plan.candidate_id.as_deref(),
+            progress.clone(),
+        );
+        let state_for_task = state.clone();
+        let plan_for_task = plan.clone();
+        let task = tokio::spawn(async move {
+            progress
+                .scope(async move {
+                    let _guard = StreamAttemptTerminalGuard::new(
+                        &state_for_task,
+                        &plan_for_task,
+                        "trace-stream-attempt-retry-owner-cancelled",
+                        Some("openai_responses_stream"),
+                        None,
+                        crate::clock::current_unix_ms(),
+                        Instant::now(),
+                    );
+                    std::future::pending::<()>().await;
+                })
+                .await;
+        });
+        task.abort();
+        let _ = task.await;
+
+        let cancelled_usage = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage read should succeed")
+                {
+                    if usage.status == "cancelled" {
+                        break usage;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled retry owner should publish a 499 terminal handoff");
+        assert_eq!(cancelled_usage.status_code, Some(499));
+        assert_eq!(cancelled_usage.billing_status, "void");
+    }
+
+    #[test]
+    fn stream_intermediate_cas_loser_reports_terminal_owner() {
+        let request_id = "req-stream-intermediate-cas-terminal-owner";
+        let plan = codex_cyber_policy_plan(request_id);
+        let progress = crate::execution_runtime::StreamCandidateWatchdogProgress::shared();
+        crate::execution_runtime::register_stream_candidate_watchdog_progress(
+            request_id,
+            plan.candidate_id.as_deref(),
+            progress.clone(),
+        );
+        assert!(progress.mark_terminal_started());
+        assert!(
+            !crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+                request_id,
+                plan.candidate_id.as_deref(),
+            )
+        );
+        assert_eq!(
+            stream_watchdog_intermediate_ownership(&plan),
+            Some(StreamWatchdogIntermediateOwnership::Terminal)
+        );
+        crate::execution_runtime::unregister_stream_candidate_watchdog_progress(
+            request_id,
+            plan.candidate_id.as_deref(),
+            &progress,
+        );
     }
 
     #[tokio::test]
@@ -12186,6 +15133,18 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_499_usage_handoff_keeps_candidate_non_terminal() {
+        assert_eq!(
+            stream_candidate_status_after_usage_handoff(RequestCandidateStatus::Cancelled, false,),
+            RequestCandidateStatus::Streaming
+        );
+        assert_eq!(
+            stream_candidate_status_after_usage_handoff(RequestCandidateStatus::Cancelled, true,),
+            RequestCandidateStatus::Cancelled
+        );
+    }
+
+    #[test]
     fn openai_client_formats_disallow_proxy_generated_sse_control_blocks() {
         let mut plan = ExecutionPlan {
             request_id: "req-openai-keepalive".into(),
@@ -12252,6 +15211,98 @@ mod tests {
                 .is_none()
         );
         assert!(tx.is_closed(), "body EOF should drop the receiver");
+    }
+
+    #[tokio::test]
+    async fn prefetched_anthropic_terminal_chunk_confirms_delivery_before_next_poll() {
+        let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let (delivery_tx, mut delivery_rx) = oneshot::channel();
+        let message_stop =
+            Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let mut body_stream = Box::pin(build_sse_body_stream_with_delivery_probe(
+            vec![message_stop.clone()],
+            rx,
+            true,
+            false,
+            true,
+            Duration::from_secs(60),
+            Some(delivery_tx),
+        ));
+
+        let chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("message_stop should arrive immediately")
+            .expect("stream should yield message_stop")
+            .expect("message_stop should be successful");
+        assert_eq!(chunk, message_stop);
+        tokio::time::timeout(Duration::from_millis(50), delivery_rx)
+            .await
+            .expect("delivery probe should not wait for another body poll")
+            .expect("delivery probe sender should remain connected");
+    }
+
+    #[tokio::test]
+    async fn prefetched_openai_done_chunk_confirms_delivery_before_next_poll() {
+        let (_tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let (delivery_tx, mut delivery_rx) = oneshot::channel();
+        let done = Bytes::from_static(b"data: [DONE]\n\n");
+        let mut body_stream = Box::pin(build_sse_body_stream_with_delivery_probe(
+            vec![done.clone()],
+            rx,
+            true,
+            false,
+            false,
+            Duration::from_secs(60),
+            Some(delivery_tx),
+        ));
+
+        let chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("OpenAI DONE should arrive immediately")
+            .expect("stream should yield DONE")
+            .expect("DONE should be successful");
+        assert_eq!(chunk, done);
+        tokio::time::timeout(Duration::from_millis(50), delivery_rx)
+            .await
+            .expect("delivery probe should not wait for another body poll")
+            .expect("delivery probe sender should remain connected");
+    }
+
+    #[tokio::test]
+    async fn prefetched_control_tail_waits_for_body_poll_before_delivery_probe() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let (delivery_tx, mut delivery_rx) = oneshot::channel();
+        let business = Bytes::from_static(b"data: {\"id\":\"prefetched\"}\n\n");
+        let control = Bytes::from_static(b": upstream-keepalive\n\n");
+        let mut body_stream = Box::pin(build_sse_body_stream_with_delivery_probe(
+            vec![business.clone(), control],
+            rx,
+            true,
+            false,
+            false,
+            Duration::from_secs(60),
+            Some(delivery_tx),
+        ));
+
+        let chunk = tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+            .await
+            .expect("business chunk should arrive")
+            .expect("stream should yield business chunk")
+            .expect("business chunk should be successful");
+        assert_eq!(chunk, business);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut delivery_rx)
+                .await
+                .is_err(),
+            "a filtered control tail must not confirm delivery before the body is polled again"
+        );
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), body_stream.next())
+                .await
+                .expect("body should reach EOF after the control tail is consumed")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -13019,10 +16070,12 @@ mod tests {
                 b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"first\\\",\\\"choices\\\":[{\\\"index\\\":0,\\\"delta\\\":{\\\"content\\\":\\\"hello\\\"}}]}\\n\\n\"}}\n",
             ));
             release_terminal_for_stream.notified().await;
+            // Semantic `[DONE]` handling may stop after this frame without a
+            // second poll of the producer, so signal before yielding it.
+            terminal_frame_drained_for_stream.notify_one();
             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
                 b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"terminal\\\",\\\"object\\\":\\\"chat.completion.chunk\\\",\\\"model\\\":\\\"gpt-5.4\\\",\\\"choices\\\":[{\\\"index\\\":0,\\\"delta\\\":{},\\\"finish_reason\\\":\\\"stop\\\"}],\\\"usage\\\":{\\\"prompt_tokens\\\":7,\\\"completion_tokens\\\":11,\\\"total_tokens\\\":18}}\\n\\ndata: [DONE]\\n\\n\"}}\n",
             ));
-            terminal_frame_drained_for_stream.notify_one();
         }
         .boxed();
 
@@ -13073,6 +16126,13 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
         drop(body_stream);
+        // A dropped client now leaves the detached producer in a bounded
+        // drain.  Release the synthetic upstream tail so the terminal usage
+        // handoff can observe the real token counts before we assert it.
+        release_terminal.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), terminal_frame_drained.notified())
+            .await
+            .expect("upstream terminal frame should be drained after disconnect");
         let candidates = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let candidates = request_candidate_repository
@@ -13112,12 +16172,12 @@ mod tests {
             }
         })
         .await
-        .expect("usage should be marked cancelled");
-        assert_eq!(stored_usage.billing_status, "void");
+        .expect("usage should be marked cancelled after the drain handoff");
+        assert_eq!(stored_usage.billing_status, "pending");
         assert_eq!(stored_usage.status_code, Some(499));
-        assert_eq!(stored_usage.input_tokens, 0);
-        assert_eq!(stored_usage.output_tokens, 0);
-        assert_eq!(stored_usage.total_tokens, 0);
+        assert_eq!(stored_usage.input_tokens, 7);
+        assert_eq!(stored_usage.output_tokens, 11);
+        assert_eq!(stored_usage.total_tokens, 18);
         let first_byte_time_ms = stored_usage
             .first_byte_time_ms
             .expect("cancelled stream should retain first byte time");
@@ -13127,17 +16187,6 @@ mod tests {
         assert!(
             response_time_ms > first_byte_time_ms,
             "terminal duration should include time after the first byte"
-        );
-
-        release_terminal.notify_one();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                terminal_frame_drained.notified()
-            )
-            .await
-            .is_err(),
-            "upstream frame stream should stop when the client disconnects"
         );
     }
 

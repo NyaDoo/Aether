@@ -1,5 +1,8 @@
 //! Quota exhaustion, replay safety, and upstream replacement policy.
 
+use std::sync::Arc;
+
+use aether_runtime_state::RuntimeState;
 use serde_json::Value;
 use uuid::Uuid;
 use wreq::ws::message::Message as WreqWsMessage;
@@ -13,7 +16,7 @@ use super::ownership::{
     await_owned_responses_websocket_plan, begin_responses_websocket_turn_with_planned_lease,
     spawn_owned_responses_websocket_plan, OwnedResponsesWebSocketDecision,
 };
-use super::request::{build_planning_parts, planned_response_create_event};
+use super::request::{build_planning_parts_at, planned_response_create_event};
 use super::state::BoundResponsesConnection;
 use super::turn::{prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome};
 use super::upstream::{bind_responses_upstream, close_bound_upstream};
@@ -24,6 +27,57 @@ use crate::handlers::proxy::websocket::transport::close_upstream_socket;
 use crate::AppState;
 
 const LOG_TARGET: &str = "aether_gateway::handlers::proxy::responses_ws";
+
+/// Keeps a logical RPM admission alive while a transparent provider retry is
+/// being planned.  If every replacement path exits unsuccessfully (including
+/// a panic/cancellation), the guard compensates the one logical admission;
+/// the intermediate failed attempt is marked as deferred below so its usage
+/// observer cannot race this cleanup.
+struct DeferredRealtimeAdmissionRollback {
+    runtime: Arc<RuntimeState>,
+    request_id: String,
+    armed: bool,
+}
+
+impl DeferredRealtimeAdmissionRollback {
+    fn new(runtime: &RuntimeState, request_id: String) -> Self {
+        Self {
+            runtime: Arc::new(runtime.clone()),
+            request_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DeferredRealtimeAdmissionRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let request_id = self.request_id.clone();
+        aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+            if let Err(error) =
+                crate::dashboard_realtime::rollback_admission(runtime.as_ref(), request_id.as_str())
+                    .await
+            {
+                tracing::warn!(target: LOG_TARGET,
+                    event_name = "dashboard_realtime_quota_retry_rollback_failed",
+                    log_type = "ops",
+                    transport = WEBSOCKET_LOG_TRANSPORT,
+                    websocket = true,
+                    request_id = %request_id,
+                    error = %error,
+                    "failed to compensate the logical realtime admission after quota retry abandonment"
+                );
+            }
+        });
+    }
+}
 
 macro_rules! debug {
     ($($arg:tt)*) => {
@@ -137,6 +191,12 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     let turn_index = active.turn_index;
     let logical_turn_id = active.logical_turn_id.clone();
     let turn_attempt = active.turn_attempt;
+    let realtime_admission_at_ms = active
+        .realtime_admission_at_ms
+        .unwrap_or(context.realtime_admission_at_ms);
+    let realtime_admission_id = format!("{}:ws:{logical_turn_id}", context.realtime_admission_id);
+    let mut realtime_rollback =
+        DeferredRealtimeAdmissionRollback::new(state.runtime_state(), realtime_admission_id);
 
     let retry_exclusion_until_unix_secs = bound
         .pending_adapter_drain
@@ -144,7 +204,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     let exhausted_key = record_exhausted_bound_key(bound, retry_exclusion_until_unix_secs);
     let exhausted_key_id = exhausted_key.as_ref().map(|(key_id, _)| key_id.clone());
 
-    let planning_parts = build_planning_parts(context);
+    let planning_parts = build_planning_parts_at(context, realtime_admission_at_ms);
     let turn_request_id = Uuid::new_v4().to_string();
     let now_unix_secs = current_unix_secs();
     let excluded_key_ids = bound.exhausted_exclusions.key_ids(now_unix_secs);
@@ -323,6 +383,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         drop(orphan);
         return false;
     }
+    realtime_rollback.disarm();
     bound.upstream_response_headers = replacement.upstream_response_headers;
     bound.pending_adapter_drain = None;
     debug!(

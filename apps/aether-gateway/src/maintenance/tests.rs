@@ -3,11 +3,13 @@ use std::sync::{Arc, Mutex};
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+use aether_data::repository::usage::InMemoryUsageReadRepository;
 use aether_data_contracts::repository::candidates::{
     RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
     UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -119,6 +121,226 @@ async fn gateway_background_request_candidate_cleanup_deletes_expired_entries_in
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
+    background_tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn gateway_startup_terminal_sweep_after_restart_reconciles_exact_durable_usage() {
+    fn terminal_usage(
+        request_id: &str,
+        candidate_id: Option<&str>,
+        candidate_index: Option<u64>,
+        status: &str,
+        now_unix_secs: i64,
+    ) -> StoredRequestUsageAudit {
+        let mut usage = StoredRequestUsageAudit::new(
+            format!("usage-{request_id}"),
+            request_id.to_string(),
+            Some("user-1".to_string()),
+            Some("api-key-1".to_string()),
+            None,
+            None,
+            "provider-1".to_string(),
+            "model-1".to_string(),
+            None,
+            Some("provider-1".to_string()),
+            Some("endpoint-1".to_string()),
+            Some("key-1".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            false,
+            false,
+            3,
+            4,
+            7,
+            0.01,
+            0.01,
+            Some(match status {
+                "completed" => 200,
+                "cancelled" => 499,
+                _ => 502,
+            }),
+            (status != "completed").then(|| format!("{status} request")),
+            (status != "completed").then(|| status.to_string()),
+            Some(25),
+            Some(5),
+            status.to_string(),
+            if status == "completed" {
+                "settled".to_string()
+            } else {
+                "void".to_string()
+            },
+            now_unix_secs.saturating_mul(1_000),
+            now_unix_secs,
+            Some(now_unix_secs),
+        )
+        .expect("terminal usage should build");
+        usage.candidate_id = candidate_id.map(str::to_string);
+        usage.candidate_index = candidate_index;
+        usage
+    }
+
+    fn active_candidate(
+        id: &str,
+        request_id: &str,
+        candidate_index: u32,
+        created_at_unix_ms: u64,
+    ) -> UpsertRequestCandidateRecord {
+        UpsertRequestCandidateRecord {
+            id: id.to_string(),
+            request_id: request_id.to_string(),
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("api-key-1".to_string()),
+            username: None,
+            api_key_name: None,
+            candidate_index,
+            retry_index: 0,
+            provider_id: Some("provider-1".to_string()),
+            endpoint_id: Some("endpoint-1".to_string()),
+            key_id: Some("key-1".to_string()),
+            status: RequestCandidateStatus::Streaming,
+            skip_reason: None,
+            is_cached: Some(false),
+            status_code: Some(200),
+            error_type: None,
+            error_message: None,
+            latency_ms: None,
+            concurrent_requests: None,
+            extra_data: None,
+            required_capabilities: None,
+            created_at_unix_ms: Some(created_at_unix_ms),
+            started_at_unix_ms: Some(created_at_unix_ms),
+            finished_at_unix_ms: None,
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let now_unix_ms = now.as_millis() as u64;
+    let now_unix_secs = now.as_secs() as i64;
+    let candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+    for record in [
+        active_candidate("cand-completed", "req-completed", 0, now_unix_ms),
+        active_candidate("cand-failed", "req-failed", 1, now_unix_ms + 1),
+        active_candidate("cand-cancelled", "req-cancelled", 2, now_unix_ms + 2),
+        active_candidate("cand-mismatch", "req-mismatch", 3, now_unix_ms + 3),
+        active_candidate(
+            "cand-metadata-only",
+            "req-metadata-only",
+            4,
+            now_unix_ms + 4,
+        ),
+    ] {
+        candidates
+            .upsert(record)
+            .await
+            .expect("candidate should seed");
+    }
+    let usages = Arc::new(InMemoryUsageReadRepository::seed([
+        terminal_usage(
+            "req-completed",
+            Some("cand-completed"),
+            Some(0),
+            "completed",
+            now_unix_secs,
+        ),
+        terminal_usage(
+            "req-failed",
+            Some("cand-failed"),
+            Some(1),
+            "failed",
+            now_unix_secs,
+        ),
+        terminal_usage(
+            "req-cancelled",
+            Some("cand-cancelled"),
+            Some(2),
+            "cancelled",
+            now_unix_secs,
+        ),
+        terminal_usage(
+            "req-mismatch",
+            Some("different-candidate"),
+            Some(3),
+            "completed",
+            now_unix_secs,
+        ),
+        {
+            let mut usage =
+                terminal_usage("req-metadata-only", None, None, "completed", now_unix_secs);
+            usage.request_metadata = Some(json!({
+                "candidate_id": "cand-metadata-only",
+                "candidate_index": 4,
+            }));
+            usage
+        },
+    ]));
+    let data_state =
+        crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+            Arc::clone(&candidates),
+            usages,
+        )
+        .with_system_config_values_for_tests([
+            (
+                "request_candidate_terminal_reconciliation_batch_size".to_string(),
+                json!(2),
+            ),
+            (
+                "request_candidate_terminal_reconciliation_batches_per_run".to_string(),
+                json!(4),
+            ),
+        ]);
+    let state = AppState::new()
+        .expect("gateway state should build")
+        .with_data_state_for_tests(data_state);
+
+    // Starting a fresh worker models a process restart after usage committed
+    // but before the candidate half of the terminal handoff was persisted.
+    // The batch size of two also forces the startup sweep through two keyset
+    // cursor pages; repeating page one would leave failed/cancelled active.
+    let background_tasks = state.spawn_background_tasks();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let completed = candidates
+            .list_by_request_id("req-completed")
+            .await
+            .expect("completed candidate should read");
+        let failed = candidates
+            .list_by_request_id("req-failed")
+            .await
+            .expect("failed candidate should read");
+        let cancelled = candidates
+            .list_by_request_id("req-cancelled")
+            .await
+            .expect("cancelled candidate should read");
+        if completed[0].status == RequestCandidateStatus::Success
+            && failed[0].status == RequestCandidateStatus::Failed
+            && cancelled[0].status == RequestCandidateStatus::Cancelled
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "startup candidate reconciliation did not complete within two seconds"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mismatch = candidates
+        .list_by_request_id("req-mismatch")
+        .await
+        .expect("mismatched candidate should read");
+    assert_eq!(mismatch[0].status, RequestCandidateStatus::Streaming);
+    let metadata_only = candidates
+        .list_by_request_id("req-metadata-only")
+        .await
+        .expect("metadata-only candidate should read");
+    assert_eq!(metadata_only[0].status, RequestCandidateStatus::Streaming);
     background_tasks.shutdown().await;
 }
 

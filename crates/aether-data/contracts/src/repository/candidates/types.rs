@@ -43,6 +43,13 @@ impl RequestCandidateStatus {
             Self::Streaming | Self::Success | Self::Failed | Self::Cancelled => true,
         }
     }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Failed | Self::Cancelled | Self::Skipped
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -515,6 +522,40 @@ pub trait RequestCandidateReadRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<StoredRequestCandidate>, crate::DataLayerError>;
 
+    /// Keyset page of candidates whose lifecycle is still active.  Maintenance
+    /// uses this after process restart to reconcile only from an authoritative,
+    /// finalized usage row; callers must still verify the exact candidate id.
+    async fn list_active_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, crate::DataLayerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Compatibility fallback for lightweight test repositories. Database
+        // adapters override this with an indexed keyset query.
+        let mut rows = self.list_recent(limit).await?;
+        rows.retain(|candidate| {
+            matches!(
+                candidate.status,
+                RequestCandidateStatus::Pending | RequestCandidateStatus::Streaming
+            ) && after_created_at_unix_ms.is_none_or(|created_at| {
+                candidate.created_at_unix_ms > created_at
+                    || (candidate.created_at_unix_ms == created_at
+                        && candidate.id.as_str() > after_id.unwrap_or_default())
+            })
+        });
+        rows.sort_by(|left, right| {
+            left.created_at_unix_ms
+                .cmp(&right.created_at_unix_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     async fn list_by_provider_id(
         &self,
         provider_id: &str,
@@ -621,6 +662,39 @@ pub trait RequestCandidateWriteRepository: Send + Sync {
         Ok(persisted)
     }
 
+    /// Atomically finalize only the exact active candidate identity.
+    ///
+    /// The default deliberately fails closed so a generic slot-keyed upsert
+    /// cannot terminalize a different candidate that was recreated between a
+    /// maintenance read and write. Durable adapters and the in-memory runtime
+    /// override this with an `id + request_id + active status` compare/update.
+    async fn finalize_active_exact(
+        &self,
+        candidate: UpsertRequestCandidateRecord,
+    ) -> Result<bool, crate::DataLayerError> {
+        candidate.validate()?;
+        if !candidate.status.is_terminal() {
+            return Err(crate::DataLayerError::InvalidInput(
+                "exact active request candidate finalization requires a terminal status"
+                    .to_string(),
+            ));
+        }
+        Ok(false)
+    }
+
+    async fn finalize_active_exact_many(
+        &self,
+        candidates: Vec<UpsertRequestCandidateRecord>,
+    ) -> Result<usize, crate::DataLayerError> {
+        let mut finalized = 0usize;
+        for candidate in candidates {
+            if self.finalize_active_exact(candidate).await? {
+                finalized = finalized.saturating_add(1);
+            }
+        }
+        Ok(finalized)
+    }
+
     async fn delete_created_before(
         &self,
         created_before_unix_secs: u64,
@@ -668,12 +742,44 @@ pub fn request_candidate_lifecycle_would_regress(
             )
 }
 
+/// Returns whether an upsert must retain the existing candidate lifecycle.
+///
+/// Terminal outcomes are immutable for a given `(request_id, candidate_index,
+/// retry_index)` slot.  A late report from another execution path may carry a
+/// different terminal outcome; allowing it to replace the first terminal row
+/// makes the candidate ledger disagree with the usage ledger.  Planning-state
+/// regressions retain the historical behaviour implemented by
+/// [`request_candidate_lifecycle_would_regress`].
+pub fn request_candidate_lifecycle_should_preserve_existing(
+    existing: RequestCandidateStatus,
+    incoming: RequestCandidateStatus,
+) -> bool {
+    let existing_terminal = matches!(
+        existing,
+        RequestCandidateStatus::Success
+            | RequestCandidateStatus::Failed
+            | RequestCandidateStatus::Cancelled
+            | RequestCandidateStatus::Skipped
+    );
+    let incoming_terminal = matches!(
+        incoming,
+        RequestCandidateStatus::Success
+            | RequestCandidateStatus::Failed
+            | RequestCandidateStatus::Cancelled
+            | RequestCandidateStatus::Skipped
+    );
+
+    (existing_terminal && incoming_terminal && existing != incoming)
+        || request_candidate_lifecycle_would_regress(existing, incoming)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_request_candidate_final_status, request_candidate_lifecycle_would_regress,
-        RequestCandidateFinalStatus, RequestCandidateStatus, StoredRequestCandidate,
-        UpsertRequestCandidateRecord,
+        derive_request_candidate_final_status,
+        request_candidate_lifecycle_should_preserve_existing,
+        request_candidate_lifecycle_would_regress, RequestCandidateFinalStatus,
+        RequestCandidateStatus, StoredRequestCandidate, UpsertRequestCandidateRecord,
     };
 
     fn candidate(
@@ -777,6 +883,37 @@ mod tests {
             ));
         }
         assert!(!request_candidate_lifecycle_would_regress(
+            RequestCandidateStatus::Streaming,
+            RequestCandidateStatus::Success,
+        ));
+    }
+
+    #[test]
+    fn terminal_candidate_conflicts_preserve_the_first_terminal_outcome() {
+        for existing in [
+            RequestCandidateStatus::Success,
+            RequestCandidateStatus::Failed,
+            RequestCandidateStatus::Cancelled,
+            RequestCandidateStatus::Skipped,
+        ] {
+            for incoming in [
+                RequestCandidateStatus::Success,
+                RequestCandidateStatus::Failed,
+                RequestCandidateStatus::Cancelled,
+                RequestCandidateStatus::Skipped,
+            ] {
+                if existing == incoming {
+                    assert!(!request_candidate_lifecycle_should_preserve_existing(
+                        existing, incoming
+                    ));
+                } else {
+                    assert!(request_candidate_lifecycle_should_preserve_existing(
+                        existing, incoming
+                    ));
+                }
+            }
+        }
+        assert!(!request_candidate_lifecycle_should_preserve_existing(
             RequestCandidateStatus::Streaming,
             RequestCandidateStatus::Success,
         ));

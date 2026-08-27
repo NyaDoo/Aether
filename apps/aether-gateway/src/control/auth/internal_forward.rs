@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use crate::constants::{
     GATEWAY_HEADER, INTERNAL_FORWARD_AUTH_NONCE_HEADER, INTERNAL_FORWARD_AUTH_SIGNATURE_HEADER,
-    INTERNAL_FORWARD_AUTH_TIMESTAMP_HEADER, TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER,
+    INTERNAL_FORWARD_AUTH_TIMESTAMP_HEADER, REALTIME_ADMISSION_AT_MS_HEADER,
+    REALTIME_ADMISSION_ID_HEADER, TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER,
     TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER, TRUSTED_ADMIN_USER_ROLE_HEADER,
     TRUSTED_AUTH_ACCESS_ALLOWED_HEADER, TRUSTED_AUTH_API_KEY_ID_HEADER,
     TRUSTED_AUTH_BALANCE_HEADER, TRUSTED_AUTH_USER_ID_HEADER, TUNNEL_AFFINITY_FORWARDED_BY_HEADER,
@@ -212,6 +213,8 @@ pub(crate) fn is_internal_forward_identity_header(name: &HeaderName) -> bool {
             | TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER
             | TUNNEL_AFFINITY_FORWARDED_BY_HEADER
             | TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER
+            | REALTIME_ADMISSION_ID_HEADER
+            | REALTIME_ADMISSION_AT_MS_HEADER
             | INTERNAL_FORWARD_AUTH_TIMESTAMP_HEADER
             | INTERNAL_FORWARD_AUTH_NONCE_HEADER
             | INTERNAL_FORWARD_AUTH_SIGNATURE_HEADER
@@ -236,6 +239,10 @@ fn signed_admin_fields(headers: &HeaderMap, method: &Method, uri: &Uri) -> Optio
     }
     let timestamp = header_value_str(headers, INTERNAL_FORWARD_AUTH_TIMESTAMP_HEADER)?;
     let nonce = header_value_str(headers, INTERNAL_FORWARD_AUTH_NONCE_HEADER)?;
+    let realtime_admission_id =
+        header_value_str(headers, REALTIME_ADMISSION_ID_HEADER).unwrap_or_default();
+    let realtime_admission_at_ms =
+        header_value_str(headers, REALTIME_ADMISSION_AT_MS_HEADER).unwrap_or_default();
     let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -250,6 +257,8 @@ fn signed_admin_fields(headers: &HeaderMap, method: &Method, uri: &Uri) -> Optio
         user_role,
         session_id,
         management_token_id,
+        realtime_admission_id,
+        realtime_admission_at_ms,
         timestamp,
         nonce,
     ])
@@ -313,6 +322,10 @@ fn signed_fields(headers: &HeaderMap, method: &Method, uri: &Uri) -> Option<Vec<
     }
     let timestamp = header_value_str(headers, INTERNAL_FORWARD_AUTH_TIMESTAMP_HEADER)?;
     let nonce = header_value_str(headers, INTERNAL_FORWARD_AUTH_NONCE_HEADER)?;
+    let realtime_admission_id =
+        header_value_str(headers, REALTIME_ADMISSION_ID_HEADER).unwrap_or_default();
+    let realtime_admission_at_ms =
+        header_value_str(headers, REALTIME_ADMISSION_AT_MS_HEADER).unwrap_or_default();
     let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -329,6 +342,8 @@ fn signed_fields(headers: &HeaderMap, method: &Method, uri: &Uri) -> Option<Vec<
         access_allowed,
         forwarded_by,
         owner_instance_id,
+        realtime_admission_id,
+        realtime_admission_at_ms,
         timestamp,
         nonce,
     ])

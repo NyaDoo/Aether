@@ -300,6 +300,109 @@ pub fn usage_can_recover_terminal_failure(
         && incoming_usage_can_recover_terminal_failure(incoming_status, incoming_billing_status)
 }
 
+/// A late success may recover a previously voided failed/cancelled terminal
+/// only when it belongs to the same routing candidate.  Request ids span all
+/// failover attempts, so status/billing fields alone cannot distinguish a
+/// legitimate completion retry from an old candidate racing a newer 499.
+/// Missing identity on either side is deliberately not proof: legacy rows can
+/// still be reviewed manually, but an online automatic recovery must fail
+/// closed rather than guess that two anonymous attempts are the same.
+pub fn usage_can_recover_terminal_failure_for_candidate(
+    existing_status: &str,
+    existing_billing_status: &str,
+    existing_candidate_id: Option<&str>,
+    incoming_status: &str,
+    incoming_billing_status: &str,
+    incoming_candidate_id: Option<&str>,
+) -> bool {
+    if !usage_can_recover_terminal_failure(
+        existing_status,
+        existing_billing_status,
+        incoming_status,
+        incoming_billing_status,
+    ) {
+        return false;
+    }
+    let existing_candidate_id = existing_candidate_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let incoming_candidate_id = incoming_candidate_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (existing_candidate_id, incoming_candidate_id) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => false,
+    }
+}
+
+/// Billing states that close the accounting lifecycle and therefore must not be
+/// regressed by a late usage upsert.  `insufficient_quota` is included here as
+/// a terminal settlement result alongside the ordinary settled/void states.
+/// Unknown non-pending values are intentionally left open for forward
+/// compatibility; adapters should preserve them once they are observed.
+pub fn usage_billing_status_is_terminal(status: &str) -> bool {
+    let status = status.trim();
+    status.eq_ignore_ascii_case("settled")
+        || status.eq_ignore_ascii_case("void")
+        || status.eq_ignore_ascii_case("insufficient_quota")
+}
+
+/// Returns whether an incoming billing state must not replace the billing
+/// state already stored for a request.  Billing is monotonic after settlement:
+/// a pending event may not reopen a settled/void row, and a settled event may
+/// not rewrite a void row (or vice versa).  The explicit void-failure recovery
+/// path remains the sole exception and is handled by
+/// [`usage_can_recover_terminal_failure`].
+pub fn usage_billing_status_conflict_preserves_existing(
+    existing_status: &str,
+    existing_billing_status: &str,
+    incoming_status: &str,
+    incoming_billing_status: &str,
+) -> bool {
+    if !usage_billing_status_is_terminal(existing_billing_status)
+        || existing_billing_status
+            .trim()
+            .eq_ignore_ascii_case(incoming_billing_status.trim())
+    {
+        return false;
+    }
+
+    !usage_can_recover_terminal_failure(
+        existing_status.trim(),
+        existing_billing_status.trim(),
+        incoming_status.trim(),
+        incoming_billing_status.trim(),
+    )
+}
+
+/// Returns whether an incoming terminal event must not replace the terminal outcome that is
+/// already stored for a request.
+///
+/// A request has one authoritative terminal outcome.  Late writes from a cancelled/failed
+/// attempt must therefore not turn an already-completed request into a different terminal state
+/// (or vice versa).  The sole intentional exception is the explicit recovery path represented by
+/// [`usage_can_recover_terminal_failure`]: a voided failed/cancelled row may be recovered by a
+/// completed, pending-billing event so that a retry can be billed normally.
+pub fn usage_terminal_status_conflict_preserves_existing(
+    existing_status: &str,
+    existing_billing_status: &str,
+    incoming_status: &str,
+    incoming_billing_status: &str,
+) -> bool {
+    let existing_is_terminal = matches!(existing_status, "completed" | "failed" | "cancelled");
+    let incoming_is_terminal = matches!(incoming_status, "completed" | "failed" | "cancelled");
+
+    existing_is_terminal
+        && incoming_is_terminal
+        && existing_status != incoming_status
+        && !usage_can_recover_terminal_failure(
+            existing_status,
+            existing_billing_status,
+            incoming_status,
+            incoming_billing_status,
+        )
+}
+
 pub fn strip_deprecated_usage_display_fields(mut usage: UpsertUsageRecord) -> UpsertUsageRecord {
     usage.username = None;
     usage.api_key_name = None;

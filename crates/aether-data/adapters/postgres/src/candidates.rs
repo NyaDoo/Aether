@@ -45,6 +45,21 @@ WHERE request_id = $1
 ORDER BY candidate_index ASC, retry_index ASC, created_at ASC
 "#;
 
+const FINALIZE_ACTIVE_EXACT_SQL: &str = r#"
+UPDATE request_candidates
+SET status = $1,
+    status_code = COALESCE($2, status_code),
+    error_type = COALESCE($3, error_type),
+    error_message = COALESCE($4, error_message),
+    latency_ms = COALESCE($5, latency_ms),
+    finished_at = COALESCE(TO_TIMESTAMP($6 / 1000.0), finished_at)
+WHERE id = $7
+  AND request_id = $8
+  AND candidate_index = $9
+  AND retry_index = $10
+  AND status IN ('pending', 'streaming')
+"#;
+
 const AGGREGATE_FINALIZED_TIMELINE_BY_ENDPOINT_IDS_SINCE_SQL: &str = r#"
 SELECT
   endpoint_id,
@@ -153,6 +168,10 @@ DO UPDATE SET
   key_id = COALESCE(EXCLUDED.key_id, request_candidates.key_id),
   status = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.status
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -165,6 +184,10 @@ DO UPDATE SET
   is_cached = COALESCE($14, request_candidates.is_cached),
   status_code = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.status_code
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status_code
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -174,6 +197,10 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.status_code, request_candidates.status_code)
   END,
   error_type = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.error_type
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_type
@@ -185,6 +212,10 @@ DO UPDATE SET
   END,
   error_message = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.error_message
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_message
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -194,6 +225,10 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.error_message, request_candidates.error_message)
   END,
   latency_ms = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.latency_ms
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.latency_ms
@@ -237,6 +272,10 @@ DO UPDATE SET
   END,
   started_at = COALESCE(EXCLUDED.started_at, request_candidates.started_at),
   finished_at = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.finished_at
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.finished_at
@@ -285,6 +324,10 @@ DO UPDATE SET
   key_id = COALESCE(EXCLUDED.key_id, request_candidates.key_id),
   status = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.status
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -297,6 +340,10 @@ DO UPDATE SET
   is_cached = COALESCE(EXCLUDED.is_cached, request_candidates.is_cached),
   status_code = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.status_code
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status_code
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -306,6 +353,10 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.status_code, request_candidates.status_code)
   END,
   error_type = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.error_type
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_type
@@ -317,6 +368,10 @@ DO UPDATE SET
   END,
   error_message = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.error_message
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_message
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -326,6 +381,10 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.error_message, request_candidates.error_message)
   END,
   latency_ms = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.latency_ms
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.latency_ms
@@ -369,6 +428,10 @@ DO UPDATE SET
   END,
   started_at = COALESCE(EXCLUDED.started_at, request_candidates.started_at),
   finished_at = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.finished_at
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.finished_at
@@ -392,6 +455,10 @@ DO UPDATE SET
   key_id = COALESCE(EXCLUDED.key_id, request_candidates.key_id),
   status = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.status
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -404,6 +471,10 @@ DO UPDATE SET
   is_cached = request_candidates.is_cached,
   status_code = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.status_code
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.status_code
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -413,6 +484,10 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.status_code, request_candidates.status_code)
   END,
   error_type = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.error_type
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_type
@@ -424,6 +499,10 @@ DO UPDATE SET
   END,
   error_message = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.error_message
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.error_message
     WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused')
@@ -433,6 +512,10 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.error_message, request_candidates.error_message)
   END,
   latency_ms = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.latency_ms
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.latency_ms
@@ -476,6 +559,10 @@ DO UPDATE SET
   END,
   started_at = COALESCE(EXCLUDED.started_at, request_candidates.started_at),
   finished_at = CASE
+    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND EXCLUDED.status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND request_candidates.status <> EXCLUDED.status
+      THEN request_candidates.finished_at
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')
       THEN request_candidates.finished_at
@@ -600,6 +687,48 @@ impl SqlxRequestCandidateReadRepository {
             i64::try_from(limit).map_err(|_| {
                 DataLayerError::UnexpectedValue(format!(
                     "invalid recent request candidate limit: {limit}"
+                ))
+            })?,
+        );
+        collect_query_rows(builder.build().fetch(&self.pool), map_request_candidate_row).await
+    }
+
+    pub async fn list_active_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut builder = QueryBuilder::<Postgres>::new(candidate_columns());
+        builder.push(" WHERE status IN ('pending', 'streaming')");
+        if let Some(after_created_at_unix_ms) = after_created_at_unix_ms {
+            let after_created_at_unix_ms =
+                i64::try_from(after_created_at_unix_ms).map_err(|_| {
+                    DataLayerError::UnexpectedValue(format!(
+                        "invalid active request candidate cursor: {after_created_at_unix_ms}"
+                    ))
+                })?;
+            builder.push(" AND ((EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT > ");
+            builder.push_bind(after_created_at_unix_ms);
+            builder.push(" OR ((EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT = ");
+            builder.push_bind(after_created_at_unix_ms);
+            builder.push(" AND id > ");
+            builder.push_bind(after_id.unwrap_or_default().to_string());
+            builder.push("))");
+        }
+        // The cursor exposed by the repository contract is millisecond
+        // precision. Order by that same projection before `id`; ordering by
+        // the full timestamp here could skip a row when two timestamps share
+        // a millisecond but their ids sort opposite to their sub-ms values.
+        builder.push(" ORDER BY (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT ASC, id ASC");
+        push_limit(
+            &mut builder,
+            i64::try_from(limit).map_err(|_| {
+                DataLayerError::UnexpectedValue(format!(
+                    "invalid active request candidate limit: {limit}"
                 ))
             })?,
         );
@@ -928,6 +1057,41 @@ FROM request_candidates"#,
             .await
     }
 
+    pub async fn finalize_active_exact(
+        &self,
+        mut candidate: UpsertRequestCandidateRecord,
+    ) -> Result<bool, DataLayerError> {
+        sanitize_request_candidate_for_postgres(&mut candidate);
+        candidate.validate()?;
+        if !candidate.status.is_terminal() {
+            return Err(DataLayerError::InvalidInput(
+                "exact active request candidate finalization requires a terminal status"
+                    .to_string(),
+            ));
+        }
+        self.tx_runner
+            .run_read_write(|tx| {
+                Box::pin(async move {
+                    let result = sqlx::query(FINALIZE_ACTIVE_EXACT_SQL)
+                        .bind(status_to_database(candidate.status))
+                        .bind(candidate.status_code.map(i32::from))
+                        .bind(&candidate.error_type)
+                        .bind(&candidate.error_message)
+                        .bind(candidate.latency_ms.map(to_i32_u64).transpose()?)
+                        .bind(candidate.finished_at_unix_ms.map(|value| value as f64))
+                        .bind(&candidate.id)
+                        .bind(&candidate.request_id)
+                        .bind(to_i32(candidate.candidate_index)?)
+                        .bind(to_i32(candidate.retry_index)?)
+                        .execute(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                    Ok(result.rows_affected() == 1)
+                }) as BoxFuture<'_, Result<bool, DataLayerError>>
+            })
+            .await
+    }
+
     pub async fn delete_created_before(
         &self,
         created_before_unix_secs: u64,
@@ -1147,6 +1311,15 @@ impl RequestCandidateReadRepository for SqlxRequestCandidateReadRepository {
         Self::list_recent(self, limit).await
     }
 
+    async fn list_active_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        Self::list_active_after(self, after_created_at_unix_ms, after_id, limit).await
+    }
+
     async fn list_finalized_by_endpoint_ids_since(
         &self,
         endpoint_ids: &[String],
@@ -1205,6 +1378,13 @@ impl RequestCandidateWriteRepository for SqlxRequestCandidateReadRepository {
         candidates: Vec<UpsertRequestCandidateRecord>,
     ) -> Result<usize, DataLayerError> {
         Self::upsert_many(self, candidates).await
+    }
+
+    async fn finalize_active_exact(
+        &self,
+        candidate: UpsertRequestCandidateRecord,
+    ) -> Result<bool, DataLayerError> {
+        Self::finalize_active_exact(self, candidate).await
     }
 
     async fn delete_created_before(
@@ -1411,6 +1591,7 @@ mod tests {
             assert!(sql.contains(
                 "request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')"
             ));
+            assert!(sql.contains("request_candidates.status <> EXCLUDED.status"));
             assert!(
                 sql.contains("EXCLUDED.status IN ('available', 'unused', 'pending', 'streaming')")
             );
@@ -1423,6 +1604,25 @@ mod tests {
             assert!(sql.contains("THEN request_candidates.status"));
             assert!(sql.contains("THEN request_candidates.latency_ms"));
         }
+    }
+
+    #[test]
+    fn active_candidate_keyset_order_matches_millisecond_cursor_projection() {
+        let source = include_str!("candidates.rs");
+        let cursor_projection = "(EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT";
+        assert!(source.contains(&format!("{cursor_projection} > ")));
+        assert!(source.contains(&format!("{cursor_projection} = ")));
+        assert!(source.contains(&format!("ORDER BY {cursor_projection} ASC, id ASC")));
+    }
+
+    #[test]
+    fn exact_active_finalization_sql_is_identity_cas_and_terminal_safe() {
+        let sql = super::FINALIZE_ACTIVE_EXACT_SQL;
+        assert!(sql.contains("WHERE id = $7"));
+        assert!(sql.contains("AND request_id = $8"));
+        assert!(sql.contains("AND candidate_index = $9"));
+        assert!(sql.contains("AND retry_index = $10"));
+        assert!(sql.contains("status IN ('pending', 'streaming')"));
     }
 
     #[test]

@@ -50,8 +50,11 @@ use crate::orchestration::{
     apply_local_stream_failure_effects, apply_local_stream_success_effects,
     release_local_pool_key_lease, LocalExecutionEffectContext, LocalStreamFailureEffect,
 };
-use crate::request_candidate_runtime::record_local_request_candidate_status;
-use crate::usage::{submit_stream_report, GatewayStreamReportRequest};
+use crate::request_candidate_runtime::{
+    record_local_request_candidate_status, spawn_candidate_persistence_retry_after_usage_handoff,
+    spawn_terminal_candidate_reconciliation,
+};
+use crate::usage::{submit_stream_report_after_terminal_usage, GatewayStreamReportRequest};
 use crate::AppState;
 
 /// 客户端取消/断开时对外记录的状态码。
@@ -402,8 +405,8 @@ impl AttemptStageGuard {
     /// 跑一段不能丢的写入，同时仍然给调用方的等待设上界。
     ///
     /// [`Self::await_stage`] 超时会 drop 掉它等待的 future，这对次要效果是对的，
-    /// 但会静默丢弃系统其余部分依赖的写入。先 spawn 再等，让上界只约束「等多久」：
-    /// 丢弃 `JoinHandle` 只是让任务脱离，它仍会跑完。
+    /// 但会静默丢弃系统其余部分依赖的写入。先在 process-lifetime runtime spawn 再等，
+    /// 让上界只约束「等多久」：丢弃 `JoinHandle` 只是让任务脱离，它仍会跑完。
     pub(crate) async fn await_detachable_stage<F>(
         self,
         trace_id: &str,
@@ -412,7 +415,20 @@ impl AttemptStageGuard {
     ) where
         F: Future<Output = ()> + Send + 'static,
     {
-        let _ = self.await_stage(trace_id, stage, tokio::spawn(write)).await;
+        // Terminal lifecycle writes must outlive the request/relay runtime.  A
+        // dropped WebSocket future normally leaves a detached task running on
+        // the same Tokio runtime, but Tokio tears those tasks down during a
+        // runtime shutdown.  Use the process-lifetime usage executor so a
+        // 499/cancellation at that boundary cannot strand a pending usage row
+        // or a streaming candidate.  The caller's stage bound still limits
+        // how long it waits for the detached task.
+        let _ = self
+            .await_stage(
+                trace_id,
+                stage,
+                aether_usage_runtime::spawn_on_usage_background_runtime(write),
+            )
+            .await;
     }
 }
 
@@ -468,6 +484,196 @@ pub(crate) struct AttemptLifecycleSeed {
     pub(crate) stage_guard: AttemptStageGuard,
 }
 
+/// Owns the short window between admission and construction of an
+/// [`ExecutionAttemptLifecycle`].  `begin()` has to perform the pending usage
+/// write and the initial candidate write before it can return an active
+/// attempt; if a WebSocket owner timeout or task cancellation drops that
+/// future in either write, there is no `ActiveProviderAttempt` yet whose
+/// `Drop` implementation could close the usage row.  This guard is armed by
+/// the WebSocket turn immediately before `begin()` and disarmed only after the
+/// lifecycle object has been returned.
+pub(crate) struct AttemptBeginTerminalGuard {
+    state: AppState,
+    plan: ExecutionPlan,
+    trace_id: String,
+    report_kind: String,
+    report_context: Option<Value>,
+    candidate_started_unix_ms: u64,
+    candidate_started_at: std::time::Instant,
+    armed: bool,
+}
+
+impl AttemptBeginTerminalGuard {
+    pub(crate) fn new(
+        state: &AppState,
+        plan: &ExecutionPlan,
+        trace_id: &str,
+        report_kind: &str,
+        report_context: Option<&Value>,
+        candidate_started_unix_ms: u64,
+        candidate_started_at: std::time::Instant,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            plan: plan.clone(),
+            trace_id: trace_id.to_string(),
+            report_kind: report_kind.to_string(),
+            // The scheduler plan is the authoritative attempt identity.  A
+            // reused/continuation report context can still carry the previous
+            // candidate id; retaining it here would make the cancellation
+            // fallback write a terminal usage row for the wrong candidate.
+            report_context: align_report_context_candidate_id(plan, report_context.cloned()),
+            candidate_started_unix_ms,
+            candidate_started_at,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AttemptBeginTerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let state = self.state.clone();
+        let plan = self.plan.clone();
+        let trace_id = self.trace_id.clone();
+        let report_kind = self.report_kind.clone();
+        let report_context = self.report_context.clone();
+        let candidate_started_unix_ms = self.candidate_started_unix_ms;
+        let candidate_started_at = self.candidate_started_at;
+
+        // The owning WebSocket task may be the one being cancelled.  Always
+        // use the process-lifetime usage executor so this fallback cannot be
+        // cancelled together with the dropped begin future.
+        aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+            let payload = GatewayStreamReportRequest {
+                trace_id,
+                report_kind,
+                report_context,
+                status_code: CLIENT_CANCELLED_STATUS_CODE,
+                headers: BTreeMap::new(),
+                provider_body_base64: None,
+                provider_body_state: Some(UsageBodyCaptureState::None),
+                client_body_base64: None,
+                client_body_state: Some(UsageBodyCaptureState::None),
+                terminal_summary: Some(ExecutionStreamTerminalSummary {
+                    parser_error: Some(
+                        "Responses WebSocket turn begin was cancelled before lifecycle ownership"
+                            .to_string(),
+                    ),
+                    ..ExecutionStreamTerminalSummary::default()
+                }),
+                telemetry: Some(ExecutionTelemetry {
+                    elapsed_ms: Some(
+                        candidate_started_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    ),
+                    ttfb_ms: None,
+                    upstream_bytes: None,
+                }),
+            };
+            let usage_persisted = {
+                let context_seed =
+                    build_terminal_usage_context_seed(&plan, payload.report_context.as_ref());
+                let payload_seed = build_stream_terminal_usage_payload_seed(&payload);
+                state
+                    .usage_runtime
+                    .record_stream_terminal_with_handoff(
+                        state.usage_lifecycle_data_state().as_ref(),
+                        context_seed,
+                        payload_seed,
+                        true,
+                    )
+                    .await
+            };
+            let terminal_at = current_unix_ms();
+            let terminal_reconciliation_update = SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Cancelled,
+                status_code: Some(CLIENT_CANCELLED_STATUS_CODE),
+                error_type: Some("websocket_turn_begin_cancelled".to_string()),
+                error_message: Some(
+                    "Responses WebSocket turn begin was cancelled before lifecycle ownership"
+                        .to_string(),
+                ),
+                latency_ms: payload
+                    .telemetry
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.elapsed_ms),
+                started_at_unix_ms: Some(candidate_started_unix_ms),
+                finished_at_unix_ms: Some(terminal_at),
+            };
+            let terminal_update = SchedulerRequestCandidateStatusUpdate {
+                status: if usage_persisted {
+                    RequestCandidateStatus::Cancelled
+                } else {
+                    RequestCandidateStatus::Streaming
+                },
+                status_code: Some(CLIENT_CANCELLED_STATUS_CODE),
+                error_type: Some(if usage_persisted {
+                    "websocket_turn_begin_cancelled".to_string()
+                } else {
+                    "usage_terminal_handoff_unconfirmed".to_string()
+                }),
+                error_message: Some(if usage_persisted {
+                    "Responses WebSocket turn begin was cancelled before lifecycle ownership"
+                        .to_string()
+                } else {
+                    "terminal usage persistence was not confirmed before candidate finalization"
+                        .to_string()
+                }),
+                latency_ms: payload
+                    .telemetry
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.elapsed_ms),
+                started_at_unix_ms: Some(candidate_started_unix_ms),
+                finished_at_unix_ms: usage_persisted.then_some(terminal_at),
+            };
+            let candidate_persisted = record_local_request_candidate_status(
+                &state,
+                &plan,
+                payload.report_context.as_ref(),
+                terminal_update,
+            )
+            .await;
+            if !usage_persisted {
+                spawn_terminal_candidate_reconciliation(
+                    state.clone(),
+                    plan.clone(),
+                    payload.report_context.clone(),
+                    terminal_reconciliation_update.clone(),
+                );
+            } else if !candidate_persisted {
+                spawn_candidate_persistence_retry_after_usage_handoff(
+                    state.clone(),
+                    plan.clone(),
+                    payload.report_context.clone(),
+                    terminal_reconciliation_update,
+                    None,
+                );
+            }
+            // The pool lease is attached to the candidate report context.  A
+            // begin cancellation has no active attempt to release it later,
+            // so make the release part of this same detached fallback.
+            release_local_pool_key_lease(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: payload.report_context.as_ref(),
+                },
+            )
+            .await;
+        });
+    }
+}
+
 /// 结算一次 attempt 需要的终态事实，由 transport 提供。
 pub(crate) struct AttemptTerminalFactsInput<'a> {
     pub(crate) facts: AttemptTerminalFacts,
@@ -506,6 +712,12 @@ impl ExecutionAttemptLifecycle {
             report_context,
             stage_guard,
         } = seed;
+
+        // Keep the usage seed and every later candidate/report write on the
+        // same routing identity.  In particular, a WebSocket continuation may
+        // start from a context copied from the preceding turn while the plan
+        // has already been assigned a fresh candidate slot.
+        let report_context = align_report_context_candidate_id(&plan, report_context);
 
         let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
         // Keep every transport on the same lifecycle data path. `AppState` can
@@ -665,18 +877,63 @@ impl ExecutionAttemptLifecycle {
         let billing_void = settlement.billing.is_void();
         let usage_runtime = Arc::clone(&state.usage_runtime);
         let usage_data = Arc::clone(state.usage_lifecycle_data_state());
-        self.stage_guard
-            .await_detachable_stage(self.trace_id.as_str(), "usage_terminal", async move {
-                usage_runtime
-                    .record_stream_terminal(
-                        usage_data.as_ref(),
-                        context_seed,
-                        payload_seed,
-                        billing_void,
-                    )
-                    .await;
-            })
-            .await;
+        let (usage_handoff_tx, usage_handoff_rx) = tokio::sync::oneshot::channel();
+        let mut usage_handoff_rx = Some(usage_handoff_rx);
+        // Spawn the usage handoff before applying the stage bound.  For a bounded
+        // relay we keep the receiver alive after the caller's wait expires so a
+        // later continuation can publish the candidate terminal state.  The old
+        // `try_recv` shortcut dropped that result and left every slow-but-valid
+        // WebSocket success permanently in `streaming`.
+        // The usage handoff is the billing authority for this attempt.  It
+        // must not be tied to the relay runtime: the latter can be shutting
+        // down exactly when a client disconnect (499) drops the turn.
+        aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+            let persisted = usage_runtime
+                .record_stream_terminal_with_handoff(
+                    usage_data.as_ref(),
+                    context_seed,
+                    payload_seed,
+                    billing_void,
+                )
+                .await;
+            let _ = usage_handoff_tx.send(persisted);
+        });
+
+        let mut usage_handoff_timed_out = false;
+        // The HTTP lifecycle uses an unbounded stage and therefore receives the durable result.
+        // Bounded relay lifecycles may stop waiting while the detached handoff continues; in
+        // that case keep a would-be success candidate non-terminal until the continuation below
+        // observes the durable result, rather than advertising success ahead of billing.
+        let usage_persisted = match self.stage_guard {
+            AttemptStageGuard::Unbounded => usage_handoff_rx
+                .take()
+                .expect("usage handoff receiver should exist")
+                .await
+                .unwrap_or(false),
+            AttemptStageGuard::Bounded(timeout) => {
+                let receiver = usage_handoff_rx
+                    .as_mut()
+                    .expect("usage handoff receiver should exist");
+                match tokio::time::timeout(timeout, receiver).await {
+                    Ok(result) => result.unwrap_or(false),
+                    Err(_) => {
+                        usage_handoff_timed_out = true;
+                        false
+                    }
+                }
+            }
+        };
+        if !usage_persisted {
+            warn!(
+                event_name = "execution_attempt_usage_handoff_unconfirmed",
+                log_type = "ops",
+                trace_id = %self.trace_id,
+                request_id = %self.plan.request_id,
+                candidate_id = ?self.plan.candidate_id,
+                fallback = "leave_candidate_streaming",
+                "execution attempt could not confirm terminal usage before candidate finalization"
+            );
+        }
 
         // 2. candidate terminal
         let (error_type, error_message) = candidate_error_fields(
@@ -687,7 +944,7 @@ impl ExecutionAttemptLifecycle {
         let candidate_state = state.clone();
         let candidate_plan = self.plan.clone();
         let candidate_report_context = payload.report_context.clone();
-        let candidate_update = SchedulerRequestCandidateStatusUpdate {
+        let candidate_terminal_update = SchedulerRequestCandidateStatusUpdate {
             status: match settlement.candidate_status {
                 AttemptCandidateStatus::Cancelled => RequestCandidateStatus::Cancelled,
                 AttemptCandidateStatus::Failed => RequestCandidateStatus::Failed,
@@ -703,15 +960,119 @@ impl ExecutionAttemptLifecycle {
             started_at_unix_ms: Some(self.candidate_started_at_unix_ms),
             finished_at_unix_ms: Some(current_unix_ms()),
         };
+        let mut candidate_update = candidate_terminal_update.clone();
+        // Every terminal candidate status (success, failure, and cancellation)
+        // is ordered behind the usage handoff. A failed/cancelled row written
+        // first is just as misleading as a success row: cleanup and report
+        // consumers can treat it as a settled attempt while the billing row is
+        // still the pending skeleton.
+        let candidate_terminal_waiting_for_usage = !usage_persisted;
+        if candidate_terminal_waiting_for_usage {
+            candidate_update.status = RequestCandidateStatus::Streaming;
+            candidate_update.finished_at_unix_ms = None;
+            candidate_update.error_type = Some("usage_terminal_handoff_unconfirmed".to_string());
+            candidate_update.error_message = Some(
+                "terminal usage persistence was not confirmed before candidate finalization"
+                    .to_string(),
+            );
+        }
+
+        // A bounded relay is allowed to return to its receive loop after the
+        // stage timeout, but a successful candidate still has to be emitted once
+        // the durable usage handoff completes.  Keep this continuation detached
+        // from the relay task; candidate upsert semantics prevent a late
+        // provisional Streaming update from regressing the terminal Success.
+        let candidate_write_reconciliation_update = candidate_terminal_update.clone();
+        if usage_handoff_timed_out && candidate_terminal_waiting_for_usage {
+            if let Some(usage_handoff_rx) = usage_handoff_rx.take() {
+                let continuation_state = candidate_state.clone();
+                let continuation_plan = candidate_plan.clone();
+                let continuation_report_context = candidate_report_context.clone();
+                aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+                    match usage_handoff_rx.await {
+                        Ok(true) => {
+                            let mut terminal_update = candidate_terminal_update;
+                            terminal_update.finished_at_unix_ms = Some(current_unix_ms());
+                            let candidate_persisted = record_local_request_candidate_status(
+                                &continuation_state,
+                                &continuation_plan,
+                                continuation_report_context.as_ref(),
+                                terminal_update.clone(),
+                            )
+                            .await;
+                            if !candidate_persisted {
+                                spawn_candidate_persistence_retry_after_usage_handoff(
+                                    continuation_state,
+                                    continuation_plan,
+                                    continuation_report_context,
+                                    terminal_update,
+                                    None,
+                                );
+                            }
+                        }
+                        Ok(false) | Err(_) => {
+                            spawn_terminal_candidate_reconciliation(
+                                continuation_state.clone(),
+                                continuation_plan.clone(),
+                                continuation_report_context.clone(),
+                                candidate_terminal_update.clone(),
+                            );
+                            warn!(
+                                event_name = "execution_attempt_candidate_terminal_deferred_usage_failed",
+                                log_type = "ops",
+                                trace_id = %continuation_plan.request_id,
+                                candidate_id = ?continuation_plan.candidate_id,
+                                fallback = "remain_streaming",
+                                "deferred usage handoff did not become durable; candidate remains non-terminal"
+                            );
+                        }
+                    }
+                });
+            } else {
+                spawn_terminal_candidate_reconciliation(
+                    candidate_state.clone(),
+                    candidate_plan.clone(),
+                    candidate_report_context.clone(),
+                    candidate_terminal_update.clone(),
+                );
+                warn!(
+                    event_name = "execution_attempt_candidate_terminal_receiver_missing",
+                    log_type = "ops",
+                    trace_id = %self.trace_id,
+                    request_id = %self.plan.request_id,
+                    fallback = "remain_streaming",
+                    "usage handoff receiver disappeared before deferred candidate finalization"
+                );
+            }
+        } else if candidate_terminal_waiting_for_usage {
+            // Unbounded attempts have already consumed the handoff receiver;
+            // if it resolved false there is no continuation left to promote the
+            // candidate when the usage queue later recovers.
+            spawn_terminal_candidate_reconciliation(
+                candidate_state.clone(),
+                candidate_plan.clone(),
+                candidate_report_context.clone(),
+                candidate_terminal_update.clone(),
+            );
+        }
         self.stage_guard
             .await_detachable_stage(self.trace_id.as_str(), "candidate_terminal", async move {
-                record_local_request_candidate_status(
+                let candidate_persisted = record_local_request_candidate_status(
                     &candidate_state,
                     &candidate_plan,
                     candidate_report_context.as_ref(),
                     candidate_update,
                 )
                 .await;
+                if usage_persisted && !candidate_persisted {
+                    spawn_candidate_persistence_retry_after_usage_handoff(
+                        candidate_state,
+                        candidate_plan,
+                        candidate_report_context,
+                        candidate_write_reconciliation_update,
+                        None,
+                    );
+                }
             })
             .await;
 
@@ -782,7 +1143,7 @@ impl ExecutionAttemptLifecycle {
                 .await_stage(
                     self.trace_id.as_str(),
                     "execution_report",
-                    submit_stream_report(state, payload),
+                    submit_stream_report_after_terminal_usage(state, payload, usage_persisted),
                 )
                 .await
             {
@@ -798,6 +1159,50 @@ impl ExecutionAttemptLifecycle {
 
         settlement
     }
+}
+
+/// Align a report context's routing identity with the immutable execution
+/// plan.  Candidate ids are the ownership key for terminal usage handoffs;
+/// allowing a stale context value to win can settle candidate A with a
+/// terminal event produced by candidate B (or vice versa).  Contexts without
+/// an object shape are left untouched so transport-specific seed values retain
+/// their existing semantics.
+fn align_report_context_candidate_id(
+    plan: &ExecutionPlan,
+    report_context: Option<Value>,
+) -> Option<Value> {
+    let Some(candidate_id) = plan
+        .candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return report_context;
+    };
+
+    let Some(Value::Object(mut object)) = report_context else {
+        return report_context;
+    };
+    let existing_candidate_id = object
+        .get("candidate_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if existing_candidate_id != Some(candidate_id) {
+        warn!(
+            event_name = "execution_attempt_candidate_context_rebound",
+            log_type = "ops",
+            request_id = %plan.request_id,
+            plan_candidate_id = %candidate_id,
+            context_candidate_id = ?existing_candidate_id,
+            "aligned a stale report-context candidate id with the execution plan"
+        );
+    }
+    object.insert(
+        "candidate_id".to_string(),
+        Value::String(candidate_id.to_string()),
+    );
+    Some(Value::Object(object))
 }
 
 /// candidate 行上的 error_type / error_message。

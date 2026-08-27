@@ -283,7 +283,6 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
             } = outcome;
             if let Some(snapshot) = local_task_snapshot {
                 let stored = state.upsert_video_task_snapshot(&snapshot).await?;
-                state.video_tasks.record_snapshot(snapshot);
                 if let Some(stored) = stored.as_ref() {
                     // Cross-gateway finalize must settle the original create
                     // request just like the direct execution path, including
@@ -293,10 +292,14 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
             }
             match report_mode {
                 crate::video_tasks::VideoTaskSyncReportMode::InlineSync => {
-                    crate::usage::submit_sync_report(state, report_payload).await?;
+                    crate::usage::submit_sync_report_after_durable_usage(state, report_payload)
+                        .await?;
                 }
                 crate::video_tasks::VideoTaskSyncReportMode::Background => {
-                    crate::usage::spawn_sync_report(state.clone(), report_payload);
+                    crate::usage::spawn_sync_report_after_durable_usage(
+                        state.clone(),
+                        report_payload,
+                    );
                 }
             }
             let mut response = response;
@@ -339,7 +342,7 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
             resolve_local_sync_success_background_report_kind(payload.report_kind.as_str())
         {
             payload.report_kind = success_report_kind.to_string();
-            crate::usage::spawn_sync_report(state.clone(), payload);
+            crate::usage::spawn_sync_report_after_durable_usage(state.clone(), payload);
         }
         response.headers_mut().insert(
             HeaderName::from_static(CONTROL_EXECUTED_HEADER),
@@ -355,7 +358,7 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
             resolve_local_sync_error_background_report_kind(payload.report_kind.as_str())
         {
             payload.report_kind = error_report_kind.to_string();
-            crate::usage::spawn_sync_report(state.clone(), payload);
+            crate::usage::spawn_sync_report_after_durable_usage(state.clone(), payload);
         }
         response.headers_mut().insert(
             HeaderName::from_static(CONTROL_EXECUTED_HEADER),

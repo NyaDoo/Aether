@@ -32,13 +32,14 @@ use std::net::SocketAddr;
 
 use axum::body::Body;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Extension, State};
 use axum::http::{HeaderMap, Response, Uri};
 
 use crate::handlers::proxy::websocket::ingress::{
     upgrade_authenticated_ai_websocket, WebSocketIngressSpec,
 };
 use crate::handlers::proxy::websocket::session::RESPONSES_WEBSOCKET_SESSION_LIMITS;
+use crate::middleware::GatewayRequestAcceptedWallClockMs;
 use crate::{AppState, GatewayError};
 
 pub(crate) async fn responses_websocket(
@@ -47,6 +48,7 @@ pub(crate) async fn responses_websocket(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     uri: Uri,
+    accepted_wall_clock: Option<Extension<GatewayRequestAcceptedWallClockMs>>,
 ) -> Result<Response<Body>, GatewayError> {
     upgrade_authenticated_ai_websocket(
         state,
@@ -54,6 +56,7 @@ pub(crate) async fn responses_websocket(
         ws,
         headers,
         uri,
+        accepted_wall_clock.map(|value| value.0 .0),
         RESPONSES_WEBSOCKET_SESSION_LIMITS,
         RESPONSES_WEBSOCKET_INGRESS_SPEC,
         session::run_responses_websocket,

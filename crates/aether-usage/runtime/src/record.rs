@@ -77,6 +77,36 @@ pub fn build_upsert_usage_record_from_event(
         }
         RequestBodyDerivedFactsAction::Preserve => {}
     }
+    // A 499 can be billable only when the gateway kept draining after the
+    // downstream disconnected and observed a real semantic completion.  The
+    // event flag drives settlement, but it also needs to survive in the usage
+    // row so later recovery/audit tooling can distinguish that case from an
+    // ordinary void disconnect.  Persist only positive proof; absence remains
+    // deliberately "unknown/not proven" for legacy rows.
+    {
+        let mut metadata = match data.request_metadata.take() {
+            Some(serde_json::Value::Object(metadata)) => metadata,
+            _ => serde_json::Map::new(),
+        };
+        // Never trust a same-named value copied from report/request metadata;
+        // only the typed terminal event is allowed to mint this evidence.
+        metadata.remove("billing_treat_as_completed");
+        metadata.remove("billing_treat_as_void");
+        if data.billing_treat_as_completed.unwrap_or(false) {
+            metadata.insert(
+                "billing_treat_as_completed".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if data.billing_treat_as_void.unwrap_or(false) {
+            metadata.insert(
+                "billing_treat_as_void".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        data.request_metadata =
+            (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata));
+    }
     let now_unix_secs = event.timestamp_ms / 1_000;
 
     Ok(UpsertUsageRecord {
@@ -184,6 +214,9 @@ fn lifecycle_status_and_billing(
     match event_type {
         UsageEventType::Pending => ("pending", "pending"),
         UsageEventType::Streaming => ("streaming", "pending"),
+        UsageEventType::Completed if data.billing_treat_as_void.unwrap_or(false) => {
+            ("completed", "void")
+        }
         UsageEventType::Completed => ("completed", "pending"),
         UsageEventType::Failed => ("failed", "void"),
         UsageEventType::Cancelled => {
@@ -431,6 +464,10 @@ mod tests {
                 status_code: Some(499),
                 response_time_ms: Some(200),
                 first_byte_time_ms: Some(50),
+                request_metadata: Some(serde_json::json!({
+                    "trace_id": "trace-cancelled",
+                    "billing_treat_as_completed": true
+                })),
                 ..UsageEventData::default()
             },
         })
@@ -444,6 +481,44 @@ mod tests {
         assert_eq!(record.status_code, Some(499));
         assert_eq!(record.response_time_ms, Some(200));
         assert_eq!(record.first_byte_time_ms, Some(50));
+        assert!(record
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get("billing_treat_as_completed"))
+            .is_none());
+    }
+
+    #[test]
+    fn explicitly_non_billable_completed_record_is_auditable_and_void() {
+        let record = build_upsert_usage_record_from_event(&UsageEvent {
+            event_type: UsageEventType::Completed,
+            request_id: "req-asset-audit".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            data: UsageEventData {
+                provider_name: "Ark".to_string(),
+                model: "__ark_asset_library__".to_string(),
+                request_type: Some("asset_library".to_string()),
+                status_code: Some(200),
+                total_cost_usd: Some(0.0),
+                actual_total_cost_usd: Some(0.0),
+                billing_treat_as_void: Some(true),
+                ..UsageEventData::default()
+            },
+        })
+        .expect("record should build");
+
+        assert_eq!(record.status, "completed");
+        assert_eq!(record.billing_status, "void");
+        assert_eq!(record.total_cost_usd, Some(0.0));
+        assert_eq!(record.actual_total_cost_usd, Some(0.0));
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_treat_as_void"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -475,6 +550,14 @@ mod tests {
         assert_eq!(record.billing_status, "pending");
         assert_eq!(record.total_tokens, Some(30));
         assert_eq!(record.status_code, Some(499));
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("billing_treat_as_completed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

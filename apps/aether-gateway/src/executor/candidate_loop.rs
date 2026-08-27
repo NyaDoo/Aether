@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use aether_ai_serving::{
     run_ai_attempt_loop, AiAttemptExecutionOutcome, AiAttemptLoopOutcome, AiAttemptLoopPort,
@@ -20,10 +21,11 @@ use crate::ai_serving::LocalExecutionAttemptSource;
 use crate::clock::current_unix_ms;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::{
-    acquire_upstream_execution_gate, build_transport_error_stop_response,
+    acquire_upstream_execution_gate, build_transport_error_stop_response_with_progress,
     execute_execution_runtime_stream_with_retry_scope,
     execute_execution_runtime_sync_with_retry_scope,
-    mark_stream_candidate_watchdog_terminal_started, StreamCandidateWatchdogProgress,
+    mark_stream_candidate_watchdog_terminal_started, register_stream_candidate_watchdog_progress,
+    unregister_stream_candidate_watchdog_progress, StreamCandidateWatchdogProgress,
     UpstreamExecutionGateProvider, UPSTREAM_EXECUTION_GATE_NAME,
 };
 use crate::executor::{
@@ -45,6 +47,11 @@ use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::{AppState, GatewayError};
 
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
+// Once an execution future has claimed terminal ownership, give its usage-first
+// finalizer a bounded grace period.  The finalizer itself is detached below if
+// the database remains slow; waiting forever here used to pin the upstream gate
+// and the request task indefinitely.
+const STREAM_TERMINAL_FINALIZATION_GRACE: Duration = Duration::from_secs(30);
 const UPSTREAM_TARGET_GATE_NAME: &str = "gateway_upstream_target";
 const UPSTREAM_EXECUTION_GATE_HOLD_STREAM_RESPONSE_ENV: &str =
     "AETHER_GATEWAY_UPSTREAM_EXECUTION_GATE_HOLD_STREAM_RESPONSE";
@@ -262,6 +269,24 @@ where
         )
         .await;
         Ok(())
+    }
+
+    fn record_retry_terminal_gap(&self, attempt: &T) {
+        crate::executor::note_current_request_retry_terminal_gap(
+            attempt.execution_plan(),
+            attempt.report_context(),
+        );
+    }
+
+    fn record_starting_attempt_terminal_gap(&self, attempt: &T) {
+        crate::executor::note_current_request_attempt_terminal_gap(
+            attempt.execution_plan(),
+            attempt.report_context(),
+        );
+    }
+
+    fn transfer_responded_terminal_owner(&self, response: &Self::Response) {
+        crate::executor::transfer_current_request_terminal_owner(response);
     }
 
     async fn execute_attempt(
@@ -807,6 +832,7 @@ where
             source.skip_provider(provider_id.as_str()).await?;
             continue;
         }
+        port.record_starting_attempt_terminal_gap(&attempt);
         port.record_attempt_started(&attempt).await?;
         let execute_started_at = std::time::Instant::now();
         let execution = match port.execute_attempt(&attempt).await {
@@ -823,6 +849,7 @@ where
         );
         match execution {
             AiAttemptExecutionOutcome::Responded(response) => {
+                port.transfer_responded_terminal_owner(&response);
                 let remaining = source.drain_execution_attempts().await?;
                 let unused_started_at = std::time::Instant::now();
                 port.mark_unused_attempts(remaining).await?;
@@ -836,6 +863,10 @@ where
                 scope,
                 fallback_response: attempt_fallback_response,
             } => {
+                // This must remain the first operation in the Retry branch.
+                // The per-attempt guard has yielded, so the request-level
+                // owner must be recorded before retry-scope/planning awaits.
+                port.record_retry_terminal_gap(&attempt);
                 if attempt_fallback_response.is_some() {
                     fallback_response = attempt_fallback_response;
                 }
@@ -964,6 +995,24 @@ where
         Ok(())
     }
 
+    fn record_retry_terminal_gap(&self, attempt: &T) {
+        crate::executor::note_current_request_retry_terminal_gap(
+            attempt.execution_plan(),
+            attempt.report_context(),
+        );
+    }
+
+    fn record_starting_attempt_terminal_gap(&self, attempt: &T) {
+        crate::executor::note_current_request_attempt_terminal_gap(
+            attempt.execution_plan(),
+            attempt.report_context(),
+        );
+    }
+
+    fn transfer_responded_terminal_owner(&self, response: &Self::Response) {
+        crate::executor::transfer_current_request_terminal_owner(response);
+    }
+
     async fn execute_attempt(
         &self,
         attempt: &T,
@@ -1028,13 +1077,14 @@ where
             LocalFailoverDecision::StopLocalFailover
         );
         let watchdog_started_at = std::time::Instant::now();
-        let execution = execute_stream_candidate_with_watchdog(
+        let execution = match execute_stream_candidate_with_watchdog(
             self.state,
             self.trace_id,
             self.plan_kind,
             plan,
             watchdog_report_context,
             stop_on_transport_errors,
+            Some(self.state),
             move || async move {
                 execute_execution_runtime_stream_with_retry_scope(
                     &execution_state,
@@ -1048,11 +1098,46 @@ where
                 .await
             },
         )
-        .await?;
+        .await
+        {
+            Ok(StreamCandidateWatchdogOutcome::ExecutionError { error, progress }) => {
+                let execution = handle_stream_watchdog_execution_error(
+                    self.state,
+                    self.trace_id,
+                    self.plan_kind,
+                    plan,
+                    watchdog_report_context,
+                    self.decision,
+                    stop_on_transport_errors,
+                    watchdog_started_at,
+                    Some(progress),
+                    error,
+                )
+                .await?;
+                StreamCandidateWatchdogOutcome::Executed(execution)
+            }
+            Ok(execution) => execution,
+            Err(error) => {
+                let execution = handle_stream_watchdog_execution_error(
+                    self.state,
+                    self.trace_id,
+                    self.plan_kind,
+                    plan,
+                    watchdog_report_context,
+                    self.decision,
+                    stop_on_transport_errors,
+                    watchdog_started_at,
+                    None,
+                    error,
+                )
+                .await?;
+                StreamCandidateWatchdogOutcome::Executed(execution)
+            }
+        };
         let mut execution = match execution {
-            StreamCandidateWatchdogOutcome::TransportTimeout => {
+            StreamCandidateWatchdogOutcome::TransportTimeout(progress) => {
                 AiAttemptExecutionOutcome::Responded(
-                    build_transport_error_stop_response(
+                    build_transport_error_stop_response_with_progress(
                         self.state,
                         plan,
                         watchdog_report_context,
@@ -1062,10 +1147,22 @@ where
                         "local_stream_candidate_watchdog_timeout",
                         stream_candidate_watchdog_timeout_message(),
                         watchdog_started_at.elapsed().as_millis() as u64,
+                        Some(progress),
                     )
                     .await?,
                 )
             }
+            StreamCandidateWatchdogOutcome::TerminalFinalizationDetached => {
+                AiAttemptExecutionOutcome::Responded(
+                    crate::execution_runtime::build_transport_error_client_response(
+                        plan,
+                        self.trace_id,
+                        self.decision,
+                        http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                    )?,
+                )
+            }
+            StreamCandidateWatchdogOutcome::ExecutionError { error, .. } => return Err(error),
             StreamCandidateWatchdogOutcome::Executed(execution) => execution,
         };
         match &mut execution {
@@ -1335,7 +1432,324 @@ fn log_stream_candidate_admission_timeout(
 #[derive(Debug)]
 enum StreamCandidateWatchdogOutcome {
     Executed(AiAttemptExecutionOutcome<Response<Body>>),
-    TransportTimeout,
+    TransportTimeout(Arc<StreamCandidateWatchdogProgress>),
+    ExecutionError {
+        error: GatewayError,
+        progress: Arc<StreamCandidateWatchdogProgress>,
+    },
+    /// Terminal usage/candidate ownership was already claimed by the execution
+    /// future.  The future continues in the background; the caller gets a
+    /// transport response without publishing a competing terminal usage event.
+    TerminalFinalizationDetached,
+}
+
+type StreamCandidateExecutionJoin =
+    tokio::task::JoinHandle<Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>>;
+
+enum StreamCandidateWatchdogWaitResult {
+    Completed(
+        Result<
+            Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
+            tokio::task::JoinError,
+        >,
+    ),
+    Detached(StreamCandidateExecutionJoin),
+    TimedOut,
+}
+
+struct AbortOnDropWatchdogExecution {
+    handle: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl AbortOnDropWatchdogExecution {
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self {
+            handle,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+/// Owns the small handoff window after a stream watchdog has reserved an
+/// intermediate retry.  The watchdog must mark the candidate as failed before
+/// the outer loop can move on, but that write can itself be cancelled (for
+/// example when the client disconnects at the same time as the first-byte
+/// timeout).  The stream execution guard intentionally yields to
+/// `RETRY_ABORT` during normal failover, so keep a second RAII owner around the
+/// candidate write: if this owner is dropped before the write completes it
+/// promotes the retry reservation to the process-lifetime 499 handoff.
+struct StreamCandidateRetryAbortGuard {
+    terminal_state: Option<AppState>,
+    plan: aether_contracts::ExecutionPlan,
+    trace_id: String,
+    plan_kind: String,
+    report_context: Option<serde_json::Value>,
+    candidate_started_unix_ms: u64,
+    candidate_started_at: std::time::Instant,
+    progress: Arc<StreamCandidateWatchdogProgress>,
+    armed: bool,
+}
+
+impl StreamCandidateRetryAbortGuard {
+    fn new(
+        terminal_state: Option<&AppState>,
+        plan: &aether_contracts::ExecutionPlan,
+        trace_id: &str,
+        plan_kind: &str,
+        report_context: Option<&serde_json::Value>,
+        candidate_started_unix_ms: u64,
+        candidate_started_at: std::time::Instant,
+        progress: Arc<StreamCandidateWatchdogProgress>,
+    ) -> Self {
+        Self {
+            terminal_state: terminal_state.cloned(),
+            plan: plan.clone(),
+            trace_id: trace_id.to_string(),
+            plan_kind: plan_kind.to_string(),
+            report_context: report_context.cloned(),
+            candidate_started_unix_ms,
+            candidate_started_at,
+            progress,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamCandidateRetryAbortGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.terminal_state.as_ref() else {
+            return;
+        };
+        if !self.armed || !self.progress.try_claim_retry_cancel_fallback() {
+            return;
+        }
+
+        // Keep the same synthetic report kind used by the stream terminal
+        // guard when no provider response exists.  The handoff helper runs on
+        // the process-lifetime usage runtime and therefore survives the
+        // cancellation that dropped this retry owner.
+        crate::execution_runtime::spawn_stream_attempt_cancelled_terminal_handoff(
+            state.clone(),
+            self.plan.clone(),
+            self.trace_id.clone(),
+            self.plan_kind.clone(),
+            self.report_context.clone(),
+            self.candidate_started_unix_ms,
+            self.candidate_started_at,
+            Some(self.progress.clone()),
+        );
+    }
+}
+
+impl Drop for AbortOnDropWatchdogExecution {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.abort();
+        }
+    }
+}
+
+/// Convert an execution-runtime error that escaped the stream watchdog into a
+/// candidate outcome.  The stream runtime records its pending usage skeleton
+/// before it starts reading the framed response; an error from that read path
+/// must therefore not be allowed to bubble out of the candidate loop without
+/// either settling usage (terminal transport policy) or explicitly retrying
+/// the candidate.  The latter intentionally leaves usage pending so a later
+/// candidate can own the single request-level terminal event.
+async fn handle_stream_watchdog_execution_error(
+    state: &AppState,
+    trace_id: &str,
+    plan_kind: &str,
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    decision: &GatewayControlDecision,
+    stop_on_transport_errors: bool,
+    watchdog_started_at: std::time::Instant,
+    watchdog_progress: Option<Arc<StreamCandidateWatchdogProgress>>,
+    error: GatewayError,
+) -> Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError> {
+    // Admission errors have their own HTTP/retry semantics and are handled by
+    // the watchdog/outer gate.  Do not turn a request-level 429 into a 502.
+    if matches!(error, GatewayError::AdmissionTimeout { .. }) {
+        return Err(error);
+    }
+
+    let error_message = error.into_message();
+    let elapsed_ms = watchdog_started_at.elapsed().as_millis() as u64;
+    if stop_on_transport_errors {
+        let response = crate::execution_runtime::build_transport_error_stop_response_with_progress(
+            state,
+            plan,
+            report_context,
+            trace_id,
+            decision,
+            http::StatusCode::BAD_GATEWAY.as_u16(),
+            "stream_execution_runtime_error",
+            error_message.as_str(),
+            elapsed_ms,
+            watchdog_progress,
+        )
+        .await?;
+        return Ok(AiAttemptExecutionOutcome::Responded(response));
+    }
+
+    // Resolve the registry's canonical Arc first. The watchdog result may
+    // carry a stale task-local clone if another scope re-registered the same
+    // request/candidate while this error was being delivered.
+    let mut owner_progress =
+        crate::execution_runtime::stream_candidate_watchdog_progress_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        )
+        .or_else(|| watchdog_progress.clone());
+    if let Some(progress) = owner_progress.as_ref() {
+        if progress.retry_abort() {
+            return Ok(AiAttemptExecutionOutcome::retry(
+                AiAttemptRetryScope::Candidate,
+            ));
+        }
+        if progress.terminal_owner_active()
+            || progress.cancel_fallback()
+            || progress.stop_requested()
+            || progress.stop_fallback()
+        {
+            // A detached terminal owner is already responsible for usage and
+            // candidate reconciliation.  Return only a client payload; a
+            // second intermediate Failed write could win the candidate
+            // terminal precedence race against its Cancelled/Failed outcome.
+            let response = crate::execution_runtime::build_transport_error_client_response(
+                plan,
+                trace_id,
+                decision,
+                http::StatusCode::BAD_GATEWAY.as_u16(),
+            )?;
+            return Ok(AiAttemptExecutionOutcome::Responded(response));
+        }
+    }
+
+    // The state check above is only a fast path.  A terminal owner can win
+    // between that check and the candidate write, so reserve the intermediate
+    // lane with the same CAS used by the stream frame/runtime error paths.
+    // When the watchdog supplied an exact progress object, claim on that
+    // object directly; this remains correct even if the registry entry was
+    // removed while a detached terminal handoff was finishing.
+    let intermediate_claimed = if let Some(progress) = owner_progress.as_ref() {
+        progress.try_mark_retry_abort()
+    } else {
+        crate::execution_runtime::try_claim_stream_candidate_intermediate_for_request(
+            plan.request_id.as_str(),
+            plan.candidate_id.as_deref(),
+        )
+    };
+    if !intermediate_claimed {
+        let owner = owner_progress.clone().or_else(|| {
+            crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+            )
+        });
+        if owner
+            .as_ref()
+            .is_some_and(|progress| progress.retry_abort())
+        {
+            return Ok(AiAttemptExecutionOutcome::retry(
+                AiAttemptRetryScope::Candidate,
+            ));
+        }
+        if owner.as_ref().is_some_and(|progress| {
+            progress.terminal_owner_active()
+                || progress.cancel_fallback()
+                || progress.stop_requested()
+                || progress.stop_fallback()
+        }) {
+            return Ok(AiAttemptExecutionOutcome::Responded(
+                crate::execution_runtime::build_transport_error_client_response(
+                    plan,
+                    trace_id,
+                    decision,
+                    http::StatusCode::BAD_GATEWAY.as_u16(),
+                )?,
+            ));
+        }
+        // An unknown owner state is treated conservatively as a retry signal;
+        // do not publish a competing Failed row after a failed CAS.
+        return Ok(AiAttemptExecutionOutcome::retry(
+            AiAttemptRetryScope::Candidate,
+        ));
+    }
+
+    // This is an intermediate candidate failure.  Keep it separate from the
+    // terminal usage handoff: the request-level usage row is finalized by the
+    // next successful candidate or by exhaustion handling.
+    if owner_progress.is_none() {
+        owner_progress =
+            crate::execution_runtime::stream_candidate_watchdog_progress_for_current_or_request(
+                plan.request_id.as_str(),
+                plan.candidate_id.as_deref(),
+            );
+    }
+    let finished_at_unix_ms = current_unix_ms();
+    let retry_abort_progress = owner_progress;
+    let mut retry_abort_guard = retry_abort_progress.map(|progress| {
+        StreamCandidateRetryAbortGuard::new(
+            Some(state),
+            plan,
+            trace_id,
+            plan_kind,
+            report_context,
+            finished_at_unix_ms.saturating_sub(elapsed_ms),
+            watchdog_started_at,
+            progress,
+        )
+    });
+    record_local_request_candidate_status(
+        state,
+        plan,
+        report_context,
+        SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Failed,
+            status_code: Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+            error_type: Some("stream_execution_runtime_error".to_string()),
+            error_message: Some(error_message),
+            latency_ms: Some(elapsed_ms),
+            started_at_unix_ms: Some(finished_at_unix_ms.saturating_sub(elapsed_ms)),
+            finished_at_unix_ms: Some(finished_at_unix_ms),
+        },
+    )
+    .await;
+    // `record_local_request_candidate_status` can fail when the candidate
+    // writer is unavailable or the persistence queue is saturated.  The
+    // retry reservation must remain armed in that case; dropping it promotes
+    // the request to the detached 499 fallback instead of leaving a pending
+    // usage row with no owner.  The persistence helper marks the shared
+    // progress only after an accepted candidate handoff.
+    if let Some(guard) = retry_abort_guard.as_mut() {
+        if guard.progress.retry_handoff_complete() {
+            guard.disarm();
+        }
+    }
+    warn!(
+        event_name = "local_stream_candidate_execution_error",
+        log_type = "ops",
+        trace_id = %trace_id,
+        plan_kind,
+        request_id = %short_request_id(plan.request_id.as_str()),
+        candidate_id = ?plan.candidate_id,
+        error_type = "stream_execution_runtime_error",
+        "gateway retrying stream candidate after execution-runtime error"
+    );
+    Ok(AiAttemptExecutionOutcome::retry(
+        AiAttemptRetryScope::Candidate,
+    ))
 }
 
 async fn execute_stream_candidate_with_watchdog<Fut>(
@@ -1345,12 +1759,14 @@ async fn execute_stream_candidate_with_watchdog<Fut>(
     plan: &aether_contracts::ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     stop_on_transport_errors: bool,
+    terminal_state: Option<&AppState>,
     execute: impl FnOnce() -> Fut,
 ) -> Result<StreamCandidateWatchdogOutcome, GatewayError>
 where
     Fut: std::future::Future<
             Output = Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
         > + Send,
+    Fut: 'static,
 {
     let timeout_duration = resolve_stream_candidate_watchdog_timeout(plan, report_context);
     let candidate_started_at = std::time::Instant::now();
@@ -1373,27 +1789,150 @@ where
         }
         Err(err) => return Err(err),
     };
-    let permit_hold = permit.map(UpstreamExecutionPermitHold::new);
+    let mut permit_hold = permit.map(UpstreamExecutionPermitHold::new);
     let watchdog_started_at = std::time::Instant::now();
     let watchdog_progress = StreamCandidateWatchdogProgress::shared();
-    let execution = watchdog_progress.clone().scope(execute());
-    tokio::pin!(execution);
+    register_stream_candidate_watchdog_progress(
+        plan.request_id.as_str(),
+        plan.candidate_id.as_deref(),
+        watchdog_progress.clone(),
+    );
+    // Run the execution in its own task.  This gives the watchdog a safe way
+    // to detach a terminal finalizer while retaining ownership of its usage
+    // handoff; a bare `Pin<&mut Fut>` would be dropped (and cancel the handoff)
+    // when the watchdog future returns.
+    let mut execution = tokio::spawn(watchdog_progress.clone().scope(execute()));
+    let mut execution_abort_guard = AbortOnDropWatchdogExecution::new(execution.abort_handle());
+    // Armed only after the watchdog wins RETRY_ABORT.  It spans the
+    // candidate-status handoff below; if this function is cancelled while the
+    // write is in flight, its Drop implementation promotes the reservation to
+    // a detached 499 terminal handoff instead of leaving usage pending.
+    let mut retry_abort_guard: Option<StreamCandidateRetryAbortGuard> = None;
     let deadline = tokio::time::sleep(timeout_duration);
     tokio::pin!(deadline);
     let execution_result = tokio::select! {
         biased;
-        result = &mut execution => Some(result),
+        result = &mut execution => {
+            execution_abort_guard.disarm();
+            StreamCandidateWatchdogWaitResult::Completed(result)
+        },
         () = &mut deadline => {
-            if watchdog_progress.terminal_started() {
-                Some(execution.await)
+            if watchdog_progress.terminal_owner_active() {
+                match tokio::time::timeout(
+                    STREAM_TERMINAL_FINALIZATION_GRACE,
+                    &mut execution,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        execution_abort_guard.disarm();
+                        StreamCandidateWatchdogWaitResult::Completed(result)
+                    }
+                    Err(_) => {
+                        // Dropping a JoinHandle detaches the task; it does not
+                        // cancel it.  Its terminal usage/candidate sequence can
+                        // therefore finish after the client receives the
+                        // bounded watchdog response.
+                        execution_abort_guard.disarm();
+                        StreamCandidateWatchdogWaitResult::Detached(execution)
+                    }
+                }
+            } else if stop_on_transport_errors && watchdog_progress.try_mark_stop_requested() {
+                execution.abort();
+                let _ = execution.await;
+                execution_abort_guard.disarm();
+                StreamCandidateWatchdogWaitResult::TimedOut
+            } else if !stop_on_transport_errors
+                && watchdog_progress.try_mark_retry_abort_external()
+            {
+                retry_abort_guard = Some(StreamCandidateRetryAbortGuard::new(
+                    terminal_state,
+                    plan,
+                    trace_id,
+                    plan_kind,
+                    report_context,
+                    candidate_started_unix_ms,
+                    candidate_started_at,
+                    watchdog_progress.clone(),
+                ));
+                execution.abort();
+                let _ = execution.await;
+                execution_abort_guard.disarm();
+                StreamCandidateWatchdogWaitResult::TimedOut
+            } else if watchdog_progress.terminal_owner_active() {
+                // A terminal finalizer (or its cancellation fallback) won the
+                // compare/exchange immediately after the first deadline
+                // check.  Preserve the same bounded grace semantics instead
+                // of aborting it as an intermediate retry.
+                match tokio::time::timeout(
+                    STREAM_TERMINAL_FINALIZATION_GRACE,
+                    &mut execution,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        execution_abort_guard.disarm();
+                        StreamCandidateWatchdogWaitResult::Completed(result)
+                    }
+                    Err(_) => {
+                        execution_abort_guard.disarm();
+                        StreamCandidateWatchdogWaitResult::Detached(execution)
+                    }
+                }
             } else {
-                None
+                // A retry/stop reservation lost a race with another owner.
+                // Abort only after the state has been observed as an already
+                // owned fallback; terminal owners take the grace branch above.
+                execution.abort();
+                let _ = execution.await;
+                execution_abort_guard.disarm();
+                StreamCandidateWatchdogWaitResult::TimedOut
             }
         }
     };
     let outcome = match execution_result {
-        Some(result) => result.map(StreamCandidateWatchdogOutcome::Executed),
-        None => {
+        StreamCandidateWatchdogWaitResult::Completed(result) => match result {
+            Err(error) => Ok(StreamCandidateWatchdogOutcome::ExecutionError {
+                error: GatewayError::Internal(format!(
+                    "stream candidate execution task failed: {error}"
+                )),
+                progress: watchdog_progress.clone(),
+            }),
+            // An ordinary execution-runtime error is part of the candidate
+            // loop's existing error contract.  Preserve it as `Err` so the
+            // caller can apply the same transport/error policy as the sync
+            // path; only task-level join failures are wrapped as an
+            // `ExecutionError` outcome (where the shared progress owner is
+            // still needed to reconcile the pending usage row).
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(execution)) => Ok(StreamCandidateWatchdogOutcome::Executed(execution)),
+        },
+        StreamCandidateWatchdogWaitResult::Detached(execution) => {
+            let detached_permit = permit_hold.take();
+            tokio::spawn(async move {
+                let _ = execution.await;
+                drop(detached_permit);
+            });
+            warn!(
+                event_name = "local_stream_candidate_terminal_finalization_detached",
+                log_type = "ops",
+                trace_id = %trace_id,
+                plan_kind,
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                grace_ms = STREAM_TERMINAL_FINALIZATION_GRACE.as_millis() as u64,
+                "stream terminal finalizer exceeded watchdog grace; continuing it detached"
+            );
+            Ok(StreamCandidateWatchdogOutcome::TerminalFinalizationDetached)
+        }
+        StreamCandidateWatchdogWaitResult::TimedOut => {
+            // The selected execution future is dropped below.  Tell any
+            // request-level cancellation guard inside it that the watchdog
+            // owns terminal handling, so it does not race the timeout path
+            // with a synthetic 499 event.
+            // This branch runs outside the task-local scope that polls the
+            // execution future.  The shared progress mark above is visible to
+            // the dropped stream guard; a task-local-only mark would be lost.
             let finished_at_unix_ms = current_unix_ms();
             let request_id = short_request_id(plan.request_id.as_str());
             let provider_name = plan.provider_name.as_deref().unwrap_or("-");
@@ -1403,21 +1942,54 @@ where
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let timeout_ms = u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
-            record_local_request_candidate_status(
-                state,
-                plan,
-                report_context,
-                SchedulerRequestCandidateStatusUpdate {
-                    status: RequestCandidateStatus::Failed,
-                    status_code: None,
-                    error_type: Some("local_stream_candidate_watchdog_timeout".to_string()),
-                    error_message: Some(stream_candidate_watchdog_timeout_message().to_string()),
-                    latency_ms: Some(candidate_started_at.elapsed().as_millis() as u64),
-                    started_at_unix_ms: Some(candidate_started_unix_ms),
-                    finished_at_unix_ms: Some(finished_at_unix_ms),
-                },
-            )
-            .await;
+            if !stop_on_transport_errors {
+                // A retrying candidate owns an intermediate failure marker so the
+                // loop can skip it.  When this watchdog is the terminal transport
+                // path, defer the candidate transition to
+                // `transport_failure::build_transport_error_stop_response`,
+                // which persists terminal usage first.  Publishing `failed`
+                // here would let cleanup observe a terminal candidate while the
+                // usage handoff is still in flight.
+                record_local_request_candidate_status(
+                    state,
+                    plan,
+                    report_context,
+                    SchedulerRequestCandidateStatusUpdate {
+                        status: RequestCandidateStatus::Failed,
+                        status_code: None,
+                        error_type: Some("local_stream_candidate_watchdog_timeout".to_string()),
+                        error_message: Some(
+                            stream_candidate_watchdog_timeout_message().to_string(),
+                        ),
+                        latency_ms: Some(candidate_started_at.elapsed().as_millis() as u64),
+                        started_at_unix_ms: Some(candidate_started_unix_ms),
+                        finished_at_unix_ms: Some(finished_at_unix_ms),
+                    },
+                )
+                .await;
+                // The intermediate candidate handoff has completed.  Do not
+                // reinterpret a later, unrelated cancellation while the next
+                // candidate is being planned as a 499 for this attempt.
+                if watchdog_progress.retry_handoff_complete() {
+                    // A retry owner may relinquish its cancellation fallback only after the
+                    // Failed candidate handoff was actually accepted.  If the writer was
+                    // unavailable or failed, keep the guard armed so Drop promotes the
+                    // RETRY_ABORT reservation to the detached 499 terminal handoff instead of
+                    // silently leaving the request usage row pending.
+                    if let Some(guard) = retry_abort_guard.as_mut() {
+                        if guard.progress.retry_handoff_complete() {
+                            guard.disarm();
+                        }
+                    }
+                }
+                if watchdog_progress.retry_handoff_complete() {
+                    unregister_stream_candidate_watchdog_progress(
+                        plan.request_id.as_str(),
+                        plan.candidate_id.as_deref(),
+                        &watchdog_progress,
+                    );
+                }
+            }
             warn!(
                 event_name = "local_stream_candidate_watchdog_timed_out",
                 log_type = "event",
@@ -1434,7 +2006,9 @@ where
                 "gateway local stream candidate watchdog timed out"
             );
             if stop_on_transport_errors {
-                Ok(StreamCandidateWatchdogOutcome::TransportTimeout)
+                Ok(StreamCandidateWatchdogOutcome::TransportTimeout(
+                    watchdog_progress.clone(),
+                ))
             } else {
                 Ok(StreamCandidateWatchdogOutcome::Executed(
                     AiAttemptExecutionOutcome::retry(AiAttemptRetryScope::Candidate),
@@ -1468,9 +2042,17 @@ where
                 },
             ))
         }
-        Ok(StreamCandidateWatchdogOutcome::TransportTimeout) => {
+        Ok(StreamCandidateWatchdogOutcome::TransportTimeout(progress)) => {
             drop(permit_hold);
-            Ok(StreamCandidateWatchdogOutcome::TransportTimeout)
+            Ok(StreamCandidateWatchdogOutcome::TransportTimeout(progress))
+        }
+        Ok(StreamCandidateWatchdogOutcome::ExecutionError { error, progress }) => {
+            drop(permit_hold);
+            Ok(StreamCandidateWatchdogOutcome::ExecutionError { error, progress })
+        }
+        Ok(StreamCandidateWatchdogOutcome::TerminalFinalizationDetached) => {
+            drop(permit_hold);
+            Ok(StreamCandidateWatchdogOutcome::TerminalFinalizationDetached)
         }
         Err(err) if is_candidate_level_admission_timeout(&err) => {
             drop(permit_hold);
@@ -1650,8 +2232,10 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
     use aether_contracts::{ExecutionPlan, ExecutionTimeouts, RequestBody};
-    use aether_data_contracts::repository::candidates::{
-        RequestCandidateStatus, UpsertRequestCandidateRecord,
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
+    use aether_data_contracts::repository::{
+        candidates::{RequestCandidateStatus, UpsertRequestCandidateRecord},
+        usage::UsageReadRepository,
     };
     use async_trait::async_trait;
     use serde_json::json;
@@ -1663,6 +2247,8 @@ mod tests {
         records: Mutex<Vec<UpsertRequestCandidateRecord>>,
         upstream_gate: Option<aether_runtime::ConcurrencyGate>,
         upstream_queue_budget: Duration,
+        status_started: Option<Arc<tokio::sync::Notify>>,
+        release_status: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl Default for TestRequestCandidateWriter {
@@ -1671,6 +2257,8 @@ mod tests {
                 records: Mutex::new(Vec::new()),
                 upstream_gate: None,
                 upstream_queue_budget: Duration::from_millis(250),
+                status_started: None,
+                release_status: None,
             }
         }
     }
@@ -1684,6 +2272,19 @@ mod tests {
                     limit,
                 )),
                 upstream_queue_budget: queue_budget,
+                status_started: None,
+                release_status: None,
+            }
+        }
+
+        fn with_blocking_status(
+            status_started: Arc<tokio::sync::Notify>,
+            release_status: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self {
+                status_started: Some(status_started),
+                release_status: Some(release_status),
+                ..Self::default()
             }
         }
     }
@@ -1701,6 +2302,12 @@ mod tests {
             Option<aether_data_contracts::repository::candidates::StoredRequestCandidate>,
             GatewayError,
         > {
+            if let Some(status_started) = self.status_started.as_ref() {
+                status_started.notify_one();
+            }
+            if let Some(release_status) = self.release_status.as_ref() {
+                release_status.notified().await;
+            }
             self.records.lock().await.push(candidate);
             Ok(None)
         }
@@ -2362,6 +2969,7 @@ mod tests {
                 &plan,
                 Some(&report_context),
                 false,
+                None,
                 || {
                     std::future::pending::<
                         Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
@@ -2400,7 +3008,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_candidate_watchdog_can_stop_on_transport_error() {
+    async fn stream_candidate_retry_abort_guard_closes_usage_when_status_write_is_cancelled() {
+        let request_id = "req-stream-retry-abort-status-cancelled";
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let usage_state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_usage_repository_for_tests(Arc::clone(
+                    &usage_repository,
+                )),
+            )
+            .with_usage_runtime_for_tests(crate::usage::UsageRuntimeConfig {
+                enabled: true,
+                ..crate::usage::UsageRuntimeConfig::default()
+            });
+        let mut plan = test_plan(Some(ExecutionTimeouts {
+            first_byte_ms: Some(5),
+            ..ExecutionTimeouts::default()
+        }));
+        plan.request_id = request_id.to_string();
+        plan.candidate_id = Some("cand-stream-retry-abort-status-cancelled".to_string());
+        let report_context = json!({
+            "request_id": request_id,
+            "candidate_id": plan.candidate_id.clone(),
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        usage_state.usage_runtime.record_pending(
+            usage_state.usage_lifecycle_data_state().as_ref(),
+            aether_usage_runtime::build_lifecycle_usage_seed(&plan, Some(&report_context)),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage read should succeed")
+                    .is_some_and(|usage| usage.status == "pending")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending usage should be visible before watchdog timeout");
+
+        let status_started = Arc::new(tokio::sync::Notify::new());
+        let release_status = Arc::new(tokio::sync::Notify::new());
+        let writer = Arc::new(TestRequestCandidateWriter::with_blocking_status(
+            Arc::clone(&status_started),
+            release_status,
+        ));
+        let writer_for_task = Arc::clone(&writer);
+        let state_for_task = usage_state.clone();
+        let plan_for_task = plan.clone();
+        let report_context_for_task = report_context.clone();
+        let task = tokio::spawn(async move {
+            execute_stream_candidate_with_watchdog(
+                writer_for_task.as_ref(),
+                "trace-stream-retry-abort-status-cancelled",
+                "claude_cli_stream",
+                &plan_for_task,
+                Some(&report_context_for_task),
+                false,
+                Some(&state_for_task),
+                || {
+                    std::future::pending::<
+                        Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
+                    >()
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), status_started.notified())
+            .await
+            .expect("retry owner should reach the candidate status write");
+        task.abort();
+        let _ = task.await;
+
+        let cancelled_usage = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage read should succeed")
+                {
+                    if usage.status == "cancelled" {
+                        break usage;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry-owner cancellation should enqueue a 499 terminal handoff");
+        assert_eq!(cancelled_usage.status_code, Some(499));
+        assert_eq!(cancelled_usage.billing_status, "void");
+        assert!(writer.records.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_candidate_watchdog_defers_terminal_candidate_on_transport_error() {
         let writer = Arc::new(TestRequestCandidateWriter::default());
         let plan = test_plan(Some(ExecutionTimeouts {
             first_byte_ms: Some(5),
@@ -2415,6 +3125,7 @@ mod tests {
             &plan,
             Some(&report_context),
             true,
+            None,
             || {
                 std::future::pending::<
                     Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
@@ -2425,14 +3136,12 @@ mod tests {
 
         assert!(matches!(
             result,
-            Ok(StreamCandidateWatchdogOutcome::TransportTimeout)
+            Ok(StreamCandidateWatchdogOutcome::TransportTimeout(_))
         ));
         let records = writer.records.lock().await;
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].status_code, None);
-        assert_eq!(
-            records[0].error_type.as_deref(),
-            Some("local_stream_candidate_watchdog_timeout")
+        assert!(
+            records.is_empty(),
+            "the shared transport-error finalizer must publish usage before a terminal candidate"
         );
     }
 
@@ -2452,6 +3161,7 @@ mod tests {
             &plan,
             Some(&report_context),
             true,
+            None,
             || async {
                 mark_stream_candidate_watchdog_terminal_started();
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2484,6 +3194,7 @@ mod tests {
             &plan,
             Some(&report_context),
             true,
+            None,
             || async {
                 Err(GatewayError::UpstreamUnavailable {
                     trace_id: "trace_execution_error".to_string(),
@@ -2523,6 +3234,7 @@ mod tests {
             &plan,
             Some(&report_context),
             false,
+            None,
             || async {
                 panic!("execute future should not run while upstream execution gate is saturated")
             },
@@ -2570,6 +3282,7 @@ mod tests {
             &plan,
             Some(&report_context),
             false,
+            None,
             || async {
                 Err(GatewayError::AdmissionTimeout {
                     trace_id: "trace_target_admission".to_string(),

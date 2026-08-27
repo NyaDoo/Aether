@@ -51,6 +51,235 @@ end
 return {1, 0, 0, remaining}
 "#;
 
+// Realtime dashboard buckets are updated in one Redis-side transaction.  The
+// request/token fields intentionally share a hash so a snapshot never observes
+// a half-applied delta across the two counters.
+const REALTIME_BUCKET_ADD_SCRIPT: &str = r#"
+local requests = tonumber(redis.call('HGET', KEYS[1], 'requests') or '0')
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or '0')
+requests = math.max(0, requests + tonumber(ARGV[1]))
+tokens = math.max(0, tokens + tonumber(ARGV[2]))
+redis.call('HSET', KEYS[1], 'requests', requests, 'tokens', tokens)
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+return {requests, tokens}
+"#;
+
+const REALTIME_BUCKET_SUM_SCRIPT: &str = r#"
+local requests = 0
+local tokens = 0
+for _, key in ipairs(KEYS) do
+    requests = requests + tonumber(redis.call('HGET', key, 'requests') or '0')
+    tokens = tokens + tonumber(redis.call('HGET', key, 'tokens') or '0')
+end
+return {requests, tokens}
+"#;
+
+// Exact-timestamp events use one sorted-set index and one hash payload store.
+// The collection key is encoded into a Redis hash tag by
+// `realtime_event_keys`, so both keys are guaranteed to land in the same
+// cluster slot and each lifecycle operation can remain a single Lua script.
+const REALTIME_EVENT_ADD_SCRIPT: &str = r#"
+local index = KEYS[1]
+local payloads = KEYS[2]
+local event_id = ARGV[1]
+local timestamp_ms = tonumber(ARGV[2])
+local request_delta = tonumber(ARGV[3])
+local token_delta = tonumber(ARGV[4])
+local ttl_ms = tonumber(ARGV[5])
+
+-- Keep the collection bounded even when traffic is continuous and a key's
+-- TTL is refreshed by every new event.  The lower retention boundary is
+-- exclusive: an event exactly at `timestamp - ttl` is evicted.
+local cutoff = timestamp_ms - ttl_ms
+local stale = redis.call('ZRANGEBYSCORE', index, '-inf', '(' .. tostring(cutoff))
+for _, stale_id in ipairs(stale) do
+    redis.call('ZREM', index, stale_id)
+    redis.call('HDEL', payloads, stale_id)
+end
+
+-- Treat a pair that was only partially retained (for example after an
+-- operator-side cleanup) as expired and repair it rather than permanently
+-- suppressing a lifecycle retry.
+local in_index = redis.call('ZSCORE', index, event_id)
+if redis.call('HEXISTS', payloads, event_id) == 1 and in_index then
+    return 0
+end
+redis.call('ZREM', index, event_id)
+redis.call('HDEL', payloads, event_id)
+
+redis.call('HSET', payloads, event_id,
+    tostring(request_delta) .. '|' .. tostring(token_delta))
+redis.call('ZADD', index, timestamp_ms, event_id)
+redis.call('PEXPIRE', index, ttl_ms)
+redis.call('PEXPIRE', payloads, ttl_ms)
+return 1
+"#;
+
+const REALTIME_EVENT_REMOVE_SCRIPT: &str = r#"
+local index = KEYS[1]
+local payloads = KEYS[2]
+local event_id = ARGV[1]
+local removed = redis.call('HDEL', payloads, event_id)
+-- Always remove the index member as well.  This also repairs a dangling
+-- sorted-set member left by an interrupted/manual write.
+redis.call('ZREM', index, event_id)
+if redis.call('ZCARD', index) == 0 then
+    redis.call('DEL', index)
+    redis.call('DEL', payloads)
+end
+return removed
+"#;
+
+const REALTIME_EVENTS_SUM_SCRIPT: &str = r#"
+local index = KEYS[1]
+local payloads = KEYS[2]
+local start_ms = ARGV[1]
+local end_ms = ARGV[2]
+local requests = 0
+local tokens = 0
+
+-- Redis score syntax `(start` makes the lower bound exclusive while the
+-- plain end score keeps the upper bound inclusive: `(start_ms, end_ms]`.
+local ids = redis.call('ZRANGEBYSCORE', index, '(' .. start_ms, end_ms)
+for _, event_id in ipairs(ids) do
+    local encoded = redis.call('HGET', payloads, event_id)
+    if encoded then
+        local request_delta, token_delta = string.match(encoded, '^([^|]+)|([^|]+)$')
+        requests = requests + (tonumber(request_delta) or 0)
+        tokens = tokens + (tonumber(token_delta) or 0)
+    else
+        -- Keep the two-part collection self-healing if an old/manual write
+        -- left an index member without a payload.
+        redis.call('ZREM', index, event_id)
+    end
+end
+return {math.max(0, requests), math.max(0, tokens)}
+"#;
+
+// A token ledger reconciles incremental stream observations with the
+// cumulative usage snapshot emitted by a terminal lifecycle event.  Both
+// operations run in Redis Lua so multiple gateway instances observe one
+// linearizable state.  `terminal_claimed=1` fences late stream frames after a
+// terminal claim; a zero terminal total intentionally leaves the ledger open
+// for a later enriched lifecycle event.
+const REALTIME_TOKEN_STREAM_ADD_SCRIPT: &str = r#"
+local ledger = KEYS[1]
+local delta = tonumber(ARGV[1]) or 0
+local ttl_ms = tonumber(ARGV[2])
+if delta <= 0 then
+    return 0
+end
+if redis.call('HGET', ledger, 'terminal_claimed') == '1' then
+    return 0
+end
+local streamed = tonumber(redis.call('HGET', ledger, 'stream_tokens') or '0')
+streamed = streamed + delta
+redis.call('HSET', ledger, 'stream_tokens', streamed, 'terminal_claimed', '0')
+redis.call('PEXPIRE', ledger, ttl_ms)
+return delta
+"#;
+
+// Idempotent variant used by transport observers that carry a sequence/event
+// identity. The marker field and cumulative stream total are updated in the
+// same Lua invocation, avoiding a race with a concurrent terminal claim.
+const REALTIME_TOKEN_STREAM_ADD_ONCE_SCRIPT: &str = r#"
+local ledger = KEYS[1]
+local event_id = ARGV[1]
+local delta = tonumber(ARGV[2]) or 0
+local ttl_ms = tonumber(ARGV[3])
+if delta <= 0 then
+    return 0
+end
+local marker = 'stream_event:' .. event_id
+if redis.call('HEXISTS', ledger, marker) == 1 then
+    return 0
+end
+if redis.call('HGET', ledger, 'terminal_claimed') == '1' then
+    return 0
+end
+local streamed = tonumber(redis.call('HGET', ledger, 'stream_tokens') or '0')
+streamed = streamed + delta
+redis.call('HSET', ledger,
+    'stream_tokens', streamed,
+    'terminal_claimed', '0',
+    marker, '1')
+redis.call('PEXPIRE', ledger, ttl_ms)
+return delta
+"#;
+
+const REALTIME_TOKEN_TERMINAL_CLAIM_SCRIPT: &str = r#"
+local ledger = KEYS[1]
+local total = tonumber(ARGV[1]) or 0
+local ttl_ms = tonumber(ARGV[2])
+if total <= 0 then
+    return 0
+end
+if redis.call('HGET', ledger, 'terminal_claimed') == '1' then
+    return 0
+end
+local streamed = tonumber(redis.call('HGET', ledger, 'stream_tokens') or '0')
+local remainder = total - streamed
+if remainder < 0 then
+    remainder = 0
+end
+redis.call('HSET', ledger,
+    'stream_tokens', streamed,
+    'terminal_claimed', '1',
+    'terminal_total', total)
+redis.call('PEXPIRE', ledger, ttl_ms)
+return remainder
+"#;
+
+// Two-phase terminal reconciliation.  The ledger is fenced immediately, but
+// the exact event identity/remainder stay pending until the caller commits
+// after the event-store write.  This closes the failure window between a
+// successful Redis claim and a failed cross-slot event write.
+const REALTIME_TOKEN_TERMINAL_PREPARE_SCRIPT: &str = r#"
+local ledger = KEYS[1]
+local event_id = ARGV[1]
+local total = tonumber(ARGV[2]) or 0
+local ttl_ms = tonumber(ARGV[3])
+if total <= 0 then
+    return 0
+end
+if redis.call('HGET', ledger, 'terminal_claimed') == '1' then
+    local pending_event = redis.call('HGET', ledger, 'terminal_event_id')
+    if pending_event == event_id and redis.call('HGET', ledger, 'terminal_committed') ~= '1' then
+        local pending = tonumber(redis.call('HGET', ledger, 'terminal_remainder') or '0')
+        redis.call('PEXPIRE', ledger, ttl_ms)
+        return pending
+    end
+    return 0
+end
+local streamed = tonumber(redis.call('HGET', ledger, 'stream_tokens') or '0')
+local remainder = total - streamed
+if remainder < 0 then
+    remainder = 0
+end
+redis.call('HSET', ledger,
+    'stream_tokens', streamed,
+    'terminal_claimed', '1',
+    'terminal_total', total,
+    'terminal_event_id', event_id,
+    'terminal_remainder', remainder,
+    'terminal_committed', (remainder == 0 and '1' or '0'))
+redis.call('PEXPIRE', ledger, ttl_ms)
+return remainder
+"#;
+
+const REALTIME_TOKEN_TERMINAL_COMMIT_SCRIPT: &str = r#"
+local ledger = KEYS[1]
+local event_id = ARGV[1]
+if redis.call('HGET', ledger, 'terminal_event_id') ~= event_id then
+    return 0
+end
+if redis.call('HGET', ledger, 'terminal_claimed') ~= '1' then
+    return 0
+end
+redis.call('HSET', ledger, 'terminal_committed', '1', 'terminal_remainder', '0')
+return 1
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RedisRuntimeDiagnostics {
     pub connected_clients: Option<u64>,
@@ -147,6 +376,30 @@ impl RedisRuntimeRunner {
         Ok(())
     }
 
+    pub(crate) async fn kv_set_if_absent(
+        &self,
+        key: &str,
+        value: String,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        let namespaced_key = self.keyspace.key(key);
+        let mut command = cmd("SET");
+        command
+            .arg(namespaced_key)
+            .arg(value)
+            .arg("NX")
+            .arg("PX")
+            .arg(u64::try_from(ttl.as_millis().max(1)).unwrap_or(u64::MAX));
+        let result = self
+            .query::<Option<String>>(
+                RedisConnectionLane::Fast,
+                "runtime kv set if absent",
+                command,
+            )
+            .await?;
+        Ok(result.is_some())
+    }
+
     pub(crate) async fn kv_get_many(
         &self,
         keys: &[String],
@@ -193,6 +446,361 @@ impl RedisRuntimeRunner {
             .query_i64(RedisConnectionLane::Fast, "runtime kv ttl", command)
             .await?;
         Ok((ttl >= -1).then_some(ttl))
+    }
+
+    pub(crate) async fn realtime_bucket_add(
+        &self,
+        key: &str,
+        request_delta: i64,
+        token_delta: i64,
+        ttl: Duration,
+    ) -> Result<(i64, i64), DataLayerError> {
+        let key = self.keyspace.key(key);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime bucket add",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_BUCKET_ADD_SCRIPT)
+                    .key(key)
+                    .arg(request_delta)
+                    .arg(token_delta)
+                    .arg(i64::try_from(ttl.as_secs().max(1)).unwrap_or(i64::MAX))
+                    .invoke_async::<(i64, i64)>(&mut connection)
+                    .await
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_bucket_read(
+        &self,
+        key: &str,
+    ) -> Result<Option<(i64, i64)>, DataLayerError> {
+        let key = self.keyspace.key(key);
+        let mut command = cmd("HMGET");
+        command.arg(key).arg("requests").arg("tokens");
+        let values = self
+            .query::<Vec<Option<i64>>>(
+                RedisConnectionLane::Fast,
+                "runtime realtime bucket read",
+                command,
+            )
+            .await?;
+        let requests = values.first().copied().flatten();
+        let tokens = values.get(1).copied().flatten();
+        if requests.is_none() && tokens.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((
+            requests.unwrap_or_default(),
+            tokens.unwrap_or_default(),
+        )))
+    }
+
+    pub(crate) async fn realtime_buckets_sum(
+        &self,
+        keys: &[String],
+    ) -> Result<(i64, i64), DataLayerError> {
+        if keys.is_empty() {
+            return Ok((0, 0));
+        }
+        let namespaced = keys
+            .iter()
+            .map(|key| self.keyspace.key(key))
+            .collect::<Vec<_>>();
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime bucket sum",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                let script = script(REALTIME_BUCKET_SUM_SCRIPT);
+                let mut invocation = script.prepare_invoke();
+                for key in &namespaced {
+                    invocation.key(key);
+                }
+                invocation
+                    .invoke_async::<(i64, i64)>(&mut connection)
+                    .await
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_event_add(
+        &self,
+        collection_key: &str,
+        event_id: &str,
+        timestamp_ms: u64,
+        request_delta: i64,
+        token_delta: i64,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        let (index, payloads) = self.realtime_event_keys(collection_key);
+        let timestamp_ms = i64::try_from(timestamp_ms).map_err(|_| {
+            DataLayerError::InvalidInput(
+                "realtime event timestamp must fit in a signed 64-bit score".to_string(),
+            )
+        })?;
+        let ttl_ms = i64::try_from(ttl.as_millis().max(1)).unwrap_or(i64::MAX);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime event add",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_EVENT_ADD_SCRIPT)
+                    .key(index)
+                    .key(payloads)
+                    .arg(event_id)
+                    .arg(timestamp_ms)
+                    .arg(request_delta)
+                    .arg(token_delta)
+                    .arg(ttl_ms)
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map(|added| added > 0)
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_event_remove(
+        &self,
+        collection_key: &str,
+        event_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let (index, payloads) = self.realtime_event_keys(collection_key);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime event remove",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_EVENT_REMOVE_SCRIPT)
+                    .key(index)
+                    .key(payloads)
+                    .arg(event_id)
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map(|removed| removed > 0)
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_events_sum(
+        &self,
+        collection_key: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<(i64, i64), DataLayerError> {
+        let (index, payloads) = self.realtime_event_keys(collection_key);
+        let start_ms = i64::try_from(start_ms).map_err(|_| {
+            DataLayerError::InvalidInput(
+                "realtime event lower timestamp must fit in a signed 64-bit score".to_string(),
+            )
+        })?;
+        let end_ms = i64::try_from(end_ms).map_err(|_| {
+            DataLayerError::InvalidInput(
+                "realtime event upper timestamp must fit in a signed 64-bit score".to_string(),
+            )
+        })?;
+        if start_ms >= end_ms {
+            return Ok((0, 0));
+        }
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime events sum",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_EVENTS_SUM_SCRIPT)
+                    .key(index)
+                    .key(payloads)
+                    .arg(start_ms)
+                    .arg(end_ms)
+                    .invoke_async::<(i64, i64)>(&mut connection)
+                    .await
+                    .map(|(requests, tokens)| (requests.max(0), tokens.max(0)))
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_token_stream_add(
+        &self,
+        identity: &str,
+        token_delta: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        let key = self.realtime_token_ledger_key(identity);
+        let ttl_ms = i64::try_from(ttl.as_millis().max(1)).unwrap_or(i64::MAX);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime token stream add",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_TOKEN_STREAM_ADD_SCRIPT)
+                    .key(key)
+                    .arg(i64::try_from(token_delta).unwrap_or(i64::MAX))
+                    .arg(ttl_ms)
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map(|accepted| u64::try_from(accepted.max(0)).unwrap_or(0))
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_token_stream_add_once(
+        &self,
+        identity: &str,
+        event_id: &str,
+        token_delta: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        let key = self.realtime_token_ledger_key(identity);
+        let ttl_ms = i64::try_from(ttl.as_millis().max(1)).unwrap_or(i64::MAX);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime token stream add once",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_TOKEN_STREAM_ADD_ONCE_SCRIPT)
+                    .key(key)
+                    .arg(event_id)
+                    .arg(i64::try_from(token_delta).unwrap_or(i64::MAX))
+                    .arg(ttl_ms)
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map(|accepted| u64::try_from(accepted.max(0)).unwrap_or(0))
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_token_terminal_claim(
+        &self,
+        identity: &str,
+        terminal_total: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        let key = self.realtime_token_ledger_key(identity);
+        let ttl_ms = i64::try_from(ttl.as_millis().max(1)).unwrap_or(i64::MAX);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime token terminal claim",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_TOKEN_TERMINAL_CLAIM_SCRIPT)
+                    .key(key)
+                    .arg(i64::try_from(terminal_total).unwrap_or(i64::MAX))
+                    .arg(ttl_ms)
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map(|remainder| u64::try_from(remainder.max(0)).unwrap_or(0))
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_token_terminal_prepare(
+        &self,
+        identity: &str,
+        event_id: &str,
+        terminal_total: u64,
+        ttl: Duration,
+    ) -> Result<u64, DataLayerError> {
+        let key = self.realtime_token_ledger_key(identity);
+        let ttl_ms = i64::try_from(ttl.as_millis().max(1)).unwrap_or(i64::MAX);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime token terminal prepare",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_TOKEN_TERMINAL_PREPARE_SCRIPT)
+                    .key(key)
+                    .arg(event_id)
+                    .arg(i64::try_from(terminal_total).unwrap_or(i64::MAX))
+                    .arg(ttl_ms)
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map(|remainder| u64::try_from(remainder.max(0)).unwrap_or(0))
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn realtime_token_terminal_commit(
+        &self,
+        identity: &str,
+        event_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let key = self.realtime_token_ledger_key(identity);
+        run_lane_with_timeout(
+            &self.connections,
+            RedisConnectionLane::Fast,
+            self.command_timeout_ms,
+            "runtime realtime token terminal commit",
+            async {
+                let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+                script(REALTIME_TOKEN_TERMINAL_COMMIT_SCRIPT)
+                    .key(key)
+                    .arg(event_id)
+                    .invoke_async::<i64>(&mut connection)
+                    .await
+                    .map(|committed| committed > 0)
+                    .map_redis_err()
+            },
+        )
+        .await
+    }
+
+    fn realtime_event_keys(&self, collection_key: &str) -> (String, String) {
+        // Encode the caller key as hex so braces, colons, and arbitrary UTF-8
+        // cannot alter the Redis hash-tag boundary.  Both names then carry the
+        // exact same `{tag}` and are safe for Redis Cluster Lua execution.
+        let tag = realtime_collection_tag(collection_key);
+        (
+            self.keyspace
+                .key(&format!("realtime:events:{{{tag}}}:index")),
+            self.keyspace
+                .key(&format!("realtime:events:{{{tag}}}:payloads")),
+        )
+    }
+
+    fn realtime_token_ledger_key(&self, identity: &str) -> String {
+        // Encode the identity into a brace-safe hash tag.  This keeps the key
+        // deterministic while preventing caller-controlled braces from
+        // changing Redis Cluster slot selection.
+        let tag = realtime_collection_tag(identity);
+        self.keyspace
+            .key(&format!("realtime:token-ledger:{{{tag}}}"))
     }
 
     pub(crate) async fn scan_keys(
@@ -706,9 +1314,24 @@ fn key_belongs_to_prefix(key: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(':'))
 }
 
+fn realtime_collection_tag(collection_key: &str) -> String {
+    let mut tag = String::with_capacity(collection_key.len().saturating_mul(2));
+    use std::fmt::Write;
+    for byte in collection_key.as_bytes() {
+        let _ = write!(tag, "{byte:02x}");
+    }
+    tag
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{key_belongs_to_prefix, parse_diagnostics, RedisRuntimeDiagnostics};
+    use super::{
+        key_belongs_to_prefix, parse_diagnostics, realtime_collection_tag, RedisRuntimeDiagnostics,
+        REALTIME_EVENTS_SUM_SCRIPT, REALTIME_EVENT_ADD_SCRIPT,
+        REALTIME_TOKEN_STREAM_ADD_ONCE_SCRIPT, REALTIME_TOKEN_STREAM_ADD_SCRIPT,
+        REALTIME_TOKEN_TERMINAL_CLAIM_SCRIPT, REALTIME_TOKEN_TERMINAL_COMMIT_SCRIPT,
+        REALTIME_TOKEN_TERMINAL_PREPARE_SCRIPT,
+    };
 
     #[test]
     fn parses_runtime_diagnostics_from_info() {
@@ -745,5 +1368,37 @@ mod tests {
         assert!(key_belongs_to_prefix("aether", "aether"));
         assert!(key_belongs_to_prefix("raw:key", ""));
         assert!(!key_belongs_to_prefix("aetherish:cache:item", "aether"));
+    }
+
+    #[test]
+    fn realtime_collection_tag_is_stable_and_brace_safe() {
+        let first = realtime_collection_tag("dashboard:{site}:events");
+        let second = realtime_collection_tag("dashboard:{site}:events");
+        assert_eq!(first, second);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!first.contains('{'));
+        assert!(!first.contains('}'));
+    }
+
+    #[test]
+    fn realtime_scripts_encode_open_closed_range_and_idempotency() {
+        assert!(REALTIME_EVENT_ADD_SCRIPT.contains("HEXISTS"));
+        assert!(REALTIME_EVENT_ADD_SCRIPT.contains("PEXPIRE"));
+        assert!(REALTIME_EVENTS_SUM_SCRIPT.contains("'(' .. start_ms"));
+        assert!(REALTIME_EVENTS_SUM_SCRIPT.contains("ZRANGEBYSCORE"));
+    }
+
+    #[test]
+    fn realtime_token_scripts_fence_terminal_and_use_ttl() {
+        assert!(REALTIME_TOKEN_STREAM_ADD_SCRIPT.contains("terminal_claimed"));
+        assert!(REALTIME_TOKEN_STREAM_ADD_SCRIPT.contains("PEXPIRE"));
+        assert!(REALTIME_TOKEN_STREAM_ADD_ONCE_SCRIPT.contains("HEXISTS"));
+        assert!(REALTIME_TOKEN_STREAM_ADD_ONCE_SCRIPT.contains("stream_event:"));
+        assert!(REALTIME_TOKEN_TERMINAL_CLAIM_SCRIPT.contains("stream_tokens"));
+        assert!(REALTIME_TOKEN_TERMINAL_CLAIM_SCRIPT.contains("terminal_claimed"));
+        assert!(REALTIME_TOKEN_TERMINAL_CLAIM_SCRIPT.contains("PEXPIRE"));
+        assert!(REALTIME_TOKEN_TERMINAL_PREPARE_SCRIPT.contains("terminal_event_id"));
+        assert!(REALTIME_TOKEN_TERMINAL_PREPARE_SCRIPT.contains("terminal_remainder"));
+        assert!(REALTIME_TOKEN_TERMINAL_COMMIT_SCRIPT.contains("terminal_committed"));
     }
 }

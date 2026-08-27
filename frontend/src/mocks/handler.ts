@@ -1619,6 +1619,23 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse(MOCK_DASHBOARD_STATS)
   },
 
+  'GET /api/dashboard/realtime': async () => {
+    await delay()
+    return createMockResponse({
+      rpm: 0,
+      tpm: 0,
+      window_seconds: 60,
+      as_of: new Date().toISOString(),
+      semantics: {
+        rpm: 'accepted_non_failed_requests',
+        tpm: 'observed_token_deltas_including_failed',
+        window: 'trailing_60_seconds',
+        failed_requests: 'excluded_from_rpm_only',
+      },
+      storage_scope: 'process',
+    })
+  },
+
   'GET /api/dashboard/recent-requests': async () => {
     await delay()
     return createMockResponse({ requests: MOCK_RECENT_REQUESTS })

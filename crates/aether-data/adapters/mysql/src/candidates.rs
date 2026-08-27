@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, MySql, MySqlConnection, QueryBuilder, Row};
 
 use aether_data_contracts::repository::candidates::{
-    request_candidate_lifecycle_would_regress, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
-    StoredRequestCandidate, UpsertRequestCandidateRecord,
+    request_candidate_lifecycle_should_preserve_existing, PublicHealthStatusCount,
+    PublicHealthTimelineBucket, RequestCandidateReadRepository, RequestCandidateStatus,
+    RequestCandidateWriteRepository, StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -40,6 +40,21 @@ SELECT
   started_at AS started_at_unix_ms,
   finished_at AS finished_at_unix_ms
 FROM request_candidates
+"#;
+
+const FINALIZE_ACTIVE_EXACT_SQL: &str = r#"
+UPDATE request_candidates
+SET status = ?,
+    status_code = COALESCE(?, status_code),
+    error_type = COALESCE(?, error_type),
+    error_message = COALESCE(?, error_message),
+    latency_ms = COALESCE(?, latency_ms),
+    finished_at = COALESCE(?, finished_at)
+WHERE id = ?
+  AND request_id = ?
+  AND candidate_index = ?
+  AND retry_index = ?
+  AND status IN ('pending', 'streaming')
 "#;
 
 #[derive(Debug, Clone)]
@@ -100,6 +115,43 @@ impl RequestCandidateReadRepository for MysqlRequestCandidateRepository {
         .fetch_all(&self.pool)
         .await
         .map_sql_err()?;
+        rows.iter().map(map_candidate_row).collect()
+    }
+
+    async fn list_active_after(
+        &self,
+        after_created_at_unix_ms: Option<u64>,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = if let Some(after_created_at_unix_ms) = after_created_at_unix_ms {
+            let after_created_at_unix_ms =
+                u64_to_i64(after_created_at_unix_ms, "active request candidate cursor")?;
+            sqlx::query(&format!(
+                "{CANDIDATE_COLUMNS} WHERE status IN ('pending', 'streaming') \
+                 AND (created_at > ? OR (created_at = ? AND id > ?)) \
+                 ORDER BY created_at ASC, id ASC LIMIT ?"
+            ))
+            .bind(after_created_at_unix_ms)
+            .bind(after_created_at_unix_ms)
+            .bind(after_id.unwrap_or_default())
+            .bind(limit_i64(limit, "active request candidate limit")?)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        } else {
+            sqlx::query(&format!(
+                "{CANDIDATE_COLUMNS} WHERE status IN ('pending', 'streaming') \
+                 ORDER BY created_at ASC, id ASC LIMIT ?"
+            ))
+            .bind(limit_i64(limit, "active request candidate limit")?)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        };
         rows.iter().map(map_candidate_row).collect()
     }
 
@@ -302,6 +354,39 @@ impl RequestCandidateWriteRepository for MysqlRequestCandidateRepository {
         }
     }
 
+    async fn finalize_active_exact(
+        &self,
+        candidate: UpsertRequestCandidateRecord,
+    ) -> Result<bool, DataLayerError> {
+        candidate.validate()?;
+        if !candidate.status.is_terminal() {
+            return Err(DataLayerError::InvalidInput(
+                "exact active request candidate finalization requires a terminal status"
+                    .to_string(),
+            ));
+        }
+        let result = sqlx::query(FINALIZE_ACTIVE_EXACT_SQL)
+            .bind(status_to_database(candidate.status))
+            .bind(candidate.status_code.map(i32::from))
+            .bind(&candidate.error_type)
+            .bind(&candidate.error_message)
+            .bind(candidate.latency_ms.map(to_i32_u64).transpose()?)
+            .bind(
+                candidate
+                    .finished_at_unix_ms
+                    .map(|value| u64_to_i64(value, "request candidate finished_at"))
+                    .transpose()?,
+            )
+            .bind(&candidate.id)
+            .bind(&candidate.request_id)
+            .bind(to_i32(candidate.candidate_index)?)
+            .bind(to_i32(candidate.retry_index)?)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn delete_created_before(
         &self,
         created_before_unix_secs: u64,
@@ -380,7 +465,7 @@ async fn insert_candidate_if_absent(
 INSERT INTO request_candidates (
   id, request_id, candidate_index, retry_index, status, created_at
 )
-VALUES (?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, 'available', ?)
 ON DUPLICATE KEY UPDATE id = id
 "#,
     )
@@ -388,7 +473,6 @@ ON DUPLICATE KEY UPDATE id = id
     .bind(&candidate.request_id)
     .bind(to_i32(candidate.candidate_index)?)
     .bind(to_i32(candidate.retry_index)?)
-    .bind(status_to_database(candidate.status))
     .bind(u64_to_i64(
         candidate.created_at_unix_ms,
         "request candidate created_at",
@@ -440,6 +524,10 @@ ON DUPLICATE KEY UPDATE
   key_id = VALUES(key_id),
   status = CASE
     WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND VALUES(status) IN ('success', 'failed', 'cancelled', 'skipped')
+      AND status <> VALUES(status)
+      THEN status
+    WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
       AND VALUES(status) IN ('available', 'unused', 'pending', 'streaming')
       THEN status
     WHEN status = 'pending' AND VALUES(status) IN ('available', 'unused')
@@ -452,6 +540,10 @@ ON DUPLICATE KEY UPDATE
   is_cached = VALUES(is_cached),
   status_code = CASE
     WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND VALUES(status) IN ('success', 'failed', 'cancelled', 'skipped')
+      AND status <> VALUES(status)
+      THEN status_code
+    WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
       AND VALUES(status) IN ('available', 'unused', 'pending', 'streaming')
       THEN status_code
     WHEN status = 'pending' AND VALUES(status) IN ('available', 'unused')
@@ -461,6 +553,10 @@ ON DUPLICATE KEY UPDATE
     ELSE COALESCE(VALUES(status_code), status_code)
   END,
   error_type = CASE
+    WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND VALUES(status) IN ('success', 'failed', 'cancelled', 'skipped')
+      AND status <> VALUES(status)
+      THEN error_type
     WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
       AND VALUES(status) IN ('available', 'unused', 'pending', 'streaming')
       THEN error_type
@@ -472,6 +568,10 @@ ON DUPLICATE KEY UPDATE
   END,
   error_message = CASE
     WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND VALUES(status) IN ('success', 'failed', 'cancelled', 'skipped')
+      AND status <> VALUES(status)
+      THEN error_message
+    WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
       AND VALUES(status) IN ('available', 'unused', 'pending', 'streaming')
       THEN error_message
     WHEN status = 'pending' AND VALUES(status) IN ('available', 'unused')
@@ -481,6 +581,10 @@ ON DUPLICATE KEY UPDATE
     ELSE COALESCE(VALUES(error_message), error_message)
   END,
   latency_ms = CASE
+    WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND VALUES(status) IN ('success', 'failed', 'cancelled', 'skipped')
+      AND status <> VALUES(status)
+      THEN latency_ms
     WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
       AND VALUES(status) IN ('available', 'unused', 'pending', 'streaming')
       THEN latency_ms
@@ -496,6 +600,10 @@ ON DUPLICATE KEY UPDATE
   created_at = VALUES(created_at),
   started_at = VALUES(started_at),
   finished_at = CASE
+    WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
+      AND VALUES(status) IN ('success', 'failed', 'cancelled', 'skipped')
+      AND status <> VALUES(status)
+      THEN finished_at
     WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
       AND VALUES(status) IN ('available', 'unused', 'pending', 'streaming')
       THEN finished_at
@@ -565,7 +673,7 @@ fn merge_candidate(
     existing: Option<StoredRequestCandidate>,
 ) -> Result<StoredRequestCandidate, DataLayerError> {
     let preserve_existing_lifecycle = existing.as_ref().is_some_and(|value| {
-        request_candidate_lifecycle_would_regress(value.status, candidate.status)
+        request_candidate_lifecycle_should_preserve_existing(value.status, candidate.status)
     });
     let merged_status = if preserve_existing_lifecycle {
         existing
@@ -927,6 +1035,16 @@ mod tests {
     };
     use serde_json::json;
 
+    #[test]
+    fn exact_active_finalization_sql_is_identity_cas_and_terminal_safe() {
+        let sql = super::FINALIZE_ACTIVE_EXACT_SQL;
+        assert!(sql.contains("WHERE id = ?"));
+        assert!(sql.contains("AND request_id = ?"));
+        assert!(sql.contains("AND candidate_index = ?"));
+        assert!(sql.contains("AND retry_index = ?"));
+        assert!(sql.contains("status IN ('pending', 'streaming')"));
+    }
+
     #[tokio::test]
     async fn repository_builds_from_lazy_pool() {
         let pool = sqlx::mysql::MySqlPoolOptions::new().connect_lazy_with(
@@ -1186,7 +1304,7 @@ mod tests {
                 started_at_unix_ms: Some(1_051),
                 finished_at_unix_ms: None,
             },
-            Some(existing),
+            Some(existing.clone()),
         )
         .expect("candidate should merge");
 
@@ -1198,6 +1316,40 @@ mod tests {
             merged.extra_data,
             Some(serde_json::json!({"terminal": true, "late": true}))
         );
+
+        let late_terminal = UpsertRequestCandidateRecord {
+            id: "candidate-late-terminal".to_string(),
+            request_id: "request-1".to_string(),
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("key-1".to_string()),
+            username: None,
+            api_key_name: None,
+            candidate_index: 0,
+            retry_index: 0,
+            provider_id: Some("provider-1".to_string()),
+            endpoint_id: Some("endpoint-1".to_string()),
+            key_id: Some("provider-key-1".to_string()),
+            status: RequestCandidateStatus::Failed,
+            skip_reason: None,
+            is_cached: Some(false),
+            status_code: Some(502),
+            error_type: Some("late_failure".to_string()),
+            error_message: Some("late terminal report".to_string()),
+            latency_ms: Some(9_999),
+            concurrent_requests: None,
+            extra_data: Some(serde_json::json!({"late_terminal": true})),
+            required_capabilities: None,
+            created_at_unix_ms: Some(1_050),
+            started_at_unix_ms: Some(1_051),
+            finished_at_unix_ms: Some(9_999),
+        };
+        let merged_terminal = super::merge_candidate(late_terminal, Some(existing))
+            .expect("terminal conflict should merge");
+        assert_eq!(merged_terminal.status, RequestCandidateStatus::Success);
+        assert_eq!(merged_terminal.status_code, Some(200));
+        assert_eq!(merged_terminal.error_type, None);
+        assert_eq!(merged_terminal.latency_ms, Some(123));
+        assert_eq!(merged_terminal.finished_at_unix_ms, Some(1_123));
     }
 
     fn sample_upsert(

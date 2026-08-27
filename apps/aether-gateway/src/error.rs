@@ -37,6 +37,21 @@ pub(crate) enum GatewayError {
 }
 
 impl GatewayError {
+    /// HTTP status emitted by `IntoResponse`, without consuming the error or
+    /// triggering response-side logging. Terminal audit guards use this to
+    /// persist the same client status before the response is constructed.
+    pub(crate) const fn status_code(&self) -> StatusCode {
+        match self {
+            Self::UpstreamUnavailable { .. } | Self::ControlUnavailable { .. } => {
+                StatusCode::BAD_GATEWAY
+            }
+            Self::LocalExecutionPlanningTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            Self::AdmissionTimeout { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::Client { status, .. } => *status,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
     pub(crate) fn into_message(self) -> String {
         match self {
             Self::UpstreamUnavailable { message, .. }

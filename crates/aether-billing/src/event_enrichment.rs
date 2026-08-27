@@ -39,6 +39,11 @@ pub async fn enrich_usage_event_with_billing(
     data: &dyn BillingModelContextLookup,
     event: &mut UsageEvent,
 ) -> Result<(), DataLayerError> {
+    if event.data.billing_treat_as_void.unwrap_or(false) {
+        event.data.total_cost_usd = Some(0.0);
+        event.data.actual_total_cost_usd = Some(0.0);
+        return Ok(());
+    }
     let treat_as_completed = matches!(event.event_type, UsageEventType::Completed)
         || event.data.billing_treat_as_completed.unwrap_or(false);
     if !treat_as_completed {
@@ -528,6 +533,34 @@ mod tests {
         {
             Ok((model_name == self.expected_name).then(|| self.context.clone()))
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_audit_only_usage_is_zero_cost_without_pricing_lookup() {
+        let lookup = TestLookup {
+            name_context: None,
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "asset-audit-only",
+            UsageEventData {
+                provider_name: "Ark".to_string(),
+                model: "__ark_asset_library__".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                request_type: Some("asset_library".to_string()),
+                status_code: Some(200),
+                billing_treat_as_void: Some(true),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("explicit audit-only billing should resolve");
+
+        assert_eq!(event.data.total_cost_usd, Some(0.0));
+        assert_eq!(event.data.actual_total_cost_usd, Some(0.0));
     }
 
     #[test]
