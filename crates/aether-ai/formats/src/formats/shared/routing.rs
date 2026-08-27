@@ -21,8 +21,10 @@ use crate::contracts::{
 };
 use crate::formats::openai::image::request::is_openai_image_stream_request;
 
-/// Client-facing root of the Doubao (Volcengine Ark) content generation task surface.
-pub const DOUBAO_VIDEO_TASKS_PATH: &str = "/v3/contents/generations/tasks";
+/// Client-facing root of the Doubao (Volcengine Ark) content generation task
+/// surface.  Ark's public API is rooted at `/api/v3`; this path is deliberately
+/// independent from the `/v3` resource suffix used to compose an upstream URL.
+pub const DOUBAO_VIDEO_TASKS_PATH: &str = "/api/v3/contents/generations/tasks";
 
 pub fn resolve_execution_runtime_stream_plan_kind(
     route_class: Option<&str>,
@@ -947,6 +949,19 @@ mod tests {
             ),
             Some(DOUBAO_VIDEO_CREATE_SYNC_PLAN_KIND)
         );
+        // The old unprefixed route is intentionally no longer part of the
+        // public video surface.
+        assert_eq!(
+            resolve_execution_runtime_sync_plan_kind(
+                Some("ai_public"),
+                Some("doubao"),
+                Some("video"),
+                None,
+                &Method::POST,
+                "/v3/contents/generations/tasks",
+            ),
+            None
+        );
         assert_eq!(
             resolve_execution_runtime_sync_plan_kind(
                 Some("ai_public"),
@@ -954,7 +969,7 @@ mod tests {
                 Some("video"),
                 None,
                 &Method::DELETE,
-                "/v3/contents/generations/tasks/cgt-123",
+                "/api/v3/contents/generations/tasks/cgt-123",
             ),
             Some(DOUBAO_VIDEO_DELETE_SYNC_PLAN_KIND)
         );
@@ -965,7 +980,7 @@ mod tests {
                 Some("video"),
                 None,
                 &Method::GET,
-                "/v3/contents/generations/tasks/cgt-123/content",
+                "/api/v3/contents/generations/tasks/cgt-123/content",
             ),
             Some(DOUBAO_VIDEO_CONTENT_PLAN_KIND)
         );
@@ -978,7 +993,7 @@ mod tests {
                 Some("video"),
                 None,
                 &Method::GET,
-                "/v3/contents/generations/tasks/cgt-123",
+                "/api/v3/contents/generations/tasks/cgt-123",
             ),
             None
         );
@@ -1013,7 +1028,7 @@ mod tests {
                 Some("video"),
                 None,
                 &Method::DELETE,
-                "/v3/contents/generations/tasks/cgt-123/content",
+                "/api/v3/contents/generations/tasks/cgt-123/content",
             ),
             None
         );

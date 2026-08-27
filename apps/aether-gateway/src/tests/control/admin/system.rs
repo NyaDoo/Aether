@@ -1452,6 +1452,14 @@ async fn gateway_handles_admin_system_api_formats_locally_with_trusted_admin_pri
     assert!(formats.iter().any(|item| item["value"] == "jina:embedding"));
     assert!(formats.iter().any(|item| item["value"] == "jina:rerank"));
     assert!(formats.iter().any(|item| item["value"] == "gemini:video"));
+    let doubao_video = formats
+        .iter()
+        .find(|item| item["value"] == "doubao:video")
+        .expect("Doubao video format should exist");
+    assert_eq!(
+        doubao_video["default_path"],
+        "/api/v3/contents/generations/tasks"
+    );
     let gemini_files = formats
         .iter()
         .find(|item| item["value"] == "gemini:files")

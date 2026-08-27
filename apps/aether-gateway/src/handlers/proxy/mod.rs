@@ -2502,7 +2502,7 @@ fn local_execution_runtime_miss_route_detail(
         path if path.starts_with("/v1/videos") => {
             Some(OPENAI_VIDEO_LOCAL_EXECUTION_RUNTIME_MISS_DETAIL)
         }
-        path if path.starts_with(aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH) => {
+        path if is_doubao_video_task_path(path) => {
             Some(DOUBAO_VIDEO_LOCAL_EXECUTION_RUNTIME_MISS_DETAIL)
         }
         path if path.starts_with("/upload/v1beta/files") || path.starts_with("/v1beta/files") => {
@@ -2517,6 +2517,11 @@ fn local_execution_runtime_miss_route_detail(
     }
 }
 
+fn is_doubao_video_task_path(path: &str) -> bool {
+    path.strip_prefix(aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2524,14 +2529,15 @@ mod tests {
 
     use super::{
         api_key_remote_ip_allowed, buffer_and_normalize_request_body, buffer_wire_request_body,
-        diagnostic_is_auth_api_key_concurrency_limited, local_execution_runtime_miss_detail,
+        diagnostic_is_auth_api_key_concurrency_limited, is_doubao_video_task_path,
+        local_execution_runtime_miss_detail, local_execution_runtime_miss_route_detail,
         owner_forward_request_is_stream, restore_redacted_stream_execution_response,
         restore_redacted_sync_execution_response, routing_overlay_allows_affinity_target,
         GatewayControlDecision, LocalExecutionRuntimeMissDiagnostic, RequestBodyBufferError,
-        RequestBodyBufferPolicy,
+        RequestBodyBufferPolicy, DOUBAO_VIDEO_LOCAL_EXECUTION_RUNTIME_MISS_DETAIL,
     };
     use axum::body::{to_bytes, Body, Bytes};
-    use axum::http::{header, HeaderMap, HeaderValue, Method, Response};
+    use axum::http::{self, header, HeaderMap, HeaderValue, Method, Response};
     use flate2::{write::GzEncoder, Compression};
     use serde_json::json;
     use std::io::Write;
@@ -3035,6 +3041,41 @@ mod tests {
             Some(
                 "没有可用提供商支持模型 gpt-5.4 的流式请求。请检查模型映射、端点启用状态和 API Key 权限（原因代码: candidate_list_empty）"
             )
+        );
+    }
+
+    #[test]
+    fn runtime_miss_route_detail_requires_a_doubao_path_boundary() {
+        let canonical = GatewayControlDecision::synthetic(
+            "/api/v3/contents/generations/tasks/task-1",
+            Some("ai_public".to_string()),
+            Some("doubao".to_string()),
+            Some("video".to_string()),
+            Some("doubao:video".to_string()),
+        );
+        let malformed = GatewayControlDecision::synthetic(
+            "/api/v3/contents/generations/tasks-evil",
+            Some("ai_public".to_string()),
+            Some("doubao".to_string()),
+            Some("video".to_string()),
+            Some("doubao:video".to_string()),
+        );
+        assert!(is_doubao_video_task_path(
+            "/api/v3/contents/generations/tasks"
+        ));
+        assert!(is_doubao_video_task_path(
+            "/api/v3/contents/generations/tasks/task-1/content"
+        ));
+        assert!(!is_doubao_video_task_path(
+            "/api/v3/contents/generations/tasks-evil"
+        ));
+        assert_eq!(
+            local_execution_runtime_miss_route_detail(Some(&canonical)),
+            Some(DOUBAO_VIDEO_LOCAL_EXECUTION_RUNTIME_MISS_DETAIL)
+        );
+        assert_ne!(
+            local_execution_runtime_miss_route_detail(Some(&malformed)),
+            Some(DOUBAO_VIDEO_LOCAL_EXECUTION_RUNTIME_MISS_DETAIL)
         );
     }
 

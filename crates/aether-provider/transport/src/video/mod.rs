@@ -313,8 +313,9 @@ pub fn build_video_create_upstream_url(
             mapped_model,
             request_query,
         ),
-        // The client path is `/v3/...` while Ark's own root is `/api/v3/...`, so
-        // the resource path is rebuilt rather than passed through verbatim.
+        // The client path is `/api/v3/...`; rebuild the provider resource path
+        // from the configured API root rather than passing the client path
+        // through verbatim.
         ProviderVideoCreateFamily::Doubao => {
             doubao_video_tasks_upstream_url(&transport.endpoint.base_url, None, request_query)
         }
@@ -763,12 +764,12 @@ mod tests {
     }
 
     #[test]
-    fn builds_doubao_video_create_url_from_client_v3_path() {
+    fn builds_doubao_video_create_url_from_client_api_v3_path() {
         let mut transport = sample_transport("doubao:video", "bearer");
         transport.endpoint.base_url = "https://ark.cn-beijing.volces.com/api".to_string();
         let url = build_video_create_upstream_url(
             &transport,
-            "/v3/contents/generations/tasks",
+            "/api/v3/contents/generations/tasks",
             Some("trace=1"),
             "doubao-seedance-2-0-260128",
             ProviderVideoCreateFamily::Doubao,

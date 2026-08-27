@@ -1595,7 +1595,7 @@ mod tests {
 
     fn test_doubao_video_decision() -> GatewayControlDecision {
         GatewayControlDecision::synthetic(
-            "/v3/contents/generations/tasks",
+            "/api/v3/contents/generations/tasks",
             Some("ai_public".to_string()),
             Some("doubao".to_string()),
             Some("video".to_string()),
@@ -1617,15 +1617,17 @@ mod tests {
     #[test]
     fn non_post_execution_gate_allows_doubao_video_lifecycle_routes() {
         let decision = test_doubao_video_decision();
-        let detail =
-            test_request_parts(http::Method::GET, "/v3/contents/generations/tasks/cgt-123");
+        let detail = test_request_parts(
+            http::Method::GET,
+            "/api/v3/contents/generations/tasks/cgt-123",
+        );
         let delete = test_request_parts(
             http::Method::DELETE,
-            "/v3/contents/generations/tasks/cgt-123",
+            "/api/v3/contents/generations/tasks/cgt-123",
         );
         let content = test_request_parts(
             http::Method::GET,
-            "/v3/contents/generations/tasks/cgt-123/content",
+            "/api/v3/contents/generations/tasks/cgt-123/content",
         );
 
         assert!(supports_local_non_post_sync_request(&detail, &decision));
@@ -1638,7 +1640,7 @@ mod tests {
         let decision = test_doubao_video_decision();
         let unknown = test_request_parts(
             http::Method::GET,
-            "/v3/contents/generations/tasks/cgt-123/unknown",
+            "/api/v3/contents/generations/tasks/cgt-123/unknown",
         );
 
         assert!(!supports_local_non_post_sync_request(&unknown, &decision));

@@ -51,8 +51,8 @@ const AI_ANY_ROUTE_PATTERNS: &[&str] = &[
     "/v1beta/operations/{*operation_path}",
     "/v1/videos",
     "/v1/videos/{*video_path}",
-    "/v3/contents/generations/tasks",
-    "/v3/contents/generations/tasks/{*task_path}",
+    "/api/v3/contents/generations/tasks",
+    "/api/v3/contents/generations/tasks/{*task_path}",
     "/upload/v1beta/files",
     "/v1beta/files",
     "/v1beta/files/{*file_path}",
@@ -134,7 +134,8 @@ pub(crate) fn admin_default_body_rules_for_signature(
 #[cfg(test)]
 mod tests {
     use super::{
-        admin_endpoint_signature_parts, public_api_format_local_path, AI_POST_ROUTE_PATTERNS,
+        admin_endpoint_signature_parts, public_api_format_local_path, AI_ANY_ROUTE_PATTERNS,
+        AI_POST_ROUTE_PATTERNS,
     };
 
     #[test]
@@ -145,6 +146,14 @@ mod tests {
                 "missing Ark asset route {path}"
             );
         }
+    }
+
+    #[test]
+    fn mounts_only_api_prefixed_doubao_video_routes() {
+        assert!(AI_ANY_ROUTE_PATTERNS.contains(&"/api/v3/contents/generations/tasks"));
+        assert!(AI_ANY_ROUTE_PATTERNS.contains(&"/api/v3/contents/generations/tasks/{*task_path}"));
+        assert!(!AI_ANY_ROUTE_PATTERNS.contains(&"/v3/contents/generations/tasks"));
+        assert!(!AI_ANY_ROUTE_PATTERNS.contains(&"/v3/contents/generations/tasks/{*task_path}"));
     }
 
     #[test]
@@ -169,7 +178,7 @@ mod tests {
                 "doubao:video",
                 "doubao",
                 "video",
-                "/v3/contents/generations/tasks",
+                "/api/v3/contents/generations/tasks",
             ),
             (
                 "aliyun:multimodal_embedding",

@@ -187,7 +187,7 @@ pub fn resolve_internal_finalize_route(signature: &str) -> Option<InternalFinali
             route_kind: "video",
         }),
         "doubao:video" => Some(InternalFinalizeRoute {
-            public_path: "/v3/contents/generations/tasks",
+            public_path: "/api/v3/contents/generations/tasks",
             route_family: "doubao",
             route_kind: "video",
         }),

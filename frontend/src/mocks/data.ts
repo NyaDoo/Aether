@@ -1251,7 +1251,7 @@ export const MOCK_API_FORMATS = {
     { value: 'jina:embedding', label: 'Jina Embedding', default_path: '/v1/embeddings', aliases: [] },
     { value: 'jina:rerank', label: 'Jina Rerank', default_path: '/v1/rerank', aliases: [] },
     { value: 'doubao:embedding', label: 'Doubao Embedding', default_path: '/embeddings/multimodal', aliases: [] },
-    { value: 'doubao:video', label: 'Doubao Video', default_path: '/v3/contents/generations/tasks', aliases: ['doubao_video', 'seedance', 'ark_video'] },
+    { value: 'doubao:video', label: 'Doubao Video', default_path: '/api/v3/contents/generations/tasks', aliases: ['doubao_video', 'seedance', 'ark_video'] },
     { value: 'doubao:asset_library', label: 'Ark Asset Library', default_path: '/?Action={action}&Version=2024-01-01', aliases: ['doubao_asset_library', 'ark_assets', 'ark_materials'] },
     {
       value: 'aliyun:multimodal_embedding',

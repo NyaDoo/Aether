@@ -8,7 +8,7 @@ its own request/response shape, route classification and plan kinds.
 | --- | --- | --- |
 | OpenAI (Sora) | `openai:video` | `POST /v1/videos`, `GET/DELETE /v1/videos/{id}`, `POST /v1/videos/{id}/{cancel,remix}`, `GET /v1/videos/{id}/content` |
 | Gemini (Veo) | `gemini:video` | `POST /v1beta/models/{model}:predictLongRunning`, `GET /v1beta/operations/{id}`, `POST .../{id}:cancel` |
-| Doubao (Volcengine Ark) | `doubao:video` | `POST /v3/contents/generations/tasks`, `GET /v3/contents/generations/tasks`, `GET/DELETE /v3/contents/generations/tasks/{id}`, `GET /v3/contents/generations/tasks/{id}/content` |
+| Doubao (Volcengine Ark) | `doubao:video` | `POST /api/v3/contents/generations/tasks`, `GET /api/v3/contents/generations/tasks`, `GET/DELETE /api/v3/contents/generations/tasks/{id}`, `GET /api/v3/contents/generations/tasks/{id}/content` |
 
 ## Prerequisite
 
@@ -33,14 +33,17 @@ does not persist or poll tasks in that mode.
 - Auth: bearer token (`Authorization: Bearer <ARK_API_KEY>`), same as the
   OpenAI surface
 
-The base URL is appended to verbatim with the same path clients call, so the
-upstream URL is always `<base_url>/v3/contents/generations/tasks`. Nothing is
-inferred or repaired: a base that already ends in `/v3` yields `/v3/v3/...` and
-Ark answers `404`, leaving the misconfiguration visible rather than silently
-rewritten. Endpoint `custom_path` is rejected for video creation because a
-create-only path does not define safe GET/DELETE resource templates.
+The client-facing path is `/api/v3/contents/generations/tasks`, while the
+provider transport appends the upstream resource suffix
+`/v3/contents/generations/tasks` to the configured API root. For the official Ark
+endpoint, configure `base_url` as `https://ark.cn-beijing.volces.com/api`; the
+resulting upstream URL is `https://ark.cn-beijing.volces.com/api/v3/...`.
+Nothing is inferred or repaired: a base that already ends in `/v3` yields
+`/v3/v3/...` and Ark answers `404`, leaving the misconfiguration visible rather
+than silently rewritten. Endpoint `custom_path` is rejected for video creation
+because a create-only path does not define safe GET/DELETE resource templates.
 
-Clients point their Ark SDK at `https://<aether-host>/v3`. Every task read,
+Clients point their Ark SDK at `https://<aether-host>/api/v3`. Every task read,
 download, delete and list request must carry the caller's Aether API key; the
 gateway uses its resolved user identity to prevent cross-tenant task access.
 Provider-side GET/DELETE requests are separately authenticated with the
@@ -89,7 +92,7 @@ working while preserving failover.
 
 ### Listing
 
-`GET /v3/contents/generations/tasks` is answered from gateway state, not
+`GET /api/v3/contents/generations/tasks` is answered from gateway state, not
 proxied. Proxying would return every task owned by the shared provider key
 across all tenants. Supported query parameters: `page_size`, `page_num`,
 `filter.status` (`queued` / `running` / `succeeded` / `failed` / `cancelled`),
@@ -105,7 +108,7 @@ not replacements for the public model identity.
 
 ### Downloading
 
-`GET /v3/contents/generations/tasks/{id}/content` is an Aether extension, not an
+`GET /api/v3/contents/generations/tasks/{id}/content` is an Aether extension, not an
 Ark route. Ark's `content.video_url` is a signed URL that expires within a day,
 so the extension proxies the bytes for callers that do not want to consume the
 signed URL directly. For native Ark compatibility, a succeeded task's normal

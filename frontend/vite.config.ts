@@ -86,7 +86,7 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
           secure: false,
         },
-        // Doubao (Volcengine Ark) video task surface
+        // Volcengine Ark material-library and other native /v3 surfaces
         '/v3/': {
           target: gatewayTarget,
           changeOrigin: true,

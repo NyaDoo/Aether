@@ -121,7 +121,7 @@ mod tests {
         assert!(service
             .read_response(
                 Some("doubao"),
-                "/v3/contents/generations/tasks/task-cross-1"
+                "/api/v3/contents/generations/tasks/task-cross-1"
             )
             .is_none());
 
@@ -348,11 +348,14 @@ mod tests {
 
         let cancelled_after_unix_secs = crate::current_unix_timestamp_secs();
         service.apply_finalize_mutation(
-            "/v3/contents/generations/tasks/cgt-active",
+            "/api/v3/contents/generations/tasks/cgt-active",
             "doubao_video_delete_sync_finalize",
         );
         let LocalVideoTaskSnapshot::Doubao(cancelled_snapshot) = service
-            .snapshot_for_route(Some("doubao"), "/v3/contents/generations/tasks/cgt-active")
+            .snapshot_for_route(
+                Some("doubao"),
+                "/api/v3/contents/generations/tasks/cgt-active",
+            )
             .expect("cancelled snapshot")
         else {
             panic!("expected Doubao snapshot");
@@ -366,7 +369,10 @@ mod tests {
             Some(cancellation_time)
         );
         let cancelled = service
-            .read_response(Some("doubao"), "/v3/contents/generations/tasks/cgt-active")
+            .read_response(
+                Some("doubao"),
+                "/api/v3/contents/generations/tasks/cgt-active",
+            )
             .expect("cancelled Ark task should remain queryable");
         assert_eq!(cancelled.status_code, 200);
         assert_eq!(cancelled.body_json["status"], "cancelled");
@@ -377,14 +383,14 @@ mod tests {
         terminal.persistence.format_converted = false;
         service.record_snapshot(LocalVideoTaskSnapshot::Doubao(terminal));
         service.apply_finalize_mutation(
-            "/v3/contents/generations/tasks/cgt-terminal",
+            "/api/v3/contents/generations/tasks/cgt-terminal",
             "doubao_video_delete_sync_finalize",
         );
         assert_eq!(
             service
                 .read_response(
                     Some("doubao"),
-                    "/v3/contents/generations/tasks/cgt-terminal",
+                    "/api/v3/contents/generations/tasks/cgt-terminal",
                 )
                 .expect("deleted Ark task response")
                 .status_code,

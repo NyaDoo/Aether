@@ -264,9 +264,10 @@ pub fn build_passthrough_path_url(
 /// Builds an Ark generation-task URL, merging configured and request query layers.
 ///
 /// The configured base URL is appended to verbatim — no API-root segment is
-/// inferred. The client surface is rooted at `/v3` while Ark's own root is
-/// `/api/v3`, so the resource path is composed from the provider base URL rather
-/// than passed through from the request path.
+/// inferred. The client surface is rooted at `/api/v3`, while the configured
+/// provider base normally already contains `/api`; the resource suffix is
+/// therefore composed independently rather than passed through from the
+/// request path.
 pub fn doubao_video_tasks_upstream_url(
     upstream_base_url: &str,
     task_id: Option<&str>,

@@ -163,7 +163,7 @@ mod tests {
         for path in [
             "/v3/asset-library",
             "/v3/asset-library/ListAssets",
-            "/v3/contents/generations/tasks/task-1",
+            "/api/v3/contents/generations/tasks/task-1",
         ] {
             assert!(
                 frontend_path_bypasses_static(path),

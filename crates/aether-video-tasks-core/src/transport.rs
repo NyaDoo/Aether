@@ -40,8 +40,9 @@ pub fn parse_doubao_video_content_variant(query_string: Option<&str>) -> Option<
 /// path to the configured base URL.
 ///
 /// The base URL is used exactly as configured — nothing is inferred or
-/// repaired. The appended path is the same one clients call, so the upstream
-/// URL is always `<base>/v3/contents/generations/tasks[/<id>]`.
+/// repaired. The configured base is the provider API root (normally ending in
+/// `/api`); the upstream resource suffix is `/v3/contents/generations/tasks`,
+/// yielding the official `/api/v3/...` URL for Ark.
 pub fn doubao_video_tasks_url(upstream_base_url: &str, task_id: Option<&str>) -> String {
     let base = upstream_base_url.trim().trim_end_matches('/');
     let (base, query) = base
@@ -49,7 +50,7 @@ pub fn doubao_video_tasks_url(upstream_base_url: &str, task_id: Option<&str>) ->
         .map(|(base, query)| (base.trim_end_matches('/'), Some(query)))
         .unwrap_or((base, None));
 
-    let mut url = format!("{base}{}", crate::DOUBAO_VIDEO_TASKS_PATH);
+    let mut url = format!("{base}{}", crate::DOUBAO_VIDEO_TASKS_UPSTREAM_PATH);
     if let Some(task_id) = task_id.map(str::trim).filter(|value| !value.is_empty()) {
         url.push('/');
         url.push_str(task_id);
@@ -99,7 +100,8 @@ mod tests {
         use super::doubao_video_tasks_url;
 
         // Ark's API root is the provider base; the version segment belongs to
-        // the resource path, matching the client-facing route.
+        // the upstream resource path. The client-facing route includes the
+        // `/api` prefix separately.
         assert_eq!(
             doubao_video_tasks_url("https://ark.cn-beijing.volces.com/api", None),
             "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"

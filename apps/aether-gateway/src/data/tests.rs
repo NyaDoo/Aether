@@ -1180,7 +1180,7 @@ async fn db_only_doubao_get_hides_cancelled_task_after_retention_window() {
     let fresh_response = state
         .read_video_task_response_for_user(
             Some("doubao"),
-            "/v3/contents/generations/tasks/cgt-cancelled-fresh",
+            "/api/v3/contents/generations/tasks/cgt-cancelled-fresh",
             "owner-doubao-cancelled",
         )
         .await
@@ -1193,7 +1193,7 @@ async fn db_only_doubao_get_hides_cancelled_task_after_retention_window() {
     let expired_response = state
         .read_video_task_response_for_user(
             Some("doubao"),
-            "/v3/contents/generations/tasks/cgt-cancelled-expired",
+            "/api/v3/contents/generations/tasks/cgt-cancelled-expired",
             "owner-doubao-cancelled",
         )
         .await

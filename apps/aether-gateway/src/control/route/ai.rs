@@ -126,7 +126,7 @@ pub(super) fn classify_ai_public_route(
             "openai:video",
             true,
         ))
-    } else if normalized_path.starts_with(aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH) {
+    } else if is_doubao_video_task_path(normalized_path) {
         Some(classified(
             "ai_public",
             "doubao",
@@ -205,6 +205,14 @@ pub(super) fn classify_ai_public_route(
     } else {
         None
     }
+}
+
+/// Returns whether a request path belongs to the canonical Doubao task
+/// resource.  Keep the boundary explicit: a path such as
+/// `/api/v3/contents/generations/tasks-evil` is not an Ark task endpoint.
+fn is_doubao_video_task_path(path: &str) -> bool {
+    path.strip_prefix(aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
 fn ark_asset_request_auth_channel(headers: &http::HeaderMap) -> &'static str {
@@ -339,6 +347,42 @@ mod tests {
         assert!(
             classify_ai_public_route(&Method::GET, "/v1/responses", None, &HeaderMap::new())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn classifies_only_the_api_prefixed_doubao_video_surface() {
+        let headers = HeaderMap::new();
+        for method in [Method::POST, Method::GET, Method::DELETE] {
+            let route = classify_ai_public_route(
+                &method,
+                "/api/v3/contents/generations/tasks/task-1",
+                None,
+                &headers,
+            )
+            .expect("API-prefixed Doubao video path should classify");
+            assert_eq!(route.route_family, "doubao");
+            assert_eq!(route.route_kind, "video");
+        }
+        assert!(
+            classify_ai_public_route(
+                &Method::POST,
+                "/v3/contents/generations/tasks",
+                None,
+                &headers,
+            )
+            .is_none(),
+            "the legacy unprefixed Doubao video path must not classify"
+        );
+        assert!(
+            classify_ai_public_route(
+                &Method::POST,
+                "/api/v3/contents/generations/tasks-evil",
+                None,
+                &headers,
+            )
+            .is_none(),
+            "a path without a resource boundary must not classify"
         );
     }
 }

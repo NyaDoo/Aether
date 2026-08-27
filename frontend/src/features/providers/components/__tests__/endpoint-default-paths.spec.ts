@@ -17,9 +17,18 @@ const apiFormats = [
   { value: 'jina:embedding', default_path: '/v1/embeddings' },
   { value: 'jina:rerank', default_path: '/v1/rerank' },
   { value: 'claude:messages', default_path: '/v1/messages' },
+  { value: 'doubao:video', default_path: '/api/v3/contents/generations/tasks' },
 ]
 
 describe('endpoint default paths', () => {
+  it('uses the official /api/v3 client path for Doubao video', () => {
+    expect(getDefaultEndpointPath({
+      apiFormat: 'doubao:video',
+      providerType: 'doubao',
+      apiFormats,
+    })).toBe('/api/v3/contents/generations/tasks')
+  })
+
   it('uses Gemini Developer API resource paths for custom Gemini endpoints', () => {
     expect(getDefaultEndpointPath({
       apiFormat: 'gemini:generate_content',

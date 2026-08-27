@@ -863,7 +863,7 @@ const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
     AdminApiFormatDefinition {
         value: "doubao:video",
         label: "Doubao Video",
-        default_path: "/v3/contents/generations/tasks",
+        default_path: "/api/v3/contents/generations/tasks",
         aliases: &["doubao_video", "seedance", "ark_video"],
     },
     AdminApiFormatDefinition {

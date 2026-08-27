@@ -48,7 +48,7 @@ pub(crate) fn frontdoor_self_loop_public_ai_path(path: &str) -> bool {
             | "/v1/videos"
             | aether_video_tasks_core::DOUBAO_VIDEO_TASKS_PATH
     ) || path.starts_with("/v1/videos/")
-        || path.starts_with("/v3/contents/generations/tasks/")
+        || path.starts_with("/api/v3/contents/generations/tasks/")
         || path == "/v3/asset-library"
         || path.starts_with("/v3/asset-library/")
         || path.starts_with("/v1beta/files/")
@@ -160,7 +160,9 @@ fn is_loopbackish_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::gateway_frontdoor_self_loop_guard_matches_with_port;
+    use super::{
+        frontdoor_self_loop_public_ai_path, gateway_frontdoor_self_loop_guard_matches_with_port,
+    };
 
     #[test]
     fn rejects_asset_library_targets_that_resolve_to_the_frontdoor() {
@@ -184,6 +186,19 @@ mod tests {
         assert!(!gateway_frontdoor_self_loop_guard_matches_with_port(
             8084,
             "http://127.0.0.1:8084/"
+        ));
+    }
+
+    #[test]
+    fn recognizes_only_api_prefixed_doubao_video_paths() {
+        assert!(frontdoor_self_loop_public_ai_path(
+            "/api/v3/contents/generations/tasks"
+        ));
+        assert!(frontdoor_self_loop_public_ai_path(
+            "/api/v3/contents/generations/tasks/task-1"
+        ));
+        assert!(!frontdoor_self_loop_public_ai_path(
+            "/v3/contents/generations/tasks/task-1"
         ));
     }
 }

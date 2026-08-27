@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn get_proof_cannot_be_replayed_as_delete() {
-        let uri = "/v3/contents/generations/tasks/task-1".parse().unwrap();
+        let uri = "/api/v3/contents/generations/tasks/task-1".parse().unwrap();
         let headers = signed_headers(&Method::GET, &uri);
 
         assert!(!verify_trusted_auth_forward_headers(
@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn valid_nonce_is_admitted_only_once_at_request_boundary() {
-        let uri = "/v3/contents/generations/tasks/task-replay"
+        let uri = "/api/v3/contents/generations/tasks/task-replay"
             .parse()
             .unwrap();
         let headers = signed_headers(&Method::GET, &uri);

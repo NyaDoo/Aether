@@ -43,6 +43,7 @@ pub use path::{
     generate_local_short_id, local_status_from_stored, resolve_local_video_registry_mutation,
     resolve_video_task_hydration_lookup_key, resolve_video_task_read_lookup_key,
     resolve_video_task_report_lookup, VideoTaskReportLookup, DOUBAO_VIDEO_TASKS_PATH,
+    DOUBAO_VIDEO_TASKS_UPSTREAM_PATH,
 };
 pub use read_side::{
     read_data_backed_video_task_response, read_data_backed_video_task_response_for_user,

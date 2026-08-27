@@ -68,6 +68,32 @@ fn classifies_ark_asset_library_routes_and_buffers_action_bodies() {
 }
 
 #[test]
+fn classifies_doubao_video_only_on_the_official_api_v3_path() {
+    let headers = headers(&[("authorization", "Bearer sk-test")]);
+    let canonical: Uri = "/api/v3/contents/generations/tasks"
+        .parse()
+        .expect("uri should parse");
+    let decision = classify_control_route(&http::Method::POST, &canonical, &headers)
+        .expect("canonical Doubao video route should classify");
+    assert_eq!(decision.route_class.as_deref(), Some("ai_public"));
+    assert_eq!(decision.route_family.as_deref(), Some("doubao"));
+    assert_eq!(decision.route_kind.as_deref(), Some("video"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("doubao:video")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+
+    let legacy: Uri = "/v3/contents/generations/tasks"
+        .parse()
+        .expect("uri should parse");
+    assert!(
+        classify_control_route(&http::Method::POST, &legacy, &headers).is_none(),
+        "legacy Doubao video path must not be classified"
+    );
+}
+
+#[test]
 fn classifies_claude_count_tokens_as_execution_runtime_operation() {
     let headers = headers(&[("x-api-key", "sk-test")]);
     let uri: Uri = "/v1/messages/count_tokens"

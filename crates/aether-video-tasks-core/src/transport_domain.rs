@@ -68,11 +68,11 @@ fn trim_openai_video_resource_root(url: &str) -> Option<String> {
 /// Recovers the provider base URL from an Ark task URL.
 ///
 /// This is the inverse of [`crate::doubao_video_tasks_url`]: it must strip the
-/// exact path that builder appends, including the version segment. Stripping
-/// less would re-add `/v3` on every follow-up request and produce `/v3/v3/...`.
+/// exact upstream resource suffix that the builder appends. Stripping less
+/// would re-add `/v3` on every follow-up request and produce `/v3/v3/...`.
 fn trim_doubao_video_resource_root(url: &str) -> Option<String> {
     let base = url.split_once('?').map(|(base, _)| base).unwrap_or(url);
-    let (root, suffix) = base.rsplit_once(crate::DOUBAO_VIDEO_TASKS_PATH)?;
+    let (root, suffix) = base.rsplit_once(crate::DOUBAO_VIDEO_TASKS_UPSTREAM_PATH)?;
     if !suffix.is_empty() && !suffix.starts_with('/') {
         return None;
     }

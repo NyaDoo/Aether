@@ -2411,7 +2411,7 @@ async fn gateway_creates_then_reads_native_doubao_video_task_through_public_rout
     let client = reqwest::Client::new();
 
     let create_response = client
-        .post(format!("{gateway_url}/v3/contents/generations/tasks"))
+        .post(format!("{gateway_url}/api/v3/contents/generations/tasks"))
         .bearer_auth("sk-doubao-public-e2e")
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(
@@ -2447,7 +2447,7 @@ async fn gateway_creates_then_reads_native_doubao_video_task_through_public_rout
 
     let detail_response = client
         .get(format!(
-            "{gateway_url}/v3/contents/generations/tasks/{local_task_id}"
+            "{gateway_url}/api/v3/contents/generations/tasks/{local_task_id}"
         ))
         .bearer_auth("sk-doubao-public-e2e")
         .send()
@@ -2474,17 +2474,19 @@ async fn gateway_creates_then_reads_native_doubao_video_task_through_public_rout
         "create and detail should each execute once"
     );
     assert_eq!(seen_requests[0].method, "POST");
-    assert!(seen_requests[0]
-        .url
-        .ends_with("/v3/contents/generations/tasks"));
+    assert_eq!(
+        seen_requests[0].url,
+        "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+    );
     assert_eq!(
         seen_requests[0].model.as_deref(),
         Some("doubao-seedance-2-0-260128")
     );
     assert_eq!(seen_requests[1].method, "GET");
-    assert!(seen_requests[1]
-        .url
-        .ends_with("/v3/contents/generations/tasks/cgt-upstream-public-e2e"));
+    assert_eq!(
+        seen_requests[1].url,
+        "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-upstream-public-e2e"
+    );
     assert!(seen_requests
         .iter()
         .all(|request| request.authorization == "Bearer sk-upstream-doubao-public-e2e"));
@@ -2570,7 +2572,7 @@ async fn gateway_doubao_task_list_total_counts_all_matching_pages() {
 
     let response = reqwest::Client::new()
         .get(format!(
-            "{gateway_url}/v3/contents/generations/tasks?page_size=1&page_num=2"
+            "{gateway_url}/api/v3/contents/generations/tasks?page_size=1&page_num=2"
         ))
         .bearer_auth("sk-doubao-task-list")
         .send()
@@ -2596,7 +2598,7 @@ async fn gateway_doubao_task_list_total_counts_all_matching_pages() {
     ] {
         let response = reqwest::Client::new()
             .get(format!(
-                "{gateway_url}/v3/contents/generations/tasks?page_size=10&filter.status={filter}"
+                "{gateway_url}/api/v3/contents/generations/tasks?page_size=10&filter.status={filter}"
             ))
             .bearer_auth("sk-doubao-task-list")
             .send()
@@ -2616,7 +2618,7 @@ async fn gateway_doubao_task_list_total_counts_all_matching_pages() {
 
     let response = reqwest::Client::new()
         .get(format!(
-            "{gateway_url}/v3/contents/generations/tasks?filter.task_ids=task-openai-via-doubao-list-hidden"
+            "{gateway_url}/api/v3/contents/generations/tasks?filter.task_ids=task-openai-via-doubao-list-hidden"
         ))
         .bearer_auth("sk-doubao-task-list")
         .send()

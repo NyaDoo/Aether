@@ -487,7 +487,7 @@ mod tests {
         let extracted = extract_request_credentials(
             &headers,
             &http::Method::POST,
-            &uri("/v3/contents/generations/tasks"),
+            &uri("/api/v3/contents/generations/tasks"),
             "doubao:video",
         );
 
@@ -501,7 +501,7 @@ mod tests {
         assert!(build_auth_context_cache_key(
             &headers,
             &http::Method::POST,
-            &uri("/v3/contents/generations/tasks"),
+            &uri("/api/v3/contents/generations/tasks"),
             "doubao:video"
         )
         .is_some());

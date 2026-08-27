@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn native_doubao_video_error_keeps_provider_body_unchanged() {
         let decision = GatewayControlDecision::synthetic(
-            "/v1/contents/generations/tasks",
+            "/api/v3/contents/generations/tasks",
             Some("ai_public".to_string()),
             Some("doubao".to_string()),
             Some("video".to_string()),

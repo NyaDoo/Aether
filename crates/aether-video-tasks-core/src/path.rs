@@ -66,7 +66,18 @@ pub fn extract_gemini_short_id_from_cancel_path(path: &str) -> Option<&str> {
 }
 
 /// Client-facing root of the Doubao (Volcengine Ark) generation task surface.
-pub const DOUBAO_VIDEO_TASKS_PATH: &str = "/v3/contents/generations/tasks";
+///
+/// Ark exposes the content-generation API below `/api/v3`.  This is the path
+/// that Aether clients call; keep it separate from the resource suffix used
+/// when composing provider URLs (see [`DOUBAO_VIDEO_TASKS_UPSTREAM_PATH`]).
+pub const DOUBAO_VIDEO_TASKS_PATH: &str = "/api/v3/contents/generations/tasks";
+
+/// Resource path appended to a configured Ark API root when calling upstream.
+///
+/// A provider endpoint is configured with its API root (normally ending in
+/// `/api`), so appending this suffix produces the official upstream URL:
+/// `<base>/api/v3/contents/generations/tasks`.
+pub const DOUBAO_VIDEO_TASKS_UPSTREAM_PATH: &str = "/v3/contents/generations/tasks";
 
 pub fn extract_doubao_task_id_from_path(path: &str) -> Option<&str> {
     let path = path.trim_end_matches('/');
@@ -439,38 +450,43 @@ mod tests {
         use super::{extract_doubao_task_id_from_content_path, extract_doubao_task_id_from_path};
 
         assert_eq!(
-            extract_doubao_task_id_from_path("/v3/contents/generations/tasks/cgt-123"),
+            extract_doubao_task_id_from_path("/api/v3/contents/generations/tasks/cgt-123"),
             Some("cgt-123")
         );
         assert_eq!(
             extract_doubao_task_id_from_content_path(
-                "/v3/contents/generations/tasks/cgt-123/content"
+                "/api/v3/contents/generations/tasks/cgt-123/content"
             ),
             Some("cgt-123")
         );
         assert_eq!(
             extract_doubao_task_id_from_content_path(
-                "/v3/contents/generations/tasks/cgt-123/content/"
+                "/api/v3/contents/generations/tasks/cgt-123/content/"
             ),
             Some("cgt-123")
         );
         // The collection root carries no task id.
         assert_eq!(
-            extract_doubao_task_id_from_path("/v3/contents/generations/tasks"),
+            extract_doubao_task_id_from_path("/api/v3/contents/generations/tasks"),
             None
         );
         // A sub-resource is not a task-level path.
         assert_eq!(
-            extract_doubao_task_id_from_path("/v3/contents/generations/tasks/cgt-123/content"),
+            extract_doubao_task_id_from_path("/api/v3/contents/generations/tasks/cgt-123/content"),
             None
         );
         assert_eq!(
-            extract_doubao_task_id_from_content_path("/v3/contents/generations/tasks/cgt-123"),
+            extract_doubao_task_id_from_content_path("/api/v3/contents/generations/tasks/cgt-123"),
             None
         );
         // Other surfaces must not be mistaken for Doubao paths.
         assert_eq!(
             extract_doubao_task_id_from_path("/v1/videos/task_123"),
+            None
+        );
+        // The pre-API-prefix route is not a supported Doubao video surface.
+        assert_eq!(
+            extract_doubao_task_id_from_path("/v3/contents/generations/tasks/cgt-123"),
             None
         );
     }
@@ -485,21 +501,21 @@ mod tests {
         assert_eq!(
             resolve_video_task_read_lookup_key(
                 Some("doubao"),
-                "/v3/contents/generations/tasks/cgt-123"
+                "/api/v3/contents/generations/tasks/cgt-123"
             ),
             Some(VideoTaskLookupKey::Id("cgt-123"))
         );
         assert_eq!(
             resolve_video_task_hydration_lookup_key(
                 Some("doubao"),
-                "/v3/contents/generations/tasks/cgt-123/content"
+                "/api/v3/contents/generations/tasks/cgt-123/content"
             ),
             Some(VideoTaskLookupKey::Id("cgt-123"))
         );
         assert_eq!(
             resolve_local_video_registry_mutation(
                 VideoTaskTruthSourceMode::RustAuthoritative,
-                "/v3/contents/generations/tasks/cgt-123",
+                "/api/v3/contents/generations/tasks/cgt-123",
                 "doubao_video_delete_sync_finalize",
             ),
             Some(LocalVideoTaskRegistryMutation::DoubaoDeleted {
@@ -516,7 +532,7 @@ mod tests {
                 "doubao:video",
                 Some(&json!({"task_id": "cgt-123"})),
             ),
-            Some("/v3/contents/generations/tasks/cgt-123".to_string())
+            Some("/api/v3/contents/generations/tasks/cgt-123".to_string())
         );
     }
 
