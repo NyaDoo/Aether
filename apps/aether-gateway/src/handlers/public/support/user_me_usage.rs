@@ -500,6 +500,7 @@ fn build_users_me_usage_record_payload(
         "status_code": item.status_code,
         "error_message": item.error_message,
         "request_type": item.request_type,
+        "operation": item.operation(),
         "input_price_per_1m": input_price_per_1m,
         "output_price_per_1m": output_price_per_1m,
         "cache_creation_price_per_1m": cache_creation_price_per_1m,
@@ -548,6 +549,7 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "outcome_class": item.outcome_class().as_str(),
         "sla_eligible": item.sla_eligible(),
         "request_type": item.request_type,
+        "operation": item.operation(),
         "input_tokens": item.input_tokens,
         "effective_input_tokens": users_me_usage_effective_input_tokens(item),
         "output_tokens": item.output_tokens,
@@ -1765,6 +1767,38 @@ mod tests {
             assert_eq!(payload["end_to_end_time_ms"], 10_626);
             assert_eq!(payload["end_to_end_first_byte_time_ms"], 10_120);
         }
+    }
+
+    #[test]
+    fn user_usage_payloads_project_canonical_operation() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "operation": "video.delete"
+            })),
+            ..sample_usage("completed")
+        };
+
+        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record["operation"], "video.delete");
+        assert_eq!(active["operation"], "video.delete");
+    }
+
+    #[test]
+    fn user_usage_payloads_map_legacy_asset_action_to_canonical_operation() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "asset_action": "ListAssets"
+            })),
+            ..sample_usage("completed")
+        };
+
+        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item);
+
+        assert_eq!(record["operation"], "asset_library.list_assets");
+        assert_eq!(active["operation"], "asset_library.list_assets");
     }
 
     #[test]

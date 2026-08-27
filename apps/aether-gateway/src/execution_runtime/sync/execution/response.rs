@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use aether_contracts::ExecutionPlan;
 use axum::body::Body;
 use axum::http::header::HeaderValue;
-use axum::http::Response;
+use axum::http::{HeaderMap, Response};
 use serde_json::json;
 
 use crate::api::response::{
@@ -123,18 +123,36 @@ fn build_local_video_success_response(
     trace_id: &str,
     decision: &GatewayControlDecision,
     body_json: &serde_json::Value,
-) -> Result<Response<Body>, GatewayError> {
+) -> Result<(Response<Body>, serde_json::Value), GatewayError> {
     let body_bytes =
         serde_json::to_vec(body_json).map_err(|err| GatewayError::Internal(err.to_string()))?;
     let mut headers = BTreeMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("content-length".to_string(), body_bytes.len().to_string());
-    build_client_response_from_parts(
+    let response = build_client_response_from_parts(
         http::StatusCode::OK.as_u16(),
         &headers,
         Body::from(body_bytes),
         trace_id,
         Some(decision),
+    )?;
+    let captured_headers = capture_response_headers(response.headers());
+    Ok((response, captured_headers))
+}
+
+fn capture_response_headers(headers: &HeaderMap) -> serde_json::Value {
+    serde_json::Value::Object(
+        headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| {
+                    (
+                        name.as_str().to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    )
+                })
+            })
+            .collect(),
     )
 }
 
@@ -172,7 +190,12 @@ pub(crate) fn maybe_build_local_video_success_outcome(
     plan.apply_to_report_context(&mut report_context);
     let client_body_json = plan.client_body_json();
 
-    let response = build_local_video_success_response(trace_id, decision, &client_body_json)?;
+    let (response, client_response_headers) =
+        build_local_video_success_response(trace_id, decision, &client_body_json)?;
+    report_context.insert(
+        "client_response_headers".to_string(),
+        client_response_headers,
+    );
     let original_report_context = payload.report_context.take();
     payload.report_kind = plan.success_report_kind().to_string();
     payload.report_context = Some(serde_json::Value::Object(report_context));
@@ -193,7 +216,7 @@ pub(crate) fn maybe_build_local_video_success_outcome(
 pub(crate) fn maybe_build_local_sync_finalize_response(
     trace_id: &str,
     decision: &GatewayControlDecision,
-    payload: &GatewaySyncReportRequest,
+    payload: &mut GatewaySyncReportRequest,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let Some(read_response) = build_local_sync_finalize_read_response(
         payload.report_kind.as_str(),
@@ -209,13 +232,23 @@ pub(crate) fn maybe_build_local_sync_finalize_response(
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("content-length".to_string(), body_bytes.len().to_string());
 
-    Ok(Some(build_client_response_from_parts(
+    let response = build_client_response_from_parts(
         read_response.status_code,
         &headers,
         Body::from(body_bytes),
         trace_id,
         Some(decision),
-    )?))
+    )?;
+    let client_response_headers = capture_response_headers(response.headers());
+    let mut report_context = cloned_report_context_object(payload);
+    report_context.insert(
+        "client_response_headers".to_string(),
+        client_response_headers,
+    );
+    payload.report_context = Some(serde_json::Value::Object(report_context));
+    payload.client_body_json = Some(read_response.body_json);
+
+    Ok(Some(response))
 }
 
 pub(crate) fn maybe_build_local_video_error_response(
@@ -269,6 +302,107 @@ mod tests {
 
     use axum::body::to_bytes;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn local_video_success_response_returns_the_headers_written_to_the_client() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/videos",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("video".to_string()),
+            Some("openai:video".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let body = json!({"id": "video-task-1", "status": "queued"});
+
+        let (response, captured_headers) =
+            build_local_video_success_response("trace-success", &decision, &body)
+                .expect("local video success response should build");
+
+        assert_eq!(
+            captured_headers["content-type"],
+            serde_json::Value::String("application/json".to_string())
+        );
+        assert_eq!(
+            captured_headers["content-length"],
+            serde_json::Value::String(
+                serde_json::to_vec(&body)
+                    .expect("body should serialize")
+                    .len()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            captured_headers["content-type"].as_str()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            captured_headers["content-length"].as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_video_finalize_records_projected_client_body_and_headers() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/videos/task-1/cancel",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("video".to_string()),
+            Some("openai:video".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let mut payload = GatewaySyncReportRequest {
+            trace_id: "trace-cancel".to_string(),
+            report_kind: "openai_video_cancel_sync_finalize".to_string(),
+            report_context: Some(json!({"task_id": "task-1"})),
+            status_code: 200,
+            headers: BTreeMap::from([(
+                "x-provider-request-id".to_string(),
+                "upstream-1".to_string(),
+            )]),
+            body_json: Some(json!({"provider_status": "cancelled"})),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        let response =
+            maybe_build_local_sync_finalize_response("trace-cancel", &decision, &mut payload)
+                .expect("cancel response should build")
+                .expect("cancel finalize should be handled");
+
+        assert_eq!(payload.client_body_json, Some(json!({})));
+        let captured_headers = payload
+            .report_context
+            .as_ref()
+            .and_then(|context| context.get("client_response_headers"))
+            .expect("client response headers should be captured");
+        assert_eq!(
+            captured_headers["content-type"].as_str(),
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+        );
+        assert_eq!(
+            captured_headers["content-length"].as_str(),
+            response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+        );
+        assert_eq!(
+            payload.body_json,
+            Some(json!({"provider_status": "cancelled"}))
+        );
+    }
 
     #[tokio::test]
     async fn local_video_error_response_rewrites_headers_without_mutating_payload() {

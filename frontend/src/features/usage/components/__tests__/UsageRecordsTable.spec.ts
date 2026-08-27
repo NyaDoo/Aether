@@ -179,6 +179,17 @@ afterEach(() => {
 })
 
 describe('UsageRecordsTable', () => {
+  it('shows a canonical video operation without replacing the lifecycle badge', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      operation: 'video.cancel',
+    })])
+
+    const operationBadges = root.querySelectorAll<HTMLElement>('[data-usage-operation="video.cancel"]')
+    expect(operationBadges.length).toBeGreaterThan(0)
+    expect([...operationBadges].every(element => element.textContent?.trim() === '取消视频')).toBe(true)
+    expect(root.textContent).toContain('流式')
+  })
+
   it('shows output TPS after the request completes', () => {
     const root = mountUsageRecordsTable([buildRecord()])
 

@@ -55,6 +55,7 @@ export interface UsageRecordDetail {
   id: string
   provider?: string // 仅管理员可见
   model: string
+  operation?: string | null
   request_type?: string | null
   requested_reasoning_effort?: string | null
   reasoning_effort?: string | null
@@ -407,6 +408,7 @@ export const meApi = {
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       target_model?: string | null
+      operation?: string | null
       request_type?: string | null
       requested_reasoning_effort?: string | null
       reasoning_effort?: string | null

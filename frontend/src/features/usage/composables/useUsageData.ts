@@ -694,6 +694,11 @@ export function useUsageData(options: UseUsageDataOptions) {
               ? record.target_model
               : null)
           : existing.target_model,
+        // Operation identifies the client action and must survive a sparse refresh.
+        operation:
+          typeof record.operation === 'string' && record.operation.trim()
+            ? record.operation
+            : existing.operation,
         // Request type is client-request identity, not a provider-candidate fact. Preserve a
         // known compact operation when a later sparse snapshot omits it.
         request_type:

@@ -1165,7 +1165,7 @@ impl UsageWriteRepository for MysqlUsageWriteRepository {
     ) -> Result<StoredRequestUsageAudit, DataLayerError> {
         let mut usage = strip_deprecated_usage_display_fields(usage);
         usage.validate()?;
-        let prepared_capture = http_capture::prepare_usage_http_capture(&mut usage)?;
+        let mut prepared_capture = http_capture::prepare_usage_http_capture(&mut usage)?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
         let existing = counters::lock_and_load_usage(&mut tx, &usage.request_id).await?;
         let attempts_terminal_failure_recovery = existing.as_ref().is_some_and(|existing| {
@@ -1214,6 +1214,16 @@ impl UsageWriteRepository for MysqlUsageWriteRepository {
 
         let capture_update_allowed = recovers_terminal_failure
             || http_capture::capture_update_allowed(existing.as_ref(), &usage.status);
+        let response_enrichment_allowed = !capture_update_allowed
+            && http_capture::deferred_video_response_enrichment_allowed(
+                existing
+                    .as_ref()
+                    .map(|stored| (stored.status.as_str(), stored.billing_status.as_str())),
+                &usage,
+            );
+        if response_enrichment_allowed {
+            prepared_capture.retain_response_enrichment_only();
+        }
         if capture_update_allowed {
             http_capture::apply_previous_metadata_tombstones(&mut usage, existing.as_ref());
         }
@@ -1224,9 +1234,11 @@ impl UsageWriteRepository for MysqlUsageWriteRepository {
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
-        if capture_update_allowed {
+        if capture_update_allowed || response_enrichment_allowed {
             http_capture::sync_usage_http_capture(&mut tx, &usage.request_id, &prepared_capture)
                 .await?;
+        }
+        if capture_update_allowed {
             let (routing_snapshot, settlement_snapshot) = prepared_snapshots
                 .as_ref()
                 .expect("capture-allowed usage has prepared snapshots");

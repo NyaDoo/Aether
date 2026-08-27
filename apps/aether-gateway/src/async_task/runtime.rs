@@ -787,6 +787,12 @@ fn build_video_task_billing_dimensions(task: &StoredVideoTask) -> Value {
         Some(Value::Object(object)) => object,
         _ => Map::new(),
     };
+    let persisted_operation = metadata
+        .get("operation")
+        .and_then(Value::as_str)
+        .and_then(aether_data_contracts::repository::usage::normalize_usage_operation)
+        .filter(|operation| matches!(*operation, "video.create" | "video.remix"));
+    let mut operation = persisted_operation.unwrap_or("video.create");
     let mut dimensions = match metadata.get("dimensions") {
         Some(Value::Object(object)) => object.clone(),
         _ => Map::new(),
@@ -839,12 +845,17 @@ fn build_video_task_billing_dimensions(task: &StoredVideoTask) -> Value {
     }
     if let Some(snapshot) = LocalVideoTaskSnapshot::from_stored_task(task) {
         let persistence = match &snapshot {
-            LocalVideoTaskSnapshot::OpenAi(seed) => (
-                seed.persistence.global_model_name.clone(),
-                seed.persistence.mapped_model.clone(),
-                seed.persistence.model_id.clone(),
-                seed.persistence.global_model_id.clone(),
-            ),
+            LocalVideoTaskSnapshot::OpenAi(seed) => {
+                if persisted_operation.is_none() && seed.remixed_from_video_id.is_some() {
+                    operation = "video.remix";
+                }
+                (
+                    seed.persistence.global_model_name.clone(),
+                    seed.persistence.mapped_model.clone(),
+                    seed.persistence.model_id.clone(),
+                    seed.persistence.global_model_id.clone(),
+                )
+            }
             LocalVideoTaskSnapshot::Gemini(seed) => (
                 seed.persistence.global_model_name.clone(),
                 seed.persistence.mapped_model.clone(),
@@ -889,6 +900,10 @@ fn build_video_task_billing_dimensions(task: &StoredVideoTask) -> Value {
         }
     }
 
+    metadata.insert(
+        "operation".to_string(),
+        Value::String(operation.to_string()),
+    );
     metadata.insert("dimensions".to_string(), Value::Object(dimensions));
     Value::Object(metadata)
 }
@@ -1601,8 +1616,37 @@ mod tests {
         assert_eq!(dimensions.get("video_resolution"), Some(&json!("720p")));
         assert_eq!(dimensions.get("video_duration_seconds"), Some(&json!(5)));
         assert_eq!(dimensions.get("video_has_video_input"), Some(&json!(true)));
+        assert_eq!(metadata.get("operation"), Some(&json!("video.create")));
         // Existing metadata must survive the merge.
         assert!(metadata.get("rust_local_snapshot").is_some());
+    }
+
+    #[test]
+    fn terminal_remix_task_keeps_remix_operation_when_lifecycle_is_cancelled() {
+        let mut task = sample_sparse_stored_task();
+        let mut snapshot = LocalVideoTaskSnapshot::from_stored_task(&task)
+            .expect("sample task should contain a local snapshot");
+        let LocalVideoTaskSnapshot::OpenAi(seed) = &mut snapshot else {
+            panic!("sample task should contain an OpenAI snapshot");
+        };
+        seed.remixed_from_video_id = Some("source-video-1".to_string());
+        task.request_metadata = Some(json!({
+            "rust_local_snapshot": snapshot.redacted_for_persistence()
+        }));
+        task.status = VideoTaskStatus::Cancelled;
+
+        let event = build_video_task_terminal_usage_event(&task)
+            .expect("cancelled remix task should produce a terminal event");
+
+        assert_eq!(event.event_type, crate::usage::UsageEventType::Cancelled);
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("operation")),
+            Some(&json!("video.remix"))
+        );
     }
 
     #[test]

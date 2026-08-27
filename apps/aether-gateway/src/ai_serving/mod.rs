@@ -231,7 +231,7 @@ pub(crate) fn generic_decision_missing_exact_provider_request(
 pub(crate) fn maybe_build_local_sync_finalize_response(
     trace_id: &str,
     decision: &GatewayControlDecision,
-    payload: &GatewaySyncReportRequest,
+    payload: &mut GatewaySyncReportRequest,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     crate::execution_runtime::maybe_build_local_sync_finalize_response(trace_id, decision, payload)
 }

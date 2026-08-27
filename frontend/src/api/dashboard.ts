@@ -246,6 +246,7 @@ export interface RequestDetail {
   endpoint_api_format?: string
   has_format_conversion?: boolean | null
   model: string
+  operation?: string | null
   target_model?: string | null  // 映射后的目标模型名
   requested_reasoning_effort?: string | null
   reasoning_effort?: string | null

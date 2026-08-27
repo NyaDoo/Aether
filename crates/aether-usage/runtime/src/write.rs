@@ -186,6 +186,8 @@ pub struct TerminalUsageSeed {
     /// zero, because the usage upsert only accepts token and cost updates while
     /// `billing_status = 'pending'`.
     pub defer_settlement: bool,
+    /// Marks a successful control operation as auditable but explicitly non-billable.
+    pub billing_treat_as_void: bool,
     pub client_contract: String,
     pub provider_contract: String,
     pub request_id: String,
@@ -685,6 +687,7 @@ fn build_terminal_usage_event_from_seed_impl(
         audit_payload,
         standardized_usage,
         billing_treat_as_completed,
+        billing_treat_as_void,
     } = seed;
     let event_type = match terminal_state {
         // A deferred submission stays pending so the terminal poll can still
@@ -782,6 +785,11 @@ fn build_terminal_usage_event_from_seed_impl(
         local_execution_runtime_miss_reason: routing.local_execution_runtime_miss_reason,
         request_metadata,
         billing_treat_as_completed: if billing_treat_as_completed {
+            Some(true)
+        } else {
+            None
+        },
+        billing_treat_as_void: if billing_treat_as_void {
             Some(true)
         } else {
             None
@@ -1056,6 +1064,8 @@ pub fn build_sync_terminal_usage_seed(
         status_code,
         provider_response_full.as_ref(),
     );
+    let billing_treat_as_void = terminal_state == UsageTerminalState::Completed
+        && sync_report_is_non_billable_video_control_operation(report_kind.as_str());
     let request_metadata = refresh_provider_response_body_metadata(
         context_seed.request_metadata,
         provider_response_full.as_ref(),
@@ -1063,6 +1073,7 @@ pub fn build_sync_terminal_usage_seed(
 
     TerminalUsageSeed {
         defer_settlement: report_kind_defers_settlement(report_kind.as_str()),
+        billing_treat_as_void,
         terminal_state,
         client_contract: context_seed.client_contract,
         provider_contract: context_seed.provider_contract,
@@ -1250,6 +1261,7 @@ pub fn build_stream_terminal_usage_seed(
 
     TerminalUsageSeed {
         defer_settlement: false,
+        billing_treat_as_void: false,
         terminal_state,
         client_contract: context_seed.client_contract,
         provider_contract: context_seed.provider_contract,
@@ -1298,11 +1310,14 @@ pub fn build_stream_terminal_usage_seed(
 }
 
 fn infer_sync_terminal_state(
-    report_kind: &str,
+    _report_kind: &str,
     status_code: u16,
     provider_response: Option<&Value>,
 ) -> UsageTerminalState {
-    if status_code == 499 || report_kind.contains("cancel") {
+    // A successful sync cancel call completed its own HTTP operation. The video task that it
+    // targets is cancelled separately by the async-task terminal event; conflating the two makes
+    // a successful cancellation command look like a client-disconnected request in usage.
+    if status_code == 499 {
         UsageTerminalState::Cancelled
     } else if !(200..300).contains(&status_code)
         || provider_response
@@ -1334,6 +1349,22 @@ fn report_kind_defers_settlement(report_kind: &str) -> bool {
             | "gemini_video_create_sync_finalize"
             | "doubao_video_create_sync_success"
             | "doubao_video_create_sync_finalize"
+    )
+}
+
+fn sync_report_is_non_billable_video_control_operation(report_kind: &str) -> bool {
+    matches!(
+        report_kind,
+        "openai_video_delete_sync_success"
+            | "openai_video_delete_sync_finalize"
+            | "openai_video_cancel_sync_success"
+            | "openai_video_cancel_sync_finalize"
+            | "gemini_video_cancel_sync_success"
+            | "gemini_video_cancel_sync_finalize"
+            | "doubao_video_delete_sync_success"
+            | "doubao_video_delete_sync_finalize"
+            | "doubao_video_cancel_sync_success"
+            | "doubao_video_cancel_sync_finalize"
     )
 }
 
@@ -2573,6 +2604,7 @@ fn infer_request_type(api_format: Option<&str>) -> String {
     match infer_endpoint_kind(api_format.unwrap_or_default()) {
         Some("video") => "video".to_string(),
         Some("image") => "image".to_string(),
+        Some("asset_library") => "asset_library".to_string(),
         _ => "chat".to_string(),
     }
 }
@@ -6594,6 +6626,7 @@ mod tests {
         let event = build_terminal_usage_event_from_seed(TerminalUsageSeed {
             terminal_state: UsageTerminalState::Completed,
             defer_settlement: false,
+            billing_treat_as_void: false,
             client_contract: "openai:chat".to_string(),
             provider_contract: "openai:chat".to_string(),
             request_id: "req-manual-seed-1".to_string(),
@@ -7082,8 +7115,17 @@ mod tests {
 
 #[cfg(test)]
 mod deferred_settlement_tests {
-    use super::{report_kind_defers_settlement, UsageTerminalState};
+    use super::{
+        build_sync_terminal_usage_seed, build_terminal_usage_event_from_seed, infer_request_type,
+        infer_sync_terminal_state, report_kind_defers_settlement,
+        sync_report_is_non_billable_video_control_operation, SyncTerminalUsagePayloadSeed,
+        TerminalUsageContextSeed, UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed,
+        UsageTerminalState,
+    };
+    use crate::record::build_upsert_usage_record_from_event;
     use crate::UsageEventType;
+    use aether_data_contracts::repository::usage::UsageBodyCaptureState;
+    use serde_json::json;
 
     #[test]
     fn video_create_reports_defer_settlement() {
@@ -7099,6 +7141,14 @@ mod deferred_settlement_tests {
                 "{report_kind} only submits a job; its cost is unknown until it finishes"
             );
         }
+    }
+
+    #[test]
+    fn asset_library_contract_keeps_its_request_type() {
+        assert_eq!(
+            infer_request_type(Some("doubao:asset_library")),
+            "asset_library"
+        );
     }
 
     #[test]
@@ -7154,6 +7204,94 @@ mod deferred_settlement_tests {
         assert_eq!(
             event_type_for(UsageTerminalState::Cancelled, true),
             UsageEventType::Cancelled
+        );
+    }
+
+    #[test]
+    fn successful_sync_cancel_reports_the_command_as_completed() {
+        for report_kind in [
+            "doubao_video_cancel_sync_success",
+            "openai_video_cancel_sync_success",
+            "gemini_video_cancel_sync_success",
+        ] {
+            assert_eq!(
+                infer_sync_terminal_state(report_kind, 200, Some(&json!({"status": "cancelled"}))),
+                UsageTerminalState::Completed,
+                "{report_kind} completed the cancel command; the target task owns cancelled state"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_video_control_operation_is_completed_and_billing_void() {
+        let report_kind = "doubao_video_cancel_sync_success";
+        assert!(sync_report_is_non_billable_video_control_operation(
+            report_kind
+        ));
+        let context = TerminalUsageContextSeed {
+            client_contract: "doubao:video".to_string(),
+            provider_contract: "doubao:video".to_string(),
+            request_id: "req-video-cancel-control".to_string(),
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("api-key-1".to_string()),
+            username: None,
+            api_key_name: None,
+            provider_name: "Doubao".to_string(),
+            model: "doubao-seedance".to_string(),
+            target_model: None,
+            model_id: None,
+            global_model_id: None,
+            provider_id: Some("provider-1".to_string()),
+            provider_endpoint_id: Some("endpoint-1".to_string()),
+            provider_api_key_id: Some("provider-key-1".to_string()),
+            request_type: "video".to_string(),
+            has_format_conversion: false,
+            is_stream: false,
+            request_headers: None,
+            request_body: None,
+            provider_request_headers: None,
+            provider_request: None,
+            body_refs: UsageBodyRefsSeed::default(),
+            body_states: UsageBodyStatesSeed::default(),
+            routing: UsageRoutingSeed::default(),
+            request_metadata: None,
+        };
+        let payload = SyncTerminalUsagePayloadSeed {
+            report_kind: report_kind.to_string(),
+            status_code: 200,
+            response_time_ms: Some(12),
+            first_byte_time_ms: Some(8),
+            provider_response_headers: Some(json!({"content-type": "application/json"})),
+            client_response_headers: Some(json!({"content-type": "application/json"})),
+            provider_response_full: Some(json!({"status": "cancelled"})),
+            provider_response_body_state: Some(UsageBodyCaptureState::Inline),
+            client_response: Some(json!({"status": "cancelled"})),
+            client_response_body_state: Some(UsageBodyCaptureState::Inline),
+            standardized_usage: None,
+            capture_metadata: None,
+        };
+
+        let event =
+            build_terminal_usage_event_from_seed(build_sync_terminal_usage_seed(context, payload))
+                .expect("cancel control usage event should build");
+        let record = build_upsert_usage_record_from_event(&event)
+            .expect("cancel control usage record should build");
+
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert_eq!(event.data.billing_treat_as_void, Some(true));
+        assert_eq!(record.status, "completed");
+        assert_eq!(record.billing_status, "void");
+    }
+
+    #[test]
+    fn sync_499_is_still_a_cancelled_request() {
+        assert_eq!(
+            infer_sync_terminal_state(
+                "doubao_video_cancel_sync_error",
+                499,
+                Some(&json!({"error": {"message": "client disconnected"}})),
+            ),
+            UsageTerminalState::Cancelled
         );
     }
 }

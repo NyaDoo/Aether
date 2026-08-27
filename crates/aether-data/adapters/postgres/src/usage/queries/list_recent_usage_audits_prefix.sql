@@ -183,6 +183,8 @@ SELECT
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_reasoning_effort'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_actual_service_tier'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'operation'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'asset_action'), '') IS NOT NULL
       OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'websocket_mode') IN ('true', 'false')
@@ -203,6 +205,10 @@ SELECT
         NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), ''),
         'provider_actual_service_tier',
         NULLIF(BTRIM("usage".request_metadata->>'provider_actual_service_tier'), ''),
+        'operation',
+        NULLIF(BTRIM("usage".request_metadata->>'operation'), ''),
+        'asset_action',
+        NULLIF(BTRIM("usage".request_metadata->>'asset_action'), ''),
         'client_requested_stream',
         CASE
           WHEN ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')

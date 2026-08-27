@@ -87,6 +87,39 @@ pub(crate) fn capture_update_allowed(
     !(previous.status == "streaming" && incoming_status == "pending")
 }
 
+/// Allows a video submission response to fill the response-side audit after the first-byte
+/// lifecycle event won the race and made the aggregate `streaming`.
+///
+/// This is deliberately narrower than [`capture_update_allowed`]: it never authorizes a generic
+/// late pending event, a non-video request, an unsuccessful response, or an explicit body-clear
+/// tombstone. Callers must retain only the response half of the prepared capture.
+pub(crate) fn deferred_video_response_enrichment_allowed(
+    previous: Option<(&str, &str)>,
+    incoming: &UpsertUsageRecord,
+) -> bool {
+    let Some((previous_status, previous_billing_status)) = previous else {
+        return false;
+    };
+    let has_positive_response_capture = incoming.response_headers.is_some()
+        || incoming.response_body.is_some()
+        || incoming.response_body_ref.is_some()
+        || incoming.client_response_headers.is_some()
+        || incoming.client_response_body.is_some()
+        || incoming.client_response_body_ref.is_some();
+
+    previous_status == "streaming"
+        && previous_billing_status == "pending"
+        && incoming.status == "pending"
+        && incoming.billing_status == "pending"
+        && incoming.request_type.as_deref() == Some("video")
+        && incoming
+            .status_code
+            .is_some_and(|code| (200..300).contains(&code))
+        && incoming.response_body_state != Some(UsageBodyCaptureState::None)
+        && incoming.client_response_body_state != Some(UsageBodyCaptureState::None)
+        && has_positive_response_capture
+}
+
 pub(crate) fn apply_previous_metadata_tombstones(
     usage: &mut UpsertUsageRecord,
     previous: Option<&StoredRequestUsageAudit>,
@@ -274,6 +307,51 @@ pub(crate) fn prepare_usage_http_capture(
         states,
         capture_mode,
     })
+}
+
+impl PreparedUsageHttpCapture {
+    /// Drops request-side capture from a narrowly-authorized late video response enrichment.
+    /// Positive response facts remain eligible for the normal COALESCE/ref-backed audit upsert.
+    pub(crate) fn retain_response_enrichment_only(&mut self) {
+        self.request_headers = None;
+        self.provider_request_headers = None;
+        self.request_body = PreparedBody {
+            field: UsageBodyField::RequestBody,
+            payload_gzip: None,
+            clear_existing: false,
+        };
+        self.provider_request_body = PreparedBody {
+            field: UsageBodyField::ProviderRequestBody,
+            payload_gzip: None,
+            clear_existing: false,
+        };
+        self.refs.request_body_ref = None;
+        self.refs.provider_request_body_ref = None;
+        self.states.request_body_state = None;
+        self.states.provider_request_body_state = None;
+
+        // Response enrichment is additive. An explicit `none` tombstone must never clear a
+        // response that belongs to the already-observed streaming lifecycle.
+        if self.response_body.clear_existing {
+            self.response_body.payload_gzip = None;
+            self.response_body.clear_existing = false;
+            self.refs.response_body_ref = None;
+            self.states.response_body_state = None;
+        }
+        if self.client_response_body.clear_existing {
+            self.client_response_body.payload_gzip = None;
+            self.client_response_body.clear_existing = false;
+            self.refs.client_response_body_ref = None;
+            self.states.client_response_body_state = None;
+        }
+        self.capture_mode = if self.refs.response_body_ref.is_some()
+            || self.refs.client_response_body_ref.is_some()
+        {
+            "ref_backed"
+        } else {
+            "none"
+        };
+    }
 }
 
 fn prepare_body(

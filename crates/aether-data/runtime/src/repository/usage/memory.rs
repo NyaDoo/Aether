@@ -2951,6 +2951,64 @@ fn merge_usage_status_code(
     incoming_status_code
 }
 
+fn deferred_video_response_enrichment_allowed(
+    existing: &StoredRequestUsageAudit,
+    incoming: &UpsertUsageRecord,
+) -> bool {
+    let has_positive_response_capture = incoming.response_headers.is_some()
+        || incoming.response_body.is_some()
+        || incoming.response_body_ref.is_some()
+        || incoming.client_response_headers.is_some()
+        || incoming.client_response_body.is_some()
+        || incoming.client_response_body_ref.is_some();
+
+    existing.status == "streaming"
+        && existing.billing_status == "pending"
+        && incoming.status == "pending"
+        && incoming.billing_status == "pending"
+        && incoming.request_type.as_deref() == Some("video")
+        && incoming
+            .status_code
+            .is_some_and(|code| (200..300).contains(&code))
+        && incoming.response_body_state != Some(UsageBodyCaptureState::None)
+        && incoming.client_response_body_state != Some(UsageBodyCaptureState::None)
+        && has_positive_response_capture
+}
+
+fn enrich_usage_response_capture(
+    mut existing: StoredRequestUsageAudit,
+    incoming: &UpsertUsageRecord,
+) -> StoredRequestUsageAudit {
+    if incoming.response_headers.is_some() {
+        existing.response_headers = incoming.response_headers.clone();
+    }
+    if incoming.response_body.is_some() {
+        existing.response_body = incoming.response_body.clone();
+    }
+    if incoming.response_body_ref.is_some() {
+        existing.response_body_ref = incoming.response_body_ref.clone();
+    }
+    if incoming.response_body_state.is_some() {
+        existing.response_body_state = incoming.response_body_state;
+    }
+    if incoming.client_response_headers.is_some() {
+        existing.client_response_headers = incoming.client_response_headers.clone();
+    }
+    if incoming.client_response_body.is_some() {
+        existing.client_response_body = incoming.client_response_body.clone();
+    }
+    if incoming.client_response_body_ref.is_some() {
+        existing.client_response_body_ref = incoming.client_response_body_ref.clone();
+    }
+    if incoming.client_response_body_state.is_some() {
+        existing.client_response_body_state = incoming.client_response_body_state;
+    }
+    existing.updated_at_unix_secs = existing
+        .updated_at_unix_secs
+        .max(incoming.updated_at_unix_secs);
+    existing
+}
+
 #[async_trait]
 impl UsageWriteRepository for InMemoryUsageReadRepository {
     fn supports_first_byte_usage_fast_path(&self) -> bool {
@@ -3040,7 +3098,13 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 && existing.status == "streaming"
                 && usage.status == "pending"
         }) {
-            return Ok(existing.expect("existing usage should be present").clone());
+            let existing = existing.expect("existing usage should be present");
+            if deferred_video_response_enrichment_allowed(&existing, &usage) {
+                let enriched = enrich_usage_response_capture(existing, &usage);
+                by_request_id.insert(usage.request_id.clone(), enriched.clone());
+                return Ok(enriched);
+            }
+            return Ok(existing);
         }
 
         let replace_client_request_body_facts = request_body_capture_replaces_derived_facts(

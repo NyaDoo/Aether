@@ -6,16 +6,17 @@ use std::sync::Arc;
 use super::{
     attach_compressed_body_refs, attach_usage_http_audit_body_refs,
     attach_usage_routing_snapshot_metadata, attach_usage_settlement_pricing_snapshot_metadata,
-    clear_previous_request_body_facts, inflate_usage_json_value,
-    prepare_request_metadata_for_body_storage, prepare_usage_body_storage,
-    prepare_usage_upsert_context, request_body_capture_replaces_derived_facts,
-    resolved_read_usage_body_ref, resolved_write_usage_body_ref,
-    split_dashboard_daily_aggregate_range, split_dashboard_hourly_aggregate_range,
-    usage_body_capture_state_for_storage, usage_body_ref, usage_capture_update_allowed,
-    usage_effective_input_tokens, usage_http_audit_body_refs, usage_http_audit_capture_mode,
-    usage_routing_snapshot_from_usage, usage_settlement_pricing_snapshot_from_usage,
-    usage_total_input_context, AggregateRangeSplit, SqlxUsageReadRepository, UsageHttpAuditRefs,
-    UsageRoutingSnapshot, UsageSettlementPricingSnapshot, MAX_INLINE_USAGE_BODY_BYTES,
+    clear_previous_request_body_facts, deferred_video_response_enrichment_allowed,
+    inflate_usage_json_value, prepare_request_metadata_for_body_storage,
+    prepare_usage_body_storage, prepare_usage_upsert_context,
+    request_body_capture_replaces_derived_facts, resolved_read_usage_body_ref,
+    resolved_write_usage_body_ref, split_dashboard_daily_aggregate_range,
+    split_dashboard_hourly_aggregate_range, usage_body_capture_state_for_storage, usage_body_ref,
+    usage_capture_update_allowed, usage_effective_input_tokens, usage_http_audit_body_refs,
+    usage_http_audit_capture_mode, usage_routing_snapshot_from_usage,
+    usage_settlement_pricing_snapshot_from_usage, usage_total_input_context, AggregateRangeSplit,
+    SqlxUsageReadRepository, UsageHttpAuditRefs, UsageRoutingSnapshot,
+    UsageSettlementPricingSnapshot, MAX_INLINE_USAGE_BODY_BYTES,
     SELECT_STALE_PENDING_USAGE_BATCH_SQL,
 };
 use crate::{PostgresPoolConfig, PostgresPoolFactory};
@@ -3272,6 +3273,10 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
         assert!(sql.contains("request_metadata->>'provider_reasoning_effort'"));
         assert!(sql.contains("request_metadata->>'provider_service_tier'"));
         assert!(sql.contains("request_metadata->>'provider_actual_service_tier'"));
+        assert!(sql.contains("'operation'"));
+        assert!(sql.contains("request_metadata->>'operation'"));
+        assert!(sql.contains("'asset_action'"));
+        assert!(sql.contains("request_metadata->>'asset_action'"));
         assert!(sql.contains("request_metadata->>'websocket_mode'"));
         assert!(sql.contains("'websocket_mode'"));
         assert!(sql.contains("AS client_family"));
@@ -4169,6 +4174,60 @@ fn terminal_capture_rejects_late_non_terminal_updates() {
     assert!(!usage_capture_update_allowed(
         Some(("completed", "settled")),
         "completed",
+    ));
+}
+
+#[test]
+fn deferred_video_submission_allows_only_positive_response_enrichment() {
+    let mut incoming = fast_clear_usage_record(
+        "req-video-response-enrichment",
+        "Doubao",
+        1_001,
+        false,
+        UsageBodyCaptureState::Inline,
+        None,
+    );
+    incoming.request_type = Some("video".to_string());
+    incoming.status = "pending".to_string();
+    incoming.billing_status = "pending".to_string();
+    incoming.status_code = Some(200);
+    incoming.response_headers = Some(json!({"content-type": "application/json"}));
+    incoming.response_body = Some(json!({"id": "task-1"}));
+    incoming.response_body_state = Some(UsageBodyCaptureState::Inline);
+
+    assert!(deferred_video_response_enrichment_allowed(
+        Some(("streaming", "pending")),
+        &incoming,
+    ));
+
+    let mut non_video = incoming.clone();
+    non_video.request_type = Some("chat".to_string());
+    assert!(!deferred_video_response_enrichment_allowed(
+        Some(("streaming", "pending")),
+        &non_video,
+    ));
+
+    let mut explicit_clear = incoming.clone();
+    explicit_clear.response_body_state = Some(UsageBodyCaptureState::None);
+    assert!(!deferred_video_response_enrichment_allowed(
+        Some(("streaming", "pending")),
+        &explicit_clear,
+    ));
+
+    let mut state_without_capture = incoming.clone();
+    state_without_capture.response_headers = None;
+    state_without_capture.response_body = None;
+    state_without_capture.response_body_ref = None;
+    state_without_capture.client_response_headers = None;
+    state_without_capture.client_response_body = None;
+    state_without_capture.client_response_body_ref = None;
+    assert!(!deferred_video_response_enrichment_allowed(
+        Some(("streaming", "pending")),
+        &state_without_capture,
+    ));
+    assert!(!deferred_video_response_enrichment_allowed(
+        Some(("completed", "pending")),
+        &incoming,
     ));
 }
 

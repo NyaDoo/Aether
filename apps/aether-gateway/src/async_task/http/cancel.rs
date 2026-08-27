@@ -1,11 +1,19 @@
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use aether_contracts::{ExecutionPlan, ExecutionResult, ExecutionTelemetry};
 use aether_data_contracts::repository::video_tasks::{
     StoredVideoTask, UpsertVideoTask, VideoTaskStatus,
+};
+use aether_usage_runtime::{
+    build_sync_terminal_usage_outcome, build_terminal_usage_event_from_outcome,
+    GatewaySyncReportRequest, UsageTerminalState,
 };
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Map, Value};
 
-use crate::video_tasks::LocalVideoTaskSnapshot;
+use crate::video_tasks::{LocalVideoTaskFollowUpPlan, LocalVideoTaskSnapshot};
 use crate::{AppState, GatewayError};
 
 use super::super::finalize_video_task_if_terminal;
@@ -64,7 +72,7 @@ pub(crate) async fn cancel_video_task_record_for_owner(
         return Err(CancelVideoTaskError::InvalidStatus(task.status));
     }
 
-    let trace_id = format!("async-task-admin-cancel-{task_id}");
+    let trace_id = build_async_cancel_trace_id();
     let cancel_plan = build_video_task_cancel_plan(&task).ok_or_else(|| {
         CancelVideoTaskError::Gateway(GatewayError::Internal(
             "video task provider cancellation contract is unavailable".to_string(),
@@ -117,7 +125,7 @@ pub(crate) async fn cancel_video_task_record_for_owner(
         ))
     })?;
 
-    execute_video_task_cancel_plan(state, &trace_id, follow_up.plan)
+    execute_video_task_cancel_plan(state, &trace_id, task.request_id.as_str(), follow_up)
         .await
         .map_err(CancelVideoTaskError::Response)?;
 
@@ -178,6 +186,277 @@ struct VideoTaskCancelPlan<'a> {
     request_path: String,
 }
 
+fn build_async_cancel_trace_id() -> String {
+    format!("async-task-cancel-{}", uuid::Uuid::now_v7())
+}
+
+struct CancelUsageLifecycleGuard {
+    state: AppState,
+    plan: ExecutionPlan,
+    report_kind: String,
+    report_context: Option<Value>,
+    started_at: Instant,
+    armed: bool,
+}
+
+#[derive(Clone)]
+struct CancelUsageTerminalOutcome {
+    terminal_state: UsageTerminalState,
+    status_code: u16,
+    error_category: Option<String>,
+    error_message: Option<String>,
+    provider_headers: BTreeMap<String, String>,
+    provider_body_json: Option<Value>,
+    provider_body_base64: Option<String>,
+    client_body_json: Option<Value>,
+    telemetry: Option<ExecutionTelemetry>,
+}
+
+impl CancelUsageTerminalOutcome {
+    fn from_execution_result(result: &ExecutionResult) -> Self {
+        let terminal_state = if (200..300).contains(&result.status_code) {
+            UsageTerminalState::Completed
+        } else {
+            UsageTerminalState::Failed
+        };
+        Self {
+            terminal_state,
+            status_code: result.status_code,
+            error_category: result
+                .error
+                .as_ref()
+                .map(|error| format!("{:?}", error.kind)),
+            error_message: result.error.as_ref().map(|error| error.message.clone()),
+            provider_headers: result.headers.clone(),
+            provider_body_json: result.body.as_ref().and_then(|body| body.json_body.clone()),
+            provider_body_base64: result
+                .body
+                .as_ref()
+                .and_then(|body| body.body_bytes_b64.clone()),
+            client_body_json: None,
+            telemetry: result.telemetry.clone(),
+        }
+    }
+
+    fn failed(status_code: u16, category: &str, message: String) -> Self {
+        Self {
+            terminal_state: UsageTerminalState::Failed,
+            status_code,
+            error_category: Some(category.to_string()),
+            error_message: Some(message),
+            provider_headers: BTreeMap::new(),
+            provider_body_json: None,
+            provider_body_base64: None,
+            client_body_json: None,
+            telemetry: None,
+        }
+    }
+
+    fn cancelled() -> Self {
+        let message = "Async video cancellation was interrupted before terminal finalization";
+        Self {
+            terminal_state: UsageTerminalState::Cancelled,
+            status_code: 499,
+            error_category: Some("video_cancel_request_cancelled".to_string()),
+            error_message: Some(message.to_string()),
+            provider_headers: BTreeMap::new(),
+            provider_body_json: None,
+            provider_body_base64: None,
+            client_body_json: None,
+            telemetry: None,
+        }
+    }
+}
+
+impl CancelUsageLifecycleGuard {
+    fn new(
+        state: &AppState,
+        parent_request_id: &str,
+        follow_up: LocalVideoTaskFollowUpPlan,
+    ) -> Self {
+        let LocalVideoTaskFollowUpPlan {
+            plan,
+            report_kind,
+            mut report_context,
+        } = follow_up;
+        ensure_cancel_parent_request_id(&mut report_context, parent_request_id);
+        let report_kind = report_kind.unwrap_or_else(|| "video_cancel_sync_finalize".to_string());
+        let mut lifecycle_seed =
+            aether_usage_runtime::build_lifecycle_usage_seed(&plan, report_context.as_ref());
+        lifecycle_seed.request_type = "video".to_string();
+        state
+            .usage_runtime
+            .record_pending(state.usage_lifecycle_data_state().as_ref(), lifecycle_seed);
+        Self {
+            state: state.clone(),
+            plan,
+            report_kind,
+            report_context,
+            started_at: Instant::now(),
+            armed: true,
+        }
+    }
+
+    async fn finish(&mut self, outcome: CancelUsageTerminalOutcome) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let handoff = spawn_cancel_usage_terminal(
+            self.state.clone(),
+            self.plan.clone(),
+            self.report_kind.clone(),
+            self.report_context.clone(),
+            self.started_at,
+            outcome,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), handoff).await;
+    }
+}
+
+fn ensure_cancel_parent_request_id(report_context: &mut Option<Value>, parent_request_id: &str) {
+    let context = report_context.get_or_insert_with(|| json!({}));
+    if !context.is_object() {
+        *context = json!({ "report_context": context.take() });
+    }
+    context
+        .as_object_mut()
+        .expect("video cancel report context should be an object")
+        .entry("parent_request_id".to_string())
+        .or_insert_with(|| Value::String(parent_request_id.to_string()));
+    // This direct control path has no separate client HTTP transport capture.
+    // An explicit empty object suppresses the generic terminal builder's legacy
+    // fallback from provider response headers into client response headers.
+    context
+        .as_object_mut()
+        .expect("video cancel report context should be an object")
+        .entry("client_response_headers".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    context
+        .as_object_mut()
+        .expect("video cancel report context should be an object")
+        .entry("usage_scope".to_string())
+        .or_insert_with(|| Value::String("video_upstream_control_action".to_string()));
+    context
+        .as_object_mut()
+        .expect("video cancel report context should be an object")
+        .entry("client_capture_scope".to_string())
+        .or_insert_with(|| Value::String("none".to_string()));
+}
+
+impl Drop for CancelUsageLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        spawn_cancel_usage_terminal(
+            self.state.clone(),
+            self.plan.clone(),
+            self.report_kind.clone(),
+            self.report_context.clone(),
+            self.started_at,
+            CancelUsageTerminalOutcome::cancelled(),
+        );
+    }
+}
+
+fn spawn_cancel_usage_terminal(
+    state: AppState,
+    plan: ExecutionPlan,
+    report_kind: String,
+    report_context: Option<Value>,
+    started_at: Instant,
+    outcome: CancelUsageTerminalOutcome,
+) -> tokio::task::JoinHandle<()> {
+    aether_usage_runtime::spawn_on_usage_background_runtime(async move {
+        record_cancel_usage_terminal(
+            &state,
+            &plan,
+            report_kind,
+            report_context,
+            started_at,
+            outcome,
+        )
+        .await;
+    })
+}
+
+async fn record_cancel_usage_terminal(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_kind: String,
+    report_context: Option<Value>,
+    started_at: Instant,
+    outcome: CancelUsageTerminalOutcome,
+) {
+    match build_cancel_usage_terminal_event(plan, report_kind, report_context, started_at, outcome)
+    {
+        Ok(event) => {
+            let _ = state
+                .usage_runtime
+                .record_terminal_event_direct_with_handoff(
+                    state.usage_lifecycle_data_state().as_ref(),
+                    event,
+                )
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(
+                event_name = "video_cancel_usage_terminal_event_build_failed",
+                log_type = "event",
+                request_id = %plan.request_id,
+                error = %error,
+                "gateway could not build the independent video cancel usage event"
+            );
+        }
+    }
+}
+
+fn build_cancel_usage_terminal_event(
+    plan: &ExecutionPlan,
+    report_kind: String,
+    report_context: Option<Value>,
+    started_at: Instant,
+    outcome: CancelUsageTerminalOutcome,
+) -> Result<aether_usage_runtime::UsageEvent, aether_data_contracts::DataLayerError> {
+    let mut telemetry = outcome.telemetry.unwrap_or(ExecutionTelemetry {
+        ttfb_ms: None,
+        elapsed_ms: None,
+        upstream_bytes: None,
+    });
+    telemetry.elapsed_ms = telemetry
+        .elapsed_ms
+        .or(Some(started_at.elapsed().as_millis() as u64));
+    let payload = GatewaySyncReportRequest {
+        trace_id: plan.request_id.clone(),
+        report_kind,
+        report_context: report_context.clone(),
+        status_code: outcome.status_code,
+        headers: outcome.provider_headers,
+        body_json: outcome.provider_body_json,
+        client_body_json: outcome.client_body_json,
+        body_base64: outcome.provider_body_base64,
+        telemetry: Some(telemetry),
+    };
+    let mut terminal = build_sync_terminal_usage_outcome(plan, report_context.as_ref(), &payload);
+    terminal.terminal_state = outcome.terminal_state;
+    terminal.request_type = "video".to_string();
+    terminal.terminal_error_message = outcome.error_message;
+    terminal.terminal_failure_category = outcome.error_category;
+    terminal.defer_settlement = false;
+    terminal.billing_treat_as_completed = false;
+    // The empty client-header object in report_context is a sentinel that only
+    // prevents the generic builder from copying provider headers. This direct
+    // upstream child has no client transport capture of its own.
+    terminal.client_response_headers = None;
+    terminal.client_response = None;
+    // Cancelling is a control operation. It must be auditable on both success
+    // and failure, but must never charge independently from video generation.
+    terminal.billing_treat_as_void = true;
+    build_terminal_usage_event_from_outcome(terminal)
+}
+
 fn build_video_task_cancel_plan(task: &StoredVideoTask) -> Option<VideoTaskCancelPlan<'_>> {
     let client_api_format = task
         .client_api_format
@@ -231,42 +510,78 @@ fn build_video_task_cancel_plan(task: &StoredVideoTask) -> Option<VideoTaskCance
 async fn execute_video_task_cancel_plan(
     state: &AppState,
     trace_id: &str,
-    plan: aether_contracts::ExecutionPlan,
+    parent_request_id: &str,
+    follow_up: LocalVideoTaskFollowUpPlan,
 ) -> Result<(), axum::response::Response> {
+    let mut usage_guard = CancelUsageLifecycleGuard::new(state, parent_request_id, follow_up);
     let result =
-        crate::execution_runtime::execute_execution_runtime_sync_plan(state, Some(trace_id), &plan)
-            .await
-            .map_err(|err| {
-                GatewayError::UpstreamUnavailable {
+        match crate::execution_runtime::execute_execution_runtime_sync_plan_with_report_context(
+            state,
+            Some(trace_id),
+            &usage_guard.plan,
+            usage_guard.report_context.as_ref(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let message = err.into_message();
+                usage_guard
+                    .finish(CancelUsageTerminalOutcome::failed(
+                        axum::http::StatusCode::BAD_GATEWAY.as_u16(),
+                        "execution_runtime_unavailable",
+                        message.clone(),
+                    ))
+                    .await;
+                return Err(GatewayError::UpstreamUnavailable {
                     trace_id: trace_id.to_string(),
-                    message: err.into_message(),
+                    message,
                 }
-                .into_response()
-            })?;
+                .into_response());
+            }
+        };
+
+    let body_json = cancel_client_body(&result);
+    usage_guard
+        .finish(CancelUsageTerminalOutcome::from_execution_result(&result))
+        .await;
 
     if result.status_code >= 400 {
         let status = axum::http::StatusCode::from_u16(result.status_code)
             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-        let body_json = result
-            .body
-            .and_then(|body| body.json_body)
-            .unwrap_or_else(|| {
-                json!({
-                    "error": {
-                        "message": result
-                            .error
-                            .as_ref()
-                            .map(|error| error.message.clone())
-                            .unwrap_or_else(|| {
-                                format!("execution runtime returned {}", result.status_code)
-                            }),
-                    }
-                })
-            });
         return Err((status, Json(body_json)).into_response());
     }
 
     Ok(())
+}
+
+fn cancel_client_body(result: &ExecutionResult) -> Value {
+    if (200..300).contains(&result.status_code) {
+        return json!({});
+    }
+    let provider_error = result
+        .body
+        .as_ref()
+        .and_then(|body| body.json_body.clone())
+        .and_then(|body| body.get("error").cloned());
+    let message = result
+        .error
+        .as_ref()
+        .map(|error| error.message.clone())
+        .or_else(|| {
+            provider_error
+                .as_ref()
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| format!("execution runtime returned {}", result.status_code));
+    json!({
+        "error": {
+            "type": "video_cancel_upstream_error",
+            "message": message,
+        }
+    })
 }
 
 async fn build_cancelled_request_metadata(
@@ -319,8 +634,199 @@ fn mark_snapshot_value_cancelled(snapshot_value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::mark_snapshot_value_cancelled;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    use aether_contracts::{ExecutionPlan, ExecutionResult, RequestBody, ResponseBody};
+    use aether_usage_runtime::{UsageEventType, UsageTerminalState};
+
+    use super::{
+        build_async_cancel_trace_id, build_cancel_usage_terminal_event, cancel_client_body,
+        ensure_cancel_parent_request_id, mark_snapshot_value_cancelled, CancelUsageTerminalOutcome,
+    };
     use serde_json::json;
+
+    fn cancel_plan() -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "cancel-child-request-1".to_string(),
+            candidate_id: None,
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "DELETE".to_string(),
+            url: "https://api.openai.example/videos/task-1".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({})),
+            stream: false,
+            client_api_format: "openai:video".to_string(),
+            provider_api_format: "openai:video".to_string(),
+            model_name: Some("sora-2".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
+
+    fn terminal_outcome(
+        terminal_state: UsageTerminalState,
+        status_code: u16,
+    ) -> CancelUsageTerminalOutcome {
+        CancelUsageTerminalOutcome {
+            terminal_state,
+            status_code,
+            error_category: None,
+            error_message: None,
+            provider_headers: BTreeMap::from([(
+                "x-provider-request-id".to_string(),
+                "provider-request-1".to_string(),
+            )]),
+            provider_body_json: Some(json!({"provider": "capture"})),
+            provider_body_base64: None,
+            client_body_json: None,
+            telemetry: None,
+        }
+    }
+
+    #[test]
+    fn async_cancel_child_request_ids_are_unique() {
+        let first = build_async_cancel_trace_id();
+        let second = build_async_cancel_trace_id();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("async-task-cancel-"));
+        assert!(second.starts_with("async-task-cancel-"));
+    }
+
+    #[test]
+    fn cancel_context_keeps_operation_and_links_parent_without_client_header_fallback() {
+        let mut context = Some(json!({
+            "operation": "video.cancel"
+        }));
+
+        ensure_cancel_parent_request_id(&mut context, "create-parent-request-1");
+
+        let context = context.expect("context should exist");
+        assert_eq!(context["operation"], "video.cancel");
+        assert_eq!(context["parent_request_id"], "create-parent-request-1");
+        assert_eq!(context["client_response_headers"], json!({}));
+        assert_eq!(context["usage_scope"], "video_upstream_control_action");
+        assert_eq!(context["client_capture_scope"], "none");
+    }
+
+    #[test]
+    fn cancel_terminal_events_are_independent_void_lifecycles() {
+        for (terminal_state, event_type, status_code) in [
+            (
+                UsageTerminalState::Completed,
+                UsageEventType::Completed,
+                204,
+            ),
+            (UsageTerminalState::Failed, UsageEventType::Failed, 502),
+            (
+                UsageTerminalState::Cancelled,
+                UsageEventType::Cancelled,
+                499,
+            ),
+        ] {
+            let event = build_cancel_usage_terminal_event(
+                &cancel_plan(),
+                "openai_video_cancel_sync_finalize".to_string(),
+                Some(json!({
+                    "operation": "video.cancel",
+                    "parent_request_id": "create-parent-request-1",
+                    "client_response_headers": {}
+                })),
+                Instant::now(),
+                terminal_outcome(terminal_state, status_code),
+            )
+            .expect("cancel terminal event should build");
+
+            assert_eq!(event.request_id, "cancel-child-request-1");
+            assert_eq!(event.event_type, event_type);
+            assert_eq!(event.data.request_type.as_deref(), Some("video"));
+            assert_eq!(event.data.billing_treat_as_void, Some(true));
+            assert_eq!(event.data.status_code, Some(status_code));
+            assert_eq!(
+                event
+                    .data
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("operation")),
+                Some(&json!("video.cancel"))
+            );
+            assert_eq!(
+                event
+                    .data
+                    .request_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("parent_request_id")),
+                Some(&json!("create-parent-request-1"))
+            );
+            assert_eq!(
+                event.data.response_headers,
+                Some(json!({
+                    "x-provider-request-id": "provider-request-1"
+                }))
+            );
+            assert_eq!(event.data.client_response_headers, None);
+            assert_eq!(event.data.client_response_body, None);
+        }
+    }
+
+    #[test]
+    fn successful_empty_cancel_response_does_not_invent_an_error_body() {
+        let result = ExecutionResult {
+            request_id: "cancel-child-request-1".to_string(),
+            candidate_id: None,
+            status_code: 204,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(json!({"provider": "success-payload"})),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        };
+
+        assert_eq!(cancel_client_body(&result), json!({}));
+    }
+
+    #[test]
+    fn failed_cancel_uses_a_control_error_projection_not_the_provider_body() {
+        let result = ExecutionResult {
+            request_id: "cancel-child-request-1".to_string(),
+            candidate_id: None,
+            status_code: 502,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(ResponseBody {
+                json_body: Some(json!({
+                    "error": {
+                        "message": "provider rejected cancel",
+                        "provider_private": "must-not-be-projected"
+                    },
+                    "provider_only": true
+                })),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        };
+
+        assert_eq!(
+            cancel_client_body(&result),
+            json!({
+                "error": {
+                    "type": "video_cancel_upstream_error",
+                    "message": "provider rejected cancel"
+                }
+            })
+        );
+    }
 
     #[test]
     fn marks_doubao_snapshot_cancelled_without_dropping_other_fields() {

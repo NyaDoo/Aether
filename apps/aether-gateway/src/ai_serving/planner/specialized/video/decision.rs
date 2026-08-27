@@ -18,6 +18,13 @@ use super::request::resolve_local_video_create_candidate_payload_parts;
 use super::support::{LocalVideoCreateCandidateAttempt, LocalVideoCreateDecisionInput};
 use super::LocalVideoCreateSpec;
 
+fn video_create_usage_extra_fields() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([(
+        "operation".to_string(),
+        serde_json::Value::String("video.create".to_string()),
+    )])
+}
+
 pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidate(
     state: &AppState,
     parts: &http::request::Parts,
@@ -54,7 +61,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         .resolve_transport_proxy_snapshot_with_tunnel_affinity(&transport)
         .await;
     let transport_profile = resolve_transport_profile(&transport);
-    let mut extra_fields = serde_json::Map::new();
+    let mut extra_fields = video_create_usage_extra_fields();
     if let Some(proxy_value) = build_request_trace_proxy_value(Some(&transport), proxy.as_ref()) {
         extra_fields.insert("proxy".to_string(), proxy_value);
     }
@@ -159,4 +166,21 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         Some(transport.as_ref()),
     )?;
     Ok(Some(decision))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::video_create_usage_extra_fields;
+
+    #[test]
+    fn video_create_planner_metadata_uses_canonical_operation() {
+        let metadata = video_create_usage_extra_fields();
+
+        assert_eq!(
+            metadata
+                .get("operation")
+                .and_then(serde_json::Value::as_str),
+            Some("video.create")
+        );
+    }
 }

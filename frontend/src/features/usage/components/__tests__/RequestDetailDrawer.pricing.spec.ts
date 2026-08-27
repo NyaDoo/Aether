@@ -253,6 +253,43 @@ describe('RequestDetailDrawer settlement pricing', () => {
     })
   })
 
+  it('shows a canonical asset-library operation in the detail header', async () => {
+    apiMocks.getRequestDetail.mockResolvedValue({
+      ...buildEmbeddingDetail(),
+      id: 'usage-asset-delete-1',
+      request_id: 'req-asset-delete-1',
+      operation: 'asset_library.delete_asset',
+    })
+
+    let isOpen!: Ref<boolean>
+    const Host = defineComponent({
+      setup() {
+        isOpen = ref(false)
+        return () => h(RequestDetailDrawer, {
+          isOpen: isOpen.value,
+          requestId: 'usage-asset-delete-1',
+        })
+      },
+    })
+
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(Host)
+    app.mount(root)
+    mountedApps.push({ app, root })
+
+    isOpen.value = true
+    await nextTick()
+
+    await vi.waitFor(() => {
+      const badge = document.body.querySelector(
+        '[data-request-detail-model-badge="operation"]',
+      )
+      expect(badge?.getAttribute('data-usage-operation')).toBe('asset_library.delete_asset')
+      expect(badge?.textContent?.trim()).toBe('删除素材')
+    })
+  })
+
   it('shows mapping, reasoning, Fast, and Cyber together in the model header', async () => {
     apiMocks.getRequestDetail.mockResolvedValue({
       ...buildEmbeddingDetail(),

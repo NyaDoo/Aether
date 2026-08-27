@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use aether_data_contracts::repository::candidates::RequestCandidateRepository;
+use aether_data_contracts::repository::usage::UsageRepository;
 use aether_data_contracts::repository::video_tasks::VideoTaskRepository;
 
 use super::{
     AuthApiKeyReadRepository, GatewayDataConfig, GatewayDataState, ProviderCatalogReadRepository,
-    RequestCandidateReadRepository, RequestCandidateWriteRepository, VideoTaskReadRepository,
-    VideoTaskWriteRepository,
+    RequestCandidateReadRepository, RequestCandidateWriteRepository, UsageReadRepository,
+    UsageWriteRepository, VideoTaskReadRepository, VideoTaskWriteRepository,
 };
 
 impl GatewayDataState {
@@ -238,6 +239,30 @@ impl GatewayDataState {
             system_config_value_cache: Default::default(),
             billing_model_context_cache: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_video_task_provider_transport_and_usage_repository_for_tests<T, U, V>(
+        repository: Arc<T>,
+        provider_catalog_repository: Arc<U>,
+        usage_repository: Arc<V>,
+        encryption_key: impl Into<String>,
+    ) -> Self
+    where
+        T: VideoTaskRepository + 'static,
+        U: ProviderCatalogReadRepository + 'static,
+        V: UsageRepository + 'static,
+    {
+        let mut state = Self::with_video_task_repository_and_provider_transport_for_tests(
+            repository,
+            provider_catalog_repository,
+            encryption_key,
+        );
+        let usage_reader: Arc<dyn UsageReadRepository> = usage_repository.clone();
+        let usage_writer: Arc<dyn UsageWriteRepository> = usage_repository;
+        state.usage_reader = Some(usage_reader);
+        state.usage_writer = Some(usage_writer);
+        state
     }
 
     #[cfg(test)]

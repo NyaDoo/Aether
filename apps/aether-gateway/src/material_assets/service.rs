@@ -427,6 +427,47 @@ fn asset_action_lifecycle_request_id(parent_request_id: &str, action: ArkAssetAc
     )
 }
 
+fn build_asset_lifecycle_usage_seed(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> aether_usage_runtime::LifecycleUsageSeed {
+    let mut seed = aether_usage_runtime::build_lifecycle_usage_seed(plan, report_context);
+    // `doubao:asset_library` is not an inference endpoint. The generic contract fallback
+    // classifies unknown endpoint kinds as chat, so make the server-owned asset
+    // identity explicit for the pending row as well as the terminal update.
+    seed.request_type = "asset_library".to_string();
+    if let Some(action) = report_context
+        .and_then(Value::as_object)
+        .and_then(|context| context.get("asset_action"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+    {
+        let metadata = seed
+            .request_metadata
+            .get_or_insert_with(|| Value::Object(Map::new()));
+        if !metadata.is_object() {
+            *metadata = Value::Object(Map::new());
+        }
+        let metadata = metadata
+            .as_object_mut()
+            .expect("asset usage metadata should be an object");
+        metadata.insert(
+            "asset_action".to_string(),
+            Value::String(action.to_string()),
+        );
+        if let Some(operation) =
+            aether_data_contracts::repository::usage::usage_operation_from_asset_action(action)
+        {
+            metadata.insert(
+                "operation".to_string(),
+                Value::String(operation.to_string()),
+            );
+        }
+    }
+    seed
+}
+
 pub(crate) async fn maybe_handle_native_asset_request(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
@@ -1531,7 +1572,7 @@ async fn execute_action(
     // child id cannot overtake this pending write, even if the HTTP task drops.
     state.usage_runtime.record_pending(
         state.usage_lifecycle_data_state().as_ref(),
-        aether_usage_runtime::build_lifecycle_usage_seed(&plan, report_context.as_ref()),
+        build_asset_lifecycle_usage_seed(&plan, report_context.as_ref()),
     );
     crate::request_candidate_runtime::record_local_request_candidate_status(
         state,
@@ -6076,6 +6117,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn asset_lifecycle_seed_uses_asset_request_type_and_canonical_operation() {
+        let plan = candidate_plan("asset-seed-request", "asset-seed-candidate");
+        let report_context = json!({
+            "asset_action": "ListAssets",
+            "usage_scope": "asset_upstream_action"
+        });
+
+        let seed = build_asset_lifecycle_usage_seed(&plan, Some(&report_context));
+
+        assert_eq!(seed.request_type, "asset_library");
+        assert_eq!(
+            seed.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("operation"))
+                .and_then(Value::as_str),
+            Some("asset_library.list_assets")
+        );
+        assert_eq!(
+            seed.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("asset_action"))
+                .and_then(Value::as_str),
+            Some("ListAssets")
+        );
+    }
+
     async fn record_pending_candidate_for_test(
         state: &AppState,
         plan: &ExecutionPlan,
@@ -6484,6 +6552,7 @@ mod tests {
         assert_eq!(usage.status, "completed");
         assert_eq!(usage.status_code, Some(200));
         assert_eq!(usage.request_type.as_deref(), Some("asset_library"));
+        assert_eq!(usage.operation(), Some("asset_library.list_assets"));
         assert_eq!(usage.billing_status, "void");
         assert_eq!(usage.total_cost_usd, 0.0);
         assert_eq!(usage.actual_total_cost_usd, 0.0);

@@ -105,6 +105,65 @@ fn mysql_usage_upsert_keeps_terminal_state_when_streaming_arrives_late() {
 }
 
 #[test]
+fn mysql_deferred_video_submission_allows_only_positive_response_enrichment() {
+    let mut incoming = sample_usage(
+        "request-video-response-enrichment",
+        "user-1",
+        "api-key-1",
+        "provider-1",
+        "provider-key-1",
+        "pending",
+        "pending",
+        1_001,
+    );
+    incoming.request_type = Some("video".to_string());
+    incoming.status_code = Some(200);
+    incoming.response_headers = Some(serde_json::json!({"content-type": "application/json"}));
+    incoming.response_body = Some(serde_json::json!({"id": "task-1"}));
+    incoming.response_body_state = Some(UsageBodyCaptureState::Inline);
+
+    assert!(
+        super::http_capture::deferred_video_response_enrichment_allowed(
+            Some(("streaming", "pending")),
+            &incoming,
+        )
+    );
+
+    let mut failed = incoming.clone();
+    failed.status_code = Some(500);
+    assert!(
+        !super::http_capture::deferred_video_response_enrichment_allowed(
+            Some(("streaming", "pending")),
+            &failed,
+        )
+    );
+
+    let mut explicit_clear = incoming;
+    explicit_clear.client_response_body_state = Some(UsageBodyCaptureState::None);
+    assert!(
+        !super::http_capture::deferred_video_response_enrichment_allowed(
+            Some(("streaming", "pending")),
+            &explicit_clear,
+        )
+    );
+
+    let mut state_without_capture = explicit_clear;
+    state_without_capture.client_response_body_state = Some(UsageBodyCaptureState::Inline);
+    state_without_capture.response_headers = None;
+    state_without_capture.response_body = None;
+    state_without_capture.response_body_ref = None;
+    state_without_capture.client_response_headers = None;
+    state_without_capture.client_response_body = None;
+    state_without_capture.client_response_body_ref = None;
+    assert!(
+        !super::http_capture::deferred_video_response_enrichment_allowed(
+            Some(("streaming", "pending")),
+            &state_without_capture,
+        )
+    );
+}
+
+#[test]
 fn mysql_stale_cleanup_never_promotes_from_a_candidate_marker() {
     let source = include_str!("../usage.rs");
     assert!(!source.contains("SELECT_COMPLETED_REQUEST_CANDIDATES_SQL"));

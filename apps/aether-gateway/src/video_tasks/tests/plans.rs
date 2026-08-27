@@ -57,6 +57,14 @@ fn rust_authoritative_service_builds_openai_cancel_follow_up_plan() {
         follow_up
             .report_context
             .as_ref()
+            .and_then(|value| value.get("operation"))
+            .and_then(Value::as_str),
+        Some("video.cancel")
+    );
+    assert_eq!(
+        follow_up
+            .report_context
+            .as_ref()
             .and_then(Value::as_object)
             .and_then(|value| value.get("task_id"))
             .and_then(Value::as_str),
@@ -113,6 +121,14 @@ fn rust_authoritative_service_builds_openai_remix_follow_up_plan() {
     assert_eq!(
         follow_up.report_kind.as_deref(),
         Some("openai_video_remix_sync_finalize")
+    );
+    assert_eq!(
+        follow_up
+            .report_context
+            .as_ref()
+            .and_then(|value| value.get("operation"))
+            .and_then(Value::as_str),
+        Some("video.remix")
     );
     assert_eq!(
         follow_up
@@ -175,6 +191,14 @@ fn rust_authoritative_service_builds_openai_delete_follow_up_plan() {
         follow_up
             .report_context
             .as_ref()
+            .and_then(|value| value.get("operation"))
+            .and_then(Value::as_str),
+        Some("video.delete")
+    );
+    assert_eq!(
+        follow_up
+            .report_context
+            .as_ref()
             .and_then(Value::as_object)
             .and_then(|value| value.get("task_id"))
             .and_then(Value::as_str),
@@ -220,6 +244,14 @@ fn rust_authoritative_service_builds_gemini_cancel_follow_up_plan() {
     assert_eq!(
         follow_up.report_kind.as_deref(),
         Some("gemini_video_cancel_sync_finalize")
+    );
+    assert_eq!(
+        follow_up
+            .report_context
+            .as_ref()
+            .and_then(|value| value.get("operation"))
+            .and_then(Value::as_str),
+        Some("video.cancel")
     );
     assert_eq!(
         follow_up

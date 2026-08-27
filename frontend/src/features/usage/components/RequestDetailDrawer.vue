@@ -943,6 +943,7 @@ const emit = defineEmits<{
     endpointApiFormat?: string | null
     hasFormatConversion?: boolean | null
     targetModel?: string | null
+    operation?: string | null
     requestedReasoningEffort?: string | null
     reasoningEffort?: string | null
     serviceTier?: string | null
@@ -1102,6 +1103,7 @@ type HeaderModelTextField =
   | 'model'
   | 'target_model'
   | 'model_version'
+  | 'operation'
   | 'request_type'
   | 'requested_reasoning_effort'
   | 'reasoning_effort'
@@ -1196,6 +1198,7 @@ watch(
     props.summaryRecord?.model,
     props.summaryRecord?.target_model,
     props.summaryRecord?.model_version,
+    props.summaryRecord?.operation,
     props.summaryRecord?.request_type,
     props.summaryRecord?.requested_reasoning_effort,
     props.summaryRecord?.reasoning_effort,
@@ -1235,6 +1238,7 @@ function emitDetailRequestState(nextDetail: RequestDetail) {
   if (!id) return
 
   const targetModel = resolveHeaderModelTextField('target_model', nextDetail)
+  const operation = resolveHeaderModelTextField('operation', nextDetail)
   const requestedReasoningEffort = resolveHeaderModelTextField(
     'requested_reasoning_effort',
     nextDetail,
@@ -1270,6 +1274,7 @@ function emitDetailRequestState(nextDetail: RequestDetail) {
     endpointApiFormat: nextDetail.endpoint_api_format ?? null,
     hasFormatConversion: nextDetail.has_format_conversion ?? null,
     ...(targetModel ? { targetModel } : {}),
+    ...(operation ? { operation } : {}),
     ...(requestedReasoningEffort ? { requestedReasoningEffort } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(serviceTier ? { serviceTier } : {}),
@@ -1561,6 +1566,7 @@ const headerModelRecord = computed(() => {
     model: resolveHeaderModelTextField('model', currentDetail) ?? '-',
     target_model: resolveHeaderModelTextField('target_model', currentDetail),
     model_version: resolveHeaderModelTextField('model_version', currentDetail),
+    operation: resolveHeaderModelTextField('operation', currentDetail),
     request_type: resolveHeaderModelTextField('request_type', currentDetail),
     requested_reasoning_effort: resolveHeaderModelTextField(
       'requested_reasoning_effort',

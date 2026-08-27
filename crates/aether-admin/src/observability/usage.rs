@@ -1210,6 +1210,7 @@ fn admin_usage_active_request_json(
         "id": item.id,
         "status": item.status,
         "request_type": item.request_type,
+        "operation": item.operation(),
         "input_tokens": item.input_tokens,
         "effective_input_tokens": admin_usage_effective_input_tokens(item),
         "output_tokens": item.output_tokens,
@@ -1339,6 +1340,7 @@ pub fn admin_usage_record_json(
         "outcome_class": item.outcome_class().as_str(),
         "sla_eligible": item.sla_eligible(),
         "request_type": item.request_type,
+        "operation": item.operation(),
         "has_fallback": admin_usage_has_fallback(item),
         "has_retry": false,
         "has_rectified": false,
@@ -2786,6 +2788,52 @@ mod tests {
             assert_eq!(payload["end_to_end_time_ms"], 10_626);
             assert_eq!(payload["end_to_end_first_byte_time_ms"], 10_120);
         }
+    }
+
+    #[test]
+    fn admin_usage_payloads_project_canonical_operation() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "operation": "video.cancel"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["operation"], "video.cancel");
+        assert_eq!(active["operation"], "video.cancel");
+    }
+
+    #[test]
+    fn admin_usage_payloads_map_legacy_asset_action_to_canonical_operation() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "asset_action": "GetVisualValidateResult"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["operation"], "asset_library.get_visual_validation");
+        assert_eq!(active["operation"], "asset_library.get_visual_validation");
     }
 
     #[test]

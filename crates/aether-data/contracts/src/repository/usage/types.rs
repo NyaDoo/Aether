@@ -351,6 +351,21 @@ impl StoredRequestUsageAudit {
         self.outcome_class().is_sla_eligible()
     }
 
+    /// Stable operation identity projected by usage APIs.
+    ///
+    /// New rows persist the canonical value directly. Asset-library rows
+    /// written before that field existed can still be projected from the
+    /// server-owned Ark action metadata without exposing the provider's
+    /// CamelCase action names as the public contract.
+    pub fn operation(&self) -> Option<&'static str> {
+        self.request_metadata_string("operation")
+            .and_then(normalize_usage_operation)
+            .or_else(|| {
+                self.request_metadata_string("asset_action")
+                    .and_then(usage_operation_from_asset_action)
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -2415,6 +2430,48 @@ pub fn usage_request_metadata_client_family(value: Option<&Value>) -> Option<&st
         .filter(|value| !value.is_empty())
 }
 
+/// Returns a canonical usage operation or rejects unknown/free-form values.
+pub fn normalize_usage_operation(value: &str) -> Option<&'static str> {
+    Some(match value.trim() {
+        "video.create" => "video.create",
+        "video.remix" => "video.remix",
+        "video.cancel" => "video.cancel",
+        "video.delete" => "video.delete",
+        "asset_library.create_group" => "asset_library.create_group",
+        "asset_library.list_groups" => "asset_library.list_groups",
+        "asset_library.get_group" => "asset_library.get_group",
+        "asset_library.update_group" => "asset_library.update_group",
+        "asset_library.delete_group" => "asset_library.delete_group",
+        "asset_library.create_asset" => "asset_library.create_asset",
+        "asset_library.list_assets" => "asset_library.list_assets",
+        "asset_library.get_asset" => "asset_library.get_asset",
+        "asset_library.update_asset" => "asset_library.update_asset",
+        "asset_library.delete_asset" => "asset_library.delete_asset",
+        "asset_library.create_visual_validation" => "asset_library.create_visual_validation",
+        "asset_library.get_visual_validation" => "asset_library.get_visual_validation",
+        _ => return None,
+    })
+}
+
+/// Maps Ark's provider action vocabulary onto the stable public usage contract.
+pub fn usage_operation_from_asset_action(value: &str) -> Option<&'static str> {
+    Some(match value.trim() {
+        "CreateAssetGroup" => "asset_library.create_group",
+        "ListAssetGroups" => "asset_library.list_groups",
+        "GetAssetGroup" => "asset_library.get_group",
+        "UpdateAssetGroup" => "asset_library.update_group",
+        "DeleteAssetGroup" => "asset_library.delete_group",
+        "CreateAsset" => "asset_library.create_asset",
+        "ListAssets" => "asset_library.list_assets",
+        "GetAsset" => "asset_library.get_asset",
+        "UpdateAsset" => "asset_library.update_asset",
+        "DeleteAsset" => "asset_library.delete_asset",
+        "CreateVisualValidateSession" => "asset_library.create_visual_validation",
+        "GetVisualValidateResult" => "asset_library.get_visual_validation",
+        _ => return None,
+    })
+}
+
 fn parse_u64(value: i32, field_name: &str) -> Result<u64, crate::DataLayerError> {
     u64::try_from(value).map_err(|_| {
         crate::DataLayerError::UnexpectedValue(format!("invalid {field_name}: {value}"))
@@ -2501,6 +2558,56 @@ mod tests {
             Some(102),
         )
         .expect("usage should build")
+    }
+
+    #[test]
+    fn usage_operation_prefers_canonical_metadata_and_maps_legacy_asset_action() {
+        let mut usage = sample_usage();
+        usage.request_metadata = Some(json!({
+            "operation": "video.cancel",
+            "asset_action": "ListAssets"
+        }));
+        assert_eq!(usage.operation(), Some("video.cancel"));
+
+        usage.request_metadata = Some(json!({
+            "asset_action": "ListAssets"
+        }));
+        assert_eq!(usage.operation(), Some("asset_library.list_assets"));
+
+        usage.request_metadata = Some(json!({
+            "operation": "provider-specific-free-form"
+        }));
+        assert_eq!(usage.operation(), None);
+    }
+
+    #[test]
+    fn asset_action_mapping_covers_the_stable_public_contract() {
+        for (action, operation) in [
+            ("CreateAssetGroup", "asset_library.create_group"),
+            ("ListAssetGroups", "asset_library.list_groups"),
+            ("GetAssetGroup", "asset_library.get_group"),
+            ("UpdateAssetGroup", "asset_library.update_group"),
+            ("DeleteAssetGroup", "asset_library.delete_group"),
+            ("CreateAsset", "asset_library.create_asset"),
+            ("ListAssets", "asset_library.list_assets"),
+            ("GetAsset", "asset_library.get_asset"),
+            ("UpdateAsset", "asset_library.update_asset"),
+            ("DeleteAsset", "asset_library.delete_asset"),
+            (
+                "CreateVisualValidateSession",
+                "asset_library.create_visual_validation",
+            ),
+            (
+                "GetVisualValidateResult",
+                "asset_library.get_visual_validation",
+            ),
+        ] {
+            assert_eq!(
+                super::usage_operation_from_asset_action(action),
+                Some(operation)
+            );
+            assert_eq!(super::normalize_usage_operation(operation), Some(operation));
+        }
     }
 
     #[test]

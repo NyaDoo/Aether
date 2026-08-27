@@ -28,6 +28,7 @@
           :key="badge.key"
           :data-usage-model-badge="badge.key"
           :data-request-detail-model-badge="context === 'detail' ? badge.key : undefined"
+          :data-usage-operation="badge.key === 'operation' ? operationBadge?.canonical : undefined"
           :variant="badge.variant"
           class="h-4 shrink-0 whitespace-nowrap rounded-full px-1.5 text-[10px] leading-4"
           :class="badge.className"
@@ -50,6 +51,7 @@
         :key="badge.key"
         :data-usage-model-badge="badge.key"
         :data-request-detail-model-badge="context === 'detail' ? badge.key : undefined"
+        :data-usage-operation="badge.key === 'operation' ? operationBadge?.canonical : undefined"
         :variant="badge.variant"
         class="h-4 shrink-0 whitespace-nowrap rounded-full px-1.5 text-[10px] leading-4"
         :class="badge.className"
@@ -67,9 +69,10 @@ import { computed } from 'vue'
 
 import { Badge } from '@/components/ui'
 import { isCyberPolicyError } from '../utils/cyberError'
+import { resolveUsageOperationPresentation } from '../utils/operation'
 import { formatServiceTierFact } from '../utils/service-tier'
 
-type ModelBadgeKey = 'compact' | 'reasoning' | 'fast' | 'cyber' | 'reasoning_tokens'
+type ModelBadgeKey = 'operation' | 'compact' | 'reasoning' | 'fast' | 'cyber' | 'reasoning_tokens'
 
 interface ModelBadgePresentation {
   key: ModelBadgeKey
@@ -84,6 +87,7 @@ interface UsageModelDisplayRecord {
   model: string
   target_model?: string | null
   model_version?: string | null
+  operation?: string | null
   request_type?: string | null
   requested_reasoning_effort?: string | null
   reasoning_effort?: string | null
@@ -131,8 +135,20 @@ const reasoningLabel = computed(() => {
   return actual ?? requested
 })
 
+const operationBadge = computed(() => resolveUsageOperationPresentation(props.record.operation))
+
 const modelBadges = computed<ModelBadgePresentation[]>(() => {
   const badges: ModelBadgePresentation[] = []
+  if (operationBadge.value) {
+    badges.push({
+      key: 'operation',
+      label: operationBadge.value.label,
+      variant: 'outline',
+      className: operationBadge.value.className,
+      title: operationBadge.value.title,
+      ariaLabel: operationBadge.value.ariaLabel,
+    })
+  }
   if (normalizeText(props.record.request_type)?.toLowerCase() === 'compact') {
     badges.push({
       key: 'compact',

@@ -8565,6 +8565,13 @@ ORDER BY "usage".user_id ASC
                             .map(|stored| (stored.status.as_str(), stored.billing_status.as_str())),
                         usage.status.as_str(),
                     );
+                    let response_enrichment_allowed = !capture_update_allowed
+                        && deferred_video_response_enrichment_allowed(
+                            previous_usage.as_ref().map(|stored| {
+                                (stored.status.as_str(), stored.billing_status.as_str())
+                            }),
+                            &usage,
+                        );
                     // A terminal transition (for example streaming -> completed) may replace
                     // stale in-flight routing/pricing facts.  A repeated write for the same
                     // terminal outcome is an enrichment and must not clear tokens/cost/headers
@@ -8689,32 +8696,34 @@ ORDER BY "usage".user_id ASC
                         .fetch_one(&mut **tx)
                         .await
                         .map_postgres_err()?;
-                    if capture_update_allowed {
-                        sync_usage_body_blob_storage(
-                            &mut **tx,
-                            &usage.request_id,
-                            UsageBodyField::RequestBody,
-                            usage.request_body.as_ref(),
-                            &request_body_storage,
-                            clear_request_body,
-                        )
-                        .await?;
-                        sync_usage_body_blob_storage(
-                            &mut **tx,
-                            &usage.request_id,
-                            UsageBodyField::ProviderRequestBody,
-                            usage.provider_request_body.as_ref(),
-                            &provider_request_body_storage,
-                            clear_provider_request_body,
-                        )
-                        .await?;
+                    if capture_update_allowed || response_enrichment_allowed {
+                        if capture_update_allowed {
+                            sync_usage_body_blob_storage(
+                                &mut **tx,
+                                &usage.request_id,
+                                UsageBodyField::RequestBody,
+                                usage.request_body.as_ref(),
+                                &request_body_storage,
+                                clear_request_body,
+                            )
+                            .await?;
+                            sync_usage_body_blob_storage(
+                                &mut **tx,
+                                &usage.request_id,
+                                UsageBodyField::ProviderRequestBody,
+                                usage.provider_request_body.as_ref(),
+                                &provider_request_body_storage,
+                                clear_provider_request_body,
+                            )
+                            .await?;
+                        }
                         sync_usage_body_blob_storage(
                             &mut **tx,
                             &usage.request_id,
                             UsageBodyField::ResponseBody,
                             usage.response_body.as_ref(),
                             &response_body_storage,
-                            clear_response_body,
+                            capture_update_allowed && clear_response_body,
                         )
                         .await?;
                         sync_usage_body_blob_storage(
@@ -8723,22 +8732,56 @@ ORDER BY "usage".user_id ASC
                             UsageBodyField::ClientResponseBody,
                             usage.client_response_body.as_ref(),
                             &client_response_body_storage,
-                            clear_client_response_body,
+                            capture_update_allowed && clear_client_response_body,
                         )
                         .await?;
                         let http_audit_headers = UsageHttpAuditHeaders {
-                            request_headers_json: request_headers_json.as_deref(),
-                            provider_request_headers_json: provider_request_headers_json.as_deref(),
+                            request_headers_json: capture_update_allowed
+                                .then_some(request_headers_json.as_deref())
+                                .flatten(),
+                            provider_request_headers_json: capture_update_allowed
+                                .then_some(provider_request_headers_json.as_deref())
+                                .flatten(),
                             response_headers_json: response_headers_json.as_deref(),
                             client_response_headers_json: client_response_headers_json.as_deref(),
+                        };
+                        let response_only_http_audit_refs = UsageHttpAuditRefs {
+                            response_body_ref: http_audit_refs.response_body_ref.clone(),
+                            client_response_body_ref: http_audit_refs
+                                .client_response_body_ref
+                                .clone(),
+                            ..UsageHttpAuditRefs::default()
+                        };
+                        let response_only_http_audit_states = UsageHttpAuditStates {
+                            response_body_state: http_audit_states.response_body_state,
+                            client_response_body_state: http_audit_states
+                                .client_response_body_state,
+                            ..UsageHttpAuditStates::default()
+                        };
+                        let selected_http_audit_refs = if capture_update_allowed {
+                            &http_audit_refs
+                        } else {
+                            &response_only_http_audit_refs
+                        };
+                        let selected_http_audit_states = if capture_update_allowed {
+                            &http_audit_states
+                        } else {
+                            &response_only_http_audit_states
+                        };
+                        let selected_capture_mode = if capture_update_allowed {
+                            http_audit_capture_mode
+                        } else if response_only_http_audit_refs.any_present() {
+                            "ref_backed"
+                        } else {
+                            "none"
                         };
                         sync_usage_http_audit_storage(
                             &mut **tx,
                             &usage.request_id,
                             &http_audit_headers,
-                            &http_audit_refs,
-                            &http_audit_states,
-                            http_audit_capture_mode,
+                            selected_http_audit_refs,
+                            selected_http_audit_states,
+                            selected_capture_mode,
                         )
                         .await?;
                     }
@@ -8839,6 +8882,41 @@ ORDER BY "usage".user_id ASC
                             .client_response_body_state
                             .or(stored.client_response_body_state);
                         stored.request_metadata = request_metadata_value;
+                    } else if response_enrichment_allowed {
+                        if usage.response_headers.is_some() {
+                            stored.response_headers = usage.response_headers.clone();
+                        }
+                        if response_body_storage.has_detached_blob() {
+                            stored.response_body = usage.response_body.clone();
+                        }
+                        if usage.client_response_headers.is_some() {
+                            stored.client_response_headers = usage.client_response_headers.clone();
+                        }
+                        if client_response_body_storage.has_detached_blob() {
+                            stored.client_response_body = usage.client_response_body.clone();
+                        }
+                        stored.response_body_ref = resolved_write_usage_body_ref(
+                            usage.response_body_ref.as_deref(),
+                            &usage.request_id,
+                            UsageBodyField::ResponseBody,
+                            response_body_storage.has_detached_blob(),
+                            http_audit_refs.response_body_ref.as_deref(),
+                        )
+                        .or(stored.response_body_ref);
+                        stored.client_response_body_ref = resolved_write_usage_body_ref(
+                            usage.client_response_body_ref.as_deref(),
+                            &usage.request_id,
+                            UsageBodyField::ClientResponseBody,
+                            client_response_body_storage.has_detached_blob(),
+                            http_audit_refs.client_response_body_ref.as_deref(),
+                        )
+                        .or(stored.client_response_body_ref);
+                        stored.response_body_state = http_audit_states
+                            .response_body_state
+                            .or(stored.response_body_state);
+                        stored.client_response_body_state = http_audit_states
+                            .client_response_body_state
+                            .or(stored.client_response_body_state);
                     }
 
                     let before_api_key_contribution =
@@ -12376,6 +12454,36 @@ fn usage_capture_update_allowed(
     }
 
     !(previous_status == "streaming" && incoming_status == "pending")
+}
+
+/// A successful deferred video submission is represented as `pending` for settlement even after
+/// its HTTP response is complete. If a first-byte write already made the row `streaming`, allow
+/// only that response capture to enrich the audit; generic late pending writes remain rejected.
+fn deferred_video_response_enrichment_allowed(
+    previous: Option<(&str, &str)>,
+    incoming: &UpsertUsageRecord,
+) -> bool {
+    let Some((previous_status, previous_billing_status)) = previous else {
+        return false;
+    };
+    let has_positive_response_capture = incoming.response_headers.is_some()
+        || incoming.response_body.is_some()
+        || incoming.response_body_ref.is_some()
+        || incoming.client_response_headers.is_some()
+        || incoming.client_response_body.is_some()
+        || incoming.client_response_body_ref.is_some();
+
+    previous_status == "streaming"
+        && previous_billing_status == "pending"
+        && incoming.status == "pending"
+        && incoming.billing_status == "pending"
+        && incoming.request_type.as_deref() == Some("video")
+        && incoming
+            .status_code
+            .is_some_and(|code| (200..300).contains(&code))
+        && incoming.response_body_state != Some(UsageBodyCaptureState::None)
+        && incoming.client_response_body_state != Some(UsageBodyCaptureState::None)
+        && has_positive_response_capture
 }
 
 fn prepare_usage_body_storage(value: Option<&Value>) -> Result<UsageBodyStorage, DataLayerError> {

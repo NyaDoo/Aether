@@ -313,7 +313,7 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
     };
 
     if let Some(mut response) =
-        maybe_build_local_sync_finalize_response(trace_id, decision, &payload)?
+        maybe_build_local_sync_finalize_response(trace_id, decision, &mut payload)?
     {
         let request_path = build_local_sync_finalize_request_path(
             payload.report_kind.as_str(),

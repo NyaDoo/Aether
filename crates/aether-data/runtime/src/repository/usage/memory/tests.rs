@@ -1093,6 +1093,86 @@ async fn streaming_refresh_without_timing_does_not_clear_stream_timing() {
 }
 
 #[tokio::test]
+async fn deferred_video_submission_enriches_only_in_memory_response_capture() {
+    let repository = InMemoryUsageReadRepository::default();
+    let mut streaming = sample_upsert_usage_record("req-deferred-video-response");
+    streaming.status = "streaming".to_string();
+    streaming.request_type = Some("video".to_string());
+    streaming.status_code = Some(200);
+    streaming.request_headers = Some(json!({"x-request": "original"}));
+    streaming.request_body = Some(json!({"prompt": "original"}));
+    streaming.request_body_state = Some(UsageBodyCaptureState::Inline);
+    streaming.candidate_id = Some("candidate-original".to_string());
+    repository
+        .upsert(streaming)
+        .await
+        .expect("streaming video usage should upsert");
+
+    let mut submission = sample_upsert_usage_record("req-deferred-video-response");
+    submission.status = "pending".to_string();
+    submission.request_type = Some("video".to_string());
+    submission.status_code = Some(200);
+    submission.provider_name = "Late Provider".to_string();
+    submission.request_headers = Some(json!({"x-request": "late"}));
+    submission.request_body = Some(json!({"prompt": "late"}));
+    submission.request_body_state = Some(UsageBodyCaptureState::Inline);
+    submission.candidate_id = Some("candidate-late".to_string());
+    submission.response_headers = Some(json!({"content-type": "application/json"}));
+    submission.response_body = Some(json!({"id": "task-1", "status": "queued"}));
+    submission.response_body_state = Some(UsageBodyCaptureState::Inline);
+    submission.client_response_headers =
+        Some(json!({"content-type": "application/json; charset=utf-8"}));
+    submission.client_response_body = Some(json!({"id": "task-1"}));
+    submission.client_response_body_state = Some(UsageBodyCaptureState::Inline);
+
+    let stored = repository
+        .upsert(submission)
+        .await
+        .expect("deferred video response should enrich usage audit");
+
+    assert_eq!(stored.status, "streaming");
+    assert_eq!(stored.billing_status, "pending");
+    assert_eq!(stored.provider_name, "OpenAI");
+    assert_eq!(stored.candidate_id.as_deref(), Some("candidate-original"));
+    assert_eq!(
+        stored.request_headers,
+        Some(json!({"x-request": "original"}))
+    );
+    assert_eq!(stored.request_body, Some(json!({"prompt": "original"})));
+    assert_eq!(
+        stored.response_headers,
+        Some(json!({"content-type": "application/json"}))
+    );
+    assert_eq!(
+        stored.response_body,
+        Some(json!({"id": "task-1", "status": "queued"}))
+    );
+    assert_eq!(
+        stored.client_response_headers,
+        Some(json!({"content-type": "application/json; charset=utf-8"}))
+    );
+    assert_eq!(stored.client_response_body, Some(json!({"id": "task-1"})));
+}
+
+#[test]
+fn deferred_video_in_memory_enrichment_rejects_state_without_capture() {
+    let existing = StoredRequestUsageAudit {
+        status: "streaming".to_string(),
+        billing_status: "pending".to_string(),
+        ..sample_usage("req-video-state-only", 1_000)
+    };
+    let mut incoming = sample_upsert_usage_record("req-video-state-only");
+    incoming.request_type = Some("video".to_string());
+    incoming.status_code = Some(200);
+    incoming.response_body_state = Some(UsageBodyCaptureState::Inline);
+    incoming.client_response_body_state = Some(UsageBodyCaptureState::Inline);
+
+    assert!(!super::deferred_video_response_enrichment_allowed(
+        &existing, &incoming,
+    ));
+}
+
+#[tokio::test]
 async fn seed_hydrates_legacy_body_ref_metadata_into_typed_fields() {
     let repository = InMemoryUsageReadRepository::seed(vec![StoredRequestUsageAudit {
         request_metadata: Some(json!({

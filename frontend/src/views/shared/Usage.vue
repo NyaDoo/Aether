@@ -623,6 +623,9 @@ async function pollActiveRequests() {
         if (typeof update.request_type === 'string' && update.request_type.trim()) {
           record.request_type = update.request_type
         }
+        if (typeof update.operation === 'string' && update.operation.trim()) {
+          record.operation = update.operation
+        }
         if (typeof update.requested_reasoning_effort === 'string' && update.requested_reasoning_effort.trim()) {
           record.requested_reasoning_effort = update.requested_reasoning_effort
         }
@@ -1108,6 +1111,7 @@ function handleDetailRequestState(update: {
   endpointApiFormat?: string | null
   hasFormatConversion?: boolean | null
   targetModel?: string | null
+  operation?: string | null
   requestedReasoningEffort?: string | null
   reasoningEffort?: string | null
   serviceTier?: string | null
@@ -1218,6 +1222,9 @@ function handleDetailRequestState(update: {
   }
   if ('targetModel' in update) {
     record.target_model = typeof update.targetModel === 'string' ? update.targetModel : update.targetModel ?? undefined
+  }
+  if ('operation' in update && typeof update.operation === 'string' && update.operation.trim()) {
+    record.operation = update.operation
   }
   if ('reasoningEffort' in update) {
     record.reasoning_effort = typeof update.reasoningEffort === 'string' ? update.reasoningEffort : null

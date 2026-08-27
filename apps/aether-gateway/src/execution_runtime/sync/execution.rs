@@ -969,6 +969,16 @@ fn sync_terminal_candidate_error_fields(
     (error_type, error_message)
 }
 
+fn sync_terminal_candidate_status(status_code: u16) -> RequestCandidateStatus {
+    if status_code == 499 {
+        RequestCandidateStatus::Cancelled
+    } else if status_code >= 400 {
+        RequestCandidateStatus::Failed
+    } else {
+        RequestCandidateStatus::Success
+    }
+}
+
 async fn record_sync_terminal_usage_and_disarm_guard(
     state: &AppState,
     plan: &ExecutionPlan,
@@ -993,15 +1003,7 @@ async fn record_sync_terminal_usage_and_disarm_guard(
     // Candidate terminal persistence is intentionally downstream of the usage handoff.  A queue
     // append alone is not enough: if the durable usage write could not be confirmed, retain a
     // streaming candidate so cleanup cannot reinterpret a skeletal row as a successful request.
-    let desired_status = if payload.status_code == 499
-        || payload.report_kind.to_ascii_lowercase().contains("cancel")
-    {
-        RequestCandidateStatus::Cancelled
-    } else if payload.status_code >= 400 {
-        RequestCandidateStatus::Failed
-    } else {
-        RequestCandidateStatus::Success
-    };
+    let desired_status = sync_terminal_candidate_status(payload.status_code);
     // Never publish *any* terminal candidate status before the handoff is
     // confirmed.  The previous ordering only downgraded successful 2xx
     // responses; a failed/499 payload could still race the pending usage row.
@@ -3640,7 +3642,7 @@ async fn execute_execution_runtime_sync_impl(
             }
         };
         if let Some(response) =
-            maybe_build_local_sync_finalize_response(trace_id, decision, &payload)?
+            maybe_build_local_sync_finalize_response(trace_id, decision, &mut payload)?
         {
             let background_success_report_kind =
                 resolve_local_sync_success_background_report_kind(payload.report_kind.as_str());
@@ -5174,6 +5176,22 @@ mod tests {
         assert_eq!(
             non_terminal_image_progress_status(RequestCandidateStatus::Streaming),
             RequestCandidateStatus::Streaming
+        );
+    }
+
+    #[test]
+    fn sync_candidate_status_distinguishes_cancel_command_from_cancelled_request() {
+        assert_eq!(
+            sync_terminal_candidate_status(StatusCode::OK.as_u16()),
+            RequestCandidateStatus::Success
+        );
+        assert_eq!(
+            sync_terminal_candidate_status(499),
+            RequestCandidateStatus::Cancelled
+        );
+        assert_eq!(
+            sync_terminal_candidate_status(StatusCode::BAD_GATEWAY.as_u16()),
+            RequestCandidateStatus::Failed
         );
     }
 }

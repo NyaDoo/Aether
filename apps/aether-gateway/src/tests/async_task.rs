@@ -1,12 +1,15 @@
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+use aether_data::repository::usage::InMemoryUsageReadRepository;
 use aether_data::repository::video_tasks::InMemoryVideoTaskRepository;
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_data_contracts::repository::usage::{UsageAuditListQuery, UsageReadRepository};
 use aether_data_contracts::repository::video_tasks::{
     UpsertVideoTask, VideoTaskStatus, VideoTaskWriteRepository,
 };
+use aether_usage_runtime::UsageRuntimeConfig;
 
 use super::{
     any, build_router_with_state, build_state_with_execution_runtime_override, json,
@@ -733,6 +736,7 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint_with
     );
 
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let mut task = sample_video_task(
         "task-openai-cancel-direct",
         VideoTaskStatus::Processing,
@@ -805,12 +809,19 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint_with
             .expect("gateway state should build")
             .with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative)
             .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_video_task_repository_and_provider_transport_for_tests(
+                crate::data::GatewayDataState::with_video_task_provider_transport_and_usage_repository_for_tests(
                     Arc::clone(&repository),
                     provider_catalog_repository,
+                    Arc::clone(&usage_repository),
                     DEVELOPMENT_ENCRYPTION_KEY,
                 ),
-            ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                enqueue_retry_initial_backoff_ms: 1,
+                enqueue_retry_max_backoff_ms: 1,
+                ..UsageRuntimeConfig::default()
+            }),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -861,6 +872,70 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint_with
         detail_json["request_metadata"]["rust_local_snapshot"]["OpenAi"]["status"],
         "Cancelled"
     );
+
+    let cancel_usage = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let rows = usage_repository
+                .list_usage_audits(&UsageAuditListQuery {
+                    limit: Some(10),
+                    newest_first: true,
+                    ..UsageAuditListQuery::default()
+                })
+                .await
+                .expect("usage list should succeed");
+            if let Some(usage) = rows
+                .into_iter()
+                .find(|usage| usage.operation() == Some("video.cancel"))
+            {
+                break usage;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("independent cancel usage should become durable");
+    assert!(cancel_usage.request_id.starts_with("async-task-cancel-"));
+    assert_ne!(cancel_usage.request_id, "request-task-openai-cancel-direct");
+    assert_eq!(cancel_usage.status, "completed");
+    assert_eq!(cancel_usage.billing_status, "void");
+    assert_eq!(cancel_usage.request_type.as_deref(), Some("video"));
+    assert_eq!(cancel_usage.operation(), Some("video.cancel"));
+    assert_eq!(
+        cancel_usage
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("parent_request_id"))
+            .and_then(serde_json::Value::as_str),
+        Some("request-task-openai-cancel-direct")
+    );
+    assert_eq!(
+        cancel_usage
+            .request_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("usage_scope"))
+            .and_then(serde_json::Value::as_str),
+        Some("video_upstream_control_action")
+    );
+    assert_eq!(cancel_usage.client_response_headers, None);
+    assert_eq!(cancel_usage.client_response_body, None);
+
+    let original_usage = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(usage) = usage_repository
+                .find_by_request_id("request-task-openai-cancel-direct")
+                .await
+                .expect("original usage lookup should succeed")
+            {
+                break usage;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original generation usage should become terminal");
+    assert_eq!(original_usage.status, "cancelled");
+    assert_eq!(original_usage.billing_status, "void");
+    assert_eq!(original_usage.operation(), Some("video.create"));
 
     gateway_handle.abort();
     upstream_handle.abort();

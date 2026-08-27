@@ -6,7 +6,8 @@ use aether_contracts::ExecutionPlan;
 use aether_data_contracts::repository::usage::{
     extract_provider_actual_service_tier_from_response,
     extract_provider_reasoning_effort_from_body, extract_provider_service_tier_from_body,
-    normalize_provider_service_tier, resolve_provider_cache_ttl_minutes, UsageBodyCaptureState,
+    normalize_provider_service_tier, normalize_usage_operation, resolve_provider_cache_ttl_minutes,
+    usage_operation_from_asset_action, UsageBodyCaptureState,
     PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
     PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
     REQUESTED_REASONING_EFFORT_METADATA_KEY, ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY,
@@ -74,6 +75,18 @@ pub(crate) fn build_usage_request_metadata_seed(
     let mut metadata = Map::new();
     if let Some(context) = context {
         copy_allowed_metadata_fields(context, &mut metadata);
+        if !metadata.contains_key("operation") {
+            let operation = context
+                .get("asset_action")
+                .and_then(Value::as_str)
+                .and_then(usage_operation_from_asset_action);
+            if let Some(operation) = operation {
+                metadata.insert(
+                    "operation".to_string(),
+                    Value::String(operation.to_string()),
+                );
+            }
+        }
     }
     (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
@@ -137,6 +150,7 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
                 | "request_path"
                 | "request_query_string"
                 | "request_path_and_query"
+                | "operation"
                 | "requested_reasoning_effort"
                 | "provider_reasoning_effort"
                 | "provider_service_tier"
@@ -350,6 +364,7 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_non_empty_string(source, target, "client_request_id");
     copy_non_empty_string(source, target, "client_trace_id");
     copy_non_empty_string(source, target, "asset_action");
+    copy_usage_operation(source, target);
     copy_non_empty_string(source, target, "usage_scope");
     copy_non_empty_string(source, target, "client_capture_scope");
     copy_non_empty_string(source, target, "provider_response_capture_state");
@@ -425,6 +440,7 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_empty_string(&mut source, target, "client_request_id");
     remove_non_empty_string(&mut source, target, "client_trace_id");
     remove_non_empty_string(&mut source, target, "asset_action");
+    remove_usage_operation(&mut source, target);
     remove_non_empty_string(&mut source, target, "usage_scope");
     remove_non_empty_string(&mut source, target, "client_capture_scope");
     remove_non_empty_string(&mut source, target, "provider_response_capture_state");
@@ -544,6 +560,20 @@ fn copy_non_empty_string(source: &Map<String, Value>, target: &mut Map<String, V
     );
 }
 
+fn copy_usage_operation(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    let Some(operation) = source
+        .get("operation")
+        .and_then(Value::as_str)
+        .and_then(normalize_usage_operation)
+    else {
+        return;
+    };
+    target.insert(
+        "operation".to_string(),
+        Value::String(operation.to_string()),
+    );
+}
+
 fn remove_non_empty_string(
     source: &mut Map<String, Value>,
     target: &mut Map<String, Value>,
@@ -556,6 +586,19 @@ fn remove_non_empty_string(
         return;
     };
     target.insert(key.to_string(), Value::String(value));
+}
+
+fn remove_usage_operation(source: &mut Map<String, Value>, target: &mut Map<String, Value>) {
+    let Some(operation) = source
+        .remove("operation")
+        .and_then(|value| value.as_str().and_then(normalize_usage_operation))
+    else {
+        return;
+    };
+    target.insert(
+        "operation".to_string(),
+        Value::String(operation.to_string()),
+    );
 }
 
 fn copy_number(source: &Map<String, Value>, target: &mut Map<String, Value>, key: &str) {
@@ -1409,5 +1452,34 @@ mod tests {
             sanitize_usage_request_metadata_ref(Some(&value)),
             sanitize_usage_request_metadata(Some(value))
         );
+    }
+
+    #[test]
+    fn usage_operation_metadata_only_accepts_canonical_values() {
+        let accepted = sanitize_usage_request_metadata(Some(json!({
+            "operation": "video.cancel"
+        })))
+        .expect("canonical operation should remain");
+        assert_eq!(accepted["operation"], "video.cancel");
+
+        assert_eq!(
+            sanitize_usage_request_metadata(Some(json!({
+                "operation": "provider-specific-free-form"
+            }))),
+            None
+        );
+    }
+
+    #[test]
+    fn asset_action_seed_adds_canonical_operation_and_keeps_source_action() {
+        let context = json!({
+            "asset_action": "ListAssets",
+            "usage_scope": "asset_upstream_action"
+        });
+        let metadata = build_usage_request_metadata_seed(&sample_plan(), context.as_object())
+            .expect("asset metadata should remain");
+
+        assert_eq!(metadata["asset_action"], "ListAssets");
+        assert_eq!(metadata["operation"], "asset_library.list_assets");
     }
 }

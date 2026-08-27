@@ -85,6 +85,22 @@ fn sqlite_usage_upsert_guards_candidate_identity_metadata_and_routing_from_late_
 }
 
 #[test]
+fn sqlite_deferred_video_enrichment_rejects_state_without_capture() {
+    let mut incoming = sample_usage("request-video-state-only", "pending", "pending", 1_001);
+    incoming.request_type = Some("video".to_string());
+    incoming.status_code = Some(200);
+    incoming.response_body_state = Some(UsageBodyCaptureState::Inline);
+    incoming.client_response_body_state = Some(UsageBodyCaptureState::Inline);
+
+    assert!(
+        !super::http_capture::deferred_video_response_enrichment_allowed(
+            Some(("streaming", "pending")),
+            &incoming,
+        )
+    );
+}
+
+#[test]
 fn sqlite_stale_cleanup_never_promotes_from_a_candidate_marker() {
     let source = include_str!("../usage.rs");
     assert!(!source.contains("SELECT_COMPLETED_REQUEST_CANDIDATES_SQL"));
@@ -1717,6 +1733,104 @@ async fn sqlite_usage_write_repository_keeps_streaming_capture_from_late_pending
             .and_then(|value| value.get("trace_id"))
             .and_then(serde_json::Value::as_str),
         Some("streaming-final")
+    );
+}
+
+#[tokio::test]
+async fn sqlite_deferred_video_submission_enriches_only_response_capture() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    seed_stats_targets(&pool).await;
+
+    let repository = SqliteUsageWriteRepository::new(pool);
+    let mut streaming = sample_usage(
+        "request-deferred-video-response",
+        "streaming",
+        "pending",
+        1_000,
+    );
+    streaming.request_type = Some("video".to_string());
+    streaming.request_headers = Some(serde_json::json!({"x-request": "original"}));
+    streaming.request_body = Some(serde_json::json!({"prompt": "original"}));
+    streaming.request_body_state = Some(UsageBodyCaptureState::Inline);
+    streaming.provider_request_headers =
+        Some(serde_json::json!({"authorization": "masked-original"}));
+    streaming.provider_request_body = Some(serde_json::json!({"model": "seedance-original"}));
+    streaming.provider_request_body_state = Some(UsageBodyCaptureState::Inline);
+    repository
+        .upsert(streaming)
+        .await
+        .expect("streaming video usage should upsert");
+
+    let mut submission = sample_usage(
+        "request-deferred-video-response",
+        "pending",
+        "pending",
+        1_001,
+    );
+    submission.request_type = Some("video".to_string());
+    submission.provider_name = "Late Provider".to_string();
+    submission.candidate_id = Some("late-candidate".to_string());
+    submission.request_headers = Some(serde_json::json!({"x-request": "late"}));
+    submission.request_body = Some(serde_json::json!({"prompt": "late"}));
+    submission.request_body_state = Some(UsageBodyCaptureState::Inline);
+    submission.provider_request_headers = Some(serde_json::json!({"authorization": "masked-late"}));
+    submission.provider_request_body = Some(serde_json::json!({"model": "seedance-late"}));
+    submission.provider_request_body_state = Some(UsageBodyCaptureState::Inline);
+    submission.response_headers = Some(serde_json::json!({"content-type": "application/json"}));
+    submission.response_body = Some(serde_json::json!({"id": "task-1", "status": "queued"}));
+    submission.response_body_state = Some(UsageBodyCaptureState::Inline);
+    submission.client_response_headers =
+        Some(serde_json::json!({"content-type": "application/json; charset=utf-8"}));
+    submission.client_response_body = Some(serde_json::json!({"id": "task-1"}));
+    submission.client_response_body_state = Some(UsageBodyCaptureState::Inline);
+
+    let current = repository
+        .upsert(submission)
+        .await
+        .expect("deferred video response should enrich usage audit");
+
+    assert_eq!(current.status, "streaming");
+    assert_eq!(current.billing_status, "pending");
+    assert_eq!(current.provider_name, "Provider One");
+    assert_eq!(current.candidate_id.as_deref(), Some("candidate-1"));
+    assert_eq!(
+        current.request_headers,
+        Some(serde_json::json!({"x-request": "original"}))
+    );
+    assert_eq!(
+        current.request_body,
+        Some(serde_json::json!({"prompt": "original"}))
+    );
+    assert_eq!(
+        current.provider_request_headers,
+        Some(serde_json::json!({"authorization": "masked-original"}))
+    );
+    assert_eq!(
+        current.provider_request_body,
+        Some(serde_json::json!({"model": "seedance-original"}))
+    );
+    assert_eq!(
+        current.response_headers,
+        Some(serde_json::json!({"content-type": "application/json"}))
+    );
+    assert_eq!(
+        current.response_body,
+        Some(serde_json::json!({"id": "task-1", "status": "queued"}))
+    );
+    assert_eq!(
+        current.client_response_headers,
+        Some(serde_json::json!({"content-type": "application/json; charset=utf-8"}))
+    );
+    assert_eq!(
+        current.client_response_body,
+        Some(serde_json::json!({"id": "task-1"}))
     );
 }
 
