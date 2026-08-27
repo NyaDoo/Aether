@@ -8,6 +8,7 @@
       <TimeRangePicker
         v-model="timeRangeModel"
         :show-granularity="false"
+        :show-time="true"
         class="hidden shrink-0 md:flex"
       />
 
@@ -59,7 +60,8 @@
         <TimeRangePicker
           v-model="timeRangeModel"
           :show-granularity="false"
-          class="min-w-0"
+          :show-time="true"
+          class="col-span-2 min-w-0"
           preset-trigger-class="!w-full"
         />
 

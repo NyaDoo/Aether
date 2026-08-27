@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{Datelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use serde_json::json;
 use url::form_urlencoded;
 
@@ -39,6 +39,17 @@ pub struct AdminStatsTimeRange {
     pub start_date: chrono::NaiveDate,
     pub end_date: chrono::NaiveDate,
     pub tz_offset_minutes: i32,
+    /// Optional precise local start boundary for custom usage ranges.
+    ///
+    /// The date fields remain the canonical day-level representation used by
+    /// existing statistics responses.  When present, this value supplies the
+    /// time-of-day selected by a `datetime-local` usage filter.
+    pub start_datetime: Option<NaiveDateTime>,
+    /// Optional precise local end boundary for custom usage ranges.
+    ///
+    /// The end minute is treated as inclusive by [`Self::to_unix_bounds`], so
+    /// the generated query bound is one minute after this value.
+    pub end_datetime: Option<NaiveDateTime>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -140,6 +151,131 @@ pub fn parse_tz_offset_minutes(query: Option<&str>) -> Result<i32, String> {
 pub fn parse_naive_date(field: &str, value: &str) -> Result<chrono::NaiveDate, String> {
     chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .map_err(|_| format!("{field} must be a valid date in YYYY-MM-DD format"))
+}
+
+/// Parse a local date/time value used by usage range filters.
+///
+/// The UI sends the value from an HTML `datetime-local` control (normally
+/// `YYYY-MM-DDTHH:mm`).  We also accept a space separator, seconds/fractional
+/// seconds, and RFC3339 values for API clients.  RFC3339 values are converted
+/// to the caller's local wall clock using `tz_offset_minutes` before being
+/// stored in the range; this keeps all range arithmetic in one timezone.
+fn parse_local_datetime(
+    field: &str,
+    value: &str,
+    tz_offset_minutes: i32,
+) -> Result<NaiveDateTime, String> {
+    let value = value.trim();
+    // `datetime-local` values have no offset and are therefore interpreted in
+    // the timezone represented by `tz_offset_minutes`.
+    for format in [
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+    ] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(value, format) {
+            return Ok(parsed);
+        }
+    }
+
+    // Be liberal for direct API callers that provide an explicit offset.  The
+    // parsed instant is projected into the requested local offset so that the
+    // normal range conversion subtracts the offset exactly once.  A literal
+    // `+` in an unescaped query string is decoded as a space by
+    // `application/x-www-form-urlencoded`; try restoring that separator as a
+    // small compatibility aid for callers that do not percent-encode it.
+    let parsed = DateTime::parse_from_rfc3339(value).ok().or_else(|| {
+        let (prefix, suffix) = value.rsplit_once(' ')?;
+        let suffix_bytes = suffix.as_bytes();
+        let is_offset_suffix = suffix_bytes.len() == 5
+            && suffix_bytes[2] == b':'
+            && suffix_bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| index == 2 || byte.is_ascii_digit());
+        if !is_offset_suffix {
+            return None;
+        }
+        DateTime::parse_from_rfc3339(&format!("{prefix}+{suffix}")).ok()
+    });
+    if let Some(parsed) = parsed {
+        let utc = parsed.with_timezone(&Utc);
+        let local_offset = chrono::Duration::minutes(i64::from(tz_offset_minutes));
+        return utc
+            .naive_utc()
+            .checked_add_signed(local_offset)
+            .ok_or_else(|| format!("{field} is outside the supported datetime range"));
+    }
+
+    Err(format!(
+        "{field} must be a valid date in YYYY-MM-DD format or datetime in YYYY-MM-DDTHH:mm format"
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedTimeRangeEndpoint {
+    date: chrono::NaiveDate,
+    datetime: Option<NaiveDateTime>,
+}
+
+fn parse_time_range_endpoint(
+    field: &str,
+    value: &str,
+    tz_offset_minutes: i32,
+) -> Result<ParsedTimeRangeEndpoint, String> {
+    let trimmed = value.trim();
+    if let Ok(date) = parse_naive_date(field, trimmed) {
+        return Ok(ParsedTimeRangeEndpoint {
+            date,
+            datetime: None,
+        });
+    }
+
+    // Keep the legacy validation message for date-only input.  This matters
+    // to API clients that already distinguish an invalid date from an invalid
+    // date/time value based on the response detail.
+    if !trimmed.contains('T') && !trimmed.contains(' ') {
+        return Err(format!("{field} must be a valid date in YYYY-MM-DD format"));
+    }
+
+    let datetime = parse_local_datetime(field, value, tz_offset_minutes)?;
+    Ok(ParsedTimeRangeEndpoint {
+        date: datetime.date(),
+        datetime: Some(datetime),
+    })
+}
+
+fn range_has_valid_order(
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+    start_datetime: Option<NaiveDateTime>,
+    end_datetime: Option<NaiveDateTime>,
+) -> bool {
+    let Some(start_local) = start_datetime.or_else(|| start_date.and_hms_opt(0, 0, 0)) else {
+        return false;
+    };
+    let Some(end_local) = (match end_datetime {
+        Some(value) => Some(value),
+        None => end_date
+            .checked_add_signed(chrono::Duration::days(1))
+            .and_then(|date| date.and_hms_opt(0, 0, 0)),
+    }) else {
+        return false;
+    };
+
+    // A datetime end is inclusive at the selected precision, so equal start
+    // and end minutes describe a valid one-minute window.  Compare the raw
+    // endpoints here (rather than the exclusive bound) so an API client that
+    // supplies seconds cannot sneak through a reversed sub-minute range.
+    if end_datetime.is_some() {
+        start_local <= end_local
+    } else {
+        // Date-only ends retain the historical inclusive whole-day behavior.
+        start_local < end_local
+    }
 }
 
 pub fn parse_bounded_u32(field: &str, value: &str, min: u32, max: u32) -> Result<u32, String> {
@@ -258,6 +394,8 @@ pub fn build_time_range_from_days(
         start_date,
         end_date,
         tz_offset_minutes,
+        start_datetime: None,
+        end_datetime: None,
     })
 }
 
@@ -287,6 +425,8 @@ pub fn build_comparison_range(
         start_date: comparison.0,
         end_date: comparison.1,
         tz_offset_minutes: current.tz_offset_minutes,
+        start_datetime: None,
+        end_datetime: None,
     })
 }
 
@@ -424,15 +564,15 @@ impl AdminStatsTimeSeriesBucket {
 impl AdminStatsTimeRange {
     pub fn resolve_optional(query: Option<&str>) -> Result<Option<Self>, String> {
         let tz_offset_minutes = parse_tz_offset_minutes(query)?;
-        let start_date = query_param_value(query, "start_date")
-            .map(|value| parse_naive_date("start_date", &value))
+        let start_endpoint = query_param_value(query, "start_date")
+            .map(|value| parse_time_range_endpoint("start_date", &value, tz_offset_minutes))
             .transpose()?;
-        let end_date = query_param_value(query, "end_date")
-            .map(|value| parse_naive_date("end_date", &value))
+        let end_endpoint = query_param_value(query, "end_date")
+            .map(|value| parse_time_range_endpoint("end_date", &value, tz_offset_minutes))
             .transpose()?;
         let preset = query_param_value(query, "preset");
 
-        if preset.is_none() && start_date.is_none() && end_date.is_none() {
+        if preset.is_none() && start_endpoint.is_none() && end_endpoint.is_none() {
             let default_days = admin_usage_default_days();
             if default_days == 0 {
                 return Ok(None);
@@ -447,23 +587,32 @@ impl AdminStatsTimeRange {
                 start_date,
                 end_date,
                 tz_offset_minutes,
+                start_datetime: None,
+                end_datetime: None,
             }));
         }
 
-        let (start_date, end_date) = match (preset.as_deref(), start_date, end_date) {
-            (Some(preset), None, None) => resolve_preset_dates(preset, tz_offset_minutes)?,
-            (None, Some(start_date), Some(end_date)) => (start_date, end_date),
-            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-                return Err("preset cannot be combined with start_date or end_date".to_string());
-            }
-            _ => {
-                return Err(
-                    "Either preset or both start_date and end_date must be provided".to_string(),
-                );
-            }
-        };
+        let (start_date, end_date, start_datetime, end_datetime) =
+            match (preset.as_deref(), start_endpoint, end_endpoint) {
+                (Some(preset), None, None) => {
+                    let (start_date, end_date) = resolve_preset_dates(preset, tz_offset_minutes)?;
+                    (start_date, end_date, None, None)
+                }
+                (None, Some(start), Some(end)) => {
+                    (start.date, end.date, start.datetime, end.datetime)
+                }
+                (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                    return Err("preset cannot be combined with start_date or end_date".to_string());
+                }
+                _ => {
+                    return Err(
+                        "Either preset or both start_date and end_date must be provided"
+                            .to_string(),
+                    );
+                }
+            };
 
-        if start_date > end_date {
+        if !range_has_valid_order(start_date, end_date, start_datetime, end_datetime) {
             return Err("start_date must be <= end_date".to_string());
         }
 
@@ -476,6 +625,8 @@ impl AdminStatsTimeRange {
             start_date,
             end_date,
             tz_offset_minutes,
+            start_datetime,
+            end_datetime,
         }))
     }
 
@@ -485,14 +636,19 @@ impl AdminStatsTimeRange {
         end_key: &str,
     ) -> Result<Self, String> {
         let tz_offset_minutes = parse_tz_offset_minutes(query)?;
-        let start_date = query_param_value(query, start_key)
+        let start_endpoint = query_param_value(query, start_key)
             .ok_or_else(|| format!("{start_key} is required"))
-            .and_then(|value| parse_naive_date(start_key, &value))?;
-        let end_date = query_param_value(query, end_key)
+            .and_then(|value| parse_time_range_endpoint(start_key, &value, tz_offset_minutes))?;
+        let end_endpoint = query_param_value(query, end_key)
             .ok_or_else(|| format!("{end_key} is required"))
-            .and_then(|value| parse_naive_date(end_key, &value))?;
+            .and_then(|value| parse_time_range_endpoint(end_key, &value, tz_offset_minutes))?;
 
-        if start_date > end_date {
+        let start_date = start_endpoint.date;
+        let end_date = end_endpoint.date;
+        let start_datetime = start_endpoint.datetime;
+        let end_datetime = end_endpoint.datetime;
+
+        if !range_has_valid_order(start_date, end_date, start_datetime, end_datetime) {
             return Err(format!("{start_key} must be <= {end_key}"));
         }
 
@@ -500,22 +656,47 @@ impl AdminStatsTimeRange {
             start_date,
             end_date,
             tz_offset_minutes,
+            start_datetime,
+            end_datetime,
         })
+    }
+
+    /// Return the local start instant represented by this range.
+    ///
+    /// Date-only ranges retain their historical midnight start.  A custom
+    /// datetime range uses the selected minute (or finer precision supplied by
+    /// an API client).
+    pub fn local_start_datetime(&self) -> Option<NaiveDateTime> {
+        self.start_datetime
+            .or_else(|| self.start_date.and_hms_opt(0, 0, 0))
+    }
+
+    /// Return the exclusive local end instant represented by this range.
+    ///
+    /// Date-only ranges retain their historical next-midnight end.  For a
+    /// custom datetime, the selected end minute is inclusive, therefore one
+    /// minute is added to form the repository's exclusive upper bound.
+    pub fn local_end_datetime_exclusive(&self) -> Option<NaiveDateTime> {
+        match self.end_datetime {
+            Some(value) => value.checked_add_signed(chrono::Duration::minutes(1)),
+            None => self
+                .end_date
+                .checked_add_signed(chrono::Duration::days(1))?
+                .and_hms_opt(0, 0, 0),
+        }
     }
 
     pub fn to_unix_bounds(&self) -> Option<(u64, u64)> {
         let offset = chrono::Duration::minutes(i64::from(self.tz_offset_minutes));
-        let start_local = self.start_date.and_hms_opt(0, 0, 0)?;
-        let end_local = self
-            .end_date
-            .checked_add_signed(chrono::Duration::days(1))?
-            .and_hms_opt(0, 0, 0)?;
+        let start_local = self.local_start_datetime()?;
+        let end_local = self.local_end_datetime_exclusive()?;
+        let start_utc_naive = start_local.checked_sub_signed(offset)?;
+        let end_utc_naive = end_local.checked_sub_signed(offset)?;
         let start_utc =
-            chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_local - offset, Utc)
-                .timestamp();
+            chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_utc_naive, Utc).timestamp();
         let end_utc =
-            chrono::DateTime::<Utc>::from_naive_utc_and_offset(end_local - offset, Utc).timestamp();
-        if start_utc < 0 || end_utc <= 0 {
+            chrono::DateTime::<Utc>::from_naive_utc_and_offset(end_utc_naive, Utc).timestamp();
+        if start_utc < 0 || end_utc <= start_utc || end_utc <= 0 {
             return None;
         }
         Some((start_utc as u64, end_utc as u64))
@@ -523,15 +704,41 @@ impl AdminStatsTimeRange {
 
     pub fn to_utc_datetime_bounds(&self) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
         let offset = chrono::Duration::minutes(i64::from(self.tz_offset_minutes));
-        let start_local = self.start_date.and_hms_opt(0, 0, 0)?;
-        let end_local = self
-            .end_date
-            .checked_add_signed(chrono::Duration::days(1))?
-            .and_hms_opt(0, 0, 0)?;
+        let start_local = self.local_start_datetime()?;
+        let end_local = self.local_end_datetime_exclusive()?;
+        let start_utc_naive = start_local.checked_sub_signed(offset)?;
+        let end_utc_naive = end_local.checked_sub_signed(offset)?;
         Some((
-            chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_local - offset, Utc),
-            chrono::DateTime::<Utc>::from_naive_utc_and_offset(end_local - offset, Utc),
+            chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_utc_naive, Utc),
+            chrono::DateTime::<Utc>::from_naive_utc_and_offset(end_utc_naive, Utc),
         ))
+    }
+
+    /// Return UTC bounds expanded to complete local-hour buckets.
+    ///
+    /// Usage time-series queries group records by the local hour.  A precise
+    /// custom range can begin or end in the middle of an hour, so the range
+    /// used to build the response must include the corresponding partial
+    /// buckets.  Date-only ranges already begin/end on an hour boundary and
+    /// therefore retain their historical bounds.
+    fn to_utc_hourly_bounds(&self) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
+        let offset = chrono::Duration::minutes(i64::from(self.tz_offset_minutes));
+        let start_local = self.local_start_datetime()?;
+        let end_local = self.local_end_datetime_exclusive()?;
+
+        let start_hour = start_local.date().and_hms_opt(start_local.hour(), 0, 0)?;
+        let end_hour_floor = end_local.date().and_hms_opt(end_local.hour(), 0, 0)?;
+        let end_hour = if end_local == end_hour_floor {
+            end_hour_floor
+        } else {
+            end_hour_floor.checked_add_signed(chrono::Duration::hours(1))?
+        };
+
+        let start_utc_naive = start_hour.checked_sub_signed(offset)?;
+        let end_utc_naive = end_hour.checked_sub_signed(offset)?;
+        let start_utc = chrono::DateTime::<Utc>::from_naive_utc_and_offset(start_utc_naive, Utc);
+        let end_utc = chrono::DateTime::<Utc>::from_naive_utc_and_offset(end_utc_naive, Utc);
+        (start_utc < end_utc).then_some((start_utc, end_utc))
     }
 
     pub fn validate_for_time_series(
@@ -1336,7 +1543,7 @@ fn build_hourly_time_series_payload_from_summaries(
     time_range: &AdminStatsTimeRange,
     buckets: &[StoredUsageTimeSeriesBucket],
 ) -> Vec<serde_json::Value> {
-    let Some((mut current, end)) = time_range.to_utc_datetime_bounds() else {
+    let Some((mut current, end)) = time_range.to_utc_hourly_bounds() else {
         return Vec::new();
     };
     let offset = chrono::Duration::minutes(i64::from(time_range.tz_offset_minutes));
@@ -1649,7 +1856,7 @@ fn build_hourly_time_series_payload(
     time_range: &AdminStatsTimeRange,
     items: &[StoredRequestUsageAudit],
 ) -> Vec<serde_json::Value> {
-    let Some((mut current, end)) = time_range.to_utc_datetime_bounds() else {
+    let Some((mut current, end)) = time_range.to_utc_hourly_bounds() else {
         return Vec::new();
     };
     let offset = chrono::Duration::minutes(i64::from(time_range.tz_offset_minutes));
@@ -2115,12 +2322,194 @@ mod tests {
 
     use super::{
         build_api_key_leaderboard_items, build_api_key_leaderboard_items_from_summaries,
-        build_user_leaderboard_items, AdminStatsUserMetadata,
+        build_time_series_payload, build_user_leaderboard_items, AdminStatsGranularity,
+        AdminStatsTimeRange, AdminStatsUserMetadata,
     };
     use aether_data::repository::auth::StoredAuthApiKeySnapshot;
     use aether_data_contracts::repository::usage::{
         StoredRequestUsageAudit, StoredUsageLeaderboardSummary,
     };
+    use chrono::{Duration, NaiveDate, NaiveDateTime};
+
+    #[test]
+    fn date_only_usage_range_keeps_full_local_day_bounds() {
+        let range = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21&end_date=2024-03-21&tz_offset_minutes=480",
+        ))
+        .expect("date-only range should parse")
+        .expect("range should be present");
+
+        assert_eq!(range.start_datetime, None);
+        assert_eq!(range.end_datetime, None);
+        let expected_start = NaiveDate::from_ymd_opt(2024, 3, 21)
+            .expect("valid date")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid time")
+            .checked_sub_signed(Duration::minutes(480))
+            .expect("offset should fit")
+            .and_utc()
+            .timestamp() as u64;
+        let expected_end = NaiveDate::from_ymd_opt(2024, 3, 22)
+            .expect("valid date")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid time")
+            .checked_sub_signed(Duration::minutes(480))
+            .expect("offset should fit")
+            .and_utc()
+            .timestamp() as u64;
+        assert_eq!(range.to_unix_bounds(), Some((expected_start, expected_end)));
+    }
+
+    #[test]
+    fn datetime_local_usage_range_preserves_minute_precision_and_inclusive_end() {
+        let range = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21T10%3A15&end_date=2024-03-21T10%3A45&tz_offset_minutes=480",
+        ))
+        .expect("datetime range should parse")
+        .expect("range should be present");
+
+        let start = NaiveDateTime::parse_from_str("2024-03-21T10:15", "%Y-%m-%dT%H:%M")
+            .expect("valid start");
+        let end =
+            NaiveDateTime::parse_from_str("2024-03-21T10:45", "%Y-%m-%dT%H:%M").expect("valid end");
+        assert_eq!(range.start_datetime, Some(start));
+        assert_eq!(range.end_datetime, Some(end));
+        assert_eq!(range.local_start_datetime(), Some(start));
+        assert_eq!(
+            range.local_end_datetime_exclusive(),
+            Some(end + Duration::minutes(1))
+        );
+
+        let expected_start = (start - Duration::minutes(480)).and_utc().timestamp() as u64;
+        let expected_end = (end + Duration::minutes(1) - Duration::minutes(480))
+            .and_utc()
+            .timestamp() as u64;
+        assert_eq!(range.to_unix_bounds(), Some((expected_start, expected_end)));
+    }
+
+    #[test]
+    fn hourly_time_series_aligns_precise_bounds_to_local_hours() {
+        let range = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21T10%3A45&end_date=2024-03-21T11%3A00&tz_offset_minutes=480",
+        ))
+        .expect("datetime range should parse")
+        .expect("range should be present");
+
+        let local_start = NaiveDateTime::parse_from_str("2024-03-21 10:50:00", "%Y-%m-%d %H:%M:%S")
+            .expect("valid first usage timestamp");
+        let local_end = NaiveDateTime::parse_from_str("2024-03-21 11:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("valid second usage timestamp");
+        let mut first_usage = sample_usage(None);
+        first_usage.created_at_unix_ms =
+            (local_start - Duration::minutes(480)).and_utc().timestamp() as u64;
+        let mut second_usage = sample_usage(None);
+        second_usage.id = "usage-2".to_string();
+        second_usage.request_id = "req-2".to_string();
+        second_usage.created_at_unix_ms =
+            (local_end - Duration::minutes(480)).and_utc().timestamp() as u64;
+
+        let payload = build_time_series_payload(
+            &range,
+            AdminStatsGranularity::Hour,
+            &[first_usage, second_usage],
+        );
+        let labels = payload
+            .iter()
+            .map(|item| {
+                item.get("date")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("hourly payload should include date labels")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["2024-03-21T10:00:00+00:00", "2024-03-21T11:00:00+00:00",]
+        );
+        assert_eq!(
+            payload
+                .iter()
+                .map(|item| item
+                    .get("total_requests")
+                    .and_then(serde_json::Value::as_u64)
+                    .expect("hourly payload should include request counts"))
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+
+        // Date-only ranges already align to hour boundaries and continue to
+        // produce exactly one complete local day of hourly buckets.
+        let date_only = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21&end_date=2024-03-21&tz_offset_minutes=480",
+        ))
+        .expect("date-only range should parse")
+        .expect("range should be present");
+        let date_only_payload =
+            build_time_series_payload(&date_only, AdminStatsGranularity::Hour, &[]);
+        assert_eq!(date_only_payload.len(), 24);
+    }
+
+    #[test]
+    fn datetime_range_accepts_space_separator_seconds_and_rfc3339() {
+        let range = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21+10%3A15%3A30&end_date=2024-03-21+10%3A16%3A30&tz_offset_minutes=480",
+        ))
+        .expect("space-separated datetime should parse")
+        .expect("range should be present");
+        assert_eq!(
+            range.start_datetime,
+            Some(
+                NaiveDateTime::parse_from_str("2024-03-21 10:15:30", "%Y-%m-%d %H:%M:%S")
+                    .expect("valid start")
+            )
+        );
+
+        // An explicit UTC value is projected into the requested +08:00 local
+        // wall clock, then converted back exactly once for the query bounds.
+        let rfc3339 = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21T02%3A15%3A00Z&end_date=2024-03-21T02%3A15%3A00Z&tz_offset_minutes=480",
+        ))
+        .expect("RFC3339 datetime should parse")
+        .expect("range should be present");
+        assert_eq!(
+            rfc3339.start_datetime,
+            Some(
+                NaiveDateTime::parse_from_str("2024-03-21 10:15:00", "%Y-%m-%d %H:%M:%S")
+                    .expect("valid local projection")
+            )
+        );
+        assert_eq!(
+            rfc3339.to_unix_bounds().map(|(start, end)| end - start),
+            Some(60)
+        );
+
+        // A raw `+08:00` in a form-encoded query arrives as a space.  It is
+        // still accepted and projected to the same local wall clock.
+        let raw_plus = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21T02%3A15%3A00+08%3A00&end_date=2024-03-21T02%3A15%3A00+08%3A00&tz_offset_minutes=480",
+        ))
+        .expect("raw plus RFC3339 datetime should parse")
+        .expect("range should be present");
+        assert_eq!(
+            raw_plus.start_datetime,
+            Some(
+                NaiveDateTime::parse_from_str("2024-03-21 02:15:00", "%Y-%m-%d %H:%M:%S")
+                    .expect("valid local projection")
+            )
+        );
+        assert_eq!(
+            raw_plus.to_unix_bounds().map(|(start, end)| end - start),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn datetime_usage_range_rejects_reversed_minutes() {
+        let error = AdminStatsTimeRange::resolve_optional(Some(
+            "start_date=2024-03-21T10%3A17&end_date=2024-03-21T10%3A16&tz_offset_minutes=0",
+        ))
+        .expect_err("reversed datetime range should fail");
+        assert_eq!(error, "start_date must be <= end_date");
+    }
 
     fn sample_usage(api_key_name: Option<&str>) -> StoredRequestUsageAudit {
         StoredRequestUsageAudit::new(

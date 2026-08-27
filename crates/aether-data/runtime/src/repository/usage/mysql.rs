@@ -27,6 +27,27 @@ use crate::DataLayerError;
 pub use aether_data_mysql::MysqlUsageWriteRepository;
 use aether_data_mysql::{MysqlUsageReadFilter, MysqlUsageStorage};
 
+const DASHBOARD_UTC_DAY_SECS: u64 = 86_400;
+
+// MySQL daily aggregate rows are keyed by the UTC start of a complete day;
+// partial-day bounds must be answered from the raw usage read model.
+fn dashboard_daily_aggregate_range_is_utc_aligned(
+    created_from_unix_secs: u64,
+    created_until_unix_secs: u64,
+) -> bool {
+    created_from_unix_secs < created_until_unix_secs
+        && created_from_unix_secs % DASHBOARD_UTC_DAY_SECS == 0
+        && created_until_unix_secs % DASHBOARD_UTC_DAY_SECS == 0
+}
+
+fn dashboard_daily_breakdown_can_use_aggregates(query: &UsageDashboardDailyBreakdownQuery) -> bool {
+    query.tz_offset_minutes == 0
+        && dashboard_daily_aggregate_range_is_utc_aligned(
+            query.created_from_unix_secs,
+            query.created_until_unix_secs,
+        )
+}
+
 #[derive(Debug, Clone)]
 pub struct MysqlUsageReadRepository {
     storage: MysqlUsageStorage,
@@ -200,12 +221,17 @@ impl UsageReadRepository for MysqlUsageReadRepository {
         if query.created_from_unix_secs >= query.created_until_unix_secs {
             return Ok(StoredUsageDashboardSummary::default());
         }
-        if let Some(summary) = self
-            .storage
-            .summarize_dashboard_usage_from_daily_aggregates(query)
-            .await?
-        {
-            return Ok(summary);
+        if dashboard_daily_aggregate_range_is_utc_aligned(
+            query.created_from_unix_secs,
+            query.created_until_unix_secs,
+        ) {
+            if let Some(summary) = self
+                .storage
+                .summarize_dashboard_usage_from_daily_aggregates(query)
+                .await?
+            {
+                return Ok(summary);
+            }
         }
         let filter = Self::range(query.created_from_unix_secs, query.created_until_unix_secs)
             .with_user_id(query.user_id.as_deref())
@@ -221,10 +247,13 @@ impl UsageReadRepository for MysqlUsageReadRepository {
         if query.created_from_unix_secs >= query.created_until_unix_secs {
             return Ok(Vec::new());
         }
-        let rows = self
-            .storage
-            .list_dashboard_daily_breakdown_from_daily_aggregates(query)
-            .await?;
+        let rows = if dashboard_daily_breakdown_can_use_aggregates(query) {
+            self.storage
+                .list_dashboard_daily_breakdown_from_daily_aggregates(query)
+                .await?
+        } else {
+            Vec::new()
+        };
         if !rows.is_empty() {
             return Ok(rows);
         }
@@ -441,6 +470,12 @@ impl UsageReadRepository for MysqlUsageReadRepository {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        dashboard_daily_aggregate_range_is_utc_aligned,
+        dashboard_daily_breakdown_can_use_aggregates,
+    };
+    use aether_data_contracts::repository::usage::UsageDashboardDailyBreakdownQuery;
+
     #[test]
     fn mysql_usage_reads_do_not_restore_the_unconditional_full_table_loader() {
         let source = include_str!("mysql.rs");
@@ -448,5 +483,26 @@ mod tests {
         assert!(!source.contains(&forbidden));
         assert!(source.contains("load_usage_records_in_range"));
         assert!(source.contains("MysqlUsageReadFilter::new"));
+    }
+
+    #[test]
+    fn mysql_dashboard_daily_aggregate_guard_requires_complete_utc_days() {
+        assert!(dashboard_daily_aggregate_range_is_utc_aligned(0, 172_800));
+        assert!(!dashboard_daily_aggregate_range_is_utc_aligned(1, 172_800));
+        assert!(!dashboard_daily_aggregate_range_is_utc_aligned(0, 172_799));
+
+        let utc_query = UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 172_800,
+            tz_offset_minutes: 0,
+            user_id: None,
+        };
+        assert!(dashboard_daily_breakdown_can_use_aggregates(&utc_query));
+
+        let local_query = UsageDashboardDailyBreakdownQuery {
+            tz_offset_minutes: 480,
+            ..utc_query
+        };
+        assert!(!dashboard_daily_breakdown_can_use_aggregates(&local_query));
     }
 }

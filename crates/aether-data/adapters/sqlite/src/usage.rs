@@ -269,6 +269,11 @@ LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = "usage".request_id
 "#;
 
+// Rows in stats_daily/stats_user_daily are keyed by the UTC start of a
+// complete day.  They cannot answer a range that starts or ends inside a day
+// (the raw usage table must be used for those edge ranges).
+const DASHBOARD_UTC_DAY_SECS: u64 = 86_400;
+
 const UPSERT_USAGE_SQL: &str = r#"
 INSERT INTO "usage" (
   request_id,
@@ -1223,6 +1228,26 @@ fn push_sqlite_usage_range(
     builder
         .push("created_at_unix_ms < ")
         .push_bind(created_until_unix_secs as i64);
+}
+
+fn dashboard_daily_aggregate_range_is_utc_aligned(
+    created_from_unix_secs: u64,
+    created_until_unix_secs: u64,
+) -> bool {
+    created_from_unix_secs < created_until_unix_secs
+        && created_from_unix_secs % DASHBOARD_UTC_DAY_SECS == 0
+        && created_until_unix_secs % DASHBOARD_UTC_DAY_SECS == 0
+}
+
+fn dashboard_daily_breakdown_can_use_aggregates(query: &UsageDashboardDailyBreakdownQuery) -> bool {
+    // Aggregate dates are UTC dates.  A non-zero client offset requires the
+    // raw query so that rows are grouped into the requested local calendar
+    // day, even when the Unix bounds happen to fall on day boundaries.
+    query.tz_offset_minutes == 0
+        && dashboard_daily_aggregate_range_is_utc_aligned(
+            query.created_from_unix_secs,
+            query.created_until_unix_secs,
+        )
 }
 
 fn push_sqlite_usage_optional_text_filter(
@@ -2714,11 +2739,16 @@ ORDER BY created_at_unix_ms ASC, id ASC
             return Ok(StoredUsageDashboardSummary::default());
         }
 
-        if let Some(summary) = self
-            .summarize_dashboard_usage_from_daily_aggregates(query)
-            .await?
-        {
-            return Ok(summary);
+        if dashboard_daily_aggregate_range_is_utc_aligned(
+            query.created_from_unix_secs,
+            query.created_until_unix_secs,
+        ) {
+            if let Some(summary) = self
+                .summarize_dashboard_usage_from_daily_aggregates(query)
+                .await?
+            {
+                return Ok(summary);
+            }
         }
 
         let mut builder = QueryBuilder::<Sqlite>::new(format!(
@@ -2802,9 +2832,12 @@ LEFT JOIN usage_settlement_snapshots AS settlement
             return Ok(Vec::new());
         }
 
-        let aggregate_rows = self
-            .list_dashboard_daily_breakdown_from_daily_aggregates(query)
-            .await?;
+        let aggregate_rows = if dashboard_daily_breakdown_can_use_aggregates(query) {
+            self.list_dashboard_daily_breakdown_from_daily_aggregates(query)
+                .await?
+        } else {
+            Vec::new()
+        };
         if !aggregate_rows.is_empty() {
             return Ok(aggregate_rows);
         }

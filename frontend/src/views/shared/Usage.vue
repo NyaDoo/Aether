@@ -200,6 +200,19 @@ function clampIntervalTimelineHours(hours: number): number {
   return Math.min(720, Math.max(1, Math.ceil(hours)))
 }
 
+function parseIntervalTimelineBoundary(value: string, boundary: 'start' | 'end'): Date {
+  const trimmed = value.trim()
+  // Date-only values are still accepted for compatibility with saved links
+  // and older callers. Treat the range as inclusive whole days in that case.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return new Date(`${trimmed}T${boundary === 'start' ? '00:00:00' : '23:59:59'}`)
+  }
+
+  // datetime-local values are intentionally timezone-less; the browser's
+  // local timezone is the same one sent alongside the range to the API.
+  return new Date(trimmed)
+}
+
 function getIntervalTimelineHours(dateRange: DateRangeParams): number {
   switch (dateRange.preset) {
     case 'yesterday':
@@ -217,8 +230,8 @@ function getIntervalTimelineHours(dateRange: DateRangeParams): number {
   }
 
   if (dateRange.start_date && dateRange.end_date) {
-    const start = new Date(`${dateRange.start_date}T00:00:00`)
-    const end = new Date(`${dateRange.end_date}T23:59:59`)
+    const start = parseIntervalTimelineBoundary(dateRange.start_date, 'start')
+    const end = parseIntervalTimelineBoundary(dateRange.end_date, 'end')
     const diffMs = end.getTime() - start.getTime()
     if (!Number.isNaN(diffMs) && diffMs >= 0) {
       return clampIntervalTimelineHours(diffMs / (1000 * 60 * 60))

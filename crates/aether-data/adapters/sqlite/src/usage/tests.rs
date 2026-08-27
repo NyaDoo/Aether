@@ -11,6 +11,37 @@ use aether_data_contracts::repository::usage::{
 use chrono::{DateTime, Utc};
 
 #[test]
+fn sqlite_dashboard_daily_aggregate_guard_requires_complete_utc_days() {
+    assert!(super::dashboard_daily_aggregate_range_is_utc_aligned(
+        0, 172_800
+    ));
+    assert!(!super::dashboard_daily_aggregate_range_is_utc_aligned(
+        1, 172_800
+    ));
+    assert!(!super::dashboard_daily_aggregate_range_is_utc_aligned(
+        0, 172_799
+    ));
+
+    let utc_query = UsageDashboardDailyBreakdownQuery {
+        created_from_unix_secs: 0,
+        created_until_unix_secs: 172_800,
+        tz_offset_minutes: 0,
+        user_id: None,
+    };
+    assert!(super::dashboard_daily_breakdown_can_use_aggregates(
+        &utc_query
+    ));
+
+    let local_query = UsageDashboardDailyBreakdownQuery {
+        tz_offset_minutes: 480,
+        ..utc_query
+    };
+    assert!(!super::dashboard_daily_breakdown_can_use_aggregates(
+        &local_query
+    ));
+}
+
+#[test]
 fn sqlite_usage_upsert_guards_candidate_identity_metadata_and_routing_from_late_lifecycle() {
     for field in [
         "provider_name",
@@ -1896,7 +1927,9 @@ INSERT INTO stats_daily (
         .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
             created_from_unix_secs: 0,
             created_until_unix_secs: 172800,
-            tz_offset_minutes: 480,
+            // Daily aggregate rows are UTC dates; a zero offset keeps this
+            // fixture on the aggregate fast path.
+            tz_offset_minutes: 0,
             user_id: None,
         })
         .await
@@ -1906,6 +1939,69 @@ INSERT INTO stats_daily (
     assert_eq!(rows[0].model, "aggregate");
     assert_eq!(rows[0].requests, 9);
     assert_eq!(rows[0].total_tokens, 37);
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_precise_range_bypasses_daily_aggregates() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    seed_stats_targets(&pool).await;
+
+    // This aggregate row overlaps the requested partial day.  Summing it
+    // would incorrectly count all nine requests instead of the raw request
+    // that actually falls inside the precise range.
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily (
+    id, "date", total_requests, success_requests, error_requests,
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+    total_cost, actual_total_cost, is_complete, created_at, updated_at
+) VALUES (
+    'daily-partial', 86400, 9, 9, 0, 10, 20, 3, 4, 1.25, 1.0, 1, 1, 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("daily aggregate should seed");
+
+    SqliteUsageWriteRepository::new(pool.clone())
+        .upsert(sample_usage("precise-raw", "completed", "settled", 100))
+        .await
+        .expect("raw usage should upsert");
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let summary = reader
+        .summarize_dashboard_usage(&UsageDashboardSummaryQuery {
+            created_from_unix_secs: 1,
+            created_until_unix_secs: 86_460,
+            user_id: None,
+        })
+        .await
+        .expect("precise dashboard summary should load");
+    assert_eq!(summary.total_requests, 1);
+    assert_eq!(summary.total_tokens, 5);
+
+    let rows = reader
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: 1,
+            created_until_unix_secs: 86_460,
+            tz_offset_minutes: 0,
+            user_id: None,
+        })
+        .await
+        .expect("precise daily breakdown should load");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].date, "1970-01-01");
+    assert_eq!(rows[0].model, "model-1");
+    assert_eq!(rows[0].requests, 1);
+    assert_eq!(rows[0].total_tokens, 5);
 }
 
 #[tokio::test]

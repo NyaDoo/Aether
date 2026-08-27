@@ -1001,6 +1001,8 @@ pub(super) async fn handle_users_me_usage_get(
             start_date,
             end_date: today,
             tz_offset_minutes: 0,
+            start_datetime: None,
+            end_datetime: None,
         })
     });
 
