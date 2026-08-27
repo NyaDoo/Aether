@@ -72,6 +72,15 @@ impl VideoTaskStore for InMemoryVideoTaskStore {
         registry.clone_doubao_snapshot(task_id)
     }
 
+    fn clone_doubao_snapshot_for_user_by_upstream_task_id(
+        &self,
+        user_id: &str,
+        upstream_task_id: &str,
+    ) -> Option<LocalVideoTaskSnapshot> {
+        let registry = self.registry.lock().ok()?;
+        registry.clone_doubao_snapshot_for_user_by_upstream_task_id(user_id, upstream_task_id)
+    }
+
     fn list_active_snapshots(&self, limit: usize) -> Vec<LocalVideoTaskSnapshot> {
         let Ok(registry) = self.registry.lock() else {
             return Vec::new();
@@ -338,6 +347,15 @@ impl VideoTaskStore for FileVideoTaskStore {
     fn clone_doubao_snapshot(&self, task_id: &str) -> Option<LocalVideoTaskSnapshot> {
         let registry = self.registry.lock().ok()?;
         registry.clone_doubao_snapshot(task_id)
+    }
+
+    fn clone_doubao_snapshot_for_user_by_upstream_task_id(
+        &self,
+        user_id: &str,
+        upstream_task_id: &str,
+    ) -> Option<LocalVideoTaskSnapshot> {
+        let registry = self.registry.lock().ok()?;
+        registry.clone_doubao_snapshot_for_user_by_upstream_task_id(user_id, upstream_task_id)
     }
 
     fn list_active_snapshots(&self, limit: usize) -> Vec<LocalVideoTaskSnapshot> {

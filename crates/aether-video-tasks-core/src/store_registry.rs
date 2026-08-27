@@ -40,7 +40,8 @@ impl VideoTaskRegistry {
 
     pub fn insert(&mut self, snapshot: LocalVideoTaskSnapshot) {
         // A snapshot's enum variant describes the upstream provider contract;
-        // the registry map describes the client route that owns the local ID.
+        // the registry map describes the client route that owns the internal
+        // persistence ID.
         // Those differ for an OpenAI request served by a Doubao endpoint.
         match snapshot
             .client_api_format()
@@ -131,6 +132,40 @@ impl VideoTaskRegistry {
 
     pub fn clone_doubao_snapshot(&self, task_id: &str) -> Option<LocalVideoTaskSnapshot> {
         self.doubao.get(task_id).cloned()
+    }
+
+    /// Resolves a native Ark task by the provider-visible ID without making
+    /// that external ID a registry key. Ownership is part of the lookup so an
+    /// upstream ID can never be used to discover another user's snapshot.
+    /// Ambiguous legacy rows fail closed instead of selecting an arbitrary
+    /// internal task.
+    pub fn clone_doubao_snapshot_for_user_by_upstream_task_id(
+        &self,
+        user_id: &str,
+        upstream_task_id: &str,
+    ) -> Option<LocalVideoTaskSnapshot> {
+        let user_id = user_id.trim();
+        let upstream_task_id = upstream_task_id.trim();
+        if user_id.is_empty() || upstream_task_id.is_empty() {
+            return None;
+        }
+
+        let mut matches = self.doubao.values().filter(|snapshot| {
+            let LocalVideoTaskSnapshot::Doubao(seed) = snapshot else {
+                return false;
+            };
+            seed.persistence
+                .client_api_format
+                .trim()
+                .eq_ignore_ascii_case("doubao:video")
+                && snapshot.belongs_to_user(user_id)
+                && seed.upstream_task_id.trim() == upstream_task_id
+        });
+        let snapshot = matches.next()?.clone();
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(snapshot)
     }
 
     pub fn list_active_snapshots(&self, limit: usize) -> Vec<LocalVideoTaskSnapshot> {

@@ -321,13 +321,29 @@ pub(crate) async fn maybe_build_internal_finalize_video_response(
             payload.report_context.as_ref(),
         );
         if let Some(request_path) = request_path {
-            state
-                .video_tasks
-                .apply_finalize_mutation(request_path.as_str(), payload.report_kind.as_str());
-            if let Some(snapshot) = state
-                .video_tasks
-                .snapshot_for_route(decision.route_family.as_deref(), request_path.as_str())
-            {
+            let snapshot = payload
+                .report_context
+                .as_ref()
+                .and_then(|context| context.get("task_id"))
+                .and_then(Value::as_str)
+                .and_then(|internal_task_id| {
+                    state
+                        .video_tasks
+                        .apply_finalize_mutation_for_internal_task_id(
+                            internal_task_id,
+                            payload.report_kind.as_str(),
+                        )
+                })
+                .or_else(|| {
+                    state.video_tasks.apply_finalize_mutation(
+                        request_path.as_str(),
+                        payload.report_kind.as_str(),
+                    );
+                    state
+                        .video_tasks
+                        .snapshot_for_route(decision.route_family.as_deref(), request_path.as_str())
+                });
+            if let Some(snapshot) = snapshot {
                 if let Some(stored) = state.upsert_video_task_snapshot(&snapshot).await? {
                     if payload.report_kind.ends_with("_cancel_sync_finalize") {
                         // The internal finalize trace is not the create

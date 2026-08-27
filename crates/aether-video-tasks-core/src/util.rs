@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn derives_a_column_sized_short_id() {
-        // A Doubao local id: `cgt-` plus a 32-char uuid.
+        // The unexposed internal Doubao key: `cgt-` plus a 32-char UUID.
         let short_id = derive_video_task_short_id("cgt-0f9a1b2c3d4e5f60718293a4b5c6d7e8");
         assert_eq!(short_id.len(), 16);
         assert_eq!(short_id, "cgt0f9a1b2c3d4e5");

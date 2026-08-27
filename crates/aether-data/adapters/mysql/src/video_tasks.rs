@@ -11,6 +11,16 @@ use aether_data_contracts::DataLayerError;
 use crate::error::SqlResultExt;
 use crate::MysqlPool;
 
+fn unique_user_external_match<T>(mut rows: Vec<T>) -> Result<Option<T>, DataLayerError> {
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(rows.pop()),
+        _ => Err(DataLayerError::UnexpectedValue(
+            "ambiguous video task user/external lookup".to_string(),
+        )),
+    }
+}
+
 const VIDEO_TASK_COLUMNS: &str = r#"
 SELECT
   id,
@@ -53,6 +63,10 @@ SELECT
 FROM video_tasks
 "#;
 
+fn find_by_user_external_sql() -> String {
+    format!("{VIDEO_TASK_COLUMNS} WHERE user_id = ? AND external_task_id = ? LIMIT 2")
+}
+
 #[derive(Debug, Clone)]
 pub struct MysqlVideoTaskRepository {
     pool: MysqlPool,
@@ -89,14 +103,13 @@ impl MysqlVideoTaskRepository {
         user_id: &str,
         external_task_id: &str,
     ) -> Result<Option<StoredVideoTask>, DataLayerError> {
-        let row = sqlx::query(&format!(
-            "{VIDEO_TASK_COLUMNS} WHERE user_id = ? AND external_task_id = ? LIMIT 1"
-        ))
-        .bind(user_id)
-        .bind(external_task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_sql_err()?;
+        let rows = sqlx::query(&find_by_user_external_sql())
+            .bind(user_id)
+            .bind(external_task_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?;
+        let row = unique_user_external_match(rows)?;
         row.as_ref().map(map_video_task_row).transpose()
     }
 }
@@ -722,11 +735,12 @@ fn optional_u32_to_i32(value: Option<u32>, name: &str) -> Result<Option<i32>, Da
 
 #[cfg(test)]
 mod tests {
-    use super::MysqlVideoTaskRepository;
+    use super::{find_by_user_external_sql, unique_user_external_match, MysqlVideoTaskRepository};
     use crate::run_migrations;
     use aether_data_contracts::repository::video_tasks::{
         UpsertVideoTask, VideoTaskStatus, VideoTaskWriteRepository,
     };
+    use aether_data_contracts::DataLayerError;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -738,6 +752,18 @@ mod tests {
         );
 
         let _repository = MysqlVideoTaskRepository::new(pool);
+    }
+
+    #[test]
+    fn user_external_lookup_fails_closed_on_ambiguity() {
+        assert!(find_by_user_external_sql().contains("LIMIT 2"));
+        assert_eq!(unique_user_external_match::<u8>(Vec::new()).unwrap(), None);
+        assert_eq!(unique_user_external_match(vec![1_u8]).unwrap(), Some(1));
+        assert!(matches!(
+            unique_user_external_match(vec![1_u8, 2]),
+            Err(DataLayerError::UnexpectedValue(message))
+                if message == "ambiguous video task user/external lookup"
+        ));
     }
 
     #[tokio::test]

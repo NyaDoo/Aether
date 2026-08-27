@@ -141,6 +141,9 @@ impl LocalVideoTaskSeed {
                 };
 
                 let mut seed = DoubaoVideoTaskSeed {
+                    // Keep an unexposed internal identity for persistence,
+                    // polling and billing. Native Ark responses project the
+                    // official upstream `cgt-*` id instead (see `doubao.rs`).
                     local_task_id: context_text(report_context, "local_task_id").unwrap_or_else(
                         || {
                             if persistence
@@ -276,8 +279,6 @@ impl LocalVideoTaskSeed {
     }
 }
 
-/// Ark task ids use a `cgt-` prefix; local ids keep that shape so clients that
-/// validate the id format keep working while the upstream id stays hidden.
 fn generate_local_doubao_task_id() -> String {
     format!("cgt-{}", Uuid::new_v4().simple())
 }
@@ -563,6 +564,7 @@ mod tests {
     fn builds_doubao_create_seed_from_finalize_report() {
         let report_context = json!({
             "request_id": "req-doubao-1",
+            "local_task_id": "cgt-obsolete-gateway-local-id",
             "user_id": "user-1",
             "api_key_id": "api-key-1",
             "original_request_body": {
@@ -587,7 +589,11 @@ mod tests {
             panic!("expected a doubao create seed");
         };
         assert_eq!(seed.upstream_task_id, "cgt-upstream-abc123");
-        assert!(seed.local_task_id.starts_with("cgt-"));
+        assert_eq!(
+            seed.local_task_id, "cgt-obsolete-gateway-local-id",
+            "the internal persistence key must remain separate"
+        );
+        assert_eq!(seed.client_body_json()["id"], "cgt-upstream-abc123");
         assert_eq!(seed.status, crate::LocalVideoTaskStatus::Queued);
         assert_eq!(seed.created_at_unix_secs, 1_768_294_532);
         assert_eq!(seed.updated_at_unix_secs, Some(1_768_294_533));

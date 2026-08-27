@@ -79,16 +79,21 @@ top-level field is absent, and only to recover billing dimensions.
 ### `callback_url`
 
 Rejected with `400`. The gateway owns task state, so an upstream callback would
-bypass it and leak the upstream task id. Silently stripping the field would be
-worse: the client would wait for a callback that never arrives.
+bypass Aether's persistence, polling and billing lifecycle. Silently stripping
+the field would be worse: the client would wait for a callback that never arrives.
 
 Use polling, or the download endpoint below.
 
 ### Task identifiers
 
-Clients receive a gateway-local id shaped like Ark's (`cgt-<uuid>`); the
-upstream id is never exposed. This keeps clients that validate the id format
-working while preserving failover.
+Native Ark clients receive the provider's official `cgt-*` task id unchanged.
+Aether keeps a separate, unexposed internal identity for persistence, polling
+and billing, and resolves public task IDs together with the authenticated user.
+GET and DELETE requests remain pinned to the provider, endpoint and key selected
+when the task was created. The same upstream ID is shown on the user's async-task
+page; duplicate upstream IDs for one user fail closed instead of selecting an
+arbitrary provider. OpenAI and Gemini surfaces retain their own client ID contracts
+when Aether converts those requests to another provider format.
 
 ### Listing
 

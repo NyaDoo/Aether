@@ -348,7 +348,7 @@ fn sample_doubao_video_task(
         id,
         user_id,
         api_key_id,
-        &format!("upstream-{id}"),
+        &format!("cgt-upstream-{id}"),
         status,
     );
     task.short_id = None;
@@ -2436,18 +2436,17 @@ async fn gateway_creates_then_reads_native_doubao_video_task_through_public_rout
     );
     let create_body: serde_json::Value =
         serde_json::from_str(&create_text).expect("create body should parse");
-    let local_task_id = create_body["id"]
+    let returned_task_id = create_body["id"]
         .as_str()
-        .expect("create response should include local task id")
+        .expect("create response should include the upstream task id")
         .to_string();
-    assert!(local_task_id.starts_with("cgt-"));
-    assert_ne!(local_task_id, "cgt-upstream-public-e2e");
+    assert_eq!(returned_task_id, "cgt-upstream-public-e2e");
     assert_eq!(create_body["status"], "queued");
     assert_eq!(create_body["model"], "Doubao-Seedance-2.0");
 
     let detail_response = client
         .get(format!(
-            "{gateway_url}/api/v3/contents/generations/tasks/{local_task_id}"
+            "{gateway_url}/api/v3/contents/generations/tasks/{returned_task_id}"
         ))
         .bearer_auth("sk-doubao-public-e2e")
         .send()
@@ -2462,7 +2461,7 @@ async fn gateway_creates_then_reads_native_doubao_video_task_through_public_rout
     );
     let detail_body: serde_json::Value =
         serde_json::from_str(&detail_text).expect("detail body should parse");
-    assert_eq!(detail_body["id"], local_task_id);
+    assert_eq!(detail_body["id"], returned_task_id);
     assert_eq!(detail_body["status"], "running");
     assert_eq!(detail_body["model"], "Doubao-Seedance-2.0");
     assert_eq!(detail_body["duration"], "5");
@@ -2590,6 +2589,9 @@ async fn gateway_doubao_task_list_total_counts_all_matching_pages() {
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["items"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["total"], json!(8));
+    assert!(payload["items"][0]["id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("cgt-upstream-")));
 
     for (filter, expected_total, expected_status) in [
         ("queued", 3, "queued"),
@@ -2618,7 +2620,23 @@ async fn gateway_doubao_task_list_total_counts_all_matching_pages() {
 
     let response = reqwest::Client::new()
         .get(format!(
-            "{gateway_url}/api/v3/contents/generations/tasks?filter.task_ids=task-openai-via-doubao-list-hidden"
+            "{gateway_url}/api/v3/contents/generations/tasks?filter.task_ids=cgt-upstream-task-doubao-list-2"
+        ))
+        .bearer_auth("sk-doubao-task-list")
+        .send()
+        .await
+        .expect("upstream-task-id filtered request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["total"], json!(1));
+    assert_eq!(
+        payload["items"][0]["id"],
+        json!("cgt-upstream-task-doubao-list-2")
+    );
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/v3/contents/generations/tasks?filter.task_ids=cgt-upstream-task-openai-via-doubao-list-hidden"
         ))
         .bearer_auth("sk-doubao-task-list")
         .send()

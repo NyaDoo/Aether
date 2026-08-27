@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use crate::DataLayerError;
 struct MemoryVideoTaskIndex {
     by_id: BTreeMap<String, StoredVideoTask>,
     short_to_id: BTreeMap<String, String>,
-    user_external_to_id: BTreeMap<(String, String), String>,
+    user_external_to_ids: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -51,11 +51,17 @@ impl InMemoryVideoTaskRepository {
                 index.short_to_id.remove(&short_id);
             }
             if let (Some(user_id), Some(external_task_id)) =
-                (previous.user_id, previous.external_task_id)
+                (&previous.user_id, &previous.external_task_id)
             {
-                index
-                    .user_external_to_id
-                    .remove(&(user_id, external_task_id));
+                let key = (user_id.clone(), external_task_id.clone());
+                if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                    index.user_external_to_ids.entry(key)
+                {
+                    entry.get_mut().remove(&previous.id);
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
             }
         }
 
@@ -64,8 +70,10 @@ impl InMemoryVideoTaskRepository {
         }
         if let (Some(user_id), Some(external_task_id)) = (&task.user_id, &task.external_task_id) {
             index
-                .user_external_to_id
-                .insert((user_id.clone(), external_task_id.clone()), task.id.clone());
+                .user_external_to_ids
+                .entry((user_id.clone(), external_task_id.clone()))
+                .or_default()
+                .insert(task.id.clone());
         }
 
         task
@@ -115,22 +123,32 @@ impl VideoTaskReadRepository for InMemoryVideoTaskRepository {
         key: VideoTaskLookupKey<'_>,
     ) -> Result<Option<StoredVideoTask>, DataLayerError> {
         let index = self.index.read().expect("video task repository lock");
-        Ok(match key {
-            VideoTaskLookupKey::Id(id) => index.by_id.get(id).cloned(),
-            VideoTaskLookupKey::ShortId(short_id) => index
+        match key {
+            VideoTaskLookupKey::Id(id) => Ok(index.by_id.get(id).cloned()),
+            VideoTaskLookupKey::ShortId(short_id) => Ok(index
                 .short_to_id
                 .get(short_id)
                 .and_then(|id| index.by_id.get(id))
-                .cloned(),
+                .cloned()),
             VideoTaskLookupKey::UserExternal {
                 user_id,
                 external_task_id,
-            } => index
-                .user_external_to_id
-                .get(&(user_id.to_string(), external_task_id.to_string()))
-                .and_then(|id| index.by_id.get(id))
-                .cloned(),
-        })
+            } => {
+                let ids = index
+                    .user_external_to_ids
+                    .get(&(user_id.to_string(), external_task_id.to_string()));
+                match ids.map(BTreeSet::len).unwrap_or_default() {
+                    0 => Ok(None),
+                    1 => Ok(ids
+                        .and_then(|ids| ids.first())
+                        .and_then(|id| index.by_id.get(id))
+                        .cloned()),
+                    _ => Err(DataLayerError::UnexpectedValue(
+                        "ambiguous video task user/external lookup".to_string(),
+                    )),
+                }
+            }
+        }
     }
 
     async fn list_active(&self, limit: usize) -> Result<Vec<StoredVideoTask>, DataLayerError> {
@@ -413,6 +431,7 @@ mod tests {
         UpsertVideoTask, VideoTaskLookupKey, VideoTaskQueryFilter, VideoTaskReadRepository,
         VideoTaskStatus, VideoTaskWriteRepository,
     };
+    use crate::DataLayerError;
 
     fn sample_task(
         id: &str,
@@ -485,6 +504,69 @@ mod tests {
             .await
             .expect("find by user/external should succeed")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn user_external_lookup_fails_closed_when_multiple_tasks_match() {
+        let repo = InMemoryVideoTaskRepository::default();
+        repo.upsert(sample_task("task-1", VideoTaskStatus::Submitted, 100))
+            .await
+            .expect("first task should insert");
+        repo.upsert(UpsertVideoTask {
+            external_task_id: Some("ext-task-1".to_string()),
+            ..sample_task("task-2", VideoTaskStatus::Submitted, 200)
+        })
+        .await
+        .expect("second task should insert");
+
+        let error = repo
+            .find(VideoTaskLookupKey::UserExternal {
+                user_id: "user-1",
+                external_task_id: "ext-task-1",
+            })
+            .await
+            .expect_err("ambiguous lookup must fail closed");
+
+        assert!(matches!(
+            error,
+            DataLayerError::UnexpectedValue(message)
+                if message == "ambiguous video task user/external lookup"
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_external_id_remains_unambiguous_across_different_users() {
+        let repo = InMemoryVideoTaskRepository::default();
+        repo.upsert(sample_task("task-1", VideoTaskStatus::Submitted, 100))
+            .await
+            .expect("first task should insert");
+        repo.upsert(UpsertVideoTask {
+            user_id: Some("user-2".to_string()),
+            external_task_id: Some("ext-task-1".to_string()),
+            ..sample_task("task-2", VideoTaskStatus::Submitted, 200)
+        })
+        .await
+        .expect("second task should insert");
+
+        let first = repo
+            .find(VideoTaskLookupKey::UserExternal {
+                user_id: "user-1",
+                external_task_id: "ext-task-1",
+            })
+            .await
+            .expect("first user lookup should succeed")
+            .expect("first user task should exist");
+        let second = repo
+            .find(VideoTaskLookupKey::UserExternal {
+                user_id: "user-2",
+                external_task_id: "ext-task-1",
+            })
+            .await
+            .expect("second user lookup should succeed")
+            .expect("second user task should exist");
+
+        assert_eq!(first.id, "task-1");
+        assert_eq!(second.id, "task-2");
     }
 
     #[tokio::test]
@@ -573,6 +655,14 @@ mod tests {
             .is_none());
         assert!(repo
             .find(VideoTaskLookupKey::ShortId("short-task-1b"))
+            .await
+            .expect("find should succeed")
+            .is_some());
+        assert!(repo
+            .find(VideoTaskLookupKey::UserExternal {
+                user_id: "user-2",
+                external_task_id: "ext-task-1b",
+            })
             .await
             .expect("find should succeed")
             .is_some());

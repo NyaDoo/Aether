@@ -55,6 +55,22 @@ fn sample_user_video_task(id: &str, user_id: &str, status: VideoTaskStatus) -> U
     }
 }
 
+fn sample_native_doubao_user_video_task(
+    internal_id: &str,
+    external_id: &str,
+    user_id: &str,
+    status: VideoTaskStatus,
+) -> UpsertVideoTask {
+    let mut task = sample_user_video_task(internal_id, user_id, status);
+    task.request_id = format!("request-native-{external_id}");
+    task.external_task_id = Some(external_id.to_string());
+    task.client_api_format = Some("doubao:video".to_string());
+    task.provider_api_format = Some("doubao:video".to_string());
+    task.format_converted = false;
+    task.prompt = Some("native Doubao prompt".to_string());
+    task
+}
+
 #[tokio::test]
 async fn users_me_video_tasks_are_owner_scoped_and_deleted_tasks_stay_hidden() {
     let now = Utc::now();
@@ -78,7 +94,19 @@ async fn users_me_video_tasks_are_owner_scoped_and_deleted_tasks_stay_hidden() {
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
     for task in [
         sample_user_video_task("owned", &user_id, VideoTaskStatus::Completed),
+        sample_native_doubao_user_video_task(
+            "internal-doubao-owned",
+            "cgt-upstream-owned",
+            &user_id,
+            VideoTaskStatus::Completed,
+        ),
         sample_user_video_task("foreign", "user-auth-2", VideoTaskStatus::Processing),
+        sample_native_doubao_user_video_task(
+            "internal-doubao-foreign",
+            "cgt-upstream-foreign",
+            "user-auth-2",
+            VideoTaskStatus::Processing,
+        ),
         sample_user_video_task("deleted", &user_id, VideoTaskStatus::Deleted),
     ] {
         repository
@@ -119,25 +147,36 @@ async fn users_me_video_tasks_are_owner_scoped_and_deleted_tasks_stay_hidden() {
     assert_eq!(list_response.status(), StatusCode::OK);
     let list_payload: serde_json::Value =
         list_response.json().await.expect("list body should parse");
-    assert_eq!(list_payload["total"], 1);
-    assert_eq!(list_payload["items"][0]["id"], "owned");
-    assert_eq!(list_payload["items"][0]["video_available"], true);
-    for forbidden in [
-        "user_id",
-        "api_key_id",
-        "external_task_id",
-        "provider_id",
-        "endpoint_id",
-        "key_id",
-        "video_url",
-        "original_request_body",
-        "request_metadata",
-        "actual_cost",
-    ] {
-        assert!(
-            list_payload["items"][0].get(forbidden).is_none(),
-            "self-service item must not expose {forbidden}"
-        );
+    assert_eq!(list_payload["total"], 2);
+    let list_items = list_payload["items"]
+        .as_array()
+        .expect("list items should be an array");
+    let list_ids = list_items
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(list_ids.contains(&"owned"));
+    assert!(list_ids.contains(&"cgt-upstream-owned"));
+    assert!(!list_ids.contains(&"internal-doubao-owned"));
+    for item in list_items {
+        assert_eq!(item["video_available"], true);
+        for forbidden in [
+            "user_id",
+            "api_key_id",
+            "external_task_id",
+            "provider_id",
+            "endpoint_id",
+            "key_id",
+            "video_url",
+            "original_request_body",
+            "request_metadata",
+            "actual_cost",
+        ] {
+            assert!(
+                item.get(forbidden).is_none(),
+                "self-service item must not expose {forbidden}"
+            );
+        }
     }
 
     let stats_response = authenticated_get("/api/users/me/video-tasks/stats")
@@ -149,18 +188,39 @@ async fn users_me_video_tasks_are_owner_scoped_and_deleted_tasks_stay_hidden() {
         .json()
         .await
         .expect("stats body should parse");
-    assert_eq!(stats_payload["total"], 1);
-    assert_eq!(stats_payload["by_status"]["completed"], 1);
+    assert_eq!(stats_payload["total"], 2);
+    assert_eq!(stats_payload["by_status"]["completed"], 2);
 
     let detail_response = authenticated_get("/api/users/me/video-tasks/owned")
         .send()
         .await
         .expect("detail request should succeed");
     assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail_payload: serde_json::Value = detail_response
+        .json()
+        .await
+        .expect("OpenAI detail body should parse");
+    assert_eq!(detail_payload["id"], "owned");
+
+    let native_detail_response = authenticated_get("/api/users/me/video-tasks/cgt-upstream-owned")
+        .send()
+        .await
+        .expect("native Doubao detail request should succeed");
+    assert_eq!(native_detail_response.status(), StatusCode::OK);
+    let native_detail_payload: serde_json::Value = native_detail_response
+        .json()
+        .await
+        .expect("native Doubao detail body should parse");
+    assert_eq!(native_detail_payload["id"], "cgt-upstream-owned");
+    assert_ne!(native_detail_payload["id"], "internal-doubao-owned");
 
     for path in [
         "/api/users/me/video-tasks/foreign",
         "/api/users/me/video-tasks/foreign/video",
+        "/api/users/me/video-tasks/cgt-upstream-foreign",
+        "/api/users/me/video-tasks/cgt-upstream-foreign/video",
+        "/api/users/me/video-tasks/internal-doubao-owned",
+        "/api/users/me/video-tasks/internal-doubao-owned/video",
         "/api/users/me/video-tasks/deleted",
         "/api/users/me/video-tasks/deleted/video",
     ] {
@@ -180,7 +240,12 @@ async fn users_me_video_tasks_are_owner_scoped_and_deleted_tasks_stay_hidden() {
         }
     }
 
-    for task_id in ["foreign", "deleted"] {
+    for task_id in [
+        "foreign",
+        "cgt-upstream-foreign",
+        "internal-doubao-owned",
+        "deleted",
+    ] {
         let cancel = client
             .post(format!(
                 "{gateway_url}/api/users/me/video-tasks/{task_id}/cancel"

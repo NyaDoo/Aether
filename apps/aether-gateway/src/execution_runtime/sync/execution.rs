@@ -3657,13 +3657,28 @@ async fn execute_execution_runtime_sync_impl(
             .await;
             apply_sync_success_effects(state, &plan, payload.report_context.as_ref(), &payload)
                 .await;
-            state
-                .video_tasks
-                .apply_finalize_mutation(request_path, payload.report_kind.as_str());
-            if let Some(snapshot) = state
-                .video_tasks
-                .snapshot_for_route(decision.route_family.as_deref(), request_path)
-            {
+            let snapshot = payload
+                .report_context
+                .as_ref()
+                .and_then(|context| context.get("task_id"))
+                .and_then(Value::as_str)
+                .and_then(|internal_task_id| {
+                    state
+                        .video_tasks
+                        .apply_finalize_mutation_for_internal_task_id(
+                            internal_task_id,
+                            payload.report_kind.as_str(),
+                        )
+                })
+                .or_else(|| {
+                    state
+                        .video_tasks
+                        .apply_finalize_mutation(request_path, payload.report_kind.as_str());
+                    state
+                        .video_tasks
+                        .snapshot_for_route(decision.route_family.as_deref(), request_path)
+                });
+            if let Some(snapshot) = snapshot {
                 if let Some(stored) = state.upsert_video_task_snapshot(&snapshot).await? {
                     if payload.report_kind.ends_with("_cancel_sync_finalize") {
                         // The follow-up execution uses its own trace request id.

@@ -397,6 +397,156 @@ mod tests {
             404
         );
     }
+
+    #[test]
+    fn native_doubao_user_routes_resolve_owned_upstream_id_to_internal_snapshot() {
+        let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
+        let mut owned = cross_format_seed(LocalVideoTaskStatus::Processing);
+        owned.local_task_id = "internal-doubao-1".to_string();
+        owned.upstream_task_id = "cgt-public-1".to_string();
+        owned.persistence.client_api_format = "doubao:video".to_string();
+        owned.persistence.format_converted = false;
+
+        // The public upstream ID deliberately collides with a different user's
+        // internal key. User-aware resolution must prefer (owner, upstream ID)
+        // and must never select the foreign snapshot.
+        let mut foreign = owned.clone();
+        foreign.local_task_id = "cgt-public-1".to_string();
+        foreign.upstream_task_id = "cgt-foreign-upstream".to_string();
+        foreign.user_id = Some("user-2".to_string());
+        foreign.api_key_id = Some("api-key-2".to_string());
+        foreign.prompt = Some("foreign task".to_string());
+        service.record_snapshot(LocalVideoTaskSnapshot::Doubao(foreign));
+        service.record_snapshot(LocalVideoTaskSnapshot::Doubao(owned));
+
+        let public_path = "/api/v3/contents/generations/tasks/cgt-public-1";
+        let response = service
+            .read_response_for_user(Some("doubao"), public_path, "user-1")
+            .expect("owner should resolve the provider-visible ID");
+        assert_eq!(response.body_json["id"], "cgt-public-1");
+        assert!(service
+            .read_response_for_user(Some("doubao"), public_path, "user-3")
+            .is_none());
+
+        let refresh = service
+            .prepare_read_refresh_sync_plan_for_user(
+                Some("doubao"),
+                public_path,
+                "user-1",
+                "trace-refresh",
+            )
+            .expect("owner should refresh through the upstream ID");
+        assert_eq!(
+            refresh.plan.url,
+            "https://ark.example.com/api/v3/contents/generations/tasks/cgt-public-1"
+        );
+        assert_eq!(
+            refresh.projection_target,
+            LocalVideoTaskProjectionTarget::Doubao {
+                task_id: "internal-doubao-1".to_string(),
+            }
+        );
+
+        let content = service
+            .prepare_doubao_content_stream_action_for_user(
+                "/api/v3/contents/generations/tasks/cgt-public-1/content",
+                None,
+                "trace-content",
+                "user-1",
+            )
+            .expect("owner should resolve content through the upstream ID");
+        let LocalVideoTaskContentAction::Immediate { status_code, .. } = content else {
+            panic!("processing task should return an immediate response");
+        };
+        assert_eq!(status_code, 202);
+
+        let follow_up = service
+            .prepare_follow_up_sync_plan_for_user(
+                "doubao_video_delete_sync",
+                public_path,
+                None,
+                Some("user-1"),
+                Some("api-key-1"),
+                "trace-cancel",
+            )
+            .expect("owner should cancel through the upstream ID");
+        assert_eq!(
+            follow_up.plan.url,
+            "https://ark.example.com/api/v3/contents/generations/tasks/cgt-public-1"
+        );
+        assert_eq!(
+            follow_up.report_kind.as_deref(),
+            Some("doubao_video_cancel_sync_finalize")
+        );
+        assert_eq!(
+            follow_up
+                .report_context
+                .as_ref()
+                .and_then(|context| context.get("task_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("internal-doubao-1")
+        );
+
+        let LocalVideoTaskSnapshot::Doubao(cancelled) = service
+            .apply_finalize_mutation_for_internal_task_id(
+                "internal-doubao-1",
+                "doubao_video_cancel_sync_finalize",
+            )
+            .expect("trusted internal ID should mutate and return the snapshot")
+        else {
+            panic!("expected Doubao snapshot");
+        };
+        assert_eq!(cancelled.status, LocalVideoTaskStatus::Cancelled);
+        assert!(service
+            .apply_finalize_mutation_for_internal_task_id(
+                "internal-doubao-1",
+                "openai_video_delete_sync_finalize",
+            )
+            .is_none());
+
+        let foreign_response = service
+            .read_response_for_user(Some("doubao"), public_path, "user-2")
+            .expect("direct internal lookup remains available to its owner");
+        assert_eq!(foreign_response.body_json["id"], "cgt-foreign-upstream");
+    }
+
+    #[test]
+    fn internal_doubao_finalize_mutation_preserves_active_delete_semantics() {
+        let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
+        let mut active = cross_format_seed(LocalVideoTaskStatus::Processing);
+        active.local_task_id = "internal-active".to_string();
+        active.persistence.client_api_format = "doubao:video".to_string();
+        active.persistence.format_converted = false;
+        service.record_snapshot(LocalVideoTaskSnapshot::Doubao(active));
+
+        let LocalVideoTaskSnapshot::Doubao(cancelled) = service
+            .apply_finalize_mutation_for_internal_task_id(
+                "internal-active",
+                "doubao_video_delete_sync_finalize",
+            )
+            .expect("active Ark DELETE should retain a cancelled snapshot")
+        else {
+            panic!("expected Doubao snapshot");
+        };
+        assert_eq!(cancelled.status, LocalVideoTaskStatus::Cancelled);
+
+        let mut terminal = cross_format_seed(LocalVideoTaskStatus::Completed);
+        terminal.local_task_id = "internal-terminal".to_string();
+        terminal.persistence.client_api_format = "doubao:video".to_string();
+        terminal.persistence.format_converted = false;
+        service.record_snapshot(LocalVideoTaskSnapshot::Doubao(terminal));
+
+        let LocalVideoTaskSnapshot::Doubao(deleted) = service
+            .apply_finalize_mutation_for_internal_task_id(
+                "internal-terminal",
+                "doubao_video_delete_sync_finalize",
+            )
+            .expect("terminal Ark DELETE should return the deleted snapshot")
+        else {
+            panic!("expected Doubao snapshot");
+        };
+        assert_eq!(deleted.status, LocalVideoTaskStatus::Deleted);
+    }
 }
 
 impl VideoTaskService {
@@ -508,6 +658,44 @@ impl VideoTaskService {
         self.store.apply_mutation(mutation);
     }
 
+    /// Applies a native Ark DELETE/cancel finalize using the private registry
+    /// key carried in trusted report context. Public request paths may contain
+    /// the upstream `cgt` ID, so they must not be reused as mutation keys.
+    pub fn apply_finalize_mutation_for_internal_task_id(
+        &self,
+        internal_task_id: &str,
+        report_kind: &str,
+    ) -> Option<LocalVideoTaskSnapshot> {
+        if self.truth_source_mode != VideoTaskTruthSourceMode::RustAuthoritative {
+            return None;
+        }
+        let internal_task_id = internal_task_id.trim();
+        if internal_task_id.is_empty() {
+            return None;
+        }
+        let snapshot = self.store.clone_doubao_snapshot(internal_task_id)?;
+        let mutation = match report_kind {
+            "doubao_video_delete_sync_finalize" if snapshot.is_active_for_refresh() => {
+                crate::LocalVideoTaskRegistryMutation::DoubaoCancelled {
+                    task_id: internal_task_id.to_string(),
+                }
+            }
+            "doubao_video_delete_sync_finalize" => {
+                crate::LocalVideoTaskRegistryMutation::DoubaoDeleted {
+                    task_id: internal_task_id.to_string(),
+                }
+            }
+            "doubao_video_cancel_sync_finalize" => {
+                crate::LocalVideoTaskRegistryMutation::DoubaoCancelled {
+                    task_id: internal_task_id.to_string(),
+                }
+            }
+            _ => return None,
+        };
+        self.store.apply_mutation(mutation);
+        self.store.clone_doubao_snapshot(internal_task_id)
+    }
+
     pub fn read_response(
         &self,
         route_family: Option<&str>,
@@ -536,7 +724,12 @@ impl VideoTaskService {
         if self.truth_source_mode != VideoTaskTruthSourceMode::RustAuthoritative {
             return None;
         }
-        let snapshot = self.snapshot_for_route(route_family, request_path)?;
+        let snapshot = if route_family == Some("doubao") {
+            let task_id = extract_doubao_task_id_from_path(request_path)?;
+            self.owned_doubao_snapshot_by_task_id(task_id, user_id)?
+        } else {
+            self.snapshot_for_route(route_family, request_path)?
+        };
         if !snapshot.belongs_to_user(user_id) {
             return None;
         }
@@ -658,10 +851,7 @@ impl VideoTaskService {
             return None;
         }
         let task_id = extract_doubao_task_id_from_content_path(request_path)?;
-        let snapshot = self.store.clone_doubao_snapshot(task_id)?;
-        if !snapshot.belongs_to_user(user_id) {
-            return None;
-        }
+        let snapshot = self.owned_doubao_snapshot_by_task_id(task_id, user_id)?;
         let has_runtime_transport = snapshot.has_runtime_auth_headers();
         let LocalVideoTaskSnapshot::Doubao(seed) = snapshot else {
             return None;
@@ -770,9 +960,14 @@ impl VideoTaskService {
             Some("gemini") => LocalVideoTaskProjectionTarget::Gemini {
                 short_id: extract_gemini_short_id_from_path(request_path)?.to_string(),
             },
-            Some("doubao") => LocalVideoTaskProjectionTarget::Doubao {
-                task_id: extract_doubao_task_id_from_path(request_path)?.to_string(),
-            },
+            Some("doubao") => {
+                let LocalVideoTaskSnapshot::Doubao(seed) = snapshot else {
+                    return None;
+                };
+                LocalVideoTaskProjectionTarget::Doubao {
+                    task_id: seed.local_task_id.clone(),
+                }
+            }
             _ => return None,
         };
         Some(LocalVideoTaskReadRefreshPlan {
@@ -791,10 +986,16 @@ impl VideoTaskService {
         if self.truth_source_mode != VideoTaskTruthSourceMode::RustAuthoritative {
             return None;
         }
-        let snapshot = self.snapshot_for_route(route_family, request_path)?;
-        if !snapshot.belongs_to_user(user_id) {
-            return None;
-        }
+        let snapshot = if route_family == Some("doubao") {
+            let task_id = extract_doubao_task_id_from_path(request_path)?;
+            self.owned_doubao_snapshot_by_task_id(task_id, user_id)?
+        } else {
+            let snapshot = self.snapshot_for_route(route_family, request_path)?;
+            if !snapshot.belongs_to_user(user_id) {
+                return None;
+            }
+            snapshot
+        };
         // A persisted snapshot is deliberately credential-redacted.  Do not
         // turn it into an upstream refresh plan unless the provider transport
         // was reconstructed for this request; otherwise a missing provider
@@ -987,11 +1188,17 @@ impl VideoTaskService {
         if self.truth_source_mode != VideoTaskTruthSourceMode::RustAuthoritative {
             return None;
         }
-        let snapshot = self.snapshot_for_follow_up_route(plan_kind, request_path)?;
         let user_id = fallback_user_id?.trim();
-        if !snapshot.belongs_to_user(user_id) {
-            return None;
-        }
+        let snapshot = if plan_kind == "doubao_video_delete_sync" {
+            let task_id = extract_doubao_task_id_from_path(request_path)?;
+            self.owned_doubao_snapshot_by_task_id(task_id, user_id)?
+        } else {
+            let snapshot = self.snapshot_for_follow_up_route(plan_kind, request_path)?;
+            if !snapshot.belongs_to_user(user_id) {
+                return None;
+            }
+            snapshot
+        };
         // DELETE/cancel/remix follow-ups also require the provider credential;
         // ownership alone must not authorize an empty-header upstream call.
         if !snapshot.has_runtime_auth_headers() {
@@ -1024,5 +1231,24 @@ impl VideoTaskService {
             "doubao_video_delete_sync" => self.snapshot_for_route(Some("doubao"), request_path),
             _ => None,
         }
+    }
+
+    fn owned_doubao_snapshot_by_task_id(
+        &self,
+        task_id: &str,
+        user_id: &str,
+    ) -> Option<LocalVideoTaskSnapshot> {
+        let task_id = task_id.trim();
+        let user_id = user_id.trim();
+        if task_id.is_empty() || user_id.is_empty() {
+            return None;
+        }
+        self.store
+            .clone_doubao_snapshot_for_user_by_upstream_task_id(user_id, task_id)
+            .or_else(|| {
+                self.store
+                    .clone_doubao_snapshot(task_id)
+                    .filter(|snapshot| snapshot.belongs_to_user(user_id))
+            })
     }
 }

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_contracts::{ExecutionPlan, RequestBody, EXECUTION_REQUEST_DIRECT_VIDEO_ASSET_HEADER};
 use aether_data_contracts::repository::video_tasks::{
-    StoredVideoTask, VideoTaskQueryFilter, VideoTaskStatus,
+    StoredVideoTask, VideoTaskLookupKey, VideoTaskQueryFilter, VideoTaskStatus,
 };
 use axum::{
     body::Body,
@@ -16,7 +16,7 @@ use url::form_urlencoded;
 
 use crate::async_task::{
     build_video_task_video_response, cancel_video_task_record_for_owner, read_video_task_detail,
-    read_video_task_page_summary, read_video_task_stats, read_video_task_video_source_for_owner,
+    read_video_task_page, read_video_task_stats, read_video_task_video_source_for_owner,
     CancelVideoTaskError, VideoTaskVideoSource,
 };
 use crate::GatewayError;
@@ -66,7 +66,10 @@ pub(super) async fn handle_users_me_video_tasks_list(
     };
     let filter =
         users_me_video_task_filter(&auth.user.id, status, query_param_value(query, "model"));
-    let page_response = match read_video_task_page_summary(state, &filter, page, page_size).await {
+    // The DTO id depends on the original client contract. Summary rows omit
+    // `client_api_format`, so use the full row here instead of guessing from
+    // the internal id or the presence of an upstream id.
+    let page_response = match read_video_task_page(state, &filter, page, page_size).await {
         Ok(response) => response,
         Err(err) => {
             return users_me_video_tasks_internal_error(request_context, "list_video_tasks", &err)
@@ -85,13 +88,24 @@ pub(super) async fn handle_users_me_video_tasks_list(
                 )
             }
         };
+    let Some(items) = page_response
+        .items
+        .iter()
+        .map(|task| build_users_me_video_task_item(task, &usage))
+        .collect::<Option<Vec<_>>>()
+    else {
+        let err = GatewayError::Internal(
+            "native Doubao video task is missing its upstream task id".to_string(),
+        );
+        return users_me_video_tasks_internal_error(
+            request_context,
+            "project_video_task_public_id",
+            &err,
+        );
+    };
 
     Json(json!({
-        "items": page_response
-            .items
-            .iter()
-            .map(|task| build_users_me_video_task_item(task, &usage))
-            .collect::<Vec<_>>(),
+        "items": items,
         "total": page_response.total,
         "page": page_response.page,
         "page_size": page_response.page_size,
@@ -170,7 +184,10 @@ pub(super) async fn handle_users_me_video_task_detail(
             )
         }
     };
-    Json(build_users_me_video_task_item(&task, &usage)).into_response()
+    let Some(item) = build_users_me_video_task_item(&task, &usage) else {
+        return users_me_video_task_not_found();
+    };
+    Json(item).into_response()
 }
 
 pub(super) async fn handle_users_me_video_task_cancel(
@@ -186,10 +203,24 @@ pub(super) async fn handle_users_me_video_task_cancel(
     else {
         return users_me_video_task_not_found();
     };
+    let task = match read_owned_video_task(state, task_id, &auth.user.id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => return users_me_video_task_not_found(),
+        Err(err) => {
+            return users_me_video_tasks_internal_error(
+                request_context,
+                "authorize_video_task_cancel",
+                &err,
+            )
+        }
+    };
+    let Some(public_task_id) = users_me_video_task_public_id(&task).map(ToOwned::to_owned) else {
+        return users_me_video_task_not_found();
+    };
 
-    match cancel_video_task_record_for_owner(state, task_id, Some(&auth.user.id)).await {
-        Ok(stored) => Json(json!({
-            "id": stored.id,
+    match cancel_video_task_record_for_owner(state, &task.id, Some(&auth.user.id)).await {
+        Ok(_stored) => Json(json!({
+            "id": public_task_id,
             "status": "cancelled",
             "message": "Task cancelled successfully",
         }))
@@ -245,23 +276,26 @@ pub(super) async fn handle_users_me_video_task_video(
             ))
         }
     };
-    let source = match read_video_task_video_source_for_owner(state, task_id, &auth.user.id).await {
-        Ok(Some(source)) => source,
-        Ok(None) => return protect_users_me_video_response(users_me_video_task_not_found()),
-        Err(err) => {
-            return protect_users_me_video_response(users_me_video_tasks_internal_error(
-                request_context,
-                "resolve_video_task_media",
-                &err,
-            ))
-        }
-    };
+    let internal_task_id = task.id.clone();
+    let source =
+        match read_video_task_video_source_for_owner(state, &internal_task_id, &auth.user.id).await
+        {
+            Ok(Some(source)) => source,
+            Ok(None) => return protect_users_me_video_response(users_me_video_task_not_found()),
+            Err(err) => {
+                return protect_users_me_video_response(users_me_video_tasks_internal_error(
+                    request_context,
+                    "resolve_video_task_media",
+                    &err,
+                ))
+            }
+        };
     let response = match source {
         VideoTaskVideoSource::Redirect { url } => {
             proxy_users_me_direct_video_asset(request_context, headers, &task, url).await
         }
         source @ VideoTaskVideoSource::Proxy { .. } => {
-            build_video_task_video_response(state, task_id, source).await
+            build_video_task_video_response(state, &internal_task_id, source).await
         }
     };
     match response {
@@ -394,15 +428,44 @@ fn users_me_video_task_filter(
 
 async fn read_owned_video_task(
     state: &AppState,
-    task_id: &str,
+    public_task_id: &str,
     user_id: &str,
 ) -> Result<Option<StoredVideoTask>, GatewayError> {
-    Ok(read_video_task_detail(state, task_id)
+    let public_task_id = public_task_id.trim();
+    let user_id = user_id.trim();
+    if public_task_id.is_empty() || user_id.is_empty() {
+        return Ok(None);
+    }
+
+    // Native Ark clients see the upstream cgt id. Resolve it together with
+    // the immutable authenticated owner before exposing or acting on a row.
+    let by_external = state
+        .data
+        .find_video_task(VideoTaskLookupKey::UserExternal {
+            user_id,
+            external_task_id: public_task_id,
+        })
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    if let Some(task) = by_external.filter(|task| {
+        is_native_doubao_video_task(task) && users_me_video_task_owner_matches(task, user_id)
+    }) {
+        return Ok(Some(task));
+    }
+
+    // OpenAI and Gemini keep their original client-facing local ids. Native
+    // Doubao rows are deliberately excluded from this public fallback; after
+    // resolution, downstream provider operations use the returned `task.id`.
+    Ok(read_video_task_detail(state, public_task_id)
         .await?
         .filter(|task| {
-            task.status != VideoTaskStatus::Deleted
-                && task.user_id.as_deref().map(str::trim) == Some(user_id.trim())
+            !is_native_doubao_video_task(task) && users_me_video_task_owner_matches(task, user_id)
         }))
+}
+
+fn users_me_video_task_owner_matches(task: &StoredVideoTask, user_id: &str) -> bool {
+    task.status != VideoTaskStatus::Deleted
+        && task.user_id.as_deref().map(str::trim) == Some(user_id.trim())
 }
 
 async fn build_users_me_video_task_usage_summaries(
@@ -445,10 +508,11 @@ async fn build_users_me_video_task_usage_summaries(
 fn build_users_me_video_task_item(
     task: &StoredVideoTask,
     usage_summaries: &BTreeMap<String, UsersMeVideoTaskUsageSummary>,
-) -> Value {
+) -> Option<Value> {
+    let public_task_id = users_me_video_task_public_id(task)?;
     let usage = usage_summaries.get(task.request_id.trim());
-    json!({
-        "id": task.id,
+    Some(json!({
+        "id": public_task_id,
         "request_id": task.request_id,
         "global_model_name": users_me_video_task_global_model_name(task),
         "model": task.model,
@@ -470,7 +534,26 @@ fn build_users_me_video_task_item(
         "updated_at": unix_secs_to_rfc3339(task.updated_at_unix_secs),
         "submitted_at": task.submitted_at_unix_secs.and_then(unix_secs_to_rfc3339),
         "completed_at": task.completed_at_unix_secs.and_then(unix_secs_to_rfc3339),
-    })
+    }))
+}
+
+fn users_me_video_task_public_id(task: &StoredVideoTask) -> Option<&str> {
+    if is_native_doubao_video_task(task) {
+        task.external_task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    } else {
+        let id = task.id.trim();
+        (!id.is_empty()).then_some(id)
+    }
+}
+
+fn is_native_doubao_video_task(task: &StoredVideoTask) -> bool {
+    task.client_api_format
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|format| format.eq_ignore_ascii_case("doubao:video"))
 }
 
 fn users_me_video_task_global_model_name(task: &StoredVideoTask) -> Option<String> {
@@ -640,7 +723,9 @@ mod tests {
 
     #[test]
     fn user_video_task_dto_exposes_only_safe_fields() {
-        let payload = build_users_me_video_task_item(&sample_task("user-1"), &BTreeMap::new());
+        let payload = build_users_me_video_task_item(&sample_task("user-1"), &BTreeMap::new())
+            .expect("OpenAI task should have a public id");
+        assert_eq!(payload["id"], "task-secret");
         assert_eq!(payload["global_model_name"], "seedance-global");
         assert_eq!(payload["video_available"], true);
         for forbidden in [
@@ -666,6 +751,23 @@ mod tests {
                 "must not expose {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn native_doubao_user_video_task_dto_uses_only_upstream_id() {
+        let mut task = sample_task("user-1");
+        task.client_api_format = Some("doubao:video".to_string());
+        task.provider_api_format = Some("doubao:video".to_string());
+        task.format_converted = false;
+        task.external_task_id = Some(" cgt-upstream-public ".to_string());
+
+        let payload = build_users_me_video_task_item(&task, &BTreeMap::new())
+            .expect("native Doubao task should have an upstream id");
+        assert_eq!(payload["id"], "cgt-upstream-public");
+        assert_ne!(payload["id"], task.id);
+
+        task.external_task_id = Some("  ".to_string());
+        assert!(build_users_me_video_task_item(&task, &BTreeMap::new()).is_none());
     }
 
     #[test]

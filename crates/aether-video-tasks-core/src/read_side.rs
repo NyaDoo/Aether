@@ -109,11 +109,20 @@ async fn read_doubao_video_task_response(
     request_path: &str,
     user_id: Option<&str>,
 ) -> Result<Option<LocalVideoTaskReadResponse>, DataLayerError> {
-    let Some(lookup) = resolve_video_task_read_lookup_key(Some("doubao"), request_path) else {
+    let Some(parsed_lookup) = resolve_video_task_read_lookup_key(Some("doubao"), request_path)
+    else {
         return Ok(None);
     };
+    let (lookup, fallback_lookup) = doubao_read_lookups_for_user(parsed_lookup, user_id);
 
-    let Some(task) = state.find_stored_video_task(lookup).await? else {
+    let task = match state.find_stored_video_task(lookup).await? {
+        Some(task) => Some(task),
+        None => match fallback_lookup {
+            Some(fallback_lookup) => state.find_stored_video_task(fallback_lookup).await?,
+            None => None,
+        },
+    };
+    let Some(task) = task else {
         return Ok(None);
     };
     if !task_belongs_to_user(&task, user_id) {
@@ -129,6 +138,22 @@ async fn read_doubao_video_task_response(
     Ok(Some(map_doubao_stored_task_to_read_response(task)))
 }
 
+fn doubao_read_lookups_for_user<'a>(
+    lookup: VideoTaskLookupKey<'a>,
+    user_id: Option<&'a str>,
+) -> (VideoTaskLookupKey<'a>, Option<VideoTaskLookupKey<'a>>) {
+    match (lookup, user_id) {
+        (local_fallback @ VideoTaskLookupKey::Id(external_task_id), Some(user_id)) => (
+            VideoTaskLookupKey::UserExternal {
+                user_id,
+                external_task_id,
+            },
+            Some(local_fallback),
+        ),
+        (lookup, _) => (lookup, None),
+    }
+}
+
 fn task_belongs_to_user(task: &StoredVideoTask, user_id: Option<&str>) -> bool {
     // Only the private inner call made by the legacy internal/admin wrapper is
     // unscoped. The public `_for_user` entry point cannot construct `None`.
@@ -141,4 +166,35 @@ fn task_belongs_to_user(task: &StoredVideoTask, user_id: Option<&str>) -> bool {
 fn non_empty_user_id(user_id: &str) -> Option<&str> {
     let user_id = user_id.trim();
     (!user_id.is_empty()).then_some(user_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::doubao_read_lookups_for_user;
+    use aether_data_contracts::repository::video_tasks::VideoTaskLookupKey;
+
+    #[test]
+    fn scopes_authenticated_doubao_reads_by_owner_and_external_id() {
+        assert_eq!(
+            doubao_read_lookups_for_user(
+                VideoTaskLookupKey::Id("cgt-upstream-123"),
+                Some("user-123"),
+            ),
+            (
+                VideoTaskLookupKey::UserExternal {
+                    user_id: "user-123",
+                    external_task_id: "cgt-upstream-123",
+                },
+                Some(VideoTaskLookupKey::Id("cgt-upstream-123")),
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_unscoped_internal_doubao_reads_on_the_local_id() {
+        assert_eq!(
+            doubao_read_lookups_for_user(VideoTaskLookupKey::Id("task-local-123"), None),
+            (VideoTaskLookupKey::Id("task-local-123"), None)
+        );
+    }
 }

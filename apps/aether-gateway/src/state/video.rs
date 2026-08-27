@@ -169,17 +169,26 @@ impl AppState {
         request_path: &str,
         user_id: &str,
     ) -> Result<bool, GatewayError> {
-        let Some(lookup) =
-            video_tasks::resolve_video_task_hydration_lookup_key(route_family, request_path)
+        let Some((lookup, fallback_lookup)) =
+            resolve_video_task_hydration_lookup_keys_for_user(route_family, request_path, user_id)
         else {
             return Ok(false);
         };
-        let Some(task) = self
+        let task = self
             .data
             .find_video_task(lookup)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?
-        else {
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let task = match (task, fallback_lookup) {
+            (Some(task), _) => Some(task),
+            (None, Some(fallback_lookup)) => self
+                .data
+                .find_video_task(fallback_lookup)
+                .await
+                .map_err(|err| GatewayError::Internal(err.to_string()))?,
+            (None, None) => None,
+        };
+        let Some(task) = task else {
             return Ok(false);
         };
         if task.user_id.as_deref().map(str::trim) != Some(user_id.trim()) {
@@ -320,5 +329,67 @@ impl AppState {
         refresh_plan: &video_tasks::LocalVideoTaskReadRefreshPlan,
     ) -> Result<bool, GatewayError> {
         async_task::execute_video_task_refresh_plan(self, refresh_plan).await
+    }
+}
+
+fn resolve_video_task_hydration_lookup_keys_for_user<'a>(
+    route_family: Option<&str>,
+    request_path: &'a str,
+    user_id: &'a str,
+) -> Option<(VideoTaskLookupKey<'a>, Option<VideoTaskLookupKey<'a>>)> {
+    let lookup = video_tasks::resolve_video_task_hydration_lookup_key(route_family, request_path)?;
+    match (route_family, lookup) {
+        (Some("doubao"), local_fallback @ VideoTaskLookupKey::Id(external_task_id)) => Some((
+            VideoTaskLookupKey::UserExternal {
+                user_id: user_id.trim(),
+                external_task_id,
+            },
+            Some(local_fallback),
+        )),
+        (_, lookup) => Some((lookup, None)),
+    }
+}
+
+#[cfg(test)]
+mod hydration_lookup_tests {
+    use super::resolve_video_task_hydration_lookup_keys_for_user;
+    use aether_data_contracts::repository::video_tasks::VideoTaskLookupKey;
+
+    #[test]
+    fn scopes_doubao_hydration_by_owner_and_external_id() {
+        assert_eq!(
+            resolve_video_task_hydration_lookup_keys_for_user(
+                Some("doubao"),
+                "/api/v3/contents/generations/tasks/cgt-upstream-123",
+                " user-123 ",
+            ),
+            Some((
+                VideoTaskLookupKey::UserExternal {
+                    user_id: "user-123",
+                    external_task_id: "cgt-upstream-123",
+                },
+                Some(VideoTaskLookupKey::Id("cgt-upstream-123")),
+            ))
+        );
+    }
+
+    #[test]
+    fn preserves_openai_and_gemini_hydration_keys() {
+        assert_eq!(
+            resolve_video_task_hydration_lookup_keys_for_user(
+                Some("openai"),
+                "/v1/videos/task-local-123",
+                "user-123",
+            ),
+            Some((VideoTaskLookupKey::Id("task-local-123"), None))
+        );
+        assert_eq!(
+            resolve_video_task_hydration_lookup_keys_for_user(
+                Some("gemini"),
+                "/v1beta/models/veo-3/operations/short-local-123",
+                "user-123",
+            ),
+            Some((VideoTaskLookupKey::ShortId("short-local-123"), None))
+        );
     }
 }

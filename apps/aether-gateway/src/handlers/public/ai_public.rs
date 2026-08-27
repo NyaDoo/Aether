@@ -7,7 +7,7 @@ use crate::control::GatewayPublicRequestContext;
 use crate::image_capabilities::openai_image_gateway_max_generation_count;
 use crate::{AppState, GatewayError};
 use aether_data_contracts::repository::video_tasks::{
-    StoredVideoTask, VideoTaskQueryFilter, VideoTaskStatus,
+    StoredVideoTask, VideoTaskLookupKey, VideoTaskQueryFilter, VideoTaskStatus,
 };
 use axum::body::{Body, Bytes};
 use axum::http::{self, Response};
@@ -181,9 +181,9 @@ pub(crate) async fn maybe_build_local_ai_public_response(
 
 /// Rejects a Doubao create request that asks the provider to call back directly.
 ///
-/// The gateway owns task state, so an upstream callback would bypass it entirely
-/// and leak the upstream task id. Failing loudly beats silently stripping the
-/// field, which would leave the client waiting for a callback that never comes.
+/// The gateway owns task persistence, polling and billing, so an upstream
+/// callback would bypass that lifecycle. Failing loudly beats silently stripping
+/// the field, which would leave the client waiting for a callback that never comes.
 fn maybe_build_local_doubao_video_request_validation_response(
     request_context: &GatewayPublicRequestContext,
     request_body: Option<&Bytes>,
@@ -259,13 +259,20 @@ async fn maybe_build_local_doubao_video_tasks_list_response(
     };
     let now_unix_secs = aether_video_tasks_core::current_unix_timestamp_secs();
 
-    // Ark supports an explicit task-id filter. The shared repository filter is
-    // intentionally user-agnostic for this field, so resolve IDs one by one
-    // and apply the ownership/status/model predicates before pagination.
+    // Ark exposes upstream task IDs to clients. Resolve each requested ID by
+    // the authenticated owner plus external ID, then apply the remaining
+    // status/model predicates before pagination.
     if !list_query.task_ids.is_empty() {
         let mut matching = Vec::with_capacity(list_query.task_ids.len());
         for task_id in &list_query.task_ids {
-            let task = match state.find_video_task_by_id(task_id).await {
+            let task = match state
+                .data
+                .find_video_task(VideoTaskLookupKey::UserExternal {
+                    user_id,
+                    external_task_id: task_id,
+                })
+                .await
+            {
                 Ok(task) => task,
                 Err(_) => {
                     return Some(build_ai_public_error_response(
@@ -276,6 +283,7 @@ async fn maybe_build_local_doubao_video_tasks_list_response(
             };
             let Some(task) = task else { continue };
             if task.user_id.as_deref().map(str::trim) == Some(user_id)
+                && task.external_task_id.as_deref().map(str::trim) == Some(task_id.as_str())
                 && doubao_task_matches_list_query(&task, &list_query, now_unix_secs)
             {
                 matching.push(task);
@@ -482,6 +490,10 @@ fn doubao_task_matches_list_query(
     now_unix_secs: u64,
 ) -> bool {
     is_doubao_video_task(task)
+        && task
+            .external_task_id
+            .as_deref()
+            .is_some_and(|task_id| !task_id.trim().is_empty())
         && aether_video_tasks_core::doubao_stored_task_is_visible_at(task, now_unix_secs)
         && query
             .status

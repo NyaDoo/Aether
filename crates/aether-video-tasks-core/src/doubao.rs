@@ -67,10 +67,28 @@ pub fn map_doubao_stored_task_to_read_response_at(
         };
     }
 
+    let Some(public_task_id) = task
+        .external_task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return LocalVideoTaskReadResponse {
+            status_code: 500,
+            body_json: json!({
+                "error": {
+                    "code": "InvalidTaskState",
+                    "message": "The generation task is missing its upstream task id.",
+                }
+            }),
+        };
+    };
+
     let status = task.status;
     LocalVideoTaskReadResponse {
         status_code: 200,
-        body_json: build_doubao_stored_task_body(task, status),
+        body_json: build_doubao_stored_task_body(task, status, &public_task_id),
     }
 }
 
@@ -87,7 +105,11 @@ struct DoubaoStoredSnapshotFields {
     frames_per_second: Option<i32>,
 }
 
-fn build_doubao_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus) -> Value {
+fn build_doubao_stored_task_body(
+    task: StoredVideoTask,
+    status: VideoTaskStatus,
+    public_task_id: &str,
+) -> Value {
     let metadata_global_model = task
         .request_metadata
         .as_ref()
@@ -174,7 +196,7 @@ fn build_doubao_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus)
             .or(task.duration_seconds)
     };
     let mut body = json!({
-        "id": task.id,
+        "id": public_task_id,
         "status": map_doubao_stored_task_status(status),
         "created_at": task.created_at_unix_ms,
         "updated_at": task.updated_at_unix_secs,
@@ -471,7 +493,7 @@ impl DoubaoVideoTaskSeed {
 
     pub fn client_body_json(&self) -> Value {
         let mut body = json!({
-            "id": self.local_task_id,
+            "id": self.upstream_task_id,
             "status": map_doubao_task_status(self.status),
             "created_at": self.created_at_unix_secs,
             "updated_at": self
@@ -1479,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn client_body_uses_local_id_and_doubao_shape() {
+    fn client_body_uses_upstream_id_and_doubao_shape() {
         let mut seed = sample_seed();
         seed.status = LocalVideoTaskStatus::Completed;
         seed.video_url = Some("https://tos.example.com/v.mp4".to_string());
@@ -1489,7 +1511,7 @@ mod tests {
 
         let body = seed.client_body_json();
 
-        assert_eq!(body["id"], "cgt-local-123");
+        assert_eq!(body["id"], "cgt-upstream-123");
         assert_eq!(body["status"], "succeeded");
         assert_eq!(
             body["content"]["video_url"],
@@ -2164,12 +2186,24 @@ mod tests {
             map_doubao_stored_task_to_read_response(sample_stored_task(VideoTaskStatus::Completed));
 
         assert_eq!(response.status_code, 200);
-        assert_eq!(response.body_json["id"], "cgt-local-123");
+        assert_eq!(response.body_json["id"], "cgt-upstream-123");
         assert_eq!(response.body_json["status"], "succeeded");
         assert_eq!(response.body_json["duration"].as_str(), Some("11"));
         assert_eq!(
             response.body_json["content"]["video_url"],
             "https://tos.example.com/video.mp4?X-Sig=abc"
         );
+    }
+
+    #[test]
+    fn stored_task_without_upstream_id_never_leaks_the_internal_id() {
+        let mut task = sample_stored_task(VideoTaskStatus::Processing);
+        task.external_task_id = None;
+
+        let response = map_doubao_stored_task_to_read_response(task);
+
+        assert_eq!(response.status_code, 500);
+        assert_eq!(response.body_json["error"]["code"], "InvalidTaskState");
+        assert!(response.body_json.get("id").is_none());
     }
 }

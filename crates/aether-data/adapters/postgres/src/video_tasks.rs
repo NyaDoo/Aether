@@ -106,7 +106,17 @@ fn find_by_short_id_sql() -> String {
 }
 
 fn find_by_user_external_sql() -> String {
-    select_video_task_sql("WHERE user_id = $1 AND external_task_id = $2\nLIMIT 1")
+    select_video_task_sql("WHERE user_id = $1 AND external_task_id = $2\nLIMIT 2")
+}
+
+fn unique_user_external_match<T>(mut rows: Vec<T>) -> Result<Option<T>, DataLayerError> {
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(rows.pop()),
+        _ => Err(DataLayerError::UnexpectedValue(
+            "ambiguous video task user/external lookup".to_string(),
+        )),
+    }
 }
 
 fn list_active_sql() -> String {
@@ -427,12 +437,13 @@ impl SqlxVideoTaskRepository {
         external_task_id: &str,
     ) -> Result<Option<StoredVideoTask>, DataLayerError> {
         let sql = find_by_user_external_sql();
-        let row = sqlx::query(&sql)
+        let rows = sqlx::query(&sql)
             .bind(user_id)
             .bind(external_task_id)
-            .fetch_optional(&self.pool)
+            .fetch_all(&self.pool)
             .await
             .map_postgres_err()?;
+        let row = unique_user_external_match(rows)?;
         row.as_ref().map(map_video_task_row).transpose()
     }
 
@@ -1085,12 +1096,13 @@ fn map_video_task_row(row: &PgRow) -> Result<StoredVideoTask, DataLayerError> {
 
 #[cfg(test)]
 mod tests {
-    use super::SqlxVideoTaskRepository;
+    use super::{find_by_user_external_sql, unique_user_external_match, SqlxVideoTaskRepository};
     use crate::{PostgresPoolConfig, PostgresPoolFactory};
     use aether_data_contracts::repository::video_tasks::{
         UpsertVideoTask, VideoTaskLookupKey, VideoTaskQueryFilter, VideoTaskReadRepository,
         VideoTaskStatus, VideoTaskWriteRepository,
     };
+    use aether_data_contracts::DataLayerError;
 
     fn build_pool() -> sqlx::PgPool {
         let factory = PostgresPoolFactory::new(PostgresPoolConfig {
@@ -1112,6 +1124,18 @@ mod tests {
     async fn repository_constructs_from_lazy_pool() {
         let repository = SqlxVideoTaskRepository::new(build_pool());
         let _ = repository.pool();
+    }
+
+    #[test]
+    fn user_external_lookup_is_bounded_and_fails_closed_on_ambiguity() {
+        assert!(find_by_user_external_sql().contains("LIMIT 2"));
+        assert_eq!(unique_user_external_match::<u8>(Vec::new()).unwrap(), None);
+        assert_eq!(unique_user_external_match(vec![1_u8]).unwrap(), Some(1));
+        assert!(matches!(
+            unique_user_external_match(vec![1_u8, 2]),
+            Err(DataLayerError::UnexpectedValue(message))
+                if message == "ambiguous video task user/external lookup"
+        ));
     }
 
     #[tokio::test]

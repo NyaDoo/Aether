@@ -1180,20 +1180,33 @@ async fn db_only_doubao_get_hides_cancelled_task_after_retention_window() {
     let fresh_response = state
         .read_video_task_response_for_user(
             Some("doubao"),
-            "/api/v3/contents/generations/tasks/cgt-cancelled-fresh",
+            "/api/v3/contents/generations/tasks/cgt-provider-cancelled-fresh",
             "owner-doubao-cancelled",
         )
         .await
         .expect("fresh DB-only read should succeed")
         .expect("fresh cancelled task should still resolve");
     assert_eq!(fresh_response.status_code, 200);
+    assert_eq!(
+        fresh_response.body_json["id"],
+        "cgt-provider-cancelled-fresh"
+    );
     assert_eq!(fresh_response.body_json["status"], "cancelled");
     assert!(fresh_response.body_json.get("content").is_none());
+    assert!(state
+        .read_video_task_response_for_user(
+            Some("doubao"),
+            "/api/v3/contents/generations/tasks/cgt-provider-cancelled-fresh",
+            "different-user",
+        )
+        .await
+        .expect("foreign DB-only read should not fail")
+        .is_none());
 
     let expired_response = state
         .read_video_task_response_for_user(
             Some("doubao"),
-            "/api/v3/contents/generations/tasks/cgt-cancelled-expired",
+            "/api/v3/contents/generations/tasks/cgt-provider-cancelled-expired",
             "owner-doubao-cancelled",
         )
         .await
