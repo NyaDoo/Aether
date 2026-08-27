@@ -219,7 +219,7 @@ describe('Dashboard realtime metrics', () => {
     authStoreState.isAdmin = true
   }
 
-  it('renders structured RPM/TPM values, window, timestamp, and semantics', async () => {
+  it('renders RPM/TPM values, window, and timestamp without accounting details', async () => {
     enableAdmin()
     dashboardApiMocks.getStats.mockResolvedValue({
       stats: [
@@ -238,9 +238,9 @@ describe('Dashboard realtime metrics', () => {
     expect(root.textContent).toContain('12.5 / 3.46K')
     expect(root.textContent).toContain('最近 60 秒')
     expect(root.textContent).toMatch(/截至 \d{2}:\d{2}:\d{2}/)
-    expect(root.textContent).toContain('已接纳且未失败请求')
-    expect(root.textContent).toContain('Token 增量')
-    expect(root.textContent).toContain('全站共享')
+    expect(root.textContent).not.toContain('口径：')
+    expect(root.textContent).not.toContain('范围：')
+    expect(root.textContent).not.toContain('全站共享')
   })
 
   it('loads realtime metrics without waiting for the aggregate dashboard', async () => {

@@ -68,18 +68,6 @@
                 >
                   {{ getDisplayedStatSubValue(stat) }}
                 </p>
-                <p
-                  v-if="isRealtimeStat(stat) && realtimeMetrics?.semantics"
-                  class="mt-0.5 text-[9px] sm:text-[10px] text-muted-foreground/80"
-                >
-                  口径：{{ formatRealtimeSemantics(realtimeMetrics.semantics) }}
-                </p>
-                <p
-                  v-if="isRealtimeStat(stat) && realtimeMetrics?.storage_scope"
-                  class="mt-0.5 text-[9px] sm:text-[10px] text-muted-foreground/80"
-                >
-                  范围：{{ formatRealtimeStorageScope(realtimeMetrics.storage_scope) }}
-                </p>
                 <div
                   v-if="stat.change || stat.extraBadge"
                   class="mt-1.5 sm:mt-2 flex items-center gap-1 sm:gap-1.5 flex-wrap"
@@ -932,7 +920,6 @@ import {
   dashboardApi,
   type DashboardStat,
   type DashboardRealtimeMetrics,
-  type DashboardRealtimeSemantics,
   type DailyStat,
   type ProviderSummary,
   type SystemHealth,
@@ -1246,16 +1233,6 @@ const emptyStatPlaceholders = computed(() => {
 const statSkeletonCount = computed(() => emptyStatPlaceholders.value.length);
 
 const REALTIME_STAT_NAME_PATTERN = /全站\s*RPM/i;
-const REALTIME_SEMANTIC_LABELS: Record<string, string> = {
-  admitted_requests_and_reported_tokens: "已接纳请求 / 已上报 Token",
-  accepted_non_failed_requests: "已接纳且未失败请求",
-  token_deltas: "Token 增量",
-  observed_token_deltas_including_failed: "Token 增量（含失败请求已产生部分）",
-  trailing_60_seconds: "滚动 60 秒窗口",
-  excluded: "已排除失败请求",
-  excluded_from_rpm_only: "失败请求仅从 RPM 排除",
-};
-
 function isRealtimeStat(stat: DashboardStatCard): boolean {
   return REALTIME_STAT_NAME_PATTERN.test(stat.name);
 }
@@ -1290,18 +1267,6 @@ function formatRealtimeAsOf(asOf: string): string {
     minute: "2-digit",
     second: "2-digit",
   })}`;
-}
-
-function formatRealtimeSemantics(semantics: DashboardRealtimeSemantics): string {
-  const label = (value: string | undefined): string => {
-    const normalized = value?.trim() || "未说明";
-    return REALTIME_SEMANTIC_LABELS[normalized] || normalized;
-  };
-  return `请求：${label(semantics.rpm)} · Token：${label(semantics.tpm)} · ${label(semantics.window)} · 失败：${label(semantics.failed_requests)}`;
-}
-
-function formatRealtimeStorageScope(scope: DashboardRealtimeMetrics["storage_scope"]): string {
-  return scope === "shared" ? "全站共享" : "单进程";
 }
 
 const realtimeDisplayValue = computed(() => {
