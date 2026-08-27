@@ -1727,6 +1727,18 @@ async fn record_asset_candidate_terminal(
     } else {
         let mut usage_outcome =
             build_sync_terminal_usage_outcome(plan, Some(&terminal_report_context), &payload);
+        // Empty objects in the report context are intentional sentinels: they
+        // stop the generic sync builder from falling back to provider headers
+        // for the client-facing capture.  They do not mean that either side's
+        // response headers were actually observed (notably on Drop/499), so
+        // restore the storage representation to `None` after that fallback has
+        // been suppressed.
+        if outcome.response.provider_headers.is_empty() {
+            usage_outcome.provider_response_headers = None;
+        }
+        if outcome.response.client_headers.is_empty() {
+            usage_outcome.client_response_headers = None;
+        }
         usage_outcome.request_type = "asset_library".to_string();
         usage_outcome.terminal_error_message = outcome.error_message.clone();
         usage_outcome.terminal_failure_category = outcome.error_type.clone();

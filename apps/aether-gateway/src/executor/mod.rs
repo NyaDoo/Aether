@@ -37,10 +37,11 @@ pub(crate) use remote::{
     maybe_execute_stream_via_remote_decision, maybe_execute_sync_via_remote_decision,
 };
 pub(crate) use request_terminal_guard::{
-    mark_stream_response_usage_terminal_owner, mark_sync_response_usage_terminal_owner,
-    note_current_request_attempt_terminal_gap, note_current_request_retry_terminal_gap,
-    pause_current_request_terminal_gap_for_attempt, response_has_usage_terminal_owner,
-    transfer_current_request_terminal_owner, RequestTerminalOwnershipGuard,
+    capture_current_request_terminal_owner, mark_stream_response_usage_terminal_owner,
+    mark_sync_response_usage_terminal_owner, note_current_request_attempt_terminal_gap,
+    note_current_request_retry_terminal_gap, pause_current_request_terminal_gap_for_attempt,
+    response_has_usage_terminal_owner, transfer_current_request_terminal_owner,
+    RequestTerminalOwnershipGuard,
 };
 pub(crate) use stream_path::maybe_execute_via_stream_decision_path;
 pub(crate) use sync_path::maybe_execute_via_sync_decision_path;

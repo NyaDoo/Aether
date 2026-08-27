@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 use aether_usage_runtime::{
-    build_sync_terminal_usage_event, GatewaySyncReportRequest, UsageEventType,
+    build_sync_terminal_usage_outcome, build_terminal_usage_event_from_outcome,
+    GatewaySyncReportRequest, UsageEventType,
 };
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{HeaderMap, Response};
@@ -30,6 +31,25 @@ const INLINE_TERMINAL_HANDOFF_WAIT: Duration = Duration::from_secs(2);
 
 tokio::task_local! {
     static REQUEST_TERMINAL_OWNER: Arc<RequestTerminalOwnershipState>;
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturedRequestTerminalOwner(Option<Arc<RequestTerminalOwnershipState>>);
+
+impl CapturedRequestTerminalOwner {
+    pub(crate) async fn scope<F>(self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        match self.0 {
+            Some(owner) => REQUEST_TERMINAL_OWNER.scope(owner, future).await,
+            None => future.await,
+        }
+    }
+}
+
+pub(crate) fn capture_current_request_terminal_owner() -> CapturedRequestTerminalOwner {
+    CapturedRequestTerminalOwner(REQUEST_TERMINAL_OWNER.try_with(Arc::clone).ok())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,10 +152,7 @@ impl TerminalClientAudit {
             "request was cancelled while no execution attempt owned terminal usage".to_string();
         Self {
             status_code,
-            headers: BTreeMap::from([(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )]),
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
             body: Some(json!({
                 "error": {
                     "type": error_type,
@@ -307,8 +324,10 @@ impl RequestTerminalOwnershipGuard {
 
     fn dispatch(&mut self, audit: TerminalClientAudit) -> Option<JoinHandle<bool>> {
         let snapshot = self.owner.claim_dispatch()?;
+        let usage_request_id = snapshot.plan.request_id.clone();
         Some(spawn_terminal_if_still_pending(
             self.state.clone(),
+            usage_request_id,
             self.request_id.clone(),
             snapshot,
             self.request_diagnostics.clone(),
@@ -322,8 +341,10 @@ impl Drop for RequestTerminalOwnershipGuard {
         let Some(snapshot) = self.owner.claim_dispatch() else {
             return;
         };
+        let usage_request_id = snapshot.plan.request_id.clone();
         let _ = spawn_terminal_if_still_pending(
             self.state.clone(),
+            usage_request_id,
             self.request_id.clone(),
             snapshot,
             self.request_diagnostics.clone(),
@@ -399,6 +420,7 @@ async fn await_terminal_handoff_bounded(join: Option<JoinHandle<bool>>) {
 fn spawn_terminal_if_still_pending(
     state: AppState,
     request_id: String,
+    ingress_trace_id: String,
     snapshot: RequestTerminalSnapshot,
     request_diagnostics: Option<Arc<RequestDiagnostics>>,
     audit: TerminalClientAudit,
@@ -407,6 +429,7 @@ fn spawn_terminal_if_still_pending(
         terminal_if_still_pending(
             &state,
             request_id.as_str(),
+            ingress_trace_id.as_str(),
             snapshot,
             request_diagnostics,
             audit,
@@ -418,6 +441,7 @@ fn spawn_terminal_if_still_pending(
 async fn terminal_if_still_pending(
     state: &AppState,
     request_id: &str,
+    ingress_trace_id: &str,
     snapshot: RequestTerminalSnapshot,
     request_diagnostics: Option<Arc<RequestDiagnostics>>,
     audit: TerminalClientAudit,
@@ -438,6 +462,7 @@ async fn terminal_if_still_pending(
 
     let terminal_event = match build_terminal_gap_event(
         request_id,
+        ingress_trace_id,
         &snapshot,
         report_context,
         request_diagnostics.as_ref(),
@@ -552,6 +577,7 @@ async fn terminal_if_still_pending(
 
 fn build_terminal_gap_event(
     request_id: &str,
+    ingress_trace_id: &str,
     snapshot: &RequestTerminalSnapshot,
     report_context: Option<Value>,
     request_diagnostics: Option<&Arc<RequestDiagnostics>>,
@@ -567,32 +593,56 @@ fn build_terminal_gap_event(
     let provider_headers = context
         .get("provider_response_headers")
         .cloned()
-        .or_else(|| upstream.as_ref().and_then(|value| value.get("headers").cloned()));
-    let provider_body = context
-        .get("provider_response")
-        .cloned()
-        .or_else(|| upstream.as_ref().and_then(|value| value.get("body").cloned()));
+        .or_else(|| {
+            upstream
+                .as_ref()
+                .and_then(|value| value.get("headers").cloned())
+        });
+    let provider_body = context.get("provider_response").cloned().or_else(|| {
+        upstream
+            .as_ref()
+            .and_then(|value| value.get("body").cloned())
+    });
+    let provider_body_ref = context
+        .get("response_body_ref")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            upstream
+                .as_ref()
+                .and_then(|value| value.get("body_ref"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
     let provider_body_state = context
         .get("provider_response_body_state")
         .cloned()
-        .or_else(|| upstream.as_ref().and_then(|value| value.get("body_state").cloned()))
+        .or_else(|| {
+            upstream
+                .as_ref()
+                .and_then(|value| value.get("body_state").cloned())
+        })
         .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_else(|| body_capture_state(provider_body.as_ref(), None));
+        .unwrap_or_else(|| {
+            body_capture_state(provider_body.as_ref(), provider_body_ref.as_deref())
+        });
     if let Some(headers) = provider_headers {
         context.insert("provider_response_headers".to_string(), headers);
     }
-    if let Some(body_ref) = upstream
-        .as_ref()
-        .and_then(|value| value.get("body_ref"))
-        .cloned()
-    {
-        context.entry("response_body_ref".to_string()).or_insert(body_ref);
+    if let Some(body_ref) = provider_body_ref.as_ref() {
+        context
+            .entry("response_body_ref".to_string())
+            .or_insert_with(|| Value::String(body_ref.clone()));
     }
 
     let explicit_client_body = context
         .get("client_response")
         .cloned()
         .or_else(|| context.get("client_response_body").cloned());
+    let client_body_ref = context
+        .get("client_response_body_ref")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     // Failed exhaustion fallbacks preserve the most recent provider error
     // when no converted client capture exists. Cancellation never borrows a
     // provider body: its synthetic 499 belongs only to client-response fields.
@@ -612,7 +662,7 @@ fn build_terminal_gap_event(
             .get("client_response_body_state")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_else(|| body_capture_state(client_body.as_ref(), None))
+            .unwrap_or_else(|| body_capture_state(client_body.as_ref(), client_body_ref.as_deref()))
     };
     context.insert(
         "client_response_headers".to_string(),
@@ -622,12 +672,18 @@ fn build_terminal_gap_event(
         "terminal_gap_error_type".to_string(),
         Value::String(audit.error_type.to_string()),
     );
+    if ingress_trace_id != request_id {
+        context.insert(
+            "terminal_gap_ingress_trace_id".to_string(),
+            Value::String(ingress_trace_id.to_string()),
+        );
+    }
 
     let elapsed_ms = request_diagnostics
         .and_then(|diagnostics| diagnostics.request_accepted_elapsed_ms())
         .unwrap_or_else(|| snapshot.observed_at.elapsed().as_millis() as u64);
     let payload = GatewaySyncReportRequest {
-        trace_id: request_id.to_string(),
+        trace_id: ingress_trace_id.to_string(),
         report_kind: match audit.event_type {
             UsageEventType::Cancelled => "request_terminal_gap_cancelled",
             _ => "request_terminal_gap_failed",
@@ -635,7 +691,10 @@ fn build_terminal_gap_event(
         .to_string(),
         report_context: Some(Value::Object(context)),
         status_code: audit.status_code,
-        headers: audit.headers.clone(),
+        // `headers` is the legacy provider-header fallback. Client headers
+        // are explicit in report_context above; leaving this empty prevents a
+        // gateway 499/5xx response head from being copied into provider audit.
+        headers: BTreeMap::new(),
         body_json: provider_body,
         client_body_json: client_body,
         body_base64: None,
@@ -645,11 +704,11 @@ fn build_terminal_gap_event(
             upstream_bytes: None,
         }),
     };
-    let mut event = build_sync_terminal_usage_event(
+    let mut event = build_terminal_usage_event_from_outcome(build_sync_terminal_usage_outcome(
         &snapshot.plan,
         payload.report_context.as_ref(),
         &payload,
-    )?;
+    ))?;
     // Never let a 2xx header alone manufacture success. This owner is entered
     // only for cancellation or an unowned failure response, and that semantic
     // terminal state wins over the builder's status-only inference.
@@ -754,32 +813,56 @@ fn gateway_error_audit_response(error: &GatewayError) -> (BTreeMap<String, Strin
     let mut headers = BTreeMap::new();
     match error {
         GatewayError::UpstreamUnavailable { trace_id, .. } => {
-            headers.insert(crate::constants::TRACE_ID_HEADER.to_string(), trace_id.clone());
-            headers.insert(crate::constants::GATEWAY_HEADER.to_string(), "rust-phase3b".into());
+            headers.insert(
+                crate::constants::TRACE_ID_HEADER.to_string(),
+                trace_id.clone(),
+            );
+            headers.insert(
+                crate::constants::GATEWAY_HEADER.to_string(),
+                "rust-phase3b".into(),
+            );
             (
                 headers,
                 json!({"error": {"message": "gateway proxy unavailable", "trace_id": trace_id}}),
             )
         }
         GatewayError::ControlUnavailable { trace_id, .. } => {
-            headers.insert(crate::constants::TRACE_ID_HEADER.to_string(), trace_id.clone());
-            headers.insert(crate::constants::GATEWAY_HEADER.to_string(), "rust-phase3b".into());
+            headers.insert(
+                crate::constants::TRACE_ID_HEADER.to_string(),
+                trace_id.clone(),
+            );
+            headers.insert(
+                crate::constants::GATEWAY_HEADER.to_string(),
+                "rust-phase3b".into(),
+            );
             (
                 headers,
                 json!({"error": {"message": "gateway control unavailable", "trace_id": trace_id}}),
             )
         }
         GatewayError::LocalExecutionPlanningTimeout { trace_id, .. } => {
-            headers.insert(crate::constants::TRACE_ID_HEADER.to_string(), trace_id.clone());
-            headers.insert(crate::constants::GATEWAY_HEADER.to_string(), "rust-phase3b".into());
+            headers.insert(
+                crate::constants::TRACE_ID_HEADER.to_string(),
+                trace_id.clone(),
+            );
+            headers.insert(
+                crate::constants::GATEWAY_HEADER.to_string(),
+                "rust-phase3b".into(),
+            );
             (
                 headers,
                 json!({"error": {"message": "gateway local execution planning timed out", "trace_id": trace_id}}),
             )
         }
         GatewayError::AdmissionTimeout { trace_id, .. } => {
-            headers.insert(crate::constants::TRACE_ID_HEADER.to_string(), trace_id.clone());
-            headers.insert(crate::constants::GATEWAY_HEADER.to_string(), "rust-phase3b".into());
+            headers.insert(
+                crate::constants::TRACE_ID_HEADER.to_string(),
+                trace_id.clone(),
+            );
+            headers.insert(
+                crate::constants::GATEWAY_HEADER.to_string(),
+                "rust-phase3b".into(),
+            );
             headers.insert("retry-after".to_string(), "1".to_string());
             (
                 headers,
@@ -811,7 +894,45 @@ fn capture_body(body: &Bytes) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::usage_is_unfinalized;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use aether_contracts::{ExecutionPlan, RequestBody};
+    use aether_data_contracts::repository::usage::UsageBodyCaptureState;
+    use aether_usage_runtime::UsageEventType;
+    use serde_json::json;
+
+    use super::{
+        build_terminal_gap_event, capture_current_request_terminal_owner,
+        pause_current_request_terminal_gap_for_attempt, usage_is_unfinalized,
+        RequestTerminalOwnershipState, RequestTerminalSnapshot, TerminalClientAudit,
+        REQUEST_TERMINAL_OWNER,
+    };
+
+    fn test_plan(candidate_id: &str) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "req-terminal-gap".to_string(),
+            candidate_id: Some(candidate_id.to_string()),
+            provider_name: Some("provider".to_string()),
+            provider_id: "provider-id".to_string(),
+            endpoint_id: "endpoint-id".to_string(),
+            key_id: "key-id".to_string(),
+            method: "POST".to_string(),
+            url: "https://provider.invalid/v1/chat/completions".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "test"})),
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("test".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
 
     #[test]
     fn durable_usage_gate_accepts_only_unfinalized_pending_or_streaming() {
@@ -820,5 +941,158 @@ mod tests {
         assert!(!usage_is_unfinalized("completed", "pending", None));
         assert!(!usage_is_unfinalized("pending", "void", None));
         assert!(!usage_is_unfinalized("streaming", "pending", Some(1)));
+    }
+
+    #[test]
+    fn next_attempt_pause_never_dispatches_the_previous_candidate_snapshot() {
+        let owner = RequestTerminalOwnershipState::new();
+        owner.note_retry(&test_plan("candidate-previous"), None);
+
+        // The synchronous starting-attempt hook refreshes identity before any
+        // candidate-start await; the per-attempt guard then pauses this owner.
+        owner.note_retry(&test_plan("candidate-current"), None);
+        assert_eq!(
+            owner
+                .snapshot()
+                .and_then(|snapshot| snapshot.plan.candidate_id),
+            Some("candidate-current".to_string())
+        );
+        owner.pause_for_attempt();
+        assert!(owner.claim_dispatch().is_none());
+
+        // A Retry from the current attempt re-arms the same exact identity
+        // before the loop performs planning/cleanup awaits.
+        owner.note_retry(&test_plan("candidate-current"), None);
+        assert_eq!(
+            owner
+                .claim_dispatch()
+                .and_then(|snapshot| snapshot.plan.candidate_id),
+            Some("candidate-current".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_event_separates_sanitized_provider_and_client_headers_and_refs() {
+        let snapshot = RequestTerminalSnapshot {
+            plan: test_plan("candidate-audit"),
+            report_context: None,
+            observed_at: Instant::now(),
+        };
+        let mut audit = TerminalClientAudit::cancelled();
+        audit.headers.insert(
+            "set-cookie".to_string(),
+            "client-session-secret".to_string(),
+        );
+        audit
+            .headers
+            .insert("x-client-only".to_string(), "client".to_string());
+        let event = build_terminal_gap_event(
+            "req-terminal-gap",
+            "ingress-trace-that-differs",
+            &snapshot,
+            Some(json!({
+                "upstream_response": {
+                    "headers": {
+                        "authorization": "Bearer provider-secret",
+                        "x-provider-only": "provider"
+                    },
+                    "body_ref": "usage://provider/body",
+                    "body_state": "reference"
+                }
+            })),
+            None,
+            &audit,
+        )
+        .expect("terminal event should build");
+
+        let provider_headers = event
+            .data
+            .response_headers
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .expect("provider headers should be captured");
+        let client_headers = event
+            .data
+            .client_response_headers
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .expect("client headers should be captured");
+        assert_eq!(provider_headers["x-provider-only"], "provider");
+        assert!(!provider_headers.contains_key("x-client-only"));
+        assert_eq!(client_headers["x-client-only"], "client");
+        assert!(!client_headers.contains_key("x-provider-only"));
+        assert_ne!(provider_headers["authorization"], "Bearer provider-secret");
+        assert_ne!(client_headers["set-cookie"], "client-session-secret");
+        assert_eq!(
+            event.data.response_body_state,
+            Some(UsageBodyCaptureState::Reference)
+        );
+        assert_eq!(event.event_type, UsageEventType::Cancelled);
+        assert_eq!(event.request_id, "req-terminal-gap");
+        assert_eq!(event.data.status_code, Some(499));
+    }
+
+    #[tokio::test]
+    async fn watchdog_spawn_context_propagates_terminal_owner_and_request_diagnostics() {
+        let owner = Arc::new(RequestTerminalOwnershipState::new());
+        owner.note_retry(&test_plan("candidate-spawned"), None);
+        let diagnostics = Arc::new(crate::request_diagnostics::RequestDiagnostics::default());
+        let diagnostics_for_child = Arc::clone(&diagnostics);
+
+        crate::request_diagnostics::scope_request_diagnostics_with(
+            Some(Arc::clone(&diagnostics)),
+            REQUEST_TERMINAL_OWNER.scope(Arc::clone(&owner), async move {
+                let captured_owner = capture_current_request_terminal_owner();
+                let captured_diagnostics =
+                    crate::request_diagnostics::current_request_diagnostics();
+                tokio::spawn(captured_owner.scope(
+                    crate::request_diagnostics::scope_request_diagnostics_with(
+                        captured_diagnostics,
+                        async move {
+                            let child_diagnostics =
+                                crate::request_diagnostics::current_request_diagnostics()
+                                    .expect("request diagnostics must cross watchdog spawn");
+                            assert!(Arc::ptr_eq(&child_diagnostics, &diagnostics_for_child));
+                            pause_current_request_terminal_gap_for_attempt();
+                        },
+                    ),
+                ))
+                .await
+                .expect("watchdog child task should complete");
+            }),
+        )
+        .await;
+
+        assert!(
+            owner.claim_dispatch().is_none(),
+            "spawned per-attempt owner must pause the outer request-gap owner"
+        );
+    }
+
+    #[test]
+    fn unowned_two_hundred_response_is_failed_not_header_inferred_success() {
+        let snapshot = RequestTerminalSnapshot {
+            plan: test_plan("candidate-semantic-failure"),
+            report_context: None,
+            observed_at: Instant::now(),
+        };
+        let audit = TerminalClientAudit::failed_from_response(
+            200,
+            BTreeMap::new(),
+            Some(json!({"error": {"message": "missing terminal owner"}})),
+            UsageBodyCaptureState::Inline,
+        );
+        let event = build_terminal_gap_event(
+            "req-terminal-gap",
+            "req-terminal-gap",
+            &snapshot,
+            None,
+            None,
+            &audit,
+        )
+        .expect("terminal event should build");
+
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.error_category.as_deref(), Some("server_error"));
     }
 }

@@ -1801,7 +1801,22 @@ where
     // to detach a terminal finalizer while retaining ownership of its usage
     // handoff; a bare `Pin<&mut Fut>` would be dropped (and cancel the handoff)
     // when the watchdog future returns.
-    let mut execution = tokio::spawn(watchdog_progress.clone().scope(execute()));
+    // Tokio task-locals do not cross `spawn`. Explicitly re-scope both the
+    // request-level terminal owner and request diagnostics so the inner
+    // per-attempt guard can pause the gap owner and retain full audit timing.
+    let terminal_owner = crate::executor::capture_current_request_terminal_owner();
+    let request_diagnostics = crate::request_diagnostics::current_request_diagnostics();
+    let execution_future = execute();
+    let execution_with_request_context =
+        terminal_owner.scope(crate::request_diagnostics::scope_request_diagnostics_with(
+            request_diagnostics,
+            execution_future,
+        ));
+    let mut execution = tokio::spawn(
+        watchdog_progress
+            .clone()
+            .scope(execution_with_request_context),
+    );
     let mut execution_abort_guard = AbortOnDropWatchdogExecution::new(execution.abort_handle());
     // Armed only after the watchdog wins RETRY_ABORT.  It spans the
     // candidate-status handoff below; if this function is cancelled while the

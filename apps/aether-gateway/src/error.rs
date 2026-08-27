@@ -232,4 +232,56 @@ mod tests {
             Some(trace_id.as_str())
         );
     }
+
+    #[test]
+    fn terminal_audit_status_matches_every_gateway_error_response_class() {
+        let cases = [
+            (
+                GatewayError::UpstreamUnavailable {
+                    trace_id: "trace-upstream".to_string(),
+                    message: "upstream".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                GatewayError::ControlUnavailable {
+                    trace_id: "trace-control".to_string(),
+                    message: "control".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                GatewayError::LocalExecutionPlanningTimeout {
+                    trace_id: "trace-planning".to_string(),
+                    phase: "next_candidate",
+                    timeout_ms: 50,
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                GatewayError::AdmissionTimeout {
+                    trace_id: "trace-admission".to_string(),
+                    gate: "upstream",
+                    queue_budget_ms: 50,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                GatewayError::Client {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    message: "client".to_string(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                GatewayError::Internal("internal".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.status_code(), expected);
+            assert_eq!(error.clone().into_response().status(), expected);
+        }
+    }
 }
